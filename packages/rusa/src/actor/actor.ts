@@ -1094,16 +1094,18 @@ export class Actor {
       lastResult = recoveryResult;
     }
 
-    // The failure notice leads with the last attempted entry, so only that
-    // attempt's own capacity rejection may stay typed; any earlier one is
-    // already a line of the accumulated report.
-    const finalFailure = failures[failures.length - 1]?.result.failure;
+    // The notice's lead line names the run's selected entry, so the exhausted
+    // chain stays typed only when that entry made the sole attempt (every
+    // other entry skipped). Otherwise each attempt's typed fact stays on its
+    // own line: typing the aggregate would pin a later entry's capacity
+    // rejection on the selected one.
+    const sole = failures.length === 1 ? failures[0]?.result.failure : undefined;
     return {
       success: false,
       output: formatRecoveryChainFailure({ failures, skipped }),
       exitCode: lastResult.exitCode || 1,
       sessionId: lastResult.sessionId,
-      ...(finalFailure?.kind === "provider-capacity" ? { failure: finalFailure } : {}),
+      ...(sole?.kind === "provider-capacity" ? { failure: sole } : {}),
     };
   }
 

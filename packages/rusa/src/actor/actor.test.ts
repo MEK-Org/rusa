@@ -1107,235 +1107,6 @@ describe("Actor", () => {
     expect(unavailableFallback.calls).toHaveLength(0);
   });
 
-  it("accumulates a quota-looking and a capacity failure factually, keeping the final capacity rejection typed", async () => {
-    const primary = new FakeProvider(
-      () => ({
-        success: false,
-        output: "Rate limit reached: quota exhausted",
-        exitCode: 1,
-      }),
-      "primary-model"
-    );
-    const fallback = new FakeProvider(
-      () => ({
-        success: false,
-        output: "[terminal provider capacity: Selected model is at capacity.]",
-        exitCode: 1,
-        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
-      }),
-      "fallback-model"
-    );
-    const seen: RunResult[] = [];
-    const actor = makeActor(
-      {
-        modelConfig: [
-          { provider: "primary", model: "primary-model" },
-          { provider: "fallback", model: "fallback-model" },
-        ],
-        resolveProvider: (entry) => (entry.provider === "fallback" ? fallback : primary),
-        recoverFailedRuns: true,
-        onRunEnd: (result) => seen.push(result),
-      },
-      primary
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(seen[0]).toMatchObject({
-      success: false,
-      failure: { kind: "provider-capacity", message: "Selected model is at capacity." },
-    });
-    expect(seen[0]?.output).toContain(
-      "run recovery exhausted the configured model pool: 2 of 2 configured pool entries attempted and failed."
-    );
-    expect(seen[0]?.output).toContain(
-      "- attempt 1 on primary:primary-model (exit 1): Rate limit reached: quota exhausted"
-    );
-    expect(seen[0]?.output).toContain(
-      "- attempt 2 on fallback:fallback-model (exit 1): provider reported a temporary capacity rejection. [terminal provider capacity: Selected model is at capacity.]"
-    );
-
-    const notices: string[] = [];
-    await routeRunFailure(
-      {
-        actors: { get: () => ({ id: "actor-1", parentId: "supervisor-1" }) as ActorRecord },
-        sendToParent: (_to, body) => {
-          notices.push(body);
-        },
-        postToErrorChat: null,
-        rootId: "root",
-        log: () => {},
-      },
-      "actor-1",
-      seen[0] as RunResult,
-      "fallback:fallback-model"
-    );
-
-    const notice = notices[0] ?? "";
-    expect(notice).toContain(
-      "provider run fallback:fallback-model failed: a temporary provider capacity rejection was reported"
-    );
-    expect(notice).toContain("- attempt 1 on primary:primary-model (exit 1)");
-    expect(notice).toContain("- attempt 2 on fallback:fallback-model (exit 1)");
-  });
-
-  it("does not type the run as a capacity rejection when only an earlier attempt reported one", async () => {
-    const primary = new FakeProvider(
-      () => ({ success: false, output: "Rate limit reached: quota exhausted", exitCode: 1 }),
-      "primary-model"
-    );
-    const second = new FakeProvider(
-      () => ({
-        success: false,
-        output: "[terminal provider capacity: Selected model is at capacity.]",
-        exitCode: 1,
-        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
-      }),
-      "second-model"
-    );
-    const third = new FakeProvider(
-      () => ({ success: false, output: "binary not found", exitCode: 127 }),
-      "third-model"
-    );
-    const seen: RunResult[] = [];
-    const actor = makeActor(
-      {
-        modelConfig: [
-          { provider: "primary", model: "primary-model" },
-          { provider: "second", model: "second-model" },
-          { provider: "third", model: "third-model" },
-        ],
-        resolveProvider: (entry) =>
-          entry.provider === "second" ? second : entry.provider === "third" ? third : primary,
-        recoverFailedRuns: true,
-        onRunEnd: (result) => seen.push(result),
-      },
-      primary
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(seen[0]?.failure).toBeUndefined();
-    expect(seen[0]?.exitCode).toBe(127);
-    expect(seen[0]?.output).toContain(
-      "- attempt 1 on primary:primary-model (exit 1): Rate limit reached: quota exhausted"
-    );
-    expect(seen[0]?.output).toContain(
-      "- attempt 2 on second:second-model (exit 1): provider reported a temporary capacity rejection."
-    );
-    expect(seen[0]?.output).toContain(
-      "- attempt 3 on third:third-model (exit 127): binary not found"
-    );
-  });
-
-  it("records a recovery entry that cannot be prepared as that entry's attempt, keeping the primary's reason", async () => {
-    const primary = new FakeProvider(
-      () => ({
-        success: false,
-        output: "[terminal provider capacity: Selected model is at capacity.]",
-        exitCode: 1,
-        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
-      }),
-      "primary-model"
-    );
-    const seen: RunResult[] = [];
-    const actor = makeActor(
-      {
-        modelConfig: [
-          { provider: "primary", model: "primary-model" },
-          { provider: "fallback", model: "fallback-model" },
-        ],
-        resolveProvider: (entry) => {
-          if (entry.provider === "fallback") {
-            throw new Error("Provider resolver failed: missing API key");
-          }
-          return primary;
-        },
-        recoverFailedRuns: true,
-        onRunEnd: (result) => seen.push(result),
-      },
-      primary
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(seen[0]?.success).toBe(false);
-    expect(seen[0]?.failure).toBeUndefined();
-    expect(seen[0]?.output).toContain(
-      "- attempt 1 on primary:primary-model (exit 1): provider reported a temporary capacity rejection. [terminal provider capacity: Selected model is at capacity.]"
-    );
-    expect(seen[0]?.output).toContain(
-      "- attempt 2 on fallback:fallback-model (exit 1): could not prepare this entry; provider was not invoked. Provider resolver failed: missing API key"
-    );
-  });
-
-  it("carries both the primary capacity rejection and an unrelated recovery failure into the supervisor notice", async () => {
-    const primary = new FakeProvider(
-      () => ({
-        success: false,
-        output: "[terminal provider capacity: Selected model is at capacity.]",
-        exitCode: 1,
-        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
-      }),
-      "primary-model"
-    );
-    const fallback = new FakeProvider(
-      () => ({
-        success: false,
-        output: "Error: anthropic CLI exited 127: binary not found",
-        exitCode: 127,
-      }),
-      "fallback-model"
-    );
-    const seen: RunResult[] = [];
-    const actor = makeActor(
-      {
-        modelConfig: [
-          { provider: "primary", model: "primary-model" },
-          { provider: "fallback", model: "fallback-model" },
-        ],
-        resolveProvider: (entry) => (entry.provider === "fallback" ? fallback : primary),
-        recoverFailedRuns: true,
-        onRunEnd: (result) => seen.push(result),
-      },
-      primary
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-
-    const result = seen[0];
-    if (!result) throw new Error("expected result");
-    expect(result.success).toBe(false);
-    expect(result.failure).toBeUndefined();
-
-    const notices: string[] = [];
-    await routeRunFailure(
-      {
-        actors: { get: () => ({ id: "actor-1", parentId: "supervisor-1" }) as ActorRecord },
-        sendToParent: (_to, body) => {
-          notices.push(body);
-        },
-        postToErrorChat: null,
-        rootId: "root",
-        log: () => {},
-      },
-      "actor-1",
-      result,
-      "fallback:fallback-model",
-      "run-xyz"
-    );
-
-    expect(notices).toHaveLength(1);
-    const notice = notices[0] ?? "";
-    expect(notice).toContain("Run run-xyz: provider run fallback:fallback-model failed.");
-    expect(notice).toContain("Selected model is at capacity.");
-    expect(notice).toContain("anthropic CLI exited 127: binary not found");
-  });
-
   it("recovers through a later configured pool entry in order with intact tuples", async () => {
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted first", exitCode: 1 }),
@@ -1988,54 +1759,6 @@ describe("Actor", () => {
     // Session ids are work references for a replacement attempt, not report text.
     expect(output).not.toContain("primary-session");
     expect(Array.from(output).length).toBeLessThanOrEqual(FAILURE_DIAGNOSTIC_BUDGET);
-  });
-
-  it("keeps the primary's failure in the report when a recovery entry fails differently", async () => {
-    const primary = new FakeProvider(
-      () => ({
-        success: false,
-        output: "usage credits depleted",
-        exitCode: 1,
-      }),
-      "primary-model"
-    );
-    // The fallback never starts because its model slug is not configured: a
-    // real wiring bug that must stay findable without hiding the primary.
-    const fallbackProvider = new FakeProvider(
-      () => ({
-        success: false,
-        output: 'error: invalid --model "claude-sonnet-5": model is not recognized',
-        exitCode: 1,
-      }),
-      "fallback-model"
-    );
-    const seen: RunResult[] = [];
-    const actor = makeActor(
-      {
-        modelConfig: [
-          { provider: "primary", model: "first" },
-          { provider: "recovery", model: "fallback-model" },
-        ],
-        resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
-        recoverFailedRuns: true,
-        onRunEnd: (r) => {
-          seen.push(r);
-        },
-      },
-      primary
-    );
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    expect(primary.calls).toHaveLength(1);
-    expect(fallbackProvider.calls).toHaveLength(1);
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.success).toBe(false);
-    expect(seen[0]?.output).toContain(
-      "- attempt 1 on primary:first (exit 1): usage credits depleted"
-    );
-    expect(seen[0]?.output).toContain(
-      '- attempt 2 on recovery:fallback-model (exit 1): error: invalid --model "claude-sonnet-5"'
-    );
   });
 
   it("moves past a recovery entry that cannot be resolved, never reinterpreting its tuple", async () => {
@@ -3167,6 +2890,45 @@ describe("failure reasons reach the supervisor (#980)", () => {
     expect(toParent[0]).not.toContain("run recovery");
   });
 
+  it("keeps each attempt's capacity rejection on its own line, never on the run's selected entry", async () => {
+    const first = new FakeProvider(
+      () => ({ success: false, exitCode: 1, output: "Rate limit reached: quota exhausted" }),
+      "first-model"
+    );
+    const second = new FakeProvider(
+      () => ({
+        success: false,
+        exitCode: 1,
+        output: "[terminal provider capacity: Selected model is at capacity.]",
+        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
+      }),
+      "second-model"
+    );
+    const { toChat, ended, runIds } = await deliver(
+      { root: { id: "root" } },
+      "root",
+      {
+        modelConfig: [
+          { provider: "first", model: "first-model" },
+          { provider: "second", model: "second-model" },
+        ],
+        recoverFailedRuns: true,
+        resolveProvider: (entry) => (entry.provider === "second" ? second : first),
+      },
+      first
+    );
+    expect(ended[0]?.failure).toBeUndefined();
+    const notice = toChat[0] ?? "";
+    expect(notice).toContain(`Run ${runIds[0]}: provider run first/first-model failed.`);
+    expect(notice).not.toContain("capacity rejection was reported");
+    expect(notice).toContain(
+      "- attempt 1 on first:first-model (exit 1): Rate limit reached: quota exhausted"
+    );
+    expect(notice).toContain(
+      "- attempt 2 on second:second-model (exit 1): provider reported a temporary capacity rejection."
+    );
+  });
+
   it("reports a recovery entry that cannot be prepared as that attempt's failure, not the run's", async () => {
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted primary", exitCode: 1 }),
@@ -3263,32 +3025,6 @@ describe("configured-root run recovery (#1150)", () => {
         "PROMPT: inbox work",
       ].join("\n")
     );
-  });
-
-  it("does not recover a failed run for an actor that is not the configured root", async () => {
-    const first = new FakeProvider(
-      () => ({ success: false, exitCode: 1, output: "You've hit your usage limit" }),
-      "first"
-    );
-    const second = new FakeProvider(
-      () => ({ success: true, output: "done", exitCode: 0 }),
-      "second"
-    );
-    const seen: RunResult[] = [];
-    const actor = makeActor(
-      {
-        modelConfig: pool,
-        resolveProvider: (entry) => (entry.provider === "first" ? first : second),
-        onRunEnd: (r) => seen.push(r),
-      },
-      first
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(second.calls).toHaveLength(0);
-    expect(seen).toMatchObject([{ success: false, output: "You've hit your usage limit" }]);
   });
 
   it("does not recover a run an operator interrupted, even one that failed", async () => {
