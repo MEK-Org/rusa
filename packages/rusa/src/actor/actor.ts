@@ -1072,6 +1072,7 @@ export class Actor {
     // one ended. An entry that could not be constructed launched nothing, so
     // it does not bear on the evidence.
     let unproven = false;
+    let observed = false;
     const attemptProvider = async (
       entry: RawProviderModelConfig,
       recoveryContext?: string
@@ -1080,15 +1081,20 @@ export class Actor {
       // A provider-selection failure never entered runProvider, so it cannot
       // make an otherwise fully observed chain unproven; missing evidence
       // from a process that did run stays unproven.
-      if (attempt.termination !== "observed" && attempt.failure?.stage !== "provider-selection") {
+      if (attempt.termination === "observed") {
+        observed = true;
+      } else if (attempt.failure?.stage !== "provider-selection") {
         unproven = true;
       }
       return attempt;
     };
-    const withEvidence = (composed: RunResult): RunResult => ({
-      ...composed,
-      termination: unproven ? "unproven" : "observed",
-    });
+    const withEvidence = (composed: RunResult): RunResult => {
+      if (unproven) return { ...composed, termination: "unproven" };
+      // A pool with only selection failures or skipped entries started no
+      // provider process, so it cannot manufacture observed termination.
+      if (observed) return { ...composed, termination: "observed" };
+      return composed;
+    };
 
     const result = await attemptProvider(selected);
     if (result.success || this.stoppedOnPurpose(result)) return result;

@@ -3468,6 +3468,49 @@ describe("termination evidence reaches the run's terminal (#1119)", () => {
     expect(await evidenceOf(actor, ends)).toBe("observed");
   });
 
+  it("does not manufacture observed evidence when every pool entry is unresolvable", async () => {
+    const { ends, lifecycle } = terminals();
+    const neverRun = new FakeProvider(() => ({ success: true, termination: "observed" }), "never");
+    const actor = makeActor(
+      {
+        lifecycle,
+        modelConfig: [{ provider: "a" }, { provider: "b" }, { provider: "c" }],
+        resolveProvider: () => {
+          throw new Error("provider is not configured");
+        },
+        recoverFailedRuns: true,
+      },
+      neverRun
+    );
+
+    expect(await evidenceOf(actor, ends)).toBeUndefined();
+    expect(neverRun.calls).toHaveLength(0);
+  });
+
+  it("does not manufacture observed evidence when selection fails and all fallbacks are ineligible", async () => {
+    const { ends, lifecycle } = terminals();
+    const neverRun = new FakeProvider(() => ({ success: true, termination: "observed" }), "never");
+    const actor = makeActor(
+      {
+        lifecycle,
+        modelConfig: [{ provider: "selected" }, { provider: "b" }, { provider: "c" }],
+        resolveProvider: (entry) => {
+          if (entry.provider === "selected") throw new Error("selected provider is not configured");
+          return neverRun;
+        },
+        recoverFailedRuns: true,
+        recoveryEligibility: (entry) =>
+          entry.provider === "selected"
+            ? { eligible: true }
+            : { eligible: false, reason: "halted" },
+      },
+      neverRun
+    );
+
+    expect(await evidenceOf(actor, ends)).toBeUndefined();
+    expect(neverRun.calls).toHaveLength(0);
+  });
+
   it("is observed after recovery only if every launched attempt was observed", async () => {
     expect(
       await pooled({ ...exhausted, termination: "observed" }, { termination: "observed" })

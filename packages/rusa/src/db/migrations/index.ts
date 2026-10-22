@@ -128,6 +128,4 @@ export const migrations: Migration[] = [
   meshChatResponsive,
   metricSamples,
   instanceRunReceipts,
-  metricSamples,
-  instanceRunReceipts,
 ];

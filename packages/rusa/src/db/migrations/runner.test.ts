@@ -132,7 +132,6 @@ describe("Database Migration System", () => {
     expect(tableNames).toContain("availability_holds");
     expect(tableNames).toContain("portable_brief_revisions");
     expect(tableNames).toContain("metric_samples");
-    expect(tableNames).toContain("metric_samples");
     expect(tableNames).toContain("host_run_receipts");
     expect(tableNames).toContain("instance_run_terminals");
 
