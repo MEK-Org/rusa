@@ -8305,8 +8305,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
         success: true,
         output: "fallback recovered",
         exitCode: 0,
+      }),
+      primary: () => RunResult = () => ({
+        success: false,
+        output: "quota exhausted",
+        exitCode: 1,
       })
-    ): Promise<{ attempts: CodingProvider[]; result: RunResult }> => {
+    ): Promise<{ attempts: CodingProvider[]; result: RunResult; runId: string }> => {
       const root = mesh.get(rootId);
       if (!root) throw new Error("root actor not ready");
       const actor = root as unknown as {
@@ -8325,13 +8330,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // first attempt fails.
       const result = await actor.runWithPoolFallback(runId, selected, async (provider) => {
         attempts.push(provider);
-        return attempts.length === 1
-          ? { success: false, output: "quota exhausted", exitCode: 1 }
-          : recover(provider);
+        return attempts.length === 1 ? primary() : recover(provider);
       });
       // Close the durable lifecycle run the way `Actor.invoke` does.
       await endLifecycleRun(lifecycleActor, runId, result);
-      return { attempts, result };
+      return { attempts, result, runId };
     };
     const runEndEvents = () =>
       getRepositories().meshEvents.listEventsByActors([rootId], { kinds: ["run_end"], limit: 20 })
@@ -8357,6 +8360,48 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
       expect(recovered.result).toMatchObject({ success: true, output: "fallback recovered" });
       expect(runEndEvents()).toHaveLength(1);
+    });
+
+    it("keeps a thrown attempt's scrubbed stack in the local run_error record after recovery", async () => {
+      // A recovered run's `run_end` holds only the replacement's output, so the
+      // thrown primary's stack must survive in its own `run_error` record.
+      const secret = "synthetic-run-error-credential";
+      vi.stubEnv("GH_TOKEN", secret);
+      try {
+        await persistOperatorPool();
+        const mesh = await boot();
+        logCapture.lines.length = 0;
+
+        const recovered = await rootPoolFallbackRun(
+          mesh,
+          operatorPool[0] as ProviderModelConfig,
+          undefined,
+          () => {
+            throw new Error(`provider launch failed with ${secret}`);
+          }
+        );
+
+        expect(recovered.attempts).toHaveLength(2);
+        expect(recovered.result).toMatchObject({ success: true, output: "fallback recovered" });
+        const records = bootRecords("run_error");
+        expect(records).toHaveLength(1);
+        expect(records[0]).toMatchObject({
+          level: "error",
+          actorId: rootId,
+          runId: recovered.runId,
+          error: "provider launch failed with [redacted]",
+          err: {
+            name: "Error",
+            message: "provider launch failed with [redacted]",
+            stack: expect.stringMatching(
+              /^Error: provider launch failed with \[redacted\]\n\s+at /
+            ),
+          },
+        });
+        expect(JSON.stringify(records[0])).not.toContain(secret);
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
 
     it("does not retry an exhausted entry when launch begins on a later pool candidate", async () => {
@@ -11059,6 +11104,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
           .map(({ time: _time, pid: _pid, hostname: _host, actorId: _actorId, ...rest }) => ({
             ...rest,
             runId: alias(rest.runId as string | undefined),
+            // A thrown run's stack names this test's call site, which differs
+            // between the two projections; its frames are not run accounting.
+            ...(rest.err ? { err: { ...(rest.err as object), stack: "[frames]" } } : {}),
           }));
         return { events, runs, logs, selection: undefined };
       };

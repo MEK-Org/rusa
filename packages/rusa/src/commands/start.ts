@@ -3223,8 +3223,12 @@ async function composeStart(
         });
       },
       onError: (event) => {
+        // `err` carries the scrubbed stack and cause chain: a recovering root
+        // keeps running after a thrown attempt, so this record is where that
+        // attempt's stack survives.
         runLogger(id, event.runId).error("run_error", {
           error: event.error instanceof Error ? event.error.message : String(event.error),
+          err: event.error,
         });
       },
       onEnd: async (event) => {
