@@ -26,7 +26,12 @@ import {
   type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
-import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
+import type {
+  ActorRecord,
+  ContextConfig,
+  ExecutionConfig,
+  PortableContextConfig,
+} from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   defaultActorBootstrapCapabilities,
@@ -2995,17 +3000,13 @@ async function composeStart(
       impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
     });
   };
-  const isPortableLedgerActor = (actorId: string): boolean => {
-    const context = actors.get(actorId)?.context;
-    return context?.type === "portable" && context.mode === "ledger";
-  };
-
   const compactPortableActorAfterRun = async (
     actorId: string,
-    runId: string
+    runId: string,
+    runContext?: ContextConfig
   ): Promise<PortableContextCompactionSummary | null> => {
-    const current = actors.get(actorId);
-    const context = current?.context?.type === "portable" ? current.context : undefined;
+    const current = runContext ?? actors.get(actorId)?.context;
+    const context = current?.type === "portable" ? current : undefined;
     const compactor = context?.mode === "ledger" ? compactorFor(context) : null;
     if (context?.mode !== "ledger" || !compactor) return null;
     try {
@@ -3179,9 +3180,11 @@ async function composeStart(
     // Which entry actually ran, for the failure-notice label. A declared pool
     // can move while idle, so this is captured at lifecycle start.
     let lastSelected = firstSelected;
+    let launchContext = actors.get(id)?.context;
     lifecycle.add({
       onStart: (event) => {
         lastSelected = event.selected;
+        launchContext = actors.get(id)?.context;
         mesh.clearSelection(id);
         const launchConfig = projectActorRunLaunchConfig(event.selected);
         runAccounting.begin(id, event.runId, launchConfig);
@@ -3278,9 +3281,10 @@ async function composeStart(
         // successor — which is what interrupted it — starts without waiting on
         // the compactor. The cursor is untouched; the sources stay in mesh_chat
         // and actor_runs, and the next ordinary run end folds them once.
+        const isLedgerRun = launchContext?.type === "portable" && launchContext.mode === "ledger";
         const deferred =
           result.interrupted === true &&
-          isPortableLedgerActor(id) &&
+          isLedgerRun &&
           portableJournalModeFor(id) === "delta";
         if (deferred) {
           mesh.recordEvent({
@@ -3294,7 +3298,10 @@ async function composeStart(
             }),
           });
         }
-        const compacted = deferred ? null : await compactPortableActorAfterRun(id, event.runId);
+        const compacted =
+          deferred || !isLedgerRun
+            ? null
+            : await compactPortableActorAfterRun(id, event.runId, launchContext);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",
