@@ -152,10 +152,8 @@ Finder _staleWarning(String name) => find.descendant(
   matching: find.byKey(const ValueKey('quota-ring-stale-warning')),
 );
 
-Finder _ringTooltip(String name) => find.ancestor(
-  of: find.text(name),
-  matching: find.byType(Tooltip),
-);
+Finder _ringTooltip(String name) =>
+    find.ancestor(of: find.text(name), matching: find.byType(Tooltip));
 
 String _tooltipOf(WidgetTester tester, String name) {
   final tooltip = tester.widget<Tooltip>(_ringTooltip(name));
@@ -187,7 +185,10 @@ void main() {
         final now = DateTime.now();
         var store = await _pumpRings(
           tester,
-          _snapshot(claudeWindows: [_claudeWeekly(now: now)], fetchedAt: now),
+          _snapshot(
+            claudeWindows: [_claudeWeekly(now: now)],
+            fetchedAt: now,
+          ),
         );
         expect(_staleWarning('Claude'), findsNothing);
         expect(_stripOpacity(tester), 1.0);
@@ -313,7 +314,7 @@ void main() {
         expect(fableTip, contains('Weekly: '));
         expect(fableTip, isNot(contains('(Fable)')));
         expect(fableTip, contains('25%'));
-        expect(fableTip, contains('Provider reset in'));
+        expect(fableTip, contains('Resets in'));
         expect(fableTip, contains('Last Read: 5 minutes ago'));
         expect(fableTip, isNot(contains('all models')));
 
@@ -504,12 +505,21 @@ void main() {
             ),
           );
 
-          expect(_tooltipOf(tester, 'Claude'), contains('Pacing: every 1.5 minutes'));
-          expect(_tooltipOf(tester, 'Claude'), isNot(contains('Limited to the configured maximum interval')));
+          expect(
+            _tooltipOf(tester, 'Claude'),
+            contains('Pacing: every 1.5 minutes'),
+          );
+          expect(
+            _tooltipOf(tester, 'Claude'),
+            isNot(contains('Limited to the configured maximum interval')),
+          );
 
           final fableTip = _tooltipOf(tester, 'Fable');
           expect(fableTip, contains('Pacing: every 15 minutes'));
-          expect(fableTip, contains('Limited to the configured maximum interval'));
+          expect(
+            fableTip,
+            contains('Limited to the configured maximum interval'),
+          );
           await store.dispose();
         });
       },
@@ -551,7 +561,10 @@ void main() {
             ),
           );
 
-          expect(_tooltipOf(tester, 'Claude'), contains('Pacing: every 1.5 minutes'));
+          expect(
+            _tooltipOf(tester, 'Claude'),
+            contains('Pacing: every 1.5 minutes'),
+          );
           expect(_tooltipOf(tester, 'Fable'), contains('Pacing: n/a'));
           expect(_tooltipOf(tester, 'Fable'), isNot(contains('90')));
           await store.dispose();
@@ -862,12 +875,7 @@ void main() {
           tester.widget<Icon>(_staleWarning('Fable')).color,
           MeshColors.quotaStaleWarning,
         );
-        expect(
-          _tooltipOf(tester, 'Fable'),
-          contains(
-            'Last Read: 3 hours ago',
-          ),
-        );
+        expect(_tooltipOf(tester, 'Fable'), contains('Last Read: 3 hours ago'));
         expect(_tooltipOf(tester, 'Fable'), isNot(contains('Warning:')));
         await store.dispose();
       });
