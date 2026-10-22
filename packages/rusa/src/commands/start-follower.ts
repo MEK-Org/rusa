@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
@@ -18,11 +19,26 @@ import {
 import { createFollowerFileOps } from "../remote-instances/follower-file-ops.js";
 import type { FollowerCommand, FollowerEvent } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
+import { isFullCommitSha } from "../remote-instances/follower-update-validation.js";
+import {
+  executeFollowerUpdate,
+  type FollowerBuildSeam,
+  type FollowerGitSeam,
+} from "../remote-instances/follower-updater.js";
 import {
   type EventTransferCapability,
+  type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
 } from "../remote-instances/protocol.js";
 import type { ResourceScope } from "../runtime/resource-scope.js";
+import { readBuildSentinel } from "../update/build-sentinel.js";
+import {
+  BuildRunner,
+  GitRunner,
+  UPDATE_BUILD_TIMEOUT_MS,
+  UPDATE_INSTALL_TIMEOUT_MS,
+} from "../update/runner.js";
+import { resolveRepoRoot } from "./service-instance.js";
 import type { RunStartOptions } from "./start.js";
 
 export class FollowerHttpError extends Error {
@@ -33,6 +49,81 @@ export class FollowerHttpError extends Error {
     super(message);
     this.name = "FollowerHttpError";
   }
+}
+
+/** The checkout and build a start-mode follower promotes for a leader update. */
+export interface StartFollowerUpdateSource {
+  git: FollowerGitSeam;
+  build: FollowerBuildSeam;
+  /** Bound on waiting for hosted actors before restart; the updater's default otherwise. */
+  drainTimeoutMs?: number;
+}
+
+export interface StartFollowerRelease {
+  /** Build-sentinel SHA of the dist this process booted from; absent when unproven. */
+  runningSha?: string;
+  /** Where updates come from, or why this launch cannot update itself. */
+  update: StartFollowerUpdateSource | { unavailable: string };
+}
+
+// `restarting` is the last status the old process can truthfully emit. Bound its
+// delivery so a dead leader connection cannot delay the restart indefinitely.
+const RESTART_FLUSH_TIMEOUT_MS = 1500;
+
+/**
+ * Resolve the running release from the launched entry point. Self-update is
+ * supported only when `rusa start` runs from `packages/rusa/dist` of a git
+ * checkout: the update resets that checkout and rebuilds that dist, and a
+ * supervisor restarts the clean exit onto it.
+ */
+export function resolveStartFollowerRelease(log: Logger): StartFollowerRelease {
+  let distDir: string;
+  try {
+    distDir = dirname(realpathSync(resolve(process.argv[1] ?? "")));
+  } catch {
+    return { update: { unavailable: "Cannot resolve the rusa start entry point" } };
+  }
+  const sentinel = readBuildSentinel(distDir);
+  const runningSha = sentinel && isFullCommitSha(sentinel) ? sentinel : undefined;
+  const unsupported = (reason: string): StartFollowerRelease => ({
+    runningSha,
+    update: { unavailable: `Follower self-update is unsupported for this launch: ${reason}` },
+  });
+  if (basename(distDir) !== "dist") {
+    return unsupported("rusa start is not running from a built dist directory");
+  }
+  const packageDir = dirname(distDir);
+  let repoRoot: string;
+  try {
+    repoRoot = resolveRepoRoot(packageDir);
+  } catch {
+    return unsupported("the running build is not inside a git checkout");
+  }
+  try {
+    const packageJson = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as {
+      name?: unknown;
+    };
+    if (
+      packageJson.name !== "rusa" ||
+      realpathSync(join(repoRoot, "packages", "rusa")) !== realpathSync(packageDir)
+    ) {
+      return unsupported("the running build is not packages/rusa of a rusa checkout");
+    }
+  } catch {
+    return unsupported("the running build is not packages/rusa of a rusa checkout");
+  }
+  const buildLog = log.child({ component: "follower-update" });
+  return {
+    runningSha,
+    update: {
+      git: new GitRunner(repoRoot),
+      build: new BuildRunner(
+        packageDir,
+        { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
+        (message) => buildLog.info("follower_update_build_progress", { message })
+      ),
+    },
+  };
 }
 
 function resolveFollowerToken(config: RusaConfig): string {
@@ -96,6 +187,17 @@ export async function composeFollowerStart(
   if (identity.role !== "follower") throw new Error("Follower start requires a leader peer");
   const repos = getRepositories("follower");
   log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
+
+  // An e2e composition must never reset and rebuild the checkout running it.
+  const release: StartFollowerRelease = opts?.e2e
+    ? (opts.e2e.followerRelease ?? {
+        update: { unavailable: "Follower update has no isolated source in this e2e composition" },
+      })
+    : resolveStartFollowerRelease(log);
+  log.info("follower_release_resolved", {
+    runningSha: release.runningSha,
+    updateUnavailable: "unavailable" in release.update ? release.update.unavailable : undefined,
+  });
 
   // 2. Setup FollowerInstance with requireReconciliation = true
   const eventQueue = new FollowerEventQueue();
@@ -277,6 +379,8 @@ export async function composeFollowerStart(
         pid: process.pid,
         generation,
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        // The leader's update reconciliation compares this with its target.
+        ...(release.runningSha ? { commitSha: release.runningSha } : {}),
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
@@ -341,6 +445,70 @@ export async function composeFollowerStart(
     process.off("SIGTERM", onSignal);
   });
 
+  const restart = async (code: number): Promise<void> => {
+    if (sendTimer) clearTimeout(sendTimer);
+    sendTimer = undefined;
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      flush(),
+      new Promise<void>((resolveTimeout) => {
+        flushTimer = setTimeout(resolveTimeout, RESTART_FLUSH_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(flushTimer);
+    log.info("follower_update_restarting", { code });
+    await resources.close();
+    process.exit(code);
+  };
+
+  const handleUpdate = async (command: FollowerUpdateCommand): Promise<void> => {
+    log.info("follower_update_received", {
+      updateId: command.updateId,
+      targetSha: command.targetSha,
+      branch: command.branch,
+    });
+    const source = release.update;
+    if ("unavailable" in source) {
+      // Never silently drop an authenticated update command.
+      log.warn("follower_update_unavailable", {
+        updateId: command.updateId,
+        error: source.unavailable,
+      });
+      emit("$instance", {
+        type: "update_status",
+        updateId: command.updateId,
+        status: "failed",
+        error: source.unavailable,
+      });
+      return;
+    }
+    const updateLog = log.child({ component: "follower-update" });
+    await executeFollowerUpdate(
+      {
+        updateId: command.updateId,
+        targetSha: command.targetSha,
+        branch: command.branch,
+        drainTimeoutMs: source.drainTimeoutMs,
+      },
+      {
+        git: source.git,
+        build: source.build,
+        drain: {
+          drain: async (timeoutMs) => {
+            instance.beginDrain();
+            const outcome = await instance.waitForQuiescence(timeoutMs);
+            log.info("follower_update_drain_complete", outcome);
+            return outcome;
+          },
+        },
+        emitter: { emitStatus: (statusEvent) => emit("$instance", statusEvent) },
+        exit: restart,
+        log: (message) => updateLog.info("follower_update_progress", { message }),
+      }
+    );
+    await flush();
+  };
+
   const startPolling = () => {
     polling = (async () => {
       let backoffMs = 500;
@@ -367,18 +535,7 @@ export async function composeFollowerStart(
             if ("actorId" in command) {
               instance.dispatch(command);
             } else if (command.type === "update") {
-              // The retained follower entry point has an explicit checkout and
-              // build source for promotion. `rusa start` does not yet, so never
-              // silently drop an authenticated update command.
-              const error =
-                "Follower update is not configured for rusa start; use the retained follower entry point";
-              log.warn("follower_update_unavailable", { updateId: command.updateId, error });
-              emit("$instance", {
-                type: "update_status",
-                updateId: command.updateId,
-                status: "failed",
-                error,
-              });
+              void handleUpdate(command);
             }
           }
           backoffMs = 500;

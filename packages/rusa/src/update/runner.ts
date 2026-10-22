@@ -236,6 +236,11 @@ export class GitRunner implements GitSeam {
   }
 }
 
+// Self-update bounds: per-step HARD timeouts so a hung install or build can't
+// wedge the instance it is updating.
+export const UPDATE_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+export const UPDATE_BUILD_TIMEOUT_MS = 20 * 60 * 1000;
+
 export interface BuildTimeouts {
   installMs: number;
   buildMs: number;
