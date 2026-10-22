@@ -117,7 +117,7 @@ describe("Database Migration System", () => {
       "0060_configured_actor_import",
       "0062_portable_brief_revisions",
       "0063_mesh_chat_responsive",
-      "0064_inbox_metric_snapshots",
+      "0064_metric_samples",
     ]);
 
     const tableNames = (
@@ -130,6 +130,7 @@ describe("Database Migration System", () => {
     expect(tableNames).toContain("obligation_completion_matchers");
     expect(tableNames).toContain("availability_holds");
     expect(tableNames).toContain("portable_brief_revisions");
+    expect(tableNames).toContain("metric_samples");
 
     const meshEventsColumns = (
       db.prepare("PRAGMA table_info(mesh_events)").all() as Array<{ name: string }>

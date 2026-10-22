@@ -17,7 +17,7 @@ const MINUTE = INBOX_METRIC_INTERVAL_MS;
 const t0 = Date.parse("2026-10-10T12:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
 
-describe("#1018 inbox metric snapshots", () => {
+describe("#1018 inbox metric samples", () => {
   let db: Database.Database;
   let inbox: SqliteInboxRepository;
   let metrics: InboxMetricRepository;
@@ -185,13 +185,18 @@ describe("#1018 inbox metric snapshots", () => {
       oldestAgeSecondsMedian: 420,
       oldestAgeSecondsMax: 1440,
     });
-    const stored = db
+    const sizes = db
       .prepare(
-        "SELECT inbox_size_median, oldest_age_seconds_max FROM inbox_metric_snapshots ORDER BY minute"
+        "SELECT value FROM metric_samples WHERE metric = 'inbox_size_median' ORDER BY minute"
       )
-      .all() as Array<{ inbox_size_median: number; oldest_age_seconds_max: number }>;
-    expect(stored.map((row) => row.inbox_size_median)).toEqual([0.5, 0.5, 0.5, 0.5, 1]);
-    expect(stored.map((row) => row.oldest_age_seconds_max)).toEqual([240, 300, 360, 420, 1440]);
+      .all() as Array<{ value: number }>;
+    const ages = db
+      .prepare(
+        "SELECT value FROM metric_samples WHERE metric = 'oldest_age_seconds_max' ORDER BY minute"
+      )
+      .all() as Array<{ value: number }>;
+    expect(sizes.map((row) => row.value)).toEqual([0.5, 0.5, 0.5, 0.5, 1]);
+    expect(ages.map((row) => row.value)).toEqual([240, 300, 360, 420, 1440]);
   });
 
   it("counts an actor holding only human-chat messages as zero size and zero age", () => {
@@ -265,24 +270,28 @@ describe("#1018 inbox metric snapshots", () => {
       true
     );
     expect(
-      (db.prepare("SELECT count(*) AS n FROM inbox_metric_snapshots").get() as { n: number }).n
+      (db.prepare("SELECT count(DISTINCT minute) AS n FROM metric_samples").get() as { n: number })
+        .n
     ).toBe(INBOX_METRIC_MAX_POINTS);
+    expect((db.prepare("SELECT count(*) AS n FROM metric_samples").get() as { n: number }).n).toBe(
+      INBOX_METRIC_MAX_POINTS * 5
+    );
 
     // A minute later the oldest position leaves the window and storage alike.
     metrics.sampleIfDue(end + MINUTE);
     expect(
-      (db.prepare("SELECT min(minute) AS m FROM inbox_metric_snapshots").get() as { m: string }).m
+      (db.prepare("SELECT min(minute) AS m FROM metric_samples").get() as { m: string }).m
     ).toBe(iso(t0 + MINUTE));
   });
 
-  it("reads the window by primary-key range rather than scanning the table", () => {
+  it("reads metric samples by indexed range rather than scanning the table", () => {
     const plan = db
       .prepare(
-        "EXPLAIN QUERY PLAN SELECT * FROM inbox_metric_snapshots WHERE minute >= ? AND minute <= ? ORDER BY minute"
+        "EXPLAIN QUERY PLAN SELECT * FROM metric_samples WHERE minute >= ? AND minute <= ? ORDER BY minute"
       )
       .all(iso(t0), iso(t0 + INBOX_METRIC_WINDOW_MS)) as Array<{ detail: string }>;
     expect(plan.map((row) => row.detail).join("\n")).toMatch(
-      /SEARCH inbox_metric_snapshots USING INDEX sqlite_autoindex_inbox_metric_snapshots_1 \(minute>\? AND minute<\?\)/
+      /SEARCH metric_samples USING INDEX idx_metric_samples_minute \(minute>\? AND minute<\?\)/
     );
   });
 });
