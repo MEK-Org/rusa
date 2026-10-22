@@ -34,7 +34,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
           return { success: provider === "fallback", output: "synthetic", exitCode: 1 };
         },
       }),
-      classifyExhaustion: async () => ({ exhausted: true }),
+      recoverFailedRuns: true,
       loadSessionId: () => undefined,
       saveSessionId: () => {},
       buildPrompt: () => ({ prompt: "synthetic" }),
@@ -432,7 +432,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
             };
           },
         }),
-        classifyExhaustion: async () => ({ exhausted: true }),
+        recoverFailedRuns: true,
         debounceMs: 10,
         loadSessionId: () => undefined,
         saveSessionId: () => {},

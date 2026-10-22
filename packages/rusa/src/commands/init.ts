@@ -216,8 +216,9 @@ export async function runInit(opts?: InitOptions): Promise<void> {
     console.log(`\n  ℹ️  Found existing config — values shown as defaults. Press Enter to keep.\n`);
   }
 
-  // Optional — enables LLM quota-error classification, avatar generation, and
-  // understanding retrieval/distill; each is skipped when absent.
+  // Optional — enables Gemini features such as portable compaction, quota
+  // parsing, avatar generation and understanding retrieval/distill; each is
+  // skipped when absent.
   const existingGeminiApiKey =
     existing?.geminiApiKey?.trim() || loadExistingEnvVar(mcHome, "GEMINI_API_KEY") || "";
   let geminiApiKey = existingGeminiApiKey;

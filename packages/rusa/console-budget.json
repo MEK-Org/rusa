@@ -37,7 +37,6 @@
     "src/observability/disk-alert.ts": 1,
     "src/providers/antigravity.ts": 4,
     "src/providers/codex.ts": 4,
-    "src/providers/exhaustion-classifier.ts": 3,
     "src/providers/model-catalog.ts": 4,
     "src/providers/model-scrape.ts": 3,
     "src/providers/provider-selection.ts": 1,
