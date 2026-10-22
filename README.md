@@ -88,6 +88,7 @@ The core primitives:
 | `list_threads()` | List the actors you have spawned, with charter summaries and status. |
 | `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. Only a parent can retire its descendants. |
 | `set_actor_model(actor_id, model_config)` | Replace a child's provider/model pool in place (parent or root only). Provider changes and multi-entry pools are only allowed for portable-context actors. |
+| `set_actor_context(actor_id, context_mode, compaction_model?)` | Update an existing actor's context mode in place (`native`, `ledger`, `tail`, `brief`). Parent or subtree admin only; applies at the next run boundary. |
 
 Two rules keep the mesh safe:
 

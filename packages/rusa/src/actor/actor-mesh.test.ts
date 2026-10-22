@@ -10,6 +10,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { DbPortableContextStore } from "../db/repositories/portable-context-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
@@ -62,6 +63,7 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import {
+  ACTOR_ADMIN_CAPABILITY,
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
   OBLIGATIONS_ADMIN_CAPABILITY,
@@ -402,6 +404,8 @@ function setup(
     seedRootGrants?: boolean;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
+    validateContext?: ActorMeshOptions["validateContext"];
+    ledgerCompactionAvailable?: boolean;
     onModelSet?: ActorMeshOptions["onModelSet"];
     onQueued?: ActorMeshOptions["onQueued"];
     createActor?: ActorMeshOptions["createActor"];
@@ -411,7 +415,7 @@ function setup(
     providerGate?: ActorMeshOptions["providerGate"];
     /** Any scheduler; a test passing a real one must not use the fake-only helpers. */
     scheduledMessages?: ScheduledMessageScheduler;
-    actors?: InMemoryActorRepository;
+    actors?: InMemoryActorRepository | SqliteActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
     handleForId?: (id: string) => string;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
@@ -470,6 +474,8 @@ function setup(
     handleForId: opts.handleForId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
+    validateContext: opts.validateContext,
+    ledgerCompactionAvailable: opts.ledgerCompactionAvailable,
     onModelSet: opts.onModelSet,
     onQueued: opts.onQueued,
     maxConcurrent: opts.maxConcurrent ?? 4,
@@ -618,7 +624,7 @@ function setup(
   const tick = () => vi.advanceTimersByTimeAsync(DEBOUNCE + 1);
   const fake = (id: string) => providers.get(id) as FakeProvider;
   return {
-    registry,
+    registry: registry as InMemoryActorRepository,
     mesh: testMesh,
     rawSpawn,
     providers,
@@ -6804,6 +6810,506 @@ describe("ActorMesh", () => {
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
     await dynamicMeshSetup.tick();
     expect(providerBExecuted).toBe(true);
+  });
+
+  describe("setActorContext", () => {
+    it("enforces authority: ancestor, admin subtree, self, retired, unknown", () => {
+      const { mesh, registry, capabilityGrants } = setup();
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const sibling = mesh.spawn({
+        charter: "sibling",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      // 1. Ancestor can set context mode
+      const outcome = mesh.setActorContext(child, "brief", parent);
+      expect(outcome).toBe("applied");
+      expect(registry.get(child)?.context).toEqual({ type: "portable", mode: "brief" });
+
+      // 2. Root (ancestor) can set context mode
+      mesh.setActorContext(child, "tail", "root");
+      expect(registry.get(child)?.context).toEqual({ type: "portable", mode: "tail" });
+
+      // 3. Admin holder can set context mode in its own subtree
+      capabilityGrants.grant({
+        actorId: sibling,
+        capability: ACTOR_ADMIN_CAPABILITY,
+        grantedBy: "root",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      const siblingChild = mesh.spawn({
+        charter: "sibling child",
+        parentId: sibling,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      mesh.setActorContext(siblingChild, "brief", sibling);
+      expect(registry.get(siblingChild)?.context).toEqual({ type: "portable", mode: "brief" });
+
+      // 4. Admin holder cannot set context mode outside its subtree
+      expect(() => mesh.setActorContext(child, "brief", sibling)).toThrow(/in its own subtree/);
+
+      // 5. Actor cannot set its own context mode (even if admin)
+      expect(() => mesh.setActorContext(sibling, "brief", sibling)).toThrow(
+        /cannot change its own context mode/
+      );
+      expect(() => mesh.setActorContext(child, "brief", child)).toThrow(
+        /cannot change its own context mode/
+      );
+
+      // 6. Non-ancestor non-admin cannot set context mode
+      expect(() => mesh.setActorContext(sibling, "brief", parent)).toThrow(/not an ancestor/);
+
+      // 7. Retired thread is refused
+      const toRetire = mesh.spawn({
+        charter: "retiring",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      mesh.retire(toRetire);
+      expect(() => mesh.setActorContext(toRetire, "brief", "root")).toThrow(/retired thread/);
+
+      // 8. Unknown thread is refused
+      expect(() => mesh.setActorContext("unknown-id", "brief", "root")).toThrow(/unknown thread/);
+    });
+
+    it("enforces validation: unknown mode, compaction model on non-ledger, ledger without compaction, native with multi-entry or class", () => {
+      const { mesh, registry } = setup({
+        ledgerCompactionAvailable: false,
+      });
+
+      const singleModel = mesh.spawn({
+        charter: "single model",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+
+      // 1. Unknown mode
+      expect(() => mesh.setActorContext(singleModel, "invalid-mode", "root")).toThrow(
+        /unknown context selection/
+      );
+
+      // 2. Compaction model on non-ledger mode
+      expect(() =>
+        mesh.setActorContext(singleModel, "native", "root", { compactionModel: "gemini-model" })
+      ).toThrow(/compactionModel is meaningless for native context/);
+      expect(() =>
+        mesh.setActorContext(singleModel, "tail", "root", { compactionModel: "gemini-model" })
+      ).toThrow(/compactionModel is meaningless for tail mode/);
+      expect(() =>
+        mesh.setActorContext(singleModel, "brief", "root", { compactionModel: "gemini-model" })
+      ).toThrow(/compactionModel is meaningless for brief mode/);
+
+      // 3. Ledger without compaction
+      expect(() => mesh.setActorContext(singleModel, "ledger", "root")).toThrow(
+        /portable ledger mode needs a Gemini API key for compaction/
+      );
+
+      // 4. Native with multi-entry pool
+      const multiModel = mesh.spawn({
+        charter: "multi model",
+        parentId: "root",
+        modelConfig: [
+          { provider: "claude", model: "claude-sonnet-5" },
+          { provider: "claude", model: "claude-opus-4-8" },
+        ],
+        context: { type: "portable", mode: "tail" },
+      });
+      expect(() => mesh.setActorContext(multiModel, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a multi-entry model pool.*narrow the pool first with set_actor_model/
+      );
+
+      // 5. Native with model class reference
+      const classModel = mesh.spawn({
+        charter: "class model",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      registry.setModelSelection(classModel, { modelClass: "fast-tier" });
+      expect(() => mesh.setActorContext(classModel, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a model class reference.*narrow the pool first with set_actor_model/
+      );
+
+      // 6. Native with single declared entry succeeds
+      expect(() => mesh.setActorContext(singleModel, "native", "root")).not.toThrow();
+      expect(registry.get(singleModel)?.context).toEqual({ type: "native" });
+    });
+
+    it("handles staged vs immediate application and emits actor_context_set", async () => {
+      const events: MeshEventInput[] = [];
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        sharedProvider: deferredRunProvider,
+        events: (event) => events.push(event),
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      // 1. Idle actor applies immediately
+      const appliedOutcome = testSetup.mesh.setActorContext(worker, "tail", "root");
+      expect(appliedOutcome).toBe("applied");
+      expect(testSetup.registry.get(worker)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toBeUndefined();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "actor_context_set",
+          actorId: worker,
+          detail: "native -> tail (applied)",
+          payload: JSON.stringify({
+            requester: "root",
+            oldMode: "native",
+            newMode: "tail",
+            outcome: "applied",
+          }),
+        })
+      );
+
+      // 2. Running actor stages update and applies at run end
+      testSetup.mesh.sendMessage(worker, "start run", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      const stagedOutcome = testSetup.mesh.setActorContext(worker, "brief", "root");
+      expect(stagedOutcome).toBe("staged");
+      // Still on tail while running
+      expect(testSetup.registry.get(worker)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "brief",
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "actor_context_set",
+          actorId: worker,
+          detail: "tail -> brief (staged)",
+          payload: JSON.stringify({
+            requester: "root",
+            oldMode: "tail",
+            newMode: "brief",
+            outcome: "staged",
+          }),
+        })
+      );
+
+      // Release run
+      releaseDeferred();
+      await testSetup.tick();
+
+      // Now applied after run end
+      expect(testSetup.registry.get(worker)?.context).toEqual({ type: "portable", mode: "brief" });
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toBeUndefined();
+    });
+
+    it("manages state across context transitions (portable-to-portable, native-to-portable, portable-to-native)", () => {
+      const { mesh, registry } = setup();
+
+      // Native actor with sessionId
+      const actor = mesh.spawn({
+        charter: "transition actor",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+        conversationId: "conv-native-123",
+      });
+      expect(registry.get(actor)?.sessionId).toBe("conv-native-123");
+
+      // Native -> Portable: drops sessionId (invoked stateless)
+      mesh.setActorContext(actor, "brief", "root");
+      expect(registry.get(actor)?.context).toEqual({ type: "portable", mode: "brief" });
+      expect(registry.get(actor)?.sessionId).toBeUndefined();
+
+      // Portable -> Portable: preserves portable state
+      mesh.setActorContext(actor, "tail", "root");
+      expect(registry.get(actor)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(registry.get(actor)?.sessionId).toBeUndefined();
+
+      // Portable -> Native: starts fresh native session (sessionId stays undefined)
+      mesh.setActorContext(actor, "native", "root");
+      expect(registry.get(actor)?.context).toEqual({ type: "native" });
+      expect(registry.get(actor)?.sessionId).toBeUndefined();
+    });
+
+    it("refuses root actor context mode changes in v1", () => {
+      const { mesh } = setup();
+      expect(() => mesh.setActorContext("root", "brief", "root")).toThrow(
+        /Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision\./
+      );
+    });
+
+    it("persists staged context mode and model changes durably across restart and applies before next launch", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        actors: actorRepo,
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      testSetup.mesh.sendMessage(worker, "work", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      const contextOutcome = testSetup.mesh.setActorContext(worker, "tail", "root");
+      expect(contextOutcome).toBe("staged");
+
+      const modelOutcome = testSetup.mesh.setActorModel(
+        worker,
+        { provider: "codex", model: "gpt-5.6-sol" },
+        "root"
+      );
+      expect(modelOutcome).toBe("staged");
+
+      const rawRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      const parsedContext = JSON.parse(rawRow.context_config);
+      const parsedModel = JSON.parse(rawRow.model_config);
+      expect(parsedContext.desired).toEqual({ type: "portable", mode: "tail" });
+      expect(parsedModel.desiredEntries).toEqual([{ provider: "codex", model: "gpt-5.6-sol" }]);
+
+      const reopenedRepo = new SqliteActorRepository(db);
+      const reloadedWorker = reopenedRepo.get(worker);
+      expect(reloadedWorker?.context).toEqual({ type: "native" });
+      expect(reloadedWorker?.modelConfig).toEqual([
+        { provider: "claude", model: "claude-sonnet-5" },
+      ]);
+      expect(reloadedWorker?.desiredContextConfig).toEqual({ type: "portable", mode: "tail" });
+      expect(reloadedWorker?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+
+      const freshSetup = setup({
+        actors: reopenedRepo,
+      });
+
+      const canRun = freshSetup.mesh.prepareRun(worker);
+      expect(canRun).toBe(true);
+
+      const launchedWorker = reopenedRepo.get(worker);
+      expect(launchedWorker?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(launchedWorker?.desiredContextConfig).toBeUndefined();
+      expect(launchedWorker?.modelConfig).toEqual([{ provider: "codex", model: "gpt-5.6-sol" }]);
+      expect(launchedWorker?.desiredModelConfig).toBeUndefined();
+
+      const clearedRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      expect(JSON.parse(clearedRow.context_config).desired).toBeUndefined();
+      expect(JSON.parse(clearedRow.model_config).desiredEntries).toBeUndefined();
+
+      releaseDeferred();
+    });
+
+    it("preserves other dimension when repeatedly setting model or context while staged", async () => {
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      testSetup.mesh.sendMessage(worker, "run", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      testSetup.mesh.setActorContext(worker, "tail", "root");
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+
+      testSetup.mesh.setActorModel(
+        worker,
+        { provider: "claude", model: "claude-opus-4-8" },
+        "root"
+      );
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+      expect(testSetup.registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "claude", model: "claude-opus-4-8" },
+      ]);
+
+      testSetup.mesh.setActorModel(worker, { provider: "codex", model: "gpt-5.6-sol" }, "root");
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+      expect(testSetup.registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+
+      testSetup.mesh.setActorContext(worker, "brief", "root");
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "brief",
+      });
+      expect(testSetup.registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+
+      releaseDeferred();
+    });
+
+    it("resumes retained portable ledger items and brief across portable -> native -> portable", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+      const contextStore = new DbPortableContextStore(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh } = setup({
+        actors: actorRepo,
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      const initialSnapshot = {
+        schemaVersion: 4 as const,
+        actorId: worker,
+        generation: 1,
+        updatedAt: "2026-10-22T10:00:00.000Z",
+        lastFoldedSourceId: "chat-1",
+        compactor: null,
+        items: [
+          {
+            id: "item-1",
+            kind: "decision" as const,
+            priority: "must" as const,
+            status: "active" as const,
+            statement: "Durable knowledge",
+            evidence: [
+              {
+                eventId: "event-1",
+                sender: "root",
+                ts: "2026-10-22T10:00:00.000Z",
+                quote: "Durable knowledge quote",
+              },
+            ],
+            updatedAt: "2026-10-22T10:00:00.000Z",
+          },
+        ],
+        brief: {
+          text: "Persistent guidance",
+          generation: 1,
+          updatedAt: "2026-10-22T10:00:00.000Z",
+        },
+      };
+      contextStore.save(initialSnapshot);
+
+      expect(contextStore.load(worker).items).toHaveLength(1);
+      expect(contextStore.load(worker).brief?.text).toBe("Persistent guidance");
+
+      mesh.setActorContext(worker, "native", "root");
+      expect(actorRepo.get(worker)?.context).toEqual({ type: "native" });
+      expect(actorRepo.get(worker)?.sessionId).toBeUndefined();
+
+      const retainedInNative = contextStore.load(worker);
+      expect(retainedInNative.items).toEqual(initialSnapshot.items);
+      expect(retainedInNative.brief).toEqual(initialSnapshot.brief);
+
+      mesh.setActorContext(worker, "brief", "root");
+      expect(actorRepo.get(worker)?.context).toEqual({ type: "portable", mode: "brief" });
+      const resumed = contextStore.load(worker);
+      expect(resumed.items).toEqual(initialSnapshot.items);
+      expect(resumed.brief).toEqual(initialSnapshot.brief);
+    });
+
+    it("starts with empty portable state and drops sessionId when switching native -> portable from empty", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+      const contextStore = new DbPortableContextStore(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh } = setup({
+        actors: actorRepo,
+      });
+
+      const worker = mesh.spawn({
+        charter: "native worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+        conversationId: "session-native-999",
+      });
+      expect(actorRepo.get(worker)?.sessionId).toBe("session-native-999");
+
+      mesh.setActorContext(worker, "tail", "root");
+      expect(actorRepo.get(worker)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(actorRepo.get(worker)?.sessionId).toBeUndefined();
+
+      const state = contextStore.load(worker);
+      expect(state.items).toEqual([]);
+      expect(state.brief).toBeNull();
+    });
   });
 
   // #199/#652: a tuple set while an actor is queued/idle applies immediately,

@@ -66,6 +66,7 @@ import {
 } from "./actor-lifecycle.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
+  ACTOR_ADMIN_CAPABILITY,
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
   HOST_GLOBAL_CAPABILITIES,
@@ -78,6 +79,7 @@ import {
   PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
 import type { RunStartHandle } from "./concurrency-limiter.js";
+import { assertSpawnContextSupported, resolveContextSelection } from "./context-selection.js";
 import {
   type EventResource,
   type EventSourceOwnerStore,
@@ -600,6 +602,15 @@ export interface ActorMeshOptions {
    * `desiredModelConfig` replacement.
    */
   validateModel?: (record: ActorRecord, modelConfig: ModelConfigInput) => ProviderModelConfig[];
+  /**
+   * Synchronous validator before staging or applying an actor's context mode change.
+   */
+  validateContext?: (record: ActorRecord, context: ContextConfig) => void;
+  /**
+   * Whether ledger compaction is available (Gemini API key present).
+   * Defaults to true when omitted and validateContext is unset.
+   */
+  ledgerCompactionAvailable?: boolean;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -907,6 +918,8 @@ export class ActorMesh {
     record: ActorRecord,
     modelConfig: ModelConfigInput
   ) => ProviderModelConfig[];
+  private readonly validateContext?: (record: ActorRecord, context: ContextConfig) => void;
+  private readonly ledgerCompactionAvailable: boolean;
   /** The execution coordinator: live actors, construction, dispatch, admission. */
   private readonly runs: RunManager;
   private readonly isHalted: (provider?: string, model?: string) => boolean;
@@ -1065,6 +1078,8 @@ export class ActorMesh {
     this.validateSpawn = opts.validateSpawn;
     this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
+    this.validateContext = opts.validateContext;
+    this.ledgerCompactionAvailable = opts.ledgerCompactionAvailable ?? true;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
     this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
@@ -1330,7 +1345,10 @@ export class ActorMesh {
               this.abandonInboxRun(event.actorId);
               // A launched run that ended without a result still ended: a pool
               // staged while it ran is due now, not at some later dispatch (#652).
-              if (event.terminal.started) this.applyPendingModel(event.actorId);
+              if (event.terminal.started) {
+                this.applyPendingModel(event.actorId);
+                this.applyPendingContext(event.actorId);
+              }
             }
             // A selection is run-scoped regardless of its terminal shape.
             this.clearSelection(event.actorId);
@@ -2313,6 +2331,7 @@ export class ActorMesh {
     // run after. A tuple set while idle/queued was already applied by
     // {@link setActorModel}, so this call is then a no-op.
     this.applyPendingModel(actorId);
+    this.applyPendingContext(actorId);
 
     // A real provider failure follows the ordinary failure route.  The one
     // bounded retry is exclusively a recovery for selected work a provider
@@ -5280,10 +5299,11 @@ export class ActorMesh {
     if (validated.length === 0) {
       throw new Error(`Cannot set an empty modelConfig on thread: ${id}`);
     }
-    const portable = record.context?.type === "portable";
+    const effectiveContext = record.desiredContextConfig ?? record.context;
+    const portable = effectiveContext?.type === "portable";
     if (validated.length > 1 && !portable) {
       throw new Error(
-        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
@@ -5294,7 +5314,7 @@ export class ActorMesh {
       validated[0].provider !== currentProvider
     ) {
       throw new Error(
-        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
+        `Cannot change provider on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
       );
     }
     // Boundary contract (#199, #652): an in-flight run completes on its
@@ -5418,6 +5438,140 @@ export class ActorMesh {
     // bookkeeping that would skip it, and every dispatch boundary re-asserts
     // the class's current definition.
     this.onModelSet?.(id, record.modelConfig, record);
+  }
+
+  /**
+   * Update an actor's context mode in-place.
+   *
+   * Same authority rule as setActorModel: ancestor or subtree admin, an actor cannot change
+   * its own mode, retired actors are refused.
+   *
+   * A switch to native is refused while the actor holds a multi-entry pool or class reference.
+   * Staged for running actors; applied immediately for idle or queued actors.
+   */
+  setActorContext(
+    id: string,
+    contextSelection: unknown,
+    requestedBy: string,
+    optsOrCompactionModel?: { compactionModel?: unknown } | string
+  ): "applied" | "staged" {
+    id = this.resolveThreadId(id);
+    requestedBy = this.resolveThreadId(requestedBy);
+    const record = this.actors.get(id);
+    if (!record) {
+      throw new Error(`Cannot set context mode on unknown thread: ${id}`);
+    }
+    if (id === this.rootId || id === "root" || !record.parentId) {
+      throw new Error(
+        `Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision.`
+      );
+    }
+    if (record.status === "retired") {
+      throw new Error(`Cannot set context mode on retired thread: ${id}`);
+    }
+    if (requestedBy === id) {
+      throw new Error(
+        `Cannot set context mode: an actor cannot change its own context mode (${id})`
+      );
+    }
+    const hasAdmin =
+      this.hasActiveCapability(requestedBy, ACTOR_ADMIN_CAPABILITY) ||
+      this.hasActiveCapability(requestedBy, MODEL_ADMIN_CAPABILITY);
+    if (hasAdmin) {
+      if (!this.isAncestorOf(requestedBy, id)) {
+        throw new Error(
+          `Cannot set context mode on thread ${id}: ${requestedBy} may only set context mode in its own subtree`
+        );
+      }
+    } else {
+      if (!this.isAncestorOf(requestedBy, id)) {
+        throw new Error(
+          `Cannot set context mode on thread ${id}: caller ${requestedBy} is not an ancestor of ${id}`
+        );
+      }
+    }
+
+    const compactionModel =
+      typeof optsOrCompactionModel === "string"
+        ? optsOrCompactionModel
+        : optsOrCompactionModel?.compactionModel;
+
+    const validated = resolveContextSelection(contextSelection, { compactionModel });
+    if (!validated) {
+      throw new Error("context_mode is required");
+    }
+
+    if (this.validateContext) {
+      this.validateContext(record, validated);
+    } else {
+      assertSpawnContextSupported(
+        { context: validated },
+        { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
+      );
+    }
+
+    if (validated.type === "native") {
+      const effectiveClass = record.desiredModelClass ?? record.modelClass;
+      if (effectiveClass !== undefined) {
+        throw new Error(
+          `Cannot switch to native context on actor ${id} while it holds a model class reference ("${effectiveClass}"): native sessions require exactly one declared entry; narrow the pool first with set_actor_model.`
+        );
+      }
+      const effectivePool = record.desiredModelConfig ?? record.modelConfig;
+      if ((effectivePool?.length ?? 0) > 1) {
+        throw new Error(
+          `Cannot switch to native context on actor ${id} while it holds a multi-entry model pool (${effectivePool?.length} candidates): native sessions require exactly one declared entry; narrow the pool first with set_actor_model.`
+        );
+      }
+    }
+
+    this.actors.patch(id, {
+      desiredContextConfig: validated,
+    });
+
+    const phase = this.activeRunState(id)?.phase;
+    const staged = phase === "running";
+    if (!staged) {
+      this.applyPendingContext(id);
+    }
+
+    const oldMode = record.context?.type === "portable" ? record.context.mode : "native";
+    const newMode = validated.type === "portable" ? validated.mode : "native";
+    const outcome = staged ? "staged" : "applied";
+
+    this.recordEvent({
+      kind: "actor_context_set",
+      actorId: id,
+      detail: `${oldMode} -> ${newMode} (${outcome})`,
+      payload: JSON.stringify({
+        requester: requestedBy,
+        oldMode,
+        newMode,
+        outcome,
+      }),
+    });
+
+    return outcome;
+  }
+
+  /**
+   * Apply the staged contextConfig replacement at the run boundary.
+   * An idle or queued actor applies immediately; a running actor applies at run end.
+   */
+  applyPendingContext(id: string): void {
+    const record = this.actors.get(id);
+    if (!record || record.desiredContextConfig === undefined) return;
+
+    const newContext = record.desiredContextConfig;
+    const wasPortable = record.context?.type === "portable";
+    const isPortable = newContext.type === "portable";
+    const resetSession = (wasPortable && !isPortable) || (!wasPortable && isPortable);
+
+    this.actors.patch(id, {
+      context: newContext,
+      desiredContextConfig: undefined,
+      ...(resetSession ? { sessionId: undefined } : {}),
+    });
   }
 
   /**
@@ -5689,6 +5843,38 @@ export class ActorMesh {
   }
 
   /**
+   * Validate that the combined effective configuration (merging any staged
+   * model/context changes with the actor's current state) is valid to run.
+   */
+  validateCombinedEffectiveTarget(id: string): boolean {
+    const record = this.actors.get(id);
+    if (!record) return false;
+
+    const effectiveContext = record.desiredContextConfig ?? record.context;
+    const effectiveClass = record.desiredModelClass ?? record.modelClass;
+    const effectivePool = record.desiredModelConfig ?? record.modelConfig;
+
+    if (effectiveContext?.type === "native") {
+      if (effectiveClass !== undefined) {
+        return false;
+      }
+      if ((effectivePool?.length ?? 0) > 1) {
+        return false;
+      }
+    } else if (effectiveContext?.type === "portable") {
+      try {
+        assertSpawnContextSupported(
+          { context: effectiveContext },
+          { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
+        );
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * Apply the shared pre-run admission rule used by the externally constructed
    * root and every mesh-created actor. It checks the staged-or-current pool
    * before committing it, so an all-held staged pool is left intact for a
@@ -5700,7 +5886,11 @@ export class ActorMesh {
     if (this.allCandidatesHalted(this.launchModelConfig(id)) || this.isShuttingDown()) {
       return false;
     }
+    if (!this.validateCombinedEffectiveTarget(id)) {
+      return false;
+    }
     this.applyPendingModel(id);
+    this.applyPendingContext(id);
     // A staged rebind or explicit pin is the supported repair path for a
     // broken current class. Apply it before inspecting the current binding so
     // an idle actor can repair itself on its next dispatch (#626).

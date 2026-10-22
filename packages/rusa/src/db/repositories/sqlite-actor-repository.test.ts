@@ -746,7 +746,7 @@ describe("SqliteActorRepository", () => {
     expect(() => repository.get("root")).toThrow(error);
   });
 
-  it("keeps a staged desired modelConfig pool in process memory, not the durable document", () => {
+  it("persists a staged desired modelConfig pool in the durable document", () => {
     repository.upsert(root);
     repository.patch("root", {
       desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
@@ -761,6 +761,7 @@ describe("SqliteActorRepository", () => {
     expect(JSON.parse(row.model_config)).toEqual({
       schemaVersion: 2,
       entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
+      desiredEntries: [{ provider: "claude", model: "claude-opus" }],
     });
   });
 
@@ -801,7 +802,7 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("root")?.desiredModelClass).toBeUndefined();
   });
 
-  it("loses a staged desired pool across a repository reopen", () => {
+  it("persists a staged desired pool across a repository reopen", () => {
     repository.upsert(root);
     repository.patch("root", {
       desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
@@ -811,7 +812,16 @@ describe("SqliteActorRepository", () => {
     ]);
 
     const reopened = new SqliteActorRepository(db);
-    expect(reopened.get("root")?.desiredModelConfig).toBeUndefined();
+    expect(reopened.get("root")?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus" },
+    ]);
+
+    const row = db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
+      model_config: string | null;
+    };
+    expect(JSON.parse(row.model_config ?? "null").desiredEntries).toEqual([
+      { provider: "claude", model: "claude-opus" },
+    ]);
   });
 
   it("does not advance process memory when the SQLite write rolls back", () => {
@@ -844,6 +854,57 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("root")?.desiredModelConfig).toEqual([
       { provider: "claude", model: "claude-opus" },
     ]);
+  });
+
+  it("persists a staged desired contextConfig in the durable document across reopen", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+
+    expect(repository.get("root")).toMatchObject({
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+    const row = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
+      context_config: string | null;
+    };
+    expect(JSON.parse(row.context_config ?? "null")).toEqual({
+      schemaVersion: 1,
+      type: "native",
+      sessionId: "session-1",
+      desired: { type: "portable", mode: "brief" },
+    });
+
+    const reopened = new SqliteActorRepository(db);
+    expect(reopened.get("root")?.desiredContextConfig).toEqual({
+      type: "portable",
+      mode: "brief",
+    });
+
+    repository.patch("root", { desiredContextConfig: undefined });
+    expect(repository.get("root")?.desiredContextConfig).toBeUndefined();
+    const clearedRow = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
+      context_config: string | null;
+    };
+    expect(JSON.parse(clearedRow.context_config ?? "null").desired).toBeUndefined();
+
+    const reopenedAfterClear = new SqliteActorRepository(db);
+    expect(reopenedAfterClear.get("root")?.desiredContextConfig).toBeUndefined();
+  });
+
+  it("preserves a staged desired contextConfig across unrelated patches and drops an explicit clear", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+    repository.patch("root", { title: "Renamed" });
+    expect(repository.get("root")).toMatchObject({
+      desiredContextConfig: { type: "portable", mode: "brief" },
+      title: "Renamed",
+    });
+
+    repository.patch("root", { desiredContextConfig: undefined });
+    expect(repository.get("root")?.desiredContextConfig).toBeUndefined();
   });
 
   it("migrates a pre-#169 singleton model_config document into a one-entry pool on read", () => {

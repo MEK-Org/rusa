@@ -91,6 +91,8 @@ export interface ActorRecord {
   desiredModelConfig?: ProviderModelConfig[];
   /** Process-local provenance for [desiredModelConfig], cleared with that staged pool. */
   desiredModelClass?: string;
+  /** Process-local staged context config replacement; deliberately not durable. */
+  desiredContextConfig?: ContextConfig;
   sessionId?: string;
   context?: ContextConfig;
   title?: string;

@@ -1,11 +1,7 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { ActorRecord, ExecutionConfig } from "../../actor/actor-record.js";
-import {
-  lookupModelClassPool,
-  type ModelClassStore,
-  type ProviderModelConfig,
-} from "../../providers/model-config.js";
+import { lookupModelClassPool, type ModelClassStore } from "../../providers/model-config.js";
 import type {
   ActorRecordPatch,
   ActorRepository,
@@ -54,20 +50,6 @@ const MODEL_CONFIG_CLASS_SCHEMA_VERSION = 3 as const;
  */
 const MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION = 4 as const;
 
-const legacyModelConfigSchema = z
-  .object({
-    schemaVersion: z.literal(LEGACY_MODEL_CONFIG_SCHEMA_VERSION),
-    provider: z.string().optional(),
-    model: z.string().optional(),
-    effort: z.string().optional(),
-  })
-  .strict()
-  .refine(
-    (config) =>
-      config.provider !== undefined || config.model !== undefined || config.effort !== undefined,
-    { message: "at least one model selection field is required" }
-  );
-
 const modelConfigEntrySchema = z
   .object({
     provider: z.string().min(1),
@@ -76,12 +58,37 @@ const modelConfigEntrySchema = z
   })
   .strict();
 
+const legacyModelConfigSchema = z
+  .object({
+    schemaVersion: z.literal(LEGACY_MODEL_CONFIG_SCHEMA_VERSION),
+    provider: z.string().optional(),
+    model: z.string().optional(),
+    effort: z.string().optional(),
+    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
+    desiredClass: z.string().min(1).optional(),
+  })
+  .strict()
+  .refine(
+    (config) =>
+      config.provider !== undefined || config.model !== undefined || config.effort !== undefined,
+    { message: "at least one model selection field is required" }
+  );
+
 const modelConfigPoolSchema = z
   .object({
     schemaVersion: z.literal(MODEL_CONFIG_POOL_SCHEMA_VERSION),
-    entries: z.array(modelConfigEntrySchema).min(1),
+    entries: z.array(modelConfigEntrySchema),
+    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
+    desiredClass: z.string().min(1).optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (config) =>
+      config.entries.length > 0 ||
+      config.desiredEntries !== undefined ||
+      config.desiredClass !== undefined,
+    { message: "entries cannot be empty unless desiredEntries or desiredClass is set" }
+  );
 
 const modelConfigClassSchema = z
   .object({
@@ -91,6 +98,8 @@ const modelConfigClassSchema = z
     // name lets the dashboard distinguish that intentional class selection
     // from an explicit pool without making the runtime re-resolve it later.
     modelClass: z.string().min(1),
+    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
+    desiredClass: z.string().min(1).optional(),
   })
   .strict();
 
@@ -101,6 +110,8 @@ const modelConfigClassReferenceSchema = z
     // back to, which is what makes "the class row is authoritative" a fact
     // about the data rather than a rule readers have to remember.
     modelClass: z.string().min(1),
+    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
+    desiredClass: z.string().min(1).optional(),
   })
   .strict();
 
@@ -114,12 +125,28 @@ const modelConfigDocumentSchema = z.union([
   legacyModelConfigSchema,
 ]);
 
+const desiredContextSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("native"),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("portable"),
+      mode: z.enum(["tail", "ledger", "brief"]),
+      compactionModel: z.string().optional(),
+    })
+    .strict(),
+]);
+
 const contextConfigSchema = z.discriminatedUnion("type", [
   z
     .object({
       schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("native"),
       sessionId: z.string().optional(),
+      desired: desiredContextSchema.optional(),
     })
     .strict(),
   z
@@ -128,6 +155,7 @@ const contextConfigSchema = z.discriminatedUnion("type", [
       type: z.literal("portable"),
       mode: z.enum(["tail", "ledger", "brief"]),
       compactionModel: z.string().optional(),
+      desired: desiredContextSchema.optional(),
     })
     .strict(),
 ]);
@@ -175,19 +203,46 @@ function parseDocument<T>(
  * writes preserve the stored document through {@link keepStoredModelConfig}.
  */
 function buildModelConfig(record: ActorRecord): string | null {
+  const desiredEntries =
+    record.desiredModelConfig && record.desiredModelConfig.length > 0
+      ? record.desiredModelConfig.map((entry) => ({
+          provider: entry.provider,
+          model: entry.model,
+          ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
+        }))
+      : undefined;
+  const desiredClass = record.desiredModelClass;
+
   if (record.modelClass !== undefined) {
     return JSON.stringify({
       schemaVersion: MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION,
       modelClass: record.modelClass,
+      ...(desiredEntries !== undefined ? { desiredEntries } : {}),
+      ...(desiredClass !== undefined ? { desiredClass } : {}),
     });
   }
-  if (!record.modelConfig || record.modelConfig.length === 0) return null;
+  if (!record.modelConfig || record.modelConfig.length === 0) {
+    if (desiredEntries !== undefined || desiredClass !== undefined) {
+      return JSON.stringify({
+        schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION,
+        entries: [],
+        ...(desiredEntries !== undefined ? { desiredEntries } : {}),
+        ...(desiredClass !== undefined ? { desiredClass } : {}),
+      });
+    }
+    return null;
+  }
   const entries = record.modelConfig.map((entry) => ({
     provider: entry.provider,
     model: entry.model,
     ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
   }));
-  return JSON.stringify({ schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries });
+  return JSON.stringify({
+    schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION,
+    entries,
+    ...(desiredEntries !== undefined ? { desiredEntries } : {}),
+    ...(desiredClass !== undefined ? { desiredClass } : {}),
+  });
 }
 
 /**
@@ -216,8 +271,32 @@ function keepStoredModelConfig(record: ActorRecord, stored: string | null): stri
     return undefined;
   }
   if (typeof parsed !== "object" || parsed === null) return undefined;
-  const storedClass = (parsed as { modelClass?: unknown }).modelClass;
-  return storedClass === record.modelClass ? stored : undefined;
+  const storedObj = parsed as {
+    modelClass?: unknown;
+    desiredEntries?: unknown;
+    desiredClass?: unknown;
+  };
+  if (storedObj.modelClass !== record.modelClass) return undefined;
+
+  const recordHasDesiredEntries = record.desiredModelConfig !== undefined;
+  const storedHasDesiredEntries = storedObj.desiredEntries !== undefined;
+  if (recordHasDesiredEntries !== storedHasDesiredEntries) return undefined;
+
+  const recordHasDesiredClass = record.desiredModelClass !== undefined;
+  const storedHasDesiredClass = storedObj.desiredClass !== undefined;
+  if (recordHasDesiredClass !== storedHasDesiredClass) return undefined;
+
+  if (
+    recordHasDesiredEntries &&
+    JSON.stringify(record.desiredModelConfig) !== JSON.stringify(storedObj.desiredEntries)
+  ) {
+    return undefined;
+  }
+  if (recordHasDesiredClass && record.desiredModelClass !== storedObj.desiredClass) {
+    return undefined;
+  }
+
+  return stored;
 }
 
 /**
@@ -243,17 +322,33 @@ function parseModelConfig(
   actorId: string,
   json: string | null,
   classes: ModelClassStore
-): Pick<ActorRecord, "modelConfig" | "modelClass" | "modelClassError"> {
+): Pick<
+  ActorRecord,
+  "modelConfig" | "modelClass" | "modelClassError" | "desiredModelConfig" | "desiredModelClass"
+> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "model_config", json, modelConfigDocumentSchema);
+  const desiredPart: Pick<ActorRecord, "desiredModelConfig" | "desiredModelClass"> = {};
+  if ("desiredEntries" in parsed && parsed.desiredEntries !== undefined) {
+    desiredPart.desiredModelConfig = parsed.desiredEntries;
+  }
+  if ("desiredClass" in parsed && parsed.desiredClass !== undefined) {
+    desiredPart.desiredModelClass = parsed.desiredClass;
+  }
+
   if ("modelClass" in parsed) {
     const resolved = lookupModelClassPool(classes, parsed.modelClass);
-    return resolved.error !== undefined
-      ? { modelClass: parsed.modelClass, modelClassError: resolved.error }
-      : { modelClass: parsed.modelClass, modelConfig: resolved.modelConfig };
+    return {
+      ...(resolved.error !== undefined
+        ? { modelClass: parsed.modelClass, modelClassError: resolved.error }
+        : { modelClass: parsed.modelClass, modelConfig: resolved.modelConfig }),
+      ...desiredPart,
+    };
   }
   if ("entries" in parsed) {
-    return { modelConfig: parsed.entries };
+    return parsed.entries.length > 0
+      ? { modelConfig: parsed.entries, ...desiredPart }
+      : desiredPart;
   }
   if (parsed.provider !== undefined && parsed.model !== undefined) {
     return {
@@ -264,9 +359,10 @@ function parseModelConfig(
           ...(parsed.effort !== undefined ? { effort: parsed.effort } : {}),
         },
       ],
+      ...desiredPart,
     };
   }
-  return {};
+  return desiredPart;
 }
 
 /**
@@ -276,6 +372,19 @@ function parseModelConfig(
  * meaning once the actor uses mesh-managed context.
  */
 function buildContextConfig(record: ActorRecord): string | null {
+  const desired =
+    record.desiredContextConfig !== undefined
+      ? record.desiredContextConfig.type === "portable"
+        ? {
+            type: "portable" as const,
+            mode: record.desiredContextConfig.mode,
+            ...(record.desiredContextConfig.compactionModel !== undefined
+              ? { compactionModel: record.desiredContextConfig.compactionModel }
+              : {}),
+          }
+        : { type: "native" as const }
+      : undefined;
+
   if (record.context?.type === "portable") {
     const config: ContextConfigDocument = {
       schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
@@ -284,14 +393,20 @@ function buildContextConfig(record: ActorRecord): string | null {
       ...(record.context.compactionModel !== undefined
         ? { compactionModel: record.context.compactionModel }
         : {}),
+      ...(desired !== undefined ? { desired } : {}),
     };
     return JSON.stringify(config);
   }
-  if (record.context?.type === "native" || record.sessionId !== undefined) {
+  if (
+    record.context?.type === "native" ||
+    record.sessionId !== undefined ||
+    desired !== undefined
+  ) {
     const config: ContextConfigDocument = {
       schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "native",
       ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
+      ...(desired !== undefined ? { desired } : {}),
     };
     return JSON.stringify(config);
   }
@@ -301,9 +416,25 @@ function buildContextConfig(record: ActorRecord): string | null {
 function parseContextConfig(
   actorId: string,
   json: string | null
-): Pick<ActorRecord, "context" | "sessionId"> {
+): Pick<ActorRecord, "context" | "sessionId" | "desiredContextConfig"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "context_config", json, contextConfigSchema);
+  const desiredPart: Pick<ActorRecord, "desiredContextConfig"> =
+    parsed.desired !== undefined
+      ? {
+          desiredContextConfig:
+            parsed.desired.type === "portable"
+              ? {
+                  type: "portable",
+                  mode: parsed.desired.mode,
+                  ...(parsed.desired.compactionModel !== undefined
+                    ? { compactionModel: parsed.desired.compactionModel }
+                    : {}),
+                }
+              : { type: "native" },
+        }
+      : {};
+
   if (parsed.type === "portable") {
     return {
       context: {
@@ -313,11 +444,13 @@ function parseContextConfig(
           ? { compactionModel: parsed.compactionModel }
           : {}),
       },
+      ...desiredPart,
     };
   }
   return {
     context: { type: "native" },
     ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
+    ...desiredPart,
   };
 }
 
@@ -403,22 +536,14 @@ function parseVoiceConfig(actorId: string, json: string | null): Pick<ActorRecor
   return { voiceConfig: googleVoiceConfig(voiceName) };
 }
 
-/** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */
-type DesiredOverlayEntry = {
-  desiredModelConfig?: ProviderModelConfig[];
-  desiredModelClass?: string;
-};
-
 /**
  * Authoritative SQLite repository for actor records. The two JSON columns are
  * versioned documents whose schema is validated here, at their consumption
  * boundary; the database stores them as ordinary TEXT.
  *
- * `desiredModelConfig` is process memory, not a durable row (an unapplied
- * pool change is discardable — see MEK-Org/rusa#169's binding to #199
- * dispatch-time-apply semantics), so it lives in an instance-local overlay.
- * Every successful upsert fully replaces an actor's overlay entry when
- * `desiredModelConfig` is present as a key on the incoming record.
+ * Staged replacements (`desiredModelConfig`, `desiredModelClass`, `desiredContextConfig`)
+ * are durably stored in the versioned `model_config` and `context_config` JSON documents
+ * so they survive process restarts and apply at the next run boundary.
  *
  * Every actor row is accompanied by its principal row, written inside the same
  * transaction. That coupling is what makes "every actor has an identity" a fact
@@ -429,7 +554,6 @@ type DesiredOverlayEntry = {
  */
 export class SqliteActorRepository implements ActorRepository {
   private readonly db: Database.Database;
-  private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
   private parentStmt?: Database.Statement;
 
   constructor(
@@ -527,9 +651,6 @@ export class SqliteActorRepository implements ActorRepository {
         addHandle.run(record.id, handle.id, storedRole);
       }
     })();
-
-    // Process memory must advance only after the durable transaction commits.
-    this.storeDesiredOverlay(record);
   }
 
   parentOf(id: string): string | null | undefined {
@@ -561,17 +682,6 @@ export class SqliteActorRepository implements ActorRepository {
   patch(id: string, changes: ActorRecordPatch): void {
     const record = this.get(id);
     if (record) this.upsert({ ...record, ...changes, id });
-  }
-
-  private storeDesiredOverlay(record: ActorRecord): void {
-    if ("desiredModelConfig" in record) {
-      this.desiredOverlay.set(record.id, {
-        desiredModelConfig: record.desiredModelConfig,
-        ...("desiredModelClass" in record ? { desiredModelClass: record.desiredModelClass } : {}),
-      });
-    } else {
-      this.desiredOverlay.delete(record.id);
-    }
   }
 
   private fromRow(row: ActorRow): ActorRecord {
@@ -623,7 +733,6 @@ export class SqliteActorRepository implements ActorRepository {
             }),
           }
         : {}),
-      ...this.desiredOverlay.get(row.id),
     };
   }
 }

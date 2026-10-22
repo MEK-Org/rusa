@@ -3391,6 +3391,12 @@ async function composeStart(
         portable: record.context?.type === "portable",
       });
     },
+    validateContext: (_record, context) => {
+      assertSpawnContextSupported(
+        { context },
+        { ledgerCompactionAvailable: portableContextApiKey !== null }
+      );
+    },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
     scheduledMessages: osScheduler,
