@@ -995,7 +995,7 @@ interface PortableInjection {
  * this in would couple it to the repository/db layer. A live mesh-log read belongs
  * in the wiring layer (here), which is where the repositories already live.
  */
-export function assemblePortableInjection(
+function assemblePortableInjection(
   id: string,
   mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,

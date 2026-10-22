@@ -5309,8 +5309,17 @@ export class ActorMesh {
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
+    // A running portable actor may jointly stage a fresh native context and a
+    // single concrete provider.  Comparing that target provider with the
+    // portable actor's current provider would make the valid target depend on
+    // whether context or model was staged first.  Native actors retain their
+    // existing provider fence, including a native -> portable -> native
+    // reversal while a cross-provider model is pending.
+    const transitioningFromPortableToNative =
+      record.context?.type === "portable" && record.desiredContextConfig?.type === "native";
     if (
       !portable &&
+      !transitioningFromPortableToNative &&
       validated.length === 1 &&
       currentProvider !== undefined &&
       validated[0].provider !== currentProvider

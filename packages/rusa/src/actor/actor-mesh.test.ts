@@ -7506,6 +7506,74 @@ describe("ActorMesh", () => {
       await tick();
     });
 
+    it("accepts the same single-entry native target in either staging order when the running actor starts portable", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const d = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        actors: actorRepo,
+        sharedProvider: d.provider,
+      });
+      const nativeTarget = [{ provider: "gemini", model: "gemini-2.5-flash" }];
+
+      // Order A: native first, then the single concrete target provider.
+      const workerA = mesh.spawn({
+        charter: "portable worker A",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+        conversationId: "portable-session-a",
+      });
+      mesh.sendMessage(workerA, "run A", "root");
+      await tick();
+      expect(mesh.activeRunState(workerA)?.phase).toBe("running");
+
+      expect(mesh.setActorContext(workerA, "native", "root")).toBe("staged");
+      expect(mesh.setActorModel(workerA, nativeTarget, "root")).toBe("staged");
+
+      // Order B: the same target provider first, then native.
+      const workerB = mesh.spawn({
+        charter: "portable worker B",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+        conversationId: "portable-session-b",
+      });
+      mesh.sendMessage(workerB, "run B", "root");
+      await tick();
+      expect(mesh.activeRunState(workerB)?.phase).toBe("running");
+
+      expect(mesh.setActorModel(workerB, nativeTarget, "root")).toBe("staged");
+      expect(mesh.setActorContext(workerB, "native", "root")).toBe("staged");
+
+      d.releaseAll();
+      await tick();
+
+      for (const worker of [workerA, workerB]) {
+        const record = registry.get(worker);
+        expect(record).toMatchObject({
+          context: { type: "native" },
+          modelConfig: nativeTarget,
+        });
+        expect(record?.sessionId).toBeUndefined();
+        expect(record?.desiredContextConfig).toBeUndefined();
+        expect(record?.desiredModelConfig).toBeUndefined();
+      }
+    });
+
     it("refuses staged native reversal after staged cross-provider model on running native actor, preserving pending dimensions on refusal", async () => {
       const db = new Database(":memory:");
       runMigrations(db);
