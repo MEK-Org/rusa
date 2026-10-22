@@ -241,6 +241,44 @@ describe("RunMaterialStore", () => {
     store.putOutput("actor-a", RUN, "original");
   });
 
+  it("reconfirms ancestor entries left behind by a failed directory sync", () => {
+    const dir = root();
+    const actorDir = join(dir, "actor-a");
+    const runDir = join(actorDir, RUN);
+    const fds = new Map<number, string>();
+    const synced: string[] = [];
+    let runDirSynced = false;
+    let failParent = true;
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        const path = fds.get(fd) ?? "";
+        if (path === runDir) runDirSynced = true;
+        // The run directory exists and is synced, but its entry in the actor
+        // directory is never confirmed.
+        if (failParent && runDirSynced && path === actorDir) {
+          failParent = false;
+          throw Object.assign(new Error("actor directory sync failed"), { code: "EIO" });
+        }
+        synced.push(path);
+        fs.fsyncSync(fd);
+      },
+    };
+    expect(() => new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toThrow(
+      RunMaterialReservationError
+    );
+
+    // The directories now exist, which proves nothing about their entries.
+    synced.length = 0;
+    expect(new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toBe(1);
+    for (const path of [dirname(dir), dir, actorDir, runDir]) expect(synced).toContain(path);
+  });
+
   it("verifies an existing file on EEXIST and refuses a corrupt one", () => {
     const store = new RunMaterialStore(root());
     const text = "the original";

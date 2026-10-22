@@ -196,7 +196,7 @@ export class RunMaterialStore {
     let wanted = candidates;
     let latest: number | undefined;
     if (kind === "prompt") {
-      latest = Math.max(this.readCounter(dir));
+      latest = this.readCounter(dir);
       for (const candidate of candidates) latest = Math.max(latest, candidate.attempt ?? 0);
       const target = attempt ?? latest;
       wanted = candidates.filter((c) => c.attempt === target);
@@ -375,6 +375,13 @@ export class RunMaterialStore {
       }
       this.syncDir(created);
       this.syncDir(dirname(created));
+    }
+    // Existence is not durability: an earlier attempt may have created a
+    // directory and then failed to sync its parent. Reconfirm every entry from
+    // `dir` up to the store root's own entry on each call.
+    const top = dirname(this.root);
+    for (let entry = dir; entry !== top && dirname(entry) !== entry; entry = dirname(entry)) {
+      this.syncDir(dirname(entry));
     }
   }
 
