@@ -4664,7 +4664,7 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
-          operatorActors: new OperatorActorControl(mesh, capabilityGrants),
+          operatorActors: new OperatorActorControl(mesh, capabilityGrants, rootId),
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the

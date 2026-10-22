@@ -47,6 +47,12 @@ export type MeshEventKind =
   // reason? }. This records allowed, denied, and revoked requests without
   // treating the configured actor or topology as an authority source (#1003).
   | "operator_obligations_admin"
+  // An authenticated human operator asked to retire an actor through the
+  // operator boundary (#1085), allowed or denied. `actorId` is the requested
+  // target and `payload` is OperatorRetireAudit: { principal, actorId,
+  // outcome, reason? }. The underlying actor retirement event remains the
+  // record of the completed lifecycle change.
+  | "operator_actor_retire"
   // The root durably re-scoped an actor by replacing its charter via
   // set_thread_charter (e.g. promoting an elder to a steward). `actorId` = the
   // re-chartered actor, `detail` = a charter excerpt.

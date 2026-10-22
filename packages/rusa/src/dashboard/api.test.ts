@@ -184,6 +184,7 @@ describe("handleMeshApiRequest", () => {
   }>;
   let rootHaltClears: string[];
   let operatorReparents: Array<{ id: string; parentId: string | null; principal: string }>;
+  let operatorRetires: Array<{ id: string; principal: string }>;
   let operatorObligationsAdmin: Array<{ id: string; enabled: boolean; principal: string }>;
   let admissionReorders: unknown[];
 
@@ -212,6 +213,7 @@ describe("handleMeshApiRequest", () => {
     rootHoldClears = [];
     rootHaltClears = [];
     operatorReparents = [];
+    operatorRetires = [];
     operatorObligationsAdmin = [];
     admissionReorders = [];
     const mockMesh = {
@@ -292,6 +294,9 @@ describe("handleMeshApiRequest", () => {
       operatorActors: {
         reparent: (id: string, parentId: string | null, principal: string) => {
           operatorReparents.push({ id, parentId, principal });
+        },
+        retire: (id: string, principal: string) => {
+          operatorRetires.push({ id, principal });
         },
         setObligationsAdmin: (id: string, enabled: boolean, principal: string) => {
           operatorObligationsAdmin.push({ id, enabled, principal });
@@ -922,6 +927,7 @@ describe("handleMeshApiRequest", () => {
       ["POST", "/api/mesh/actors", JSON.stringify({ charter: "c", provider: "agy", model: "m" })],
       ["POST", `/api/mesh/actors/${UUID_B}/reparent`, JSON.stringify({ parentId: UUID_A })],
       ["POST", `/api/mesh/actors/${UUID_B}/reparent`, JSON.stringify({ parentId: null })],
+      ["POST", `/api/mesh/actors/${UUID_B}/retire`, undefined],
       ["POST", `/api/mesh/actors/${UUID_A}/chat`, JSON.stringify({ body: "hi" })],
       ["POST", `/api/mesh/actors/${UUID_A}/interrupt`, JSON.stringify({ by: LOCAL_USER })],
       ["POST", `/api/mesh/actors/${UUID_A}/run-now`, undefined],
@@ -948,6 +954,7 @@ describe("handleMeshApiRequest", () => {
       }
       expect(rootSpawns).toEqual([]);
       expect(operatorReparents).toEqual([]);
+      expect(operatorRetires).toEqual([]);
       expect(admissionReorders).toEqual([]);
       expect(meshChat.listForActor(UUID_A)).toEqual([]);
       expect(obligations.get("task")?.ownerId).toBe(UUID_A);
@@ -1403,6 +1410,38 @@ describe("handleMeshApiRequest", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ ok: true });
     expect(operatorReparents).toEqual([{ id: UUID_B, parentId: UUID_A, principal: LOCAL_USER }]);
+  });
+
+  it("POST /api/mesh/actors/:id/retire delegates authenticated operator retirement", async () => {
+    const { res } = await call(deps, "POST", `/api/mesh/actors/${UUID_B}/retire`);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(operatorRetires).toEqual([{ id: UUID_B, principal: LOCAL_USER }]);
+  });
+
+  it("POST /api/mesh/actors/:id/retire returns 400 when operator retirement is refused", async () => {
+    if (!deps.operatorActors) throw new Error("operatorActors required");
+    const throwingDeps: DashboardDataDeps = {
+      ...deps,
+      operatorActors: {
+        ...deps.operatorActors,
+        retire: () => {
+          throw new Error("actor has in-flight run");
+        },
+      } as unknown as OperatorActorControl,
+    };
+    const { res } = await call(throwingDeps, "POST", `/api/mesh/actors/${UUID_B}/retire`);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "actor has in-flight run" });
+  });
+
+  it("POST /api/mesh/actors/:id/retire returns 400 on malformed percent-encoded id", async () => {
+    const { res } = await call(deps, "POST", "/api/mesh/actors/%E0%A4%A/retire");
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "malformed actor id" });
   });
 
   it("POST /api/mesh/actors/:id/obligations-admin returns the operator binding readback", async () => {
