@@ -5,6 +5,7 @@ import {
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
+import { outputOmittedChars } from "../remote-instances/run-material.js";
 
 /**
  * Project the exact validated tuple selected for a launch into the durable run
@@ -60,6 +61,7 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
       success: result.success,
       exitCode: result.exitCode,
       output: result.output,
+      outputOmittedChars: outputOmittedChars(result),
     });
     activeRunIds.delete(actorId);
   };

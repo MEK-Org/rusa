@@ -399,6 +399,8 @@ export interface MeshEventInput {
   detail?: string;
   /** Heavy payload: a run's output (message body moved to mesh_chat). */
   body?: string;
+  /** Characters cut from the front of `body` before it got here (#1020). */
+  bodyOmittedChars?: number;
   /** JSON payload (e.g. {messageId, to} for message_sent). */
   payload?: string;
   /** Run outcome for `run_end`. */

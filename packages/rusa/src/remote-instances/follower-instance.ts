@@ -3,12 +3,14 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../actor/computer-use-lock.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
-import { createActorRuntime } from "./actor-runtime.js";
+import { createActorRuntime, type RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
 import type {
   FollowerFileOperation,
   FollowerFileOperationResult,
+  LeaderCommand,
+  MaterialReadReply,
   ProviderFactory,
 } from "./protocol.js";
 
@@ -25,6 +27,8 @@ export interface FollowerInstanceOptions {
   providerOptions?: Record<string, unknown>;
   /** Without it, this follower refuses every `fileOp`. */
   fileOps?: FollowerFileOps;
+  /** Without it, runs are never bound here and every `materialRead` is refused (#1020). */
+  material?: RunMaterialOptions;
 }
 
 /** Execution half of an instance: many ordinary Actors, one Node process. */
@@ -37,6 +41,7 @@ export class FollowerInstance {
   private readonly providerOptions?: Record<string, unknown>;
   private readonly computerUseLock = new ComputerUseLock();
   private readonly fileOps?: FollowerFileOps;
+  private readonly material?: RunMaterialOptions;
 
   constructor(
     private readonly home: string,
@@ -50,6 +55,7 @@ export class FollowerInstance {
     this.repositories = options?.repositories;
     this.providerOptions = options?.providerOptions;
     this.fileOps = options?.fileOps;
+    this.material = options?.material;
   }
 
   get isReconciled(): boolean {
@@ -74,6 +80,10 @@ export class FollowerInstance {
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(actorId)) throw new Error("Invalid actor ID");
     if (message.type === "fileOp") {
       void this.runFileOp(actorId, message.requestId, message.operation);
+      return;
+    }
+    if (message.type === "materialRead") {
+      this.readMaterial(actorId, message);
       return;
     }
     if (message.type !== "init") {
@@ -103,7 +113,8 @@ export class FollowerInstance {
           });
         },
         this.computerUseLock,
-        this.repositories
+        this.repositories,
+        this.material
       );
       this.actors.set(actorId, actor);
     }
@@ -143,6 +154,39 @@ export class FollowerInstance {
       eventId: randomUUID(),
       actorId,
       message: { type: "fileOpResult", requestId, ...outcome },
+    });
+  }
+
+  /**
+   * Answer a leader's read of one retained original (#1020). The actor need
+   * not be hosted now: material outlives the runtime that wrote it.
+   */
+  private readMaterial(
+    actorId: string,
+    { requestId, runId, kind, attempt }: Extract<LeaderCommand, { type: "materialRead" }>
+  ): void {
+    let result: MaterialReadReply;
+    try {
+      if (!this.material) throw new Error("this follower does not retain run material");
+      const read = this.material.store.read(actorId, runId, kind, attempt);
+      result =
+        read.status === "ok"
+          ? {
+              status: "ok",
+              ...(read.attempt === undefined ? {} : { attempt: read.attempt }),
+              bytes: read.bytes,
+              sha256: read.sha256,
+              content: read.content.toString("base64"),
+            }
+          : read;
+    } catch (err) {
+      result = { status: "error", error: err instanceof Error ? err.message : String(err) };
+    }
+    if (this.stopped) return;
+    this.emit({
+      eventId: randomUUID(),
+      actorId,
+      message: { type: "materialReadResult", requestId, result },
     });
   }
 

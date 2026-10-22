@@ -123,6 +123,29 @@ export interface RunResult {
    * an older reader ignores it.
    */
   failure?: RunFailure;
+  /**
+   * Present only when `output` is the tail of a longer original that the
+   * execution host retained (#1020). Absent means `output` is the whole output.
+   */
+  outputBound?: RunOutputBound;
+}
+
+/**
+ * How a follower's bounded completion describes the output it did not send
+ * (#1020). Version 1 carries at most the last 40,000 UTF-16 code units of the
+ * original in `RunResult.output`; the original is retained, byte-exact, on the
+ * run's execution host under `sha256`.
+ */
+export interface RunOutputBound {
+  version: 1;
+  /** UTF-16 length of the original output. */
+  totalChars: number;
+  /** UTF-8 byte length of the original output. */
+  bytes: number;
+  /** SHA-256 hex of the original output's UTF-8 bytes. */
+  sha256: string;
+  /** A failed run's diagnostic, computed from the original before bounding. */
+  failureDiagnostic?: string;
 }
 
 /** The failure a run caught, as its source established it (#980). */

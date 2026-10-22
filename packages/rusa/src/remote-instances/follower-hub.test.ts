@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
@@ -10,7 +10,12 @@ import { FollowerEventQueue } from "./follower-event-queue.js";
 import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { FOLLOWER_HTTP_BODY_LIMIT_BYTES, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
-import { FILE_OP_TIMEOUT_MS, RemoteInstance } from "./remote-instance.js";
+import {
+  FILE_OP_TIMEOUT_MS,
+  MaterialReadUnavailableError,
+  RemoteInstance,
+} from "./remote-instance.js";
+import { MATERIAL_READ_TIMEOUT_MS, MATERIAL_READS_PER_HOST } from "./run-material.js";
 
 const hubs: FollowerHub[] = [];
 afterEach(async () => {
@@ -1233,5 +1238,162 @@ describe("follower file operations (#1013)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("bounded execution and material reads (#1020)", () => {
+  const RUN = "0f7e3c1a-1111-4222-8333-444455556666";
+  const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+  async function registerWith(h: Awaited<ReturnType<typeof setup>>, id: string, offer?: object) {
+    const response = await h.post("/register", {
+      id,
+      platform: "linux",
+      pid: 7,
+      generation: `${id}-process-one`,
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      ...(offer ? { boundedExecution: offer } : {}),
+    });
+    expect(response.status).toBe(200);
+    const reply = (await response.json()) as Record<string, unknown> & {
+      session: string;
+      leaderToken: string;
+    };
+    return { reply, identity: { id, generation: `${id}-process-one`, ...reply } };
+  }
+
+  it("echoes the capability only to a follower that offers it, on registration and reconnect", async () => {
+    const h = await setup();
+    const offered = await registerWith(h, "new", { version: 1 });
+    expect(offered.reply.boundedExecution).toEqual({ version: 1 });
+    // An N−1 follower sends nothing and hears nothing back.
+    const legacy = await registerWith(h, "old");
+    expect(legacy.reply).not.toHaveProperty("boundedExecution");
+    // An unknown version is not an offer.
+    const future = await registerWith(h, "future", { version: 2 });
+    expect(future.reply).not.toHaveProperty("boundedExecution");
+    // A same-process reconnect that stops offering it loses it.
+    const again = await registerWith(h, "new");
+    expect(again.reply).not.toHaveProperty("boundedExecution");
+    await expect(
+      h.hub.materialRead("new", "actor-1", { runId: RUN, kind: "output" })
+    ).rejects.toMatchObject({
+      reason: "unsupported",
+    });
+  });
+
+  it("reads one original through /poll and /events and verifies it byte for byte", async () => {
+    const h = await setup();
+    const { identity } = await registerWith(h, "mac", { version: 1 });
+    const content = Buffer.from("the whole prompt ✓", "utf8");
+    const pending = h.hub.materialRead("mac", "actor-1", { runId: RUN, kind: "prompt" });
+    const commands = (await (await h.post("/poll", identity)).json()) as Array<{
+      actorId: string;
+      message: { type: string; requestId: string; runId: string; kind: string };
+    }>;
+    const command = commands.find((c) => c.message.type === "materialRead");
+    expect(command).toMatchObject({ actorId: "actor-1", message: { runId: RUN, kind: "prompt" } });
+    const answer = (eventId: string, actorId: string, result: object) =>
+      h.post("/events", {
+        ...identity,
+        batchId: eventId,
+        events: [
+          {
+            eventId,
+            actorId,
+            message: { type: "materialReadResult", requestId: command?.message.requestId, result },
+          },
+        ],
+      });
+    const ok = {
+      status: "ok",
+      attempt: 2,
+      bytes: content.length,
+      sha256: sha(content),
+      content: content.toString("base64"),
+    };
+    // Another actor's answer settles nothing.
+    await answer("wrong-actor", "actor-2", ok);
+    await answer("right-actor", "actor-1", ok);
+    const read = await pending;
+    expect(read).toMatchObject({ status: "ok", attempt: 2, bytes: content.length });
+    expect(read.status === "ok" && read.content.equals(content)).toBe(true);
+  });
+
+  it("rejects for an absent follower", async () => {
+    const h = await setup();
+    await expect(
+      h.hub.materialRead("absent", "actor-1", { runId: RUN, kind: "output" })
+    ).rejects.toMatchObject({ reason: "offline" });
+  });
+
+  it("refuses an unsupported host, bounds reads in flight, times out and rejects on close", async () => {
+    vi.useFakeTimers();
+    try {
+      const legacy = new RemoteInstance("old", "linux", 1);
+      await expect(legacy.materialRead("a", { runId: RUN, kind: "output" })).rejects.toBeInstanceOf(
+        MaterialReadUnavailableError
+      );
+      expect(legacy.commands).toHaveLength(0);
+
+      const remote = new RemoteInstance("mac", "darwin", 1);
+      remote.boundedExecution = true;
+      const inFlight = Array.from({ length: MATERIAL_READS_PER_HOST }, () =>
+        remote.materialRead("a", { runId: RUN, kind: "output" })
+      );
+      const outcomes = inFlight.map((p) =>
+        p.catch((err: MaterialReadUnavailableError) => err.reason)
+      );
+      await expect(remote.materialRead("a", { runId: RUN, kind: "output" })).rejects.toMatchObject({
+        reason: "busy",
+      });
+      await vi.advanceTimersByTimeAsync(MATERIAL_READ_TIMEOUT_MS);
+      expect(await Promise.all(outcomes)).toEqual(Array(MATERIAL_READS_PER_HOST).fill("timeout"));
+
+      const open = remote.materialRead("a", { runId: RUN, kind: "output" });
+      const closed = expect(open).rejects.toMatchObject({ reason: "disconnected" });
+      remote.close();
+      await closed;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("turns a corrupt, mismatched or malformed answer into integrity or error, never content", async () => {
+    const remote = new RemoteInstance("mac", "darwin", 1);
+    remote.boundedExecution = true;
+    const content = Buffer.from("original");
+    const reply = (request: { kind: "prompt" | "output"; attempt?: number }, result: object) => {
+      const pending = remote.materialRead("a", { runId: RUN, ...request });
+      const command = remote.commands.at(-1) as { message: { requestId: string } };
+      remote.receive({
+        actorId: "a",
+        message: { type: "materialReadResult", requestId: command.message.requestId, result },
+      } as Parameters<RemoteInstance["receive"]>[0]);
+      return pending;
+    };
+    const good = {
+      status: "ok",
+      bytes: content.length,
+      sha256: sha(content),
+      content: content.toString("base64"),
+    };
+    expect(await reply({ kind: "output" }, { ...good, content: "dGFtcGVyZWQ=" })).toEqual({
+      status: "integrity",
+    });
+    expect(await reply({ kind: "output" }, { ...good, bytes: -1 })).toEqual({
+      status: "error",
+      error: "malformed material read reply",
+    });
+    // A prompt answer for a different attempt than the one asked for is refused.
+    expect(await reply({ kind: "prompt", attempt: 3 }, { ...good, attempt: 2 })).toEqual({
+      status: "error",
+      error: "malformed material read reply",
+    });
+    expect(await reply({ kind: "prompt", attempt: 3 }, { ...good, attempt: 3 })).toMatchObject({
+      status: "ok",
+      attempt: 3,
+    });
+    expect(await reply({ kind: "output" }, { status: "missing" })).toEqual({ status: "missing" });
   });
 });
