@@ -383,7 +383,12 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
-import { BuildRunner, GitRunner } from "../update/runner.js";
+import {
+  BuildRunner,
+  GitRunner,
+  UPDATE_BUILD_TIMEOUT_MS,
+  UPDATE_INSTALL_TIMEOUT_MS,
+} from "../update/runner.js";
 import { ChatRoomService } from "../voice/chat-room.js";
 import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
@@ -412,12 +417,10 @@ import {
   recordAndAnnounceRequestedRestart,
   ServiceLifecycleStore,
 } from "./service-lifecycle.js";
-import { composeFollowerStart } from "./start-follower.js";
+import { composeFollowerStart, type StartFollowerRelease } from "./start-follower.js";
 
-// `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
-// root; a bounded drain so a stuck worker can't block the restart forever.
-const UPDATE_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
-const UPDATE_BUILD_TIMEOUT_MS = 20 * 60 * 1000;
+// `update` tool bound: a bounded drain so a stuck worker can't block the
+// restart forever. The per-step build timeouts live with the BuildRunner.
 const UPDATE_DRAIN_TIMEOUT_MS = 60 * 1000;
 
 // v1 explicit never-notify list : bot-sender tracker-churn event types
@@ -783,6 +786,12 @@ export interface RunStartE2EHooks {
   /** Exercise follower HTTP command ingestion while retaining E2E shutdown handles. */
   followerPolling?: boolean;
   followerProviderFactory?: ProviderFactory;
+  /**
+   * The follower's running release and update source. Without it an e2e
+   * follower reports no release and refuses updates: the production source
+   * would reset and rebuild the checkout running the test.
+   */
+  followerRelease?: StartFollowerRelease;
   onFollowerReady?: (handles: {
     instance: FollowerInstance;
     instanceIdentity: InstanceIdentity;
