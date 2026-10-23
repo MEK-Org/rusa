@@ -3174,11 +3174,7 @@ async function composeStart(
   // notices to active chat room actors with an in-memory 5-minute cooldown.
   const roomEntry = new RoomEntryService({
     inbox: getRepositories().inbox,
-    roster: () =>
-      chatRoom
-        .participants()
-        .filter((participant) => actors.get(participant.actorId)?.status === "active")
-        .map((participant) => participant.actorId),
+    roster: () => chatRoom.participants().map((participant) => participant.actorId),
     log: (message) => log.warn("room_entry", { message }),
   });
 

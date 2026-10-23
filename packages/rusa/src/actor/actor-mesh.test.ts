@@ -11319,6 +11319,15 @@ describe("ActorMesh", () => {
           expect(t.unhandledResponsive(actorId)).toHaveLength(1);
         }
         expect(t.preemptions()).toEqual([]);
+
+        for (const actorId of [first, second]) {
+          t.resolvers.get(actorId)?.({ success: true, exitCode: 0, output: "finished" });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        for (const actorId of [first, second]) {
+          expect(t.runs.get(actorId)).toBe(2);
+          expect(t.admissions.get(actorId)).toEqual([false, true]);
+        }
       });
 
       it("promotes a queued run without preempting or adding a follow-up", async () => {
