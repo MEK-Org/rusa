@@ -977,7 +977,7 @@ export function resolveChatQueryActors(
   }
   const mine = scope.viewerIds;
   const result = new Set(actors.filter((id) => !mine.has(id)));
-  if (result.size < 2) {
+  if (result.size === 1) {
     for (const id of mine) result.add(id);
   }
   return { ok: true, actors: [...result] };
