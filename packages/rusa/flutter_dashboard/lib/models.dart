@@ -1778,6 +1778,68 @@ class QuotaHistoryDto {
   );
 }
 
+/// One sampled minute of cross-actor inbox backlog (#1018). The statistics are
+/// null only when no live actor existed that minute.
+class InboxMetricPointDto {
+  const InboxMetricPointDto({
+    required this.minute,
+    required this.observedAt,
+    required this.actorCount,
+    this.inboxSizeMedian,
+    this.inboxSizeMax,
+    this.oldestAgeSecondsMedian,
+    this.oldestAgeSecondsMax,
+  });
+
+  final String minute;
+  final String observedAt;
+  final int actorCount;
+  final double? inboxSizeMedian;
+  final double? inboxSizeMax;
+  final double? oldestAgeSecondsMedian;
+  final double? oldestAgeSecondsMax;
+
+  factory InboxMetricPointDto.fromJson(Map<String, dynamic> j) =>
+      InboxMetricPointDto(
+        minute: j['minute'] as String? ?? '',
+        observedAt: j['observedAt'] as String? ?? '',
+        actorCount: (j['actorCount'] as num?)?.toInt() ?? 0,
+        inboxSizeMedian: (j['inboxSizeMedian'] as num?)?.toDouble(),
+        inboxSizeMax: (j['inboxSizeMax'] as num?)?.toDouble(),
+        oldestAgeSecondsMedian: (j['oldestAgeSecondsMedian'] as num?)
+            ?.toDouble(),
+        oldestAgeSecondsMax: (j['oldestAgeSecondsMax'] as num?)?.toDouble(),
+      );
+}
+
+/// The prior three days of per-minute inbox samples. [points] is sparse: a
+/// minute without a sample is absent, never zero.
+class InboxMetricsDto {
+  const InboxMetricsDto({
+    required this.generatedAt,
+    required this.windowStart,
+    required this.windowEnd,
+    required this.intervalSeconds,
+    required this.points,
+  });
+
+  final String generatedAt;
+  final String windowStart;
+  final String windowEnd;
+  final int intervalSeconds;
+  final List<InboxMetricPointDto> points;
+
+  factory InboxMetricsDto.fromJson(Map<String, dynamic> j) => InboxMetricsDto(
+    generatedAt: j['generatedAt'] as String? ?? '',
+    windowStart: j['windowStart'] as String? ?? '',
+    windowEnd: j['windowEnd'] as String? ?? '',
+    intervalSeconds: (j['intervalSeconds'] as num?)?.toInt() ?? 60,
+    points: (j['points'] as List<dynamic>? ?? const [])
+        .map((e) => InboxMetricPointDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+  );
+}
+
 class QuotaProviderConfigDto {
   const QuotaProviderConfigDto({required this.primaryWindow});
 

@@ -15,7 +15,6 @@ export const GEMINI_USAGE_PURPOSES = [
   "quota_parse",
   "model_catalog_parse",
   "kimi_screen_classification",
-  "exhaustion_classification",
   "understanding_distillation",
   "understanding_retrieval",
   "avatar_generation",
@@ -23,6 +22,15 @@ export const GEMINI_USAGE_PURPOSES = [
   "speech_synthesis",
 ] as const;
 export type GeminiUsagePurpose = (typeof GEMINI_USAGE_PURPOSES)[number];
+/**
+ * Purposes no call site records any more. A report still accepts them so calls
+ * already spent stay counted rather than invalid; they are never "unobserved".
+ * `exhaustion_classification`: the run-failure classifier, removed by #1150.
+ */
+export const GEMINI_RETIRED_USAGE_PURPOSES = ["exhaustion_classification"] as const;
+export type GeminiRecordedUsagePurpose =
+  | GeminiUsagePurpose
+  | (typeof GEMINI_RETIRED_USAGE_PURPOSES)[number];
 
 // Names deliberately avoid "token": the logger redacts credential fields
 // containing that word. Provider counts are copied through this allowlist only.
@@ -49,7 +57,7 @@ export interface GeminiUsageRecord {
   processId: string;
   pid: number;
   attemptId: string;
-  purpose: GeminiUsagePurpose;
+  purpose: GeminiRecordedUsagePurpose;
   actorId: string | null;
   runId: string | null;
   requestedModel: string;

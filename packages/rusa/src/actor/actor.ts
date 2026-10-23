@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   describeModelConfigEntry,
   type ProviderModelConfig,
@@ -30,6 +29,7 @@ import {
   type RunStartHandle,
   RunStartStaleProviderError,
 } from "./concurrency-limiter.js";
+import { FAILURE_DIAGNOSTIC_BUDGET, failureDiagnostic } from "./failure-sink.js";
 import type { InjectRecord } from "./portable-context.js";
 import {
   type ActorRunMode,
@@ -133,20 +133,20 @@ export interface ActorOptions {
   /** Firehose: receives the agent's streamed output. */
   log?: (chunk: string) => void;
   /**
-   * Eligibility classifier for pool-chain fallback after a failed invocation
-   * (MEK-Org/rusa#450). When set, an invocation that fails with a classified
-   * capacity/quota exhaustion recovers onto the remaining entries of this
-   * actor's declared {@link modelConfig} pool, in order, each entry keeping
-   * its own provider/model/effort tuple. When unset (every worker), a failed
-   * invocation is reported as-is — exhaustion is a signal to the parent, not
-   * something the actor self-heals out of.
+   * Recover a failed run onto the remaining entries of this actor's declared
+   * {@link modelConfig} pool, in order, at most once per entry, each entry
+   * keeping its own provider/model/effort tuple (#1150). Any failed run that
+   * was not stopped on purpose qualifies; nothing guesses its cause. Set only
+   * for the configured root. A worker's failed run is reported as-is: its
+   * parent decides whether to retry, change models, hold a provider or
+   * escalate.
    */
-  classifyExhaustion?: ExhaustionClassifier;
+  recoverFailedRuns?: boolean;
   /**
    * Structured, bounded diagnostic for each pool-fallback transition: the
-   * invocation on `failed` was classified exhausted, so recovery is moving to
-   * `next`. Carries configured entry tuples and counts only — never provider
-   * output, which echoes the prompt and can hold secrets.
+   * invocation on `failed` failed, so recovery is moving to `next`. Carries
+   * configured entry tuples and counts only — never provider output, which
+   * echoes the prompt and can hold secrets.
    */
   onPoolFallback?: (diagnostic: PoolFallbackDiagnostic) => void;
   /**
@@ -207,6 +207,16 @@ export interface ActorOptions {
    */
   onProviderAttempt?: (provider: ProviderAttempt) => void | Promise<void>;
   /**
+   * Prepare one provider invocation after its prompt is assembled, before
+   * `onProviderAttempt` and the adapter. A rejection prevents that provider
+   * from starting.
+   * The returned prompt attempt, when present, is carried to the launched
+   * prompt observer without changing the provider-facing prompt.
+   */
+  beforeProviderAttempt?: (context: {
+    runId: string;
+  }) => number | undefined | Promise<number | undefined>;
+  /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked.
    */
@@ -237,7 +247,7 @@ export type RunAbandonReason = ActorLifecycleAbandonmentReason;
 
 /**
  * One pool-fallback transition within a run: the invocation on {@link failed}
- * was classified exhausted, so recovery is moving to {@link next}. Emitted
+ * failed, so recovery is moving to {@link next}. Emitted
  * through {@link ActorOptions.onPoolFallback} before each recovery attempt.
  */
 export interface PoolFallbackDiagnostic {
@@ -260,54 +270,9 @@ export interface PoolFallbackDiagnostic {
 }
 
 /**
- * Compose the failure report for a pool recovery attempt that failed for a reason
- * that is *not* exhaustion .
- *
- * The primary's exhaustion is the load-bearing fact — it is why recovery was
- * attempted at all, and it is the condition that actually resolves on a timer.
- * The recovery failure only explains why recovery didn't happen. Reporting the
- * latter alone converts a self-healing wait into an error naming a model nobody
- * configured, which is what made ISSUE_NUM cost two separate diagnoses.
- *
- * The primary's exhaustion is carried as a *named condition*, never as its raw
- * output: ISSUE_NUM deliberately scrubs raw provider output out of synthesized
- * failures because a provider echoes the prompt, and the prompt carries secrets.
- * The recovery's raw output is kept because this path already returned it
- * verbatim before this function existed; withholding it would lose the config
- * diagnostics (`invalid --model ...`) that make a wiring bug findable.
- */
-export function formatPoolRecoveryFailure(input: {
-  primaryName: string;
-  recoveryEntry: string;
-  recoveryOutput: string;
-  /** The primary's own temporary-capacity reason, never a quota reading. */
-  primaryCapacityReason?: string;
-}): string {
-  if (input.primaryCapacityReason) {
-    return [
-      `primary ${input.primaryName} was temporarily unavailable; recovery onto pool entry ${input.recoveryEntry} failed for an unrelated reason.`,
-      "",
-      `Terminal provider capacity reason: ${input.primaryCapacityReason}`,
-      "That capacity rejection is not a quota reading and implies no reset timer. The recovery error below explains only why recovery was unavailable.",
-      "",
-      `--- pool entry ${input.recoveryEntry} (recovery failed) ---`,
-      input.recoveryOutput,
-    ].join("\n");
-  }
-  return [
-    `primary ${input.primaryName} exhausted; recovery onto pool entry ${input.recoveryEntry} failed for an unrelated reason.`,
-    "",
-    `The exhaustion of ${input.primaryName} is what caused this run to fail, and it clears on a timer. The recovery error below explains only why recovery was unavailable — it is context, not the cause.`,
-    "",
-    `--- pool entry ${input.recoveryEntry} (recovery failed) ---`,
-    input.recoveryOutput,
-  ].join("\n");
-}
-
-/**
  * The primary entry's resolver refused it, so no provider was invoked (#980).
  * Raised only at that boundary: a recovery entry that cannot be prepared is
- * reported as context to the exhaustion that caused the run to fail.
+ * recorded as that entry's failed attempt, and recovery moves on.
  */
 class ProviderSelectionError extends Error {
   constructor(override readonly cause: unknown) {
@@ -723,7 +688,7 @@ export class Actor {
   /** The genuine-execution body of a run (everything after the beforeRun gate). */
   private async executeTurn(nudge: RunNudge): Promise<void> {
     let responsive = isResponsiveNudge(nudge);
-    const sessionId = this.opts.loadSessionId();
+    let sessionId: string | undefined;
     // The provider treats the actor's cwd as its private directory and shadows
     // everything beside it (see buildActorBwrapArgs). This object is just the
     // opt-in signal.
@@ -741,8 +706,15 @@ export class Actor {
 
     this.killable = true;
     this.coalesceAborted = false;
+    // The run's controller carries only stops someone chose: an operator
+    // interrupt, a responsive preemption, a voice coalesce. Each provider
+    // attempt gets its own controller, linked to this one, which the watchdog
+    // timers abort instead; a watchdog kill therefore ends that attempt
+    // without marking the whole run stopped, and a recovery attempt starts on
+    // a live signal (#1150).
     const abortController = new AbortController();
     this.coalesceAbortController = abortController;
+    let attemptController: AbortController | undefined;
     let stallTimer: NodeJS.Timeout | undefined;
     let ceilingTimer: NodeJS.Timeout | undefined;
     let firstChunkSeen = false;
@@ -765,7 +737,7 @@ export class Actor {
       }
       stallTimer = setTimeout(() => {
         this.opts.log?.(`\n[Watchdog] Run stalled (no output for 15 minutes). Terminating...\n`);
-        abortController.abort(STALL_WATCHDOG_ABORT_REASON);
+        attemptController?.abort(STALL_WATCHDOG_ABORT_REASON);
       }, WATCHDOG_STALL_TIMEOUT_MS);
     };
 
@@ -776,13 +748,14 @@ export class Actor {
     // timer spanning the gate reads "queued" as "stalled" and kills it at 5:00 of
     // *waiting*. That abort is also the only one the run ever gets — abort() is
     // idempotent — so the run then spawns on a dead signal and executes to the
-    // provider backstop with nothing watching it.
+    // provider backstop with nothing watching it. They restart for each provider
+    // attempt, so a recovery attempt never runs out its predecessor's clock.
     const startWatchdogTimers = () => {
       ceilingTimer = setTimeout(() => {
         this.opts.log?.(
           `\n[Watchdog] Run ceiling timeout reached (${runTimeoutMs}ms). Terminating...\n`
         );
-        abortController.abort(RUN_CEILING_ABORT_REASON);
+        attemptController?.abort(RUN_CEILING_ABORT_REASON);
       }, runTimeoutMs);
       resetStallTimer();
     };
@@ -790,44 +763,68 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = async (provider: CodingProvider): Promise<RunResult> => {
+    const runProvider = async (
+      provider: CodingProvider,
+      recoveryContext?: string
+    ): Promise<RunResult> => {
       const runId = this.currentRunId;
-      await this.opts.onProviderAttempt?.(provider);
-      return provider.run({
-        prompt: built.prompt,
-        onPromptLaunched: (prompt) => {
-          if (runId)
+      // Unreachable, type narrowing only: currentRunId is set in executeTurn before runProvider is called.
+      if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);
+      const prompt = recoveryContext ? `${recoveryContext}\n\n${built.prompt}` : built.prompt;
+      const attempt = new AbortController();
+      attemptController = attempt;
+      const stop = () => attempt.abort(abortController.signal.reason);
+      if (abortController.signal.aborted) stop();
+      else abortController.signal.addEventListener("abort", stop, { once: true });
+      startWatchdogTimers();
+      try {
+        const promptAttempt = await this.opts.beforeProviderAttempt?.({ runId });
+        await this.opts.onProviderAttempt?.(provider);
+        const result = await provider.run({
+          prompt,
+          onPromptLaunched: (prompt) => {
             void this.lifecycle.emit("onPrompt", {
               actorId: this.id,
               runId,
               prompt,
+              ...(promptAttempt === undefined ? {} : { attempt: promptAttempt }),
             });
-        },
-        cwd: this.opts.cwd,
-        // Continue this actor's own session (id undefined on first run → created).
-        session: { id: sessionId },
-        mcpServers: this.opts.mcpServers,
-        addDirs: this.opts.addDirs,
-        sandbox,
-        computerUse: this.opts.isComputerUseAdmitted?.() === true,
-        // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
-        // margin. The AbortController is the primary kill path; Node's spawn
-        // timeout is only a backstop for the rare case our abort fails to land.
-        timeoutMs: runTimeoutMs + 30_000,
-        signal: abortController.signal,
-        onChunk: (chunk: string) => {
-          // Once per RUN, not per provider attempt: `runWithPoolFallback` can call
-          // runProvider again on a different model, and the question this answers
-          // is "when did this wake start producing output", not "when did each
-          // attempt". The flag lives in the run scope for that reason.
-          if (!firstChunkSeen) {
-            firstChunkSeen = true;
-            this.opts.onFirstChunk?.();
-          }
-          resetStallTimer();
-          this.opts.log?.(chunk);
-        },
-      });
+          },
+          cwd: this.opts.cwd,
+          // Continue this actor's own session (id undefined on first run → created).
+          session: { id: sessionId },
+          mcpServers: this.opts.mcpServers,
+          addDirs: this.opts.addDirs,
+          sandbox,
+          computerUse: this.opts.isComputerUseAdmitted?.() === true,
+          // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
+          // margin. The AbortController is the primary kill path; Node's spawn
+          // timeout is only a backstop for the rare case our abort fails to land.
+          timeoutMs: runTimeoutMs + 30_000,
+          signal: attempt.signal,
+          onChunk: (chunk: string) => {
+            // Once per RUN, not per provider attempt: `runWithPoolFallback` can call
+            // runProvider again on a different model, and the question this answers
+            // is "when did this wake start producing output", not "when did each
+            // attempt". The flag lives in the run scope for that reason.
+            if (!firstChunkSeen) {
+              firstChunkSeen = true;
+              this.opts.onFirstChunk?.();
+            }
+            resetStallTimer();
+            this.opts.log?.(chunk);
+          },
+        });
+        // A watchdog kill is attributed to its own attempt here, so a recovery
+        // account names it; a chosen stop is attributed once, to the run, below.
+        if (attempt.signal.aborted && !abortController.signal.aborted) {
+          attributeAbort(result, attempt.signal);
+        }
+        return result;
+      } finally {
+        clearTimers();
+        abortController.signal.removeEventListener("abort", stop);
+      }
     };
     const invoke = async (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
@@ -863,6 +860,7 @@ export class Actor {
       ) {
         this.interruptedWatermark = null;
       }
+      sessionId = this.opts.loadSessionId();
       built = this.opts.buildPrompt();
       const runId = this.currentRunId;
       if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);
@@ -884,14 +882,7 @@ export class Actor {
       // BEFORE its hook for the opposite reason — there the risk is reporting the
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
-      startWatchdogTimers();
-      let primary: CodingProvider;
-      try {
-        primary = this.opts.resolveProvider(selected);
-      } catch (err) {
-        throw new ProviderSelectionError(err);
-      }
-      return this.runWithPoolFallback(runId, selected, primary, runProvider);
+      return this.runWithPoolFallback(runId, selected, runProvider);
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -977,29 +968,10 @@ export class Actor {
         return;
       }
       if (this.coalesceAborted) return;
-      const selection = err instanceof ProviderSelectionError;
       const cause = err instanceof ProviderSelectionError ? err.cause : err;
       const runId = this.currentRunId;
       if (runId) await this.lifecycle.emit("onError", { actorId: this.id, runId, error: cause });
-      result = {
-        success: false,
-        // A PoolExhaustedError carries the operator-facing pool summary as its
-        // message; pasting a stack here would bury it (#655).
-        output:
-          cause instanceof PoolExhaustedError
-            ? cause.message
-            : cause instanceof Error
-              ? (cause.stack ?? cause.message)
-              : String(cause),
-        exitCode: 1,
-        sessionId,
-        // The run record keeps the stack above; the notice uses this message
-        // (#980).
-        failure: {
-          ...(selection ? { stage: "provider-selection" as const } : {}),
-          message: cause instanceof Error ? cause.message : String(cause),
-        },
-      };
+      result = { ...thrownRunResult(err), sessionId };
     } finally {
       this.pendingStart = undefined;
       clearTimers();
@@ -1008,14 +980,7 @@ export class Actor {
     if (this.coalesceAborted) return;
     this.coalesceAbortController = undefined;
 
-    if (abortController.signal.aborted) {
-      if (!result.cancelled) {
-        result.success = false;
-        Object.assign(result, formatSigtermResult(result.output, abortController.signal));
-      } else if (!result.abortReason) {
-        result.abortReason = extractAbortReason(abortController.signal);
-      }
-    }
+    if (abortController.signal.aborted) attributeAbort(result, abortController.signal);
 
     if (result.sessionId && result.sessionId !== sessionId) {
       this.opts.saveSessionId(result.sessionId);
@@ -1047,14 +1012,21 @@ export class Actor {
   }
 
   /**
-   * Run the gated primary entry, then — only when this actor has an
-   * exhaustion classifier and the primary's failure is classified as provider
-   * capacity/quota exhaustion — recover onto the remaining entries of the
-   * declared modelConfig pool, in configured order, without retrying the
-   * failed entry (MEK-Org/rusa#450). Each entry keeps its own
-   * provider/model/effort tuple: the chain never reinterprets a model under a
-   * different provider. The classifier is wired only for the root, so a
-   * worker's failures still report as-is.
+   * Run the gated primary entry, then — only for an actor with
+   * {@link ActorOptions.recoverFailedRuns} — recover a failed run onto the
+   * remaining entries of the declared modelConfig pool, in configured order,
+   * without retrying the failed entry (#1150). Each entry gets at most one
+   * attempt and keeps its own provider/model/effort tuple: the chain never
+   * reinterprets a model under a different provider. Recovery is gated on the
+   * run having failed, not on a guess at why; a run stopped on purpose (an
+   * operator interrupt, a responsive preemption, a voice coalesce) is never
+   * retried. A provider's own stall watchdog or run ceiling is a failure, not
+   * a stop, so it is recovered like any other.
+   *
+   * Each replacement receives the original prompt behind a factual account of
+   * the earlier attempts, so it can check what they already did instead of
+   * blindly repeating it. When every entry has failed or been skipped, the
+   * run's result accumulates each attempt's bounded diagnostic.
    *
    * Recovery honors current halt and pacing eligibility non-blockingly via
    * {@link ActorOptions.recoveryEligibility}, evaluated per candidate at the
@@ -1065,27 +1037,34 @@ export class Actor {
   private async runWithPoolFallback(
     runId: string,
     selected: RawProviderModelConfig,
-    primary: CodingProvider,
-    runProvider: (provider: CodingProvider) => Promise<RunResult>
+    runProvider: (provider: CodingProvider, recoveryContext?: string) => Promise<RunResult>
   ): Promise<RunResult> {
-    const result = await runProvider(primary);
-    const classify = this.opts.classifyExhaustion;
-    if (result.success || !classify) return result;
-    if (!(await classify(result)).exhausted) return result;
-
-    const primaryName = describeModelConfigEntry(selected);
+    if (!this.opts.recoverFailedRuns) {
+      // Without recovery a throw is the run's own: executeTurn's terminal
+      // boundary synthesizes and reports it.
+      let primary: CodingProvider;
+      try {
+        primary = this.opts.resolveProvider(selected);
+      } catch (err) {
+        throw new ProviderSelectionError(err);
+      }
+      return runProvider(primary);
+    }
+    const result = await this.attemptPoolEntry(runId, selected, runProvider);
+    if (result.success || this.stoppedOnPurpose(result)) return result;
     // The chain excludes the failed entry by value, not by position: the gate
     // may have launched a later pool entry (earliest-available-first), and
     // recovery must never retry the entry that just failed, wherever it sits
     // in the declared order.
     const chain = this.opts.modelConfig.filter((entry) => !sameModelConfigEntry(entry, selected));
+    // A single-entry pool has nowhere to recover to: its own result is the
+    // whole account.
+    if (chain.length === 0) return result;
+
     let failed = selected;
     let lastResult = result;
-    const attempted: RawProviderModelConfig[] = [selected];
+    const failures: FailedPoolAttempt[] = [{ entry: { ...selected }, result }];
     const skipped: PoolSkippedEntry[] = [];
-    const primaryCapacityReason =
-      result.failure?.kind === "provider-capacity" ? result.failure.message : undefined;
-    let capacityFailure = result.failure?.kind === "provider-capacity" ? result.failure : undefined;
 
     for (const [index, entry] of chain.entries()) {
       const attempt = index + 2; // attempt 1 was the gated primary
@@ -1116,75 +1095,73 @@ export class Actor {
         remainingAfter,
       });
       this.opts.log?.(
-        `\n[PoolFallback] ${describeModelConfigEntry(failed)} exhausted; trying next configured pool entry ${describeModelConfigEntry(entry)}\n`
+        `\n[PoolFallback] ${describeModelConfigEntry(failed)} failed; trying next configured pool entry ${describeModelConfigEntry(entry)}\n`
       );
-      let provider: CodingProvider;
-      try {
-        provider = this.opts.resolveProvider(entry);
-      } catch (err) {
-        // The entry could not even be built — e.g. its provider was dropped
-        // from config after this pool was persisted. That is a configuration
-        // failure, and it must stay one rather than be retried under some
-        // other tuple; but the run still failed because the primary was
-        // exhausted, so report it the same way as a recovery attempt that
-        // failed for a non-exhaustion reason below: exhaustion first, the
-        // resolver error as context. Letting it escape would reach the
-        // terminal boundary as a bare stack with no mention of the exhaustion.
-        return {
-          success: false,
-          output: formatPoolRecoveryFailure({
-            primaryName,
-            recoveryEntry: describeModelConfigEntry(entry),
-            recoveryOutput: err instanceof Error ? err.message : String(err),
-            primaryCapacityReason,
-          }),
-          exitCode: lastResult.exitCode || 1,
-          sessionId: lastResult.sessionId,
-        };
-      }
-      attempted.push(entry);
-      const recoveryResult = await runProvider(provider);
-      if (recoveryResult.success) return recoveryResult;
-      if (!capacityFailure && recoveryResult.failure?.kind === "provider-capacity") {
-        capacityFailure = recoveryResult.failure;
-      }
-      if (!(await classify(recoveryResult)).exhausted) {
-        // We only reach here because the primary was classified exhausted, so
-        // returning the entry's error bare would report a soft, timer-bound
-        // condition as an unrelated hard failure . Keep the entry's
-        // exitCode/sessionId — the recovery attempt is the live session — but
-        // lead the output with the exhaustion that actually caused this run.
-        return {
-          ...recoveryResult,
-          failure: undefined,
-          output: formatPoolRecoveryFailure({
-            primaryName,
-            recoveryEntry: describeModelConfigEntry(entry),
-            recoveryOutput: recoveryResult.output,
-            primaryCapacityReason,
-          }),
-        };
-      }
+      const recoveryResult = await this.attemptPoolEntry(
+        runId,
+        entry,
+        runProvider,
+        formatRecoveryContext({ runId, entry, failures })
+      );
+      if (recoveryResult.success || this.stoppedOnPurpose(recoveryResult)) return recoveryResult;
+      failures.push({ entry: { ...entry }, result: recoveryResult });
       failed = entry;
       lastResult = recoveryResult;
     }
 
+    // The notice's lead line names the run's selected entry, so the exhausted
+    // chain stays typed only when that entry made the sole attempt (every
+    // other entry skipped). Otherwise each attempt's typed fact stays on its
+    // own line: typing the aggregate would pin a later entry's capacity
+    // rejection on the selected one.
+    const sole = failures.length === 1 ? failures[0]?.result.failure : undefined;
     return {
       success: false,
-      output: formatPoolExhaustedFailure({ attempted, skipped }),
+      output: formatRecoveryChainFailure({ failures, skipped }),
       exitCode: lastResult.exitCode || 1,
       sessionId: lastResult.sessionId,
-      ...(capacityFailure
-        ? {
-            output: formatPoolExhaustedFailure({
-              attempted,
-              skipped,
-              capacityReason: capacityFailure.message,
-            }),
-            failure: capacityFailure,
-          }
-        : {}),
+      ...(sole?.kind === "provider-capacity" ? { failure: sole } : {}),
     };
+  }
+
+  /**
+   * One recovering run's attempt on one pool entry. Whatever ends the attempt —
+   * a returned failure, an entry that cannot be built (its provider dropped
+   * from config after the pool was persisted), or a provider that throws — is
+   * that entry's result, so the chain keeps every earlier failure and the
+   * remaining entries still get their attempts.
+   */
+  private async attemptPoolEntry(
+    runId: string,
+    entry: RawProviderModelConfig,
+    runProvider: (provider: CodingProvider, recoveryContext?: string) => Promise<RunResult>,
+    recoveryContext?: string
+  ): Promise<RunResult> {
+    try {
+      let provider: CodingProvider;
+      try {
+        provider = this.opts.resolveProvider(entry);
+      } catch (err) {
+        throw new ProviderSelectionError(err);
+      }
+      return await runProvider(provider, recoveryContext);
+    } catch (err) {
+      const cause = err instanceof ProviderSelectionError ? err.cause : err;
+      await this.lifecycle.emit("onError", { actorId: this.id, runId, error: cause });
+      return thrownRunResult(err);
+    }
+  }
+
+  /**
+   * Whether this run was stopped on purpose rather than failing: this run's
+   * own abort signal fired (operator interrupt, responsive preemption, voice
+   * coalesce), or the result attributes an interrupt. Mechanical — read from
+   * the signal and typed result fields, never from output. A provider-internal
+   * stall-watchdog or run-ceiling kill is `cancelled` too, but nobody chose
+   * it, so it does not count: it aborts only its own attempt's signal.
+   */
+  private stoppedOnPurpose(result: RunResult): boolean {
+    return Boolean(result.interrupted || this.coalesceAbortController?.signal.aborted);
   }
 }
 
@@ -1207,93 +1184,144 @@ function sameModelConfigEntry(a: RawProviderModelConfig, b: RawProviderModelConf
   );
 }
 
+/**
+ * The failed result for a run or attempt that threw instead of returning:
+ * the record keeps the stack, the notice uses the message (#980).
+ */
+function thrownRunResult(err: unknown): RunResult {
+  const selection = err instanceof ProviderSelectionError;
+  const cause = selection ? err.cause : err;
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return {
+    success: false,
+    // A PoolExhaustedError carries the operator-facing pool summary as its
+    // message; pasting a stack here would bury it (#655).
+    output:
+      cause instanceof PoolExhaustedError
+        ? cause.message
+        : cause instanceof Error
+          ? (cause.stack ?? cause.message)
+          : String(cause),
+    exitCode: 1,
+    failure: { ...(selection ? { stage: "provider-selection" as const } : {}), message },
+  };
+}
+
+/** Attribute an aborted signal's SIGTERM to the result it ended, in place. */
+function attributeAbort(result: RunResult, signal: AbortSignal): void {
+  if (!result.cancelled) {
+    result.success = false;
+    Object.assign(result, formatSigtermResult(result.output, signal));
+  } else if (!result.abortReason) {
+    result.abortReason = extractAbortReason(signal);
+  }
+}
+
 /** A configured pool entry skipped during recovery without an attempt. */
 export interface PoolSkippedEntry {
   entry: RawProviderModelConfig;
   reason: "halted" | "pacing" | "exhausted";
 }
 
-/**
- * The terminal report when every configured pool entry was tried or evaluated
- * and either failed with classified capacity/quota exhaustion or was skipped
- * as currently ineligible (halted, exhausted, or pacing). Actionable on purpose:
- * it names the condition, lists what was attempted in order, lists skipped
- * candidates with their reasons, says what clears the condition (reset timers,
- * operator unhalt), and what an operator can do about it. Only configured entry
- * tuples are named — raw provider output is never pasted here, because a provider
- * echoes the prompt and the prompt carries secrets.
- */
-export function formatPoolExhaustedFailure(input: {
-  /** Every entry attempted, launch first, then the chain in tried order. */
-  attempted: readonly RawProviderModelConfig[];
-  /** Entries in the recovery chain that were skipped due to halt, exhaustion, or pacing. */
-  skipped?: readonly PoolSkippedEntry[];
-  /** Structured temporary-capacity evidence preserved by the provider adapter. */
-  capacityReason?: string;
-}): string {
-  if (input.capacityReason) {
-    const totalConfigured = input.attempted.length + (input.skipped?.length ?? 0);
-    const lines = [
-      input.skipped && input.skipped.length > 0
-        ? `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
-        : `model pool exhausted: all ${input.attempted.length} configured pool ${input.attempted.length === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion.`,
-      `Terminal provider capacity reason: ${input.capacityReason}`,
-    ];
-    if (input.attempted.length > 0) {
-      lines.push(
-        `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
-      );
-    }
-    if (input.skipped && input.skipped.length > 0) {
-      lines.push(
-        `Skipped in order: ${input.skipped.map((s) => `${describeModelConfigEntry(s.entry)} (${s.reason})`).join(", ")}.`
-      );
-    }
-    lines.push(
-      "Temporary capacity exhaustion does not infer a quota reset timer. Retry only through the existing declared pool when a candidate is eligible."
-    );
-    return lines.join("\n");
-  }
-  const isSingle = input.attempted.length === 1 && (!input.skipped || input.skipped.length === 0);
-  const lines: string[] = [];
+/** One configured pool entry's failed attempt within a recovering run. */
+export interface FailedPoolAttempt {
+  entry: RawProviderModelConfig;
+  /** What the attempt returned; a `provider-selection` failure was never invoked. */
+  result: RunResult;
+}
 
-  if (input.skipped && input.skipped.length > 0) {
-    const totalConfigured = input.attempted.length + input.skipped.length;
-    if (input.attempted.length === 0) {
-      // Fail-fast admission (e.g. #655: every lane already reported exhausted):
-      // nothing was spent on an attempt, so the summary names only the skips.
-      lines.push(
-        totalConfigured === 1
-          ? "model pool exhausted: the configured pool entry is currently ineligible; none was attempted."
-          : `model pool exhausted: all ${totalConfigured} configured pool entries are currently ineligible; none was attempted.`
-      );
-    } else {
-      lines.push(
-        `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
-      );
-      lines.push(
-        `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
-      );
-    }
+/**
+ * One attempt's factual line: its tuple, exit, and the same sanitized,
+ * clipped diagnostic a failure notice carries (#980). `session` adds the
+ * attempt's provider session as a work reference for a replacement; it stays
+ * out of operator-facing reports.
+ */
+function formatFailedAttempt(
+  index: number,
+  { entry, result }: FailedPoolAttempt,
+  budget: number,
+  session: boolean
+): string {
+  const exit = [
+    `exit ${result.exitCode}`,
+    ...(result.abortReason ? [result.abortReason] : []),
+    ...(session && result.sessionId ? [`session ${result.sessionId}`] : []),
+  ].join(", ");
+  const facts =
+    result.failure?.stage === "provider-selection"
+      ? "could not prepare this entry; provider was not invoked. "
+      : result.failure?.kind === "provider-capacity"
+        ? "provider reported a temporary capacity rejection. "
+        : "";
+  const diagnostic = failureDiagnostic(result, budget) || "(no diagnostic output)";
+  return `- attempt ${index + 1} on ${describeModelConfigEntry(entry)} (${exit}): ${facts}${diagnostic}`;
+}
+
+/**
+ * The account a replacement attempt reads ahead of the original prompt
+ * (#1150): which run this is, which entries already failed and what each
+ * reported, and that their side effects may already exist. Facts only — it
+ * names no cause, because none was established.
+ */
+export function formatRecoveryContext(input: {
+  runId: string;
+  entry: RawProviderModelConfig;
+  failures: readonly FailedPoolAttempt[];
+}): string {
+  return [
+    `[run recovery] Run ${input.runId}: attempt ${input.failures.length + 1}, now on configured pool entry ${describeModelConfigEntry(input.entry)}. Earlier attempts of this same run failed:`,
+    ...input.failures.map((failure, index) =>
+      formatFailedAttempt(index, failure, FAILURE_DIAGNOSTIC_BUDGET, true)
+    ),
+    "",
+    "The original task follows unchanged. An earlier attempt may already have changed files, branches, pull requests, messages or tracker state before it failed: check what actually happened before repeating any step, and continue from there. If the failure needs a person's judgment, report that the ordinary way.",
+    "",
+    "--- original task ---",
+  ].join("\n");
+}
+
+/**
+ * The terminal report when every configured pool entry was attempted and
+ * failed, or was skipped as currently ineligible (halted, coordinator-reported
+ * exhausted, or pacing). It accumulates each attempt's sanitized, clipped
+ * diagnostic in attempt order and names no cause. Each diagnostic gets an
+ * equal share of half the failure notice's budget, leaving the rest for the
+ * attempt lines themselves; with an unusually long pool the notice's own clip
+ * still keeps the first and last attempts.
+ */
+export function formatRecoveryChainFailure(input: {
+  failures: readonly FailedPoolAttempt[];
+  skipped: readonly PoolSkippedEntry[];
+}): string {
+  const total = input.failures.length + input.skipped.length;
+  const budget = Math.floor(FAILURE_DIAGNOSTIC_BUDGET / (2 * input.failures.length));
+  const lines = [
+    `run recovery exhausted the configured model pool: ${input.failures.length} of ${total} configured pool ${total === 1 ? "entry" : "entries"} attempted and failed${input.skipped.length > 0 ? `; ${input.skipped.length} skipped as currently ineligible` : ""}.`,
+    ...input.failures.map((failure, index) => formatFailedAttempt(index, failure, budget, false)),
+  ];
+  if (input.skipped.length > 0) {
     lines.push(
       `Skipped in order: ${input.skipped.map((s) => `${describeModelConfigEntry(s.entry)} (${s.reason})`).join(", ")}.`
     );
-    lines.push(
-      "The exhaustion and pacing states are provider-side conditions that clear on reset timers or operator unhalt; no configured entry has capacity right now. Wait for a quota reset, unhalt the provider, or configure an additional pool entry that has capacity so recovery has somewhere to go."
-    );
-  } else {
-    lines.push(
-      `model pool exhausted: all ${input.attempted.length} configured pool ${isSingle ? "entry" : "entries"} reported provider capacity/quota exhaustion.`
-    );
-    lines.push(
-      `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
-    );
-    lines.push(
-      isSingle
-        ? "The exhaustion is a provider-side condition that clears on the provider's reset timer. Wait for a quota reset, or switch to a portable actor (context.type: portable) and configure an ordered model pool so recovery has fallback candidates."
-        : "The exhaustion is a provider-side condition that clears on the providers' reset timers; no configured entry has capacity right now. Wait for a quota reset, or configure an additional pool entry that has capacity so recovery has somewhere to go."
-    );
   }
-
   return lines.join("\n");
+}
+
+/**
+ * The admission-time report when every configured pool entry is currently
+ * ineligible (#655: every lane already reported exhausted or halted), so no
+ * attempt was made. Only configured entry tuples are named.
+ */
+export function formatPoolExhaustedFailure(input: {
+  /** Every configured entry, with the reason it is currently ineligible. */
+  skipped: readonly PoolSkippedEntry[];
+}): string {
+  const total = input.skipped.length;
+  return [
+    total === 1
+      ? "model pool exhausted: the configured pool entry is currently ineligible; none was attempted."
+      : `model pool exhausted: all ${total} configured pool entries are currently ineligible; none was attempted.`,
+    `Skipped in order: ${input.skipped.map((s) => `${describeModelConfigEntry(s.entry)} (${s.reason})`).join(", ")}.`,
+    "The exhaustion and pacing states are provider-side conditions that clear on reset timers or operator unhalt; no configured entry has capacity right now. Wait for a quota reset, unhalt the provider, or configure an additional pool entry that has capacity so recovery has somewhere to go.",
+  ].join("\n");
 }

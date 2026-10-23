@@ -1,0 +1,472 @@
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { failureDiagnostic } from "../actor/failure-sink.js";
+import { ACTOR_RUN_OUTPUT_MAX_CHARS } from "../db/repositories/actor-run-repository.js";
+import type { RunResult } from "../providers/types.js";
+import {
+  BOUNDED_COMPLETE_MAX_BYTES,
+  boundedCompleteFits,
+  boundRunResult,
+  outputOmittedChars,
+  parseOutputBound,
+  RUN_MATERIAL_READ_MAX_BYTES,
+  RUN_MATERIAL_RETENTION_MS,
+  RUN_MATERIAL_ROOT,
+  RunMaterialIntegrityError,
+  type RunMaterialIo,
+  RunMaterialReservationError,
+  RunMaterialStore,
+} from "./run-material.js";
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function root(): string {
+  const dir = mkdtempSync(join(tmpdir(), "rusa-run-material-"));
+  dirs.push(dir);
+  return join(dir, "run-material", "v1");
+}
+
+const sha = (text: string | Buffer) => createHash("sha256").update(text).digest("hex");
+const RUN = "0f7e3c1a-1111-4222-8333-444455556666";
+
+describe("RunMaterialStore", () => {
+  it("retains every prompt attempt and the output byte-exactly under content-named files", () => {
+    const store = new RunMaterialStore(root());
+    const first = "prompt one ✓";
+    const second = "x".repeat(3 * 1024 * 1024);
+    const a1 = store.reservePromptAttempt("actor-a", RUN);
+    expect(store.putPrompt("actor-a", RUN, a1, first)).toEqual({
+      bytes: Buffer.byteLength(first),
+      sha256: sha(first),
+    });
+    const a2 = store.reservePromptAttempt("actor-a", RUN);
+    store.putPrompt("actor-a", RUN, a2, second);
+    const output = `${"o".repeat(5 * 1024 * 1024)}🙂`;
+    store.putOutput("actor-a", RUN, output);
+
+    expect([a1, a2]).toEqual([1, 2]);
+    expect(readdirSync(join(store.root, "actor-a", RUN)).sort()).toEqual(
+      [
+        "attempt",
+        `output.${sha(output)}`,
+        `prompt-1.${sha(first)}`,
+        `prompt-2.${sha(second)}`,
+      ].sort()
+    );
+    const one = store.read("actor-a", RUN, "prompt", 1);
+    expect(one.status === "ok" && one.content.toString("utf8")).toBe(first);
+    const latest = store.read("actor-a", RUN, "prompt");
+    expect(latest.status === "ok" && latest.attempt).toBe(2);
+    expect(latest.status === "ok" && latest.content.toString("utf8")).toBe(second);
+    const out = store.read("actor-a", RUN, "output");
+    expect(out.status === "ok" && out.content.equals(Buffer.from(output, "utf8"))).toBe(true);
+    expect(store.read("actor-a", RUN, "prompt", 3)).toEqual({ status: "missing" });
+    expect(store.read("actor-a", "1f7e3c1a-1111-4222-8333-444455556666", "output")).toEqual({
+      status: "missing",
+    });
+  });
+
+  it("advances the attempt key through failed writes and across a restart", () => {
+    const dir = root();
+    let failLinks = true;
+    const io: RunMaterialIo = {
+      ...fs,
+      linkSync: (from: fs.PathLike, to: fs.PathLike) => {
+        if (failLinks) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+        fs.linkSync(from, to);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    const failed = store.reservePromptAttempt("actor-a", RUN);
+    expect(() => store.putPrompt("actor-a", RUN, failed, "lost here")).toThrow("disk full");
+    // Nothing is published for a failed write, not even a temporary file.
+    expect(readdirSync(join(dir, "actor-a", RUN))).toEqual(["attempt"]);
+    failLinks = false;
+    expect(store.reservePromptAttempt("actor-a", RUN)).toBe(2);
+    // A fresh process finds the persisted key, not only the highest stored file.
+    const restarted = new RunMaterialStore(dir);
+    expect(restarted.reservePromptAttempt("actor-a", RUN)).toBe(3);
+  });
+
+  it("does not serve an older original when the newest allocated attempt was lost", () => {
+    const dir = root();
+    let failLinks = false;
+    const io: RunMaterialIo = {
+      ...fs,
+      linkSync: (from: fs.PathLike, to: fs.PathLike) => {
+        if (failLinks) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+        fs.linkSync(from, to);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    store.openRun("actor-a", RUN);
+    const first = store.reservePromptAttempt("actor-a", RUN);
+    store.putPrompt("actor-a", RUN, first, "retained first");
+    const second = store.reservePromptAttempt("actor-a", RUN);
+    failLinks = true;
+    expect(() => store.putPrompt("actor-a", RUN, second, "lost second")).toThrow("disk full");
+
+    // The persisted allocation, rather than the highest filename, says that
+    // latest is unavailable. Explicit historical reads remain available.
+    expect(store.read("actor-a", RUN, "prompt")).toEqual({ status: "missing", attempt: 2 });
+    expect(store.read("actor-a", RUN, "prompt", 1)).toMatchObject({ status: "ok", attempt: 1 });
+    store.closeRun("actor-a", RUN);
+    expect(store.read("actor-a", RUN, "prompt")).toEqual({ status: "missing", attempt: 2 });
+    const reopened = new RunMaterialStore(dir);
+    expect(reopened.read("actor-a", RUN, "prompt")).toEqual({ status: "missing", attempt: 2 });
+    expect(reopened.read("actor-a", RUN, "prompt", 1)).toMatchObject({
+      status: "ok",
+      attempt: 1,
+    });
+  });
+
+  it("reports an invalid counter as integrity on reads and refuses it for reservation", () => {
+    const dir = root();
+    const store = new RunMaterialStore(dir);
+    store.putPrompt("actor-a", RUN, store.reservePromptAttempt("actor-a", RUN), "first");
+    writeFileSync(join(dir, "actor-a", RUN, "attempt"), "not a number\n");
+
+    expect(store.read("actor-a", RUN, "prompt")).toEqual({ status: "integrity" });
+    expect(store.latestPromptAttempt("actor-a", RUN)).toBe("integrity");
+    expect(() => store.reservePromptAttempt("actor-a", RUN)).toThrow(RunMaterialReservationError);
+  });
+
+  it("refuses a counter write before it can return a prompt key", () => {
+    const dir = root();
+    let failCounter = false;
+    const io: RunMaterialIo = {
+      ...fs,
+      renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+        if (failCounter && String(to).endsWith("/attempt")) {
+          throw Object.assign(new Error("read-only counter"), { code: "EROFS" });
+        }
+        fs.renameSync(from, to);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    const first = store.reservePromptAttempt("actor-a", RUN);
+    store.putPrompt("actor-a", RUN, first, "retained first");
+
+    failCounter = true;
+    expect(() => store.reservePromptAttempt("actor-a", RUN)).toThrow(RunMaterialReservationError);
+    // Attempt 2 was never admitted, so attempt 1 remains the latest real key.
+    expect(store.read("actor-a", RUN, "prompt")).toMatchObject({ status: "ok", attempt: 1 });
+    store.closeRun("actor-a", RUN);
+    expect(store.read("actor-a", RUN, "prompt", 1)).toMatchObject({ status: "ok", attempt: 1 });
+  });
+
+  it("refuses a reservation when the run directory cannot be written", () => {
+    const io: RunMaterialIo = {
+      ...fs,
+      mkdirSync: () => {
+        throw Object.assign(new Error("read-only file system"), { code: "EROFS" });
+      },
+    };
+    const store = new RunMaterialStore(root(), io);
+    expect(() => store.reservePromptAttempt("actor-a", RUN)).toThrow(RunMaterialReservationError);
+    expect(() => store.putOutput("actor-a", RUN, "out")).toThrow("read-only");
+  });
+
+  it("refuses an unreadable run directory instead of inventing a fallback key", () => {
+    const dir = root();
+    const runDir = join(dir, "actor-a", RUN);
+    const io: RunMaterialIo = {
+      ...fs,
+      readdirSync: ((path: fs.PathLike) => {
+        if (String(path) === runDir) {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        }
+        return fs.readdirSync(path);
+      }) as typeof fs.readdirSync,
+      linkSync: () => {
+        throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    expect(() => store.reservePromptAttempt("actor-a", RUN)).toThrow(RunMaterialReservationError);
+    expect(() => store.putPrompt("actor-a", RUN, 1, "full fallback")).toThrow("disk full");
+  });
+
+  it("refuses an unconfirmed counter directory sync and leaves a safe gap", () => {
+    const dir = root();
+    const runDir = join(dir, "actor-a", RUN);
+    const fds = new Map<number, string>();
+    let runDirSyncs = 0;
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        if (fds.get(fd) === runDir) {
+          runDirSyncs++;
+          // The first sync establishes the newly-created directory. The
+          // second follows the counter rename and is its durability proof.
+          if (runDirSyncs === 2) {
+            throw Object.assign(new Error("counter directory sync failed"), { code: "EIO" });
+          }
+        }
+        fs.fsyncSync(fd);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    expect(() => store.reservePromptAttempt("actor-a", RUN)).toThrow(RunMaterialReservationError);
+    // The rename can be visible even though its durability was not confirmed.
+    // A later healthy process spends the following key rather than using it.
+    expect(new RunMaterialStore(dir).reservePromptAttempt("actor-a", RUN)).toBe(2);
+  });
+
+  it("refuses a reservation when the run directory cannot be opened for sync", () => {
+    const dir = root();
+    const runDir = join(dir, "actor-a", RUN);
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((path: fs.PathLike, flags: string | number, mode?: number) => {
+        if (String(path) === runDir && flags === "r") {
+          throw Object.assign(new Error("directory sync unavailable"), { code: "EPERM" });
+        }
+        return fs.openSync(path, flags, mode);
+      }) as typeof fs.openSync,
+    };
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("process.platform descriptor is unavailable");
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      expect(() => new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toThrow(
+        RunMaterialReservationError
+      );
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
+  it("syncs every newly created path entry before publishing a material ref", () => {
+    const dir = root();
+    const synced = new Set<string>();
+    const fds = new Map<number, string>();
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        const path = fds.get(fd);
+        if (path) synced.add(path);
+        fs.fsyncSync(fd);
+      },
+      linkSync: (from: fs.PathLike, to: fs.PathLike) => {
+        const run = join(dir, "actor-a", RUN);
+        for (const path of [dirname(dir), dir, join(dir, "actor-a"), run]) {
+          expect(synced.has(path)).toBe(true);
+        }
+        fs.linkSync(from, to);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    store.putOutput("actor-a", RUN, "original");
+  });
+
+  it("reconfirms ancestor entries left behind by a failed directory sync", () => {
+    const dir = root();
+    const actorDir = join(dir, "actor-a");
+    const runDir = join(actorDir, RUN);
+    const fds = new Map<number, string>();
+    const synced: string[] = [];
+    let runDirSynced = false;
+    let failParent = true;
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        const path = fds.get(fd) ?? "";
+        if (path === runDir) runDirSynced = true;
+        // The run directory exists and is synced, but its entry in the actor
+        // directory is never confirmed.
+        if (failParent && runDirSynced && path === actorDir) {
+          failParent = false;
+          throw Object.assign(new Error("actor directory sync failed"), { code: "EIO" });
+        }
+        synced.push(path);
+        fs.fsyncSync(fd);
+      },
+    };
+    expect(() => new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toThrow(
+      RunMaterialReservationError
+    );
+
+    // The directories now exist, which proves nothing about their entries.
+    synced.length = 0;
+    expect(new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toBe(1);
+    // The store reconfirms its own top entry inside the existing home too.
+    for (const path of [dirname(dirname(dir)), dirname(dir), dir, actorDir, runDir]) {
+      expect(synced).toContain(path);
+    }
+  });
+
+  it("reconfirms the store's own entry in the home after its sync failed", () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-run-material-home-"));
+    dirs.push(home);
+    const fds = new Map<number, string>();
+    const synced: string[] = [];
+    let failHome = true;
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        const path = fds.get(fd) ?? "";
+        // `run-material/` is created, but its entry in the home is never
+        // confirmed.
+        if (failHome && path === home) {
+          failHome = false;
+          throw Object.assign(new Error("home sync failed"), { code: "EIO" });
+        }
+        synced.push(path);
+        fs.fsyncSync(fd);
+      },
+    };
+    const dir = join(home, RUN_MATERIAL_ROOT);
+    expect(() => new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toThrow(
+      RunMaterialReservationError
+    );
+    expect(failHome).toBe(false);
+
+    synced.length = 0;
+    expect(new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toBe(1);
+    expect(synced).toContain(home);
+    // The home is the ceiling: nothing above it is touched.
+    expect(synced).not.toContain(dirname(home));
+  });
+
+  it("verifies an existing file on EEXIST and refuses a corrupt one", () => {
+    const store = new RunMaterialStore(root());
+    const text = "the original";
+    store.putOutput("actor-a", RUN, text);
+    // Same content again is the same immutable file.
+    expect(store.putOutput("actor-a", RUN, text)).toEqual({
+      bytes: Buffer.byteLength(text),
+      sha256: sha(text),
+    });
+    writeFileSync(join(store.root, "actor-a", RUN, `output.${sha(text)}`), "tampered");
+    expect(() => store.putOutput("actor-a", RUN, text)).toThrow(RunMaterialIntegrityError);
+    expect(store.read("actor-a", RUN, "output")).toEqual({ status: "integrity" });
+  });
+
+  it("refuses reads above the raw cap without discarding the original", () => {
+    const store = new RunMaterialStore(root());
+    const big = "b".repeat(RUN_MATERIAL_READ_MAX_BYTES + 1);
+    store.putOutput("actor-a", RUN, big);
+    expect(store.read("actor-a", RUN, "output")).toEqual({
+      status: "tooLarge",
+      bytes: big.length,
+      sha256: sha(big),
+    });
+    const file = join(store.root, "actor-a", RUN, `output.${sha(big)}`);
+    expect(readFileSync(file).length).toBe(big.length);
+  });
+
+  it("expires idle runs after retention but never an open run", () => {
+    const store = new RunMaterialStore(root());
+    const OTHER = "2f7e3c1a-1111-4222-8333-444455556666";
+    store.openRun("actor-a", RUN);
+    store.putPrompt("actor-a", RUN, store.reservePromptAttempt("actor-a", RUN), "active");
+    store.putOutput("actor-a", OTHER, "idle");
+    const old = (Date.now() - RUN_MATERIAL_RETENTION_MS - 60_000) / 1000;
+    for (const runId of [RUN, OTHER]) {
+      const dir = join(store.root, "actor-a", runId);
+      for (const name of readdirSync(dir)) utimesSync(join(dir, name), old, old);
+      utimesSync(dir, old, old);
+    }
+    expect(store.sweep()).toBe(1);
+    expect(store.read("actor-a", OTHER, "output")).toEqual({ status: "missing" });
+    expect(store.read("actor-a", RUN, "prompt", 1).status).toBe("ok");
+    store.closeRun("actor-a", RUN);
+    expect(store.sweep()).toBe(1);
+    expect(store.read("actor-a", RUN, "prompt", 1)).toEqual({ status: "missing" });
+  });
+
+  it("refuses identifiers that could leave the store", () => {
+    const store = new RunMaterialStore(root());
+    expect(() => store.putOutput("../escape", RUN, "x")).toThrow("Invalid");
+    expect(() => store.read("actor-a", "../../etc", "output")).toThrow("Invalid");
+  });
+});
+
+describe("bounded run results", () => {
+  const failed = (output: string, extra: Partial<RunResult> = {}): RunResult => ({
+    success: false,
+    exitCode: 1,
+    output,
+    sessionId: "session-1",
+    interruptSource: "operator",
+    abortReason: "interrupt:operator",
+    failure: { stage: "provider-selection", message: "cannot prepare" },
+    ...extra,
+  });
+
+  it("keeps only the output tail and every other field untouched", () => {
+    const output = `HEAD-ERROR ${"y".repeat(5 * 1024 * 1024)} TAIL`;
+    const result = failed(output);
+    const bounded = boundRunResult(result, {
+      bytes: Buffer.byteLength(output),
+      sha256: sha(output),
+    });
+    expect(bounded.output).toBe(output.slice(-ACTOR_RUN_OUTPUT_MAX_CHARS));
+    expect(bounded.outputBound).toEqual({
+      version: 1,
+      totalChars: output.length,
+      bytes: Buffer.byteLength(output),
+      sha256: sha(output),
+      failureDiagnostic: failureDiagnostic(result),
+    });
+    const { output: _a, outputBound: _b, ...rest } = bounded;
+    const { output: _c, ...original } = result;
+    expect(rest).toEqual(original);
+    expect(outputOmittedChars(bounded)).toBe(output.length - ACTOR_RUN_OUTPUT_MAX_CHARS);
+    expect(boundedCompleteFits(bounded)).toBe(true);
+  });
+
+  it("computes the diagnostic from the full output, not the tail", () => {
+    const output = `Error: the real cause\n${"stack line\n".repeat(200_000)}`;
+    const result = failed(output, { failure: undefined });
+    const bounded = boundRunResult(result, { bytes: 1, sha256: sha("x") });
+    expect(bounded.outputBound?.failureDiagnostic).toContain("Error: the real cause");
+    expect(bounded.output).not.toContain("Error: the real cause");
+  });
+
+  it("does not fit when an untouched field makes the envelope too large", () => {
+    const result = failed("short", { sessionId: "s".repeat(BOUNDED_COMPLETE_MAX_BYTES) });
+    expect(boundedCompleteFits(boundRunResult(result, { bytes: 5, sha256: sha("short") }))).toBe(
+      false
+    );
+  });
+
+  it("validates a received bound before trusting its counts", () => {
+    const good = boundRunResult(failed("z".repeat(50_000)), { bytes: 50_000, sha256: sha("z") });
+    const bound = good.outputBound as NonNullable<RunResult["outputBound"]>;
+    expect(parseOutputBound(good)).toEqual(good.outputBound);
+    expect(parseOutputBound({ ...good, outputBound: { ...bound, totalChars: 3 } })).toBe(undefined);
+    expect(parseOutputBound({ ...good, outputBound: { ...bound, sha256: "nope" } })).toBe(
+      undefined
+    );
+    expect(parseOutputBound({ ...good, output: "z".repeat(40_001) })).toBe(undefined);
+  });
+});

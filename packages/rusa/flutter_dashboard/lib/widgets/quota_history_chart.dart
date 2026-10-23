@@ -1,9 +1,11 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../models.dart';
 import '../theme.dart';
+import 'chart_frame.dart';
 
 const _providerSeriesColors = <String, Color>{
   'claude': Color(0xFFC15F3C),
@@ -101,16 +103,31 @@ class QuotaHistoryChart extends StatelessWidget {
     super.key,
     required this.history,
     this.isStale = false,
+    this.sharedRange,
   });
 
   final QuotaHistoryDto history;
   final bool isStale;
 
+  /// The range shared by every Overview chart (#1018); defaults to the
+  /// history's own bounds.
+  final ({DateTime start, DateTime end})? sharedRange;
+
   @override
   Widget build(BuildContext context) {
-    final (:start, :end, phrase: range, title: _) = quotaHistoryRangeOf(
-      history,
-    );
+    final own = quotaHistoryRangeOf(history);
+    final start = sharedRange?.start ?? own.start;
+    final end = sharedRange?.end ?? own.end;
+    final range =
+        'prior ${(end.difference(start).inMinutes / (24 * 60)).round()} days';
+    // History is fetched once (#26) while the shared end keeps moving with the
+    // inbox charts, so once its readings stop a minute or more short of the
+    // range's end, the end label says where they stop instead of "now".
+    final dataEnd = end.difference(own.end) >= const Duration(minutes: 1)
+        ? DateFormat('HH:mm').format(own.end.toLocal())
+        : null;
+    final asOfLabel = dataEnd == null ? null : 'as of $dataEnd';
+    final asOfNote = dataEnd == null ? '' : ' Readings end at $dataEnd.';
     final visible = history.history
         .where(
           (series) =>
@@ -170,7 +187,7 @@ class QuotaHistoryChart extends StatelessWidget {
 
     final cachedNote = isStale
         ? ' Cached snapshot as of ${history.generatedAt}.'
-        : '';
+        : asOfNote;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -185,7 +202,7 @@ class QuotaHistoryChart extends StatelessWidget {
           ),
           const SizedBox(height: 8),
         ],
-        _ChartSection(
+        ChartSection(
           title: 'Quota Headroom',
           subtitle:
               'The amount of quota remaining compared with the amount of time '
@@ -203,13 +220,16 @@ class QuotaHistoryChart extends StatelessWidget {
             start: start,
             end: end,
           ),
-          series: headroomSeries,
-          colors: colors,
-          emptyLegend: 'No controller decisions recorded in the $range.',
+          legend: _SeriesLegend(
+            series: headroomSeries,
+            colors: colors,
+            empty: 'No controller decisions recorded in the $range.',
+          ),
           isStale: isStale,
+          endLabel: asOfLabel,
         ),
         const SizedBox(height: 16),
-        _ChartSection(
+        ChartSection(
           title: 'Throttle Period',
           subtitle:
               'How long the mesh waits between runs. The scale is logarithmic.',
@@ -225,142 +245,50 @@ class QuotaHistoryChart extends StatelessWidget {
             start: start,
             end: end,
           ),
-          series: throttleSeries,
-          colors: colors,
-          emptyLegend: 'No throttle decisions recorded in the $range.',
+          legend: _SeriesLegend(
+            series: throttleSeries,
+            colors: colors,
+            empty: 'No throttle decisions recorded in the $range.',
+          ),
           isStale: isStale,
+          endLabel: asOfLabel,
         ),
       ],
     );
   }
 }
 
-/// One plot: heading, plain-English subtitle, the canvas itself, and the color
-/// key for the providers drawn on it.
-class _ChartSection extends StatelessWidget {
-  const _ChartSection({
-    required this.title,
-    required this.subtitle,
-    required this.semanticsLabel,
-    required this.chartKey,
-    required this.endLabelKey,
-    required this.painter,
+/// The color key for the series drawn on one plot.
+class _SeriesLegend extends StatelessWidget {
+  const _SeriesLegend({
     required this.series,
     required this.colors,
-    required this.emptyLegend,
-    required this.isStale,
+    required this.empty,
   });
 
-  final String title;
-  final String subtitle;
-  final String semanticsLabel;
-  final Key chartKey;
-  final Key endLabelKey;
-  final CustomPainter painter;
   final List<QuotaHistorySeriesDto> series;
   final Map<QuotaHistorySeriesDto, Color> colors;
-  final String emptyLegend;
-  final bool isStale;
+  final String empty;
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    if (series.isEmpty) {
+      return Text(
+        empty,
+        style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+      );
+    }
+    return Wrap(
+      spacing: 18,
+      runSpacing: 8,
       children: [
-        Text(
-          title,
-          style: const TextStyle(
-            color: MeshColors.textPrimary,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
+        for (final s in series)
+          ChartLegendItem(
+            label: s.scope == 'model'
+                ? '${_providerTitle(s.provider)} · ${s.label}'
+                : _providerTitle(s.provider),
+            color: colors[s]!,
           ),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          subtitle,
-          style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
-        ),
-        const SizedBox(height: 8),
-        Semantics(
-          label: semanticsLabel,
-          child: Container(
-            height: 220,
-            decoration: BoxDecoration(
-              color: MeshColors.bgTertiary,
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: MeshColors.border.withValues(alpha: 0.5),
-              ),
-            ),
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 2),
-            child: Stack(
-              children: [
-                CustomPaint(
-                  key: chartKey,
-                  painter: painter,
-                  size: Size.infinite,
-                ),
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: Text(
-                    isStale ? 'cached' : 'now',
-                    key: endLabelKey,
-                    style: kMonoStyle.copyWith(
-                      color: MeshColors.textMuted,
-                      fontSize: 9,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
-        if (series.isEmpty)
-          Text(
-            emptyLegend,
-            style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
-          )
-        else
-          Wrap(
-            spacing: 18,
-            runSpacing: 8,
-            children: [
-              for (final s in series) _LegendItem(series: s, color: colors[s]!),
-            ],
-          ),
-      ],
-    );
-  }
-}
-
-class _LegendItem extends StatelessWidget {
-  const _LegendItem({required this.series, required this.color});
-
-  final QuotaHistorySeriesDto series;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 18,
-          height: 3,
-          decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.circular(2),
-          ),
-        ),
-        const SizedBox(width: 6),
-        Text(
-          series.scope == 'model'
-              ? '${_providerTitle(series.provider)} · ${series.label}'
-              : _providerTitle(series.provider),
-          style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
-        ),
       ],
     );
   }
@@ -470,49 +398,6 @@ void _paintTrace(Canvas canvas, QuotaSeriesTrace trace, Color color) {
   }
 }
 
-/// Paints one axis label in the charts' muted monospace.
-void _paintAxisLabel(
-  Canvas canvas,
-  String text,
-  Offset offset, {
-  double width = 40,
-  TextAlign align = TextAlign.left,
-}) {
-  final painter = TextPainter(
-    text: TextSpan(
-      text: text,
-      style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 9),
-    ),
-    textDirection: TextDirection.ltr,
-    textAlign: align,
-  )..layout(maxWidth: width);
-  painter.paint(canvas, offset);
-}
-
-/// Paints the quarter gridlines and the "ago" labels along the time axis.
-void _paintTimeAxis(
-  Canvas canvas,
-  Rect plot,
-  DateTime start,
-  DateTime end,
-  Paint gridPaint,
-) {
-  for (var quarter = 0; quarter <= 4; quarter++) {
-    final x = plot.left + (quarter / 4) * plot.width;
-    canvas.drawLine(Offset(x, plot.top), Offset(x, plot.bottom), gridPaint);
-  }
-
-  final span = end.difference(start);
-  _paintAxisLabel(canvas, _agoLabel(span), Offset(plot.left, plot.bottom + 7));
-  _paintAxisLabel(
-    canvas,
-    _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
-    Offset(plot.center.dx - 28, plot.bottom + 7),
-    width: 56,
-    align: TextAlign.center,
-  );
-}
-
 /// Paints quota headroom (percentLeft - timeRemainingPct).
 /// Vertically centered at 0% (range -50% to +50%).
 /// Positive = surplus quota / additional quota to burn (above 0), negative = underwater / burning fast (below 0).
@@ -533,11 +418,6 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
   final DateTime start;
   final DateTime end;
 
-  static const _left = 42.0;
-  static const _right = 10.0;
-  static const _top = 10.0;
-  static const _bottom = 27.0;
-
   /// Map one series onto [plot], breaking at resets and missing decisions.
   @visibleForTesting
   static QuotaSeriesTrace traceFor(
@@ -557,17 +437,10 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final plot = Rect.fromLTRB(
-      _left,
-      _top,
-      size.width - _right,
-      size.height - _bottom,
-    );
+    final plot = chartPlotRect(size);
     if (plot.width <= 0 || plot.height <= 0) return;
 
-    final gridPaint = Paint()
-      ..color = MeshColors.border.withValues(alpha: 0.7)
-      ..strokeWidth = 1;
+    final gridPaint = chartGridPaint();
     final zeroPaint = Paint()
       ..color = MeshColors.textMuted.withValues(alpha: 0.6)
       ..strokeWidth = 1.2;
@@ -581,16 +454,9 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
         Offset(plot.right, y),
         percent == 0 ? zeroPaint : gridPaint,
       );
-      final labelText = percent > 0 ? '+$percent%' : '$percent%';
-      _paintAxisLabel(
-        canvas,
-        labelText,
-        Offset(0, y - 7),
-        width: _left - 6,
-        align: TextAlign.right,
-      );
+      paintChartValueLabel(canvas, percent > 0 ? '+$percent%' : '$percent%', y);
     }
-    _paintTimeAxis(canvas, plot, start, end, gridPaint);
+    paintChartTimeAxis(canvas, plot, start, end, gridPaint);
 
     for (var i = 0; i < series.length; i++) {
       _paintTrace(canvas, traceFor(series[i], start, end, plot), colors[i]);
@@ -603,14 +469,6 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
       oldDelegate.colors != colors ||
       oldDelegate.start != start ||
       oldDelegate.end != end;
-}
-
-String _agoLabel(Duration duration) {
-  final hours = duration.inHours;
-  if (hours >= 24 && hours % 24 == 0) {
-    return '${hours ~/ 24}d ago';
-  }
-  return '${hours}h ago';
 }
 
 /// The base-10 decade axis behind the throttle-period chart. The observed
@@ -677,11 +535,6 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
   final DateTime start;
   final DateTime end;
 
-  static const _left = 42.0;
-  static const _right = 10.0;
-  static const _top = 10.0;
-  static const _bottom = 27.0;
-
   /// Map one series onto [plot], breaking at resets and non-finite intervals.
   @visibleForTesting
   static QuotaSeriesTrace traceFor(
@@ -703,17 +556,10 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final plot = Rect.fromLTRB(
-      _left,
-      _top,
-      size.width - _right,
-      size.height - _bottom,
-    );
+    final plot = chartPlotRect(size);
     if (plot.width <= 0 || plot.height <= 0) return;
 
-    final gridPaint = Paint()
-      ..color = MeshColors.border.withValues(alpha: 0.7)
-      ..strokeWidth = 1;
+    final gridPaint = chartGridPaint();
     final minorGridPaint = Paint()
       ..color = MeshColors.border.withValues(alpha: 0.3)
       ..strokeWidth = 1;
@@ -730,13 +576,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
       final decadeSeconds = math.pow(10, exponent).toDouble();
       final y = yFor(decadeSeconds);
       canvas.drawLine(Offset(plot.left, y), Offset(plot.right, y), gridPaint);
-      _paintAxisLabel(
-        canvas,
-        '${decadeSeconds.round()}s',
-        Offset(0, y - 7),
-        width: _left - 6,
-        align: TextAlign.right,
-      );
+      paintChartValueLabel(canvas, '${decadeSeconds.round()}s', y);
       // Unlabelled 2x-9x ticks inside each decade, so the compressed spacing
       // reads as logarithmic at a glance.
       if (exponent == axis.maxExponent) continue;
@@ -750,7 +590,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
       }
     }
 
-    _paintTimeAxis(canvas, plot, start, end, gridPaint);
+    paintChartTimeAxis(canvas, plot, start, end, gridPaint);
 
     for (var i = 0; i < series.length; i++) {
       _paintTrace(

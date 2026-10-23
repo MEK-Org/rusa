@@ -25,6 +25,7 @@ import {
 } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
+import { InboxMetricRepository } from "../db/repositories/inbox-metric-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -3298,6 +3299,32 @@ describe("handleMeshApiRequest", () => {
     meshEvents.record({ kind: "run_start", actorId: UUID_A });
     const { res } = await call(deps, "GET", "/api/mesh/events");
     expect(JSON.parse(res.body)).toEqual({ events: [], nextCursor: null });
+  });
+
+  it("GET /api/mesh/inbox-metrics serves only the aggregate window, and 503 when unwired", async () => {
+    expect((await call(deps, "GET", "/api/mesh/inbox-metrics")).res.statusCode).toBe(503);
+
+    // The route serves stored points as-is; which entries count is the repository's test.
+    const metrics = new InboxMetricRepository(db, () => () => false);
+    const sampled = metrics.sampleIfDue();
+    const { res } = await call(
+      { ...deps, inboxMetrics: metrics },
+      "GET",
+      "/api/mesh/inbox-metrics"
+    );
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Object.keys(body).sort()).toEqual([
+      "generatedAt",
+      "intervalSeconds",
+      "points",
+      "windowEnd",
+      "windowStart",
+    ]);
+    expect(body.intervalSeconds).toBe(60);
+    expect(Date.parse(body.windowEnd) - Date.parse(body.windowStart)).toBe(3 * 24 * 60 * 60 * 1000);
+    // Each point is a cross-actor summary; no actor id or inbox entry leaves the server.
+    expect(body.points).toEqual([sampled]);
   });
 
   it("GET /api/mesh/inbox resolves a mesh message body into the payload, not its id", async () => {

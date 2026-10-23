@@ -61,7 +61,6 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
-import * as exhaustionClassifier from "../providers/exhaustion-classifier.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -2502,7 +2501,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {
-    it("wires exhaustion classification only for root actors", async () => {
+    it("enables failed-run recovery only for the root actor (#1150)", async () => {
       const config = {
         github: { account: "mock-bot" },
         providers: {
@@ -2554,18 +2553,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh) throw new Error("mesh not ready");
       const workerActor = mesh.get("test-kimi-worker");
       expect(workerActor).toBeDefined();
-      const kimiActorOpts = (workerActor as unknown as { opts: { classifyExhaustion?: unknown } })
+      const kimiActorOpts = (workerActor as unknown as { opts: { recoverFailedRuns?: unknown } })
         .opts;
       const rootActorOpts = (
         mesh.get(rootId) as unknown as {
-          opts: { classifyExhaustion?: unknown };
+          opts: { recoverFailedRuns?: unknown };
         }
       ).opts;
 
-      // Workers report quota exhaustion to their parent rather than consuming
+      // Workers report a failed run to their parent rather than consuming
       // their own configured pool. Only the root enables recovery.
-      expect(kimiActorOpts.classifyExhaustion).toBeUndefined();
-      expect(rootActorOpts.classifyExhaustion).toBeTypeOf("function");
+      expect(kimiActorOpts.recoverFailedRuns).toBeUndefined();
+      expect(rootActorOpts.recoverFailedRuns).toBe(true);
     });
 
     it("boot wires the obligation store's actor guard, so it is not inert", async () => {
@@ -3101,7 +3100,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   describe("run settlement on provider return (#828)", () => {
     /**
      * Boot the production wiring with one rehydrated worker and hand back the
-     * hooks `runStart` actually built for it. The Actor's own classification is
+     * hooks `runStart` actually built for it. The Actor's own run settlement is
      * covered in actor.test.ts; what is asserted here is everything downstream
      * of it — durable history, the `run_end` a dashboard reads, and the
      * mechanical notice a parent receives.
@@ -3113,8 +3112,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           github: { account: "mock-bot" },
           providers: { antigravity: { cliCommand: "agy" } },
           rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-          // No geminiApiKey: the failure route's exhaustion classifier then takes
-          // its deterministic offline branch, so this test never leaves the box.
         }),
         "utf8"
       );
@@ -5695,6 +5692,129 @@ describe("runStart webhook event routing (Phase 4)", () => {
     compactSpy.mockRestore();
   });
 
+  it("compacts ledger state using launch context when a different context mode is staged mid-run", async () => {
+    let mesh: ActorMesh | undefined;
+    const compactSpy = vi
+      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
+      .mockImplementation(async ({ state, messages, now }) => ({
+        state: {
+          ...state,
+          generation: state.generation + 1,
+          updatedAt: now,
+          lastFoldedSourceId: messages.at(-1)?.id ?? null,
+          items: [
+            {
+              id: "mem-staged-instruction",
+              kind: "decision" as const,
+              priority: "must" as const,
+              status: "active" as const,
+              statement: "The ledger instruction was folded using launch context.",
+              evidence: [
+                {
+                  eventId: messages[0]?.id ?? "missing-source",
+                  sender: "operator",
+                  ts: messages[0]?.ts ?? now,
+                  quote: "Fold this ledger message.",
+                },
+              ],
+              updatedAt: now,
+            },
+          ],
+        },
+        quarantined: [],
+        operations: 0,
+      }));
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+
+    const workerId = activeMesh.spawn({
+      charter: "ledger worker staging context change",
+      parentId: rootId,
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      context: { type: "portable", mode: "ledger" },
+    });
+    const worker = activeMesh.get(workerId);
+    if (!worker) throw new Error("worker not found");
+
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: workerId,
+      body: "Fold this ledger message.",
+    });
+
+    // 1. Launch the run in ledger mode: captures launchContext = { type: "portable", mode: "ledger" }
+    const runId = await startLifecycleRun(worker as Actor, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+
+    // 2. Stage a different context mode (tail) while the worker is running
+    const runningSpy = vi.spyOn(worker as Actor, "isRunning", "get").mockReturnValue(true);
+    const stageOutcome = activeMesh.setActorContext(workerId, "tail", rootId);
+    expect(stageOutcome).toBe("staged");
+    expect(activeMesh.actors.get(workerId)?.context).toEqual({ type: "portable", mode: "ledger" });
+    expect(activeMesh.actors.get(workerId)?.desiredContextConfig).toEqual({
+      type: "portable",
+      mode: "tail",
+    });
+
+    // 3. Complete the run: mesh finishInboxRun applies pending context (to tail),
+    // but the lifecycle listener must use the captured launchContext to fold the completed ledger run
+    runningSpy.mockReturnValue(false);
+    await endLifecycleRun(worker as Actor, runId, {
+      success: true,
+      output: "ledger worker run completed",
+      exitCode: 0,
+    });
+
+    // Observe that compaction executed using the launch configuration
+    expect(compactSpy).toHaveBeenCalledOnce();
+    const state = getRepositories().portableContext.load(workerId);
+    expect(state.generation).toBe(1);
+    expect(state.lastFoldedSourceId).toBeTruthy();
+
+    const compactedEvents = getRepositories().meshEvents.listEventsByActors([workerId], {
+      kinds: ["portable_context_compacted"],
+      limit: 10,
+    }).events;
+    expect(compactedEvents).toHaveLength(1);
+    expect(compactedEvents[0]?.detail).toContain("generation 1");
+
+    // And verify the pending context is now applied for the next run
+    expect(activeMesh.actors.get(workerId)?.context).toEqual({ type: "portable", mode: "tail" });
+    expect(activeMesh.actors.get(workerId)?.desiredContextConfig).toBeUndefined();
+
+    compactSpy.mockRestore();
+  });
+
   it("defers an interrupted run's fold under compacted_memory_delta and folds the delta once later (#1062)", async () => {
     let mesh: ActorMesh | undefined;
     const COMPACTOR_DELAY_MS = 300;
@@ -5708,12 +5828,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       releaseFirstFold = resolve;
     });
     onTestFinished(() => releaseFirstFold());
-    // The compactor needs a synthetic API key, but failed-run classification
-    // is unrelated to this fixture and must stay offline.
-    const classifierSpy = vi
-      .spyOn(exhaustionClassifier, "createExhaustionClassifier")
-      .mockReturnValue(async () => ({ exhausted: false }));
-    onTestFinished(() => classifierSpy.mockRestore());
     const compactSpy = vi
       .spyOn(GeminiPortableContextCompactor.prototype, "compact")
       .mockImplementation(async ({ state, messages, now }) => {
@@ -7255,6 +7369,109 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig).toBeUndefined();
   });
 
+  it("production composition validates effective candidate context on setActorModel and enforces provider constraints on setActorContext", async () => {
+    clearProviderModelCatalog();
+    let mesh: ActorMesh | undefined;
+    const config = {
+      github: {
+        account: "mock-bot",
+      },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+        openrouter: {
+          cliCommand: "openrouter",
+          openrouterPoc: {
+            authDir: homeDir,
+            artifactDir: homeDir,
+          },
+        },
+      },
+      rootActor: {
+        provider: "claude",
+        model: "claude-sonnet-5",
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+
+    const prevPoc = process.env.RUSA_OPENROUTER_POC;
+    process.env.RUSA_OPENROUTER_POC = "1";
+    onTestFinished(() => {
+      if (prevPoc === undefined) {
+        delete process.env.RUSA_OPENROUTER_POC;
+      } else {
+        process.env.RUSA_OPENROUTER_POC = prevPoc;
+      }
+    });
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+    expect(mesh).toBeDefined();
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+
+    // 1. While a native actor is running, stage tail/brief, then set a multi-entry pool:
+    // start.ts validateModel must validate with the effective candidate portable context
+    const runningWorkerId = activeMesh.spawn({
+      charter: "running native worker",
+      parentId: rootId,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      context: { type: "native" },
+    });
+    const runningActor = activeMesh.get(runningWorkerId);
+    if (!runningActor) throw new Error("running worker not found");
+    const runningSpy = vi.spyOn(runningActor, "isRunning", "get").mockReturnValue(true);
+
+    const contextOutcome = activeMesh.setActorContext(runningWorkerId, "tail", rootId);
+    expect(contextOutcome).toBe("staged");
+    expect(activeMesh.actors.get(runningWorkerId)?.context?.type).toBe("native");
+    expect(activeMesh.actors.get(runningWorkerId)?.desiredContextConfig).toMatchObject({
+      type: "portable",
+      mode: "tail",
+    });
+
+    // Multi-candidate pool would be rejected on native, but effective candidate context is portable:
+    const modelOutcome = activeMesh.setActorModel(
+      runningWorkerId,
+      [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "claude", model: "claude-opus-5" },
+      ],
+      rootId
+    );
+    expect(modelOutcome).toBe("staged");
+    expect(activeMesh.actors.get(runningWorkerId)?.desiredModelConfig).toHaveLength(2);
+
+    runningSpy.mockReturnValue(false);
+
+    // 2. Portable actor with an OpenRouter model entry cannot transition to native:
+    // start.ts validateContext must invoke validateModelConfigPool against candidate native context
+    const openrouterWorkerId = activeMesh.spawn({
+      charter: "openrouter worker",
+      parentId: rootId,
+      modelConfig: { provider: "openrouter", model: "vendor/fixed-model" },
+      context: { type: "portable", mode: "tail" },
+    });
+
+    expect(() => {
+      activeMesh.setActorContext(openrouterWorkerId, "native", rootId);
+    }).toThrow(/OpenRouter prototype requires portable context/);
+    expect(activeMesh.actors.get(openrouterWorkerId)?.context?.type).toBe("portable");
+    expect(activeMesh.actors.get(openrouterWorkerId)?.desiredContextConfig).toBeUndefined();
+  });
+
   it("root's run_start records the live model after a pool set while idle, not the value frozen when root was built (#199 amend gap 1, extended to pools)", async () => {
     // A prior test in this file registers a real "antigravity"/"agy" model
     // catalog via setProviderModelCatalog and never clears it; that module-level
@@ -8306,7 +8523,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // `runWithPoolFallback` is the production boundary that resolves the
     // ordered remaining root pool.
     // `requestRun` is mocked file-wide, so this drives the lifecycle with a
-    // stubbed provider and classifies the primary as exhausted.
+    // stubbed provider whose primary attempt fails.
     const rootPoolFallbackRun = async (
       mesh: ActorMesh,
       selected: ProviderModelConfig,
@@ -8314,42 +8531,36 @@ describe("runStart webhook event routing (Phase 4)", () => {
         success: true,
         output: "fallback recovered",
         exitCode: 0,
+      }),
+      primary: () => RunResult = () => ({
+        success: false,
+        output: "quota exhausted",
+        exitCode: 1,
       })
-    ): Promise<{ attempts: CodingProvider[]; result: RunResult }> => {
+    ): Promise<{ attempts: CodingProvider[]; result: RunResult; runId: string }> => {
       const root = mesh.get(rootId);
       if (!root) throw new Error("root actor not ready");
       const actor = root as unknown as {
-        opts: {
-          classifyExhaustion?: (result: RunResult) => Promise<{ exhausted: boolean }>;
-        };
+        opts: { recoverFailedRuns?: boolean };
         runWithPoolFallback: (
           runId: string,
           selected: ProviderModelConfig,
-          primary: CodingProvider,
           runProvider: (provider: CodingProvider) => Promise<RunResult>
         ) => Promise<RunResult>;
       };
-      if (!actor.opts.classifyExhaustion) throw new Error("root pool fallback not configured");
-      actor.opts.classifyExhaustion = vi.fn(async () => ({ exhausted: true }));
+      if (!actor.opts.recoverFailedRuns) throw new Error("root pool fallback not configured");
       const lifecycleActor = root as Actor;
       const runId = await startLifecycleRun(lifecycleActor, selected);
-      const primary: CodingProvider = {
-        name: selected.provider,
-        providerName: selected.provider,
-        model: selected.model,
-        effort: selected.effort,
-        run: async () => ({ success: true, output: "unused", exitCode: 0 }),
-      };
       const attempts: CodingProvider[] = [];
-      const result = await actor.runWithPoolFallback(runId, selected, primary, async (provider) => {
+      // The chain resolves each entry itself, the selected one first; only that
+      // first attempt fails.
+      const result = await actor.runWithPoolFallback(runId, selected, async (provider) => {
         attempts.push(provider);
-        return provider === primary
-          ? { success: false, output: "quota exhausted", exitCode: 1 }
-          : recover(provider);
+        return attempts.length === 1 ? primary() : recover(provider);
       });
       // Close the durable lifecycle run the way `Actor.invoke` does.
       await endLifecycleRun(lifecycleActor, runId, result);
-      return { attempts, result };
+      return { attempts, result, runId };
     };
     const runEndEvents = () =>
       getRepositories().meshEvents.listEventsByActors([rootId], { kinds: ["run_end"], limit: 20 })
@@ -8375,6 +8586,48 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
       expect(recovered.result).toMatchObject({ success: true, output: "fallback recovered" });
       expect(runEndEvents()).toHaveLength(1);
+    });
+
+    it("keeps a thrown attempt's scrubbed stack in the local run_error record after recovery", async () => {
+      // A recovered run's `run_end` holds only the replacement's output, so the
+      // thrown primary's stack must survive in its own `run_error` record.
+      const secret = "synthetic-run-error-credential";
+      vi.stubEnv("GH_TOKEN", secret);
+      try {
+        await persistOperatorPool();
+        const mesh = await boot();
+        logCapture.lines.length = 0;
+
+        const recovered = await rootPoolFallbackRun(
+          mesh,
+          operatorPool[0] as ProviderModelConfig,
+          undefined,
+          () => {
+            throw new Error(`provider launch failed with ${secret}`);
+          }
+        );
+
+        expect(recovered.attempts).toHaveLength(2);
+        expect(recovered.result).toMatchObject({ success: true, output: "fallback recovered" });
+        const records = bootRecords("run_error");
+        expect(records).toHaveLength(1);
+        expect(records[0]).toMatchObject({
+          level: "error",
+          actorId: rootId,
+          runId: recovered.runId,
+          error: "provider launch failed with [redacted]",
+          err: {
+            name: "Error",
+            message: "provider launch failed with [redacted]",
+            stack: expect.stringMatching(
+              /^Error: provider launch failed with \[redacted\]\n\s+at /
+            ),
+          },
+        });
+        expect(JSON.stringify(records[0])).not.toContain(secret);
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
 
     it("does not retry an exhausted entry when launch begins on a later pool candidate", async () => {
@@ -11077,6 +11330,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
           .map(({ time: _time, pid: _pid, hostname: _host, actorId: _actorId, ...rest }) => ({
             ...rest,
             runId: alias(rest.runId as string | undefined),
+            // A thrown run's stack names this test's call site, which differs
+            // between the two projections; its frames are not run accounting.
+            ...(rest.err ? { err: { ...(rest.err as object), stack: "[frames]" } } : {}),
           }));
         return { events, runs, logs, selection: undefined };
       };

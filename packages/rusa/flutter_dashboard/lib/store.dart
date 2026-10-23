@@ -373,6 +373,7 @@ class DashboardStore {
   var _liveCodeUnits = 0;
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
+  final _inboxMetrics = BehaviorSubject<InboxMetricsDto?>.seeded(null);
   final _recentActivity = BehaviorSubject<List<RecentActivityItem>>.seeded(
     const [],
   );
@@ -404,6 +405,10 @@ class DashboardStore {
   /// screen, which is not the same kind of stale.
   final _actorsStale = BehaviorSubject<bool>.seeded(false);
   final _quotaHistoryStale = BehaviorSubject<bool>.seeded(false);
+  final _inboxMetricsStale = BehaviorSubject<bool>.seeded(false);
+  Timer? _inboxMetricsCooldown;
+  bool _inboxMetricsInFlight = false;
+  static const inboxMetricsRefreshInterval = Duration(minutes: 1);
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
@@ -470,6 +475,8 @@ class DashboardStore {
   ValueStream<List<LiveLine>> get live => _live.stream;
   ValueStream<QuotaSnapshotDto?> get quota => _quota.stream;
   ValueStream<QuotaHistoryDto?> get quotaHistory => _quotaHistory.stream;
+  ValueStream<InboxMetricsDto?> get inboxMetrics => _inboxMetrics.stream;
+  ValueStream<bool> get inboxMetricsStale => _inboxMetricsStale.stream;
   ValueStream<List<RecentActivityItem>> get recentActivity =>
       _recentActivity.stream;
   ValueStream<Map<String, RunModelSelection>> get runSelections =>
@@ -947,6 +954,45 @@ class DashboardStore {
         _quotaHistoryStale.add(true);
       }
     }
+  }
+
+  /// Re-reads the inbox window at most once a minute, its sampling rate,
+  /// however often the Overview ticks or remounts (#1018). The cooldown starts
+  /// with the request, and no tick starts another until it settles, so an
+  /// older response never lands over a newer one; a failed fetch ends the
+  /// cooldown, so the next tick retries. Quota history is not polled (#26);
+  /// the shared chart range still moves with this payload.
+  Future<void> pollInboxMetrics() async {
+    if (_inboxMetricsInFlight) return;
+    if (_inboxMetricsCooldown?.isActive ?? false) return;
+    final cooldown = Timer(inboxMetricsRefreshInterval, () {});
+    _inboxMetricsCooldown = cooldown;
+    _inboxMetricsInFlight = true;
+    final answered = await refreshInboxMetrics();
+    _inboxMetricsInFlight = false;
+    if (!answered) cooldown.cancel();
+  }
+
+  /// Per-minute inbox backlog (#1018). A 503 means the server has no
+  /// collector; any other failure keeps the last window, marked cached.
+  /// Returns whether the server answered.
+  Future<bool> refreshInboxMetrics() async {
+    try {
+      final metrics = await _api.fetchInboxMetrics();
+      _inboxMetrics.add(metrics);
+      _inboxMetricsStale.add(false);
+      return true;
+    } on DashboardApiException catch (e) {
+      if (e.status == 503) {
+        _inboxMetrics.add(null);
+        _inboxMetricsStale.add(false);
+        return true;
+      }
+      if (_inboxMetrics.valueOrNull != null) _inboxMetricsStale.add(true);
+    } catch (e) {
+      if (_inboxMetrics.valueOrNull != null) _inboxMetricsStale.add(true);
+    }
+    return false;
   }
 
   /// Replace the normalized actor-state snapshot from one authoritative server
@@ -2174,6 +2220,7 @@ class DashboardStore {
     _quotaPoll?.cancel();
     _queuePacingPoll?.cancel();
     _runtimeRetry?.cancel();
+    _inboxMetricsCooldown?.cancel();
     for (final s in _subs) {
       await s.cancel();
     }
@@ -2197,11 +2244,13 @@ class DashboardStore {
       _live.close(),
       _quota.close(),
       _quotaHistory.close(),
+      _inboxMetrics.close(),
       _recentActivity.close(),
       _quotaRefreshing.close(),
       _quotaStale.close(),
       _actorsStale.close(),
       _quotaHistoryStale.close(),
+      _inboxMetricsStale.close(),
       _avatarEpoch.close(),
       _dashboardConfig.close(),
       _error.close(),

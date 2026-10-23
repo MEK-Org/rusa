@@ -26,7 +26,12 @@ import {
   type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
-import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
+import type {
+  ActorRecord,
+  ContextConfig,
+  ExecutionConfig,
+  PortableContextConfig,
+} from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   defaultActorBootstrapCapabilities,
@@ -210,6 +215,7 @@ import type {
   AvailabilityHold,
   AvailabilityHoldOrigin,
 } from "../db/repositories/availability-hold-repository.js";
+import type { Repositories } from "../db/repositories/index.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -288,7 +294,6 @@ import {
   codexAuthBrokerConfigured,
   configureCodexAuthBroker,
 } from "../providers/codex-auth-broker.js";
-import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   acceptableModelPins,
   ingestKimiHostModels,
@@ -341,11 +346,19 @@ import { FollowerHub } from "../remote-instances/follower-hub.js";
 import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { registerFollowerRegistrationRecovery } from "../remote-instances/follower-registration-recovery.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
+import { runMaterialListener } from "../remote-instances/leader-run-material.js";
 import type {
   FollowerFileOperation,
   FollowerFileOperationResult,
   ProviderFactory,
 } from "../remote-instances/protocol.js";
+import { MaterialReadUnavailableError } from "../remote-instances/remote-instance.js";
+import {
+  outputOmittedChars,
+  RUN_MATERIAL_ROOT,
+  RUN_MATERIAL_SWEEP_INTERVAL_MS,
+  RunMaterialStore,
+} from "../remote-instances/run-material.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -384,7 +397,12 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
-import { BuildRunner, GitRunner } from "../update/runner.js";
+import {
+  BuildRunner,
+  GitRunner,
+  UPDATE_BUILD_TIMEOUT_MS,
+  UPDATE_INSTALL_TIMEOUT_MS,
+} from "../update/runner.js";
 import { ChatRoomService } from "../voice/chat-room.js";
 import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
@@ -413,12 +431,10 @@ import {
   recordAndAnnounceRequestedRestart,
   ServiceLifecycleStore,
 } from "./service-lifecycle.js";
-import { composeFollowerStart } from "./start-follower.js";
+import { composeFollowerStart, type StartFollowerRelease } from "./start-follower.js";
 
-// `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
-// root; a bounded drain so a stuck worker can't block the restart forever.
-const UPDATE_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
-const UPDATE_BUILD_TIMEOUT_MS = 20 * 60 * 1000;
+// `update` tool bound: a bounded drain so a stuck worker can't block the
+// restart forever. The per-step build timeouts live with the BuildRunner.
 const UPDATE_DRAIN_TIMEOUT_MS = 60 * 1000;
 
 // v1 explicit never-notify list : bot-sender tracker-churn event types
@@ -784,6 +800,12 @@ export interface RunStartE2EHooks {
   /** Exercise follower HTTP command ingestion while retaining E2E shutdown handles. */
   followerPolling?: boolean;
   followerProviderFactory?: ProviderFactory;
+  /**
+   * The follower's running release and update source. Without it an e2e
+   * follower reports no release and refuses updates: the production source
+   * would reset and rebuild the checkout running the test.
+   */
+  followerRelease?: StartFollowerRelease;
   onFollowerReady?: (handles: {
     instance: FollowerInstance;
     instanceIdentity: InstanceIdentity;
@@ -978,9 +1000,9 @@ function assemblePortableInjection(
   mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
-  onDeltaFallback: (error: unknown) => void = () => {}
+  onDeltaFallback: (error: unknown) => void = () => {},
+  repositories: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = getRepositories()
 ): PortableInjection {
-  const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
@@ -1067,18 +1089,26 @@ function assemblePortableInjection(
     : { readRunIds };
 }
 
-function assembleConfiguredPortableInjection(
+export function assembleConfiguredPortableInjection(
   record: ActorRecord,
   apiKey: string | null,
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
-  onDeltaFallback?: (error: unknown) => void
+  onDeltaFallback?: (error: unknown) => void,
+  repositories?: Pick<Repositories, "actorRuns" | "obligations" | "meshChat">
 ): PortableInjection | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
   }
-  return assemblePortableInjection(record.id, record.context.mode, store, journal, onDeltaFallback);
+  return assemblePortableInjection(
+    record.id,
+    record.context.mode,
+    store,
+    journal,
+    onDeltaFallback,
+    repositories
+  );
 }
 
 export async function compactPortableContext(input: {
@@ -2048,7 +2078,6 @@ async function composeStart(
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
-  const classifyExhaustion = createExhaustionClassifier(config.geminiApiKey);
   const repoRoot = (() => {
     try {
       return resolveRepoRoot();
@@ -2127,6 +2156,10 @@ async function composeStart(
     runId ? actorRunLog.child({ actorId, runId }) : actorRunLog.child({ actorId });
 
   const meshEventLog = log.child({ component: "mesh-events" });
+  // This leader's own run material: what a bound run's host sent in full
+  // because it could not keep it (#1020).
+  const runMaterial = new RunMaterialStore(join(mcHome, RUN_MATERIAL_ROOT));
+  const runMaterialLog = log.child({ component: "run-material" });
   const meshEvents: MeshEventSink = (e) => {
     const id = getRepositories().meshEvents.record(e);
     try {
@@ -2988,17 +3021,13 @@ async function composeStart(
       impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
     });
   };
-  const isPortableLedgerActor = (actorId: string): boolean => {
-    const context = actors.get(actorId)?.context;
-    return context?.type === "portable" && context.mode === "ledger";
-  };
-
   const compactPortableActorAfterRun = async (
     actorId: string,
-    runId: string
+    runId: string,
+    runContext?: ContextConfig
   ): Promise<PortableContextCompactionSummary | null> => {
-    const current = actors.get(actorId);
-    const context = current?.context?.type === "portable" ? current.context : undefined;
+    const current = runContext ?? actors.get(actorId)?.context;
+    const context = current?.type === "portable" ? current : undefined;
     const compactor = context?.mode === "ledger" ? compactorFor(context) : null;
     if (context?.mode !== "ledger" || !compactor) return null;
     try {
@@ -3172,9 +3201,21 @@ async function composeStart(
     // Which entry actually ran, for the failure-notice label. A declared pool
     // can move while idle, so this is captured at lifecycle start.
     let lastSelected = firstSelected;
+    let launchContext = actors.get(id)?.context;
+    // A run bound to its execution host keeps its originals there; only an
+    // unbound run's prompt goes to `run_prompts` (#1020).
+    lifecycle.add(
+      runMaterialListener(
+        id,
+        runMaterial,
+        (runId, prompt) => getRepositories().runPrompts.recordForActor(id, runId, prompt),
+        runMaterialLog
+      )
+    );
     lifecycle.add({
       onStart: (event) => {
         lastSelected = event.selected;
+        launchContext = actors.get(id)?.context;
         mesh.clearSelection(id);
         const launchConfig = projectActorRunLaunchConfig(event.selected);
         runAccounting.begin(id, event.runId, launchConfig);
@@ -3190,9 +3231,6 @@ async function composeStart(
       },
     });
     lifecycle.add({
-      onPrompt: (event) => {
-        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt);
-      },
       onQueued: (event) => {
         mesh.recordEvent({
           kind: "run_queued",
@@ -3221,12 +3259,17 @@ async function composeStart(
             effort: launchConfig.effort,
             responsive: event.responsive,
             runId: event.runId,
+            ...(event.material ? { material: event.material } : {}),
           }),
         });
       },
       onError: (event) => {
+        // `err` carries the scrubbed stack and cause chain: a recovering root
+        // keeps running after a thrown attempt, so this record is where that
+        // attempt's stack survives.
         runLogger(id, event.runId).error("run_error", {
           error: event.error instanceof Error ? event.error.message : String(event.error),
+          err: event.error,
         });
       },
       onEnd: async (event) => {
@@ -3254,6 +3297,7 @@ async function composeStart(
           success: result.success,
           detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
           body: result.output,
+          bodyOmittedChars: outputOmittedChars(result),
           payload: runEndPayload({ ...result, runId: event.runId }),
         });
       },
@@ -3267,10 +3311,9 @@ async function composeStart(
         // successor — which is what interrupted it — starts without waiting on
         // the compactor. The cursor is untouched; the sources stay in mesh_chat
         // and actor_runs, and the next ordinary run end folds them once.
+        const isLedgerRun = launchContext?.type === "portable" && launchContext.mode === "ledger";
         const deferred =
-          result.interrupted === true &&
-          isPortableLedgerActor(id) &&
-          portableJournalModeFor(id) === "delta";
+          result.interrupted === true && isLedgerRun && portableJournalModeFor(id) === "delta";
         if (deferred) {
           mesh.recordEvent({
             kind: "portable_context_compaction_deferred",
@@ -3283,7 +3326,10 @@ async function composeStart(
             }),
           });
         }
-        const compacted = deferred ? null : await compactPortableActorAfterRun(id, event.runId);
+        const compacted =
+          deferred || !isLedgerRun
+            ? null
+            : await compactPortableActorAfterRun(id, event.runId, launchContext);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",
@@ -3376,9 +3422,23 @@ async function composeStart(
       // class reference would otherwise pass through it untouched.
       const resolved = resolveModelClasses(modelClasses, modelConfig);
       const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
+      const effectiveContext = record.desiredContextConfig ?? record.context;
       return validateModelConfigPool(config, filled, {
-        portable: record.context?.type === "portable",
+        portable: effectiveContext?.type === "portable",
       });
+    },
+    validateContext: (record, context) => {
+      assertSpawnContextSupported(
+        { context },
+        { ledgerCompactionAvailable: portableContextApiKey !== null }
+      );
+      const effectivePool =
+        (record.desiredModelConfig as ProviderModelConfig[] | undefined) ?? record.modelConfig;
+      if (effectivePool && effectivePool.length > 0) {
+        validateModelConfigPool(config, effectivePool, {
+          portable: context.type === "portable",
+        });
+      }
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
@@ -3540,7 +3600,7 @@ async function composeStart(
             entry: { ...entry },
             reason: isProviderHalted(entry.provider, entry.model) ? "halted" : "exhausted",
           }));
-          return new PoolExhaustedError(formatPoolExhaustedFailure({ attempted: [], skipped }));
+          return new PoolExhaustedError(formatPoolExhaustedFailure({ skipped }));
         },
         onSelected: request.threadId
           ? (selection) => {
@@ -3969,7 +4029,7 @@ async function composeStart(
           // actor, not an alternate authority-bearing construction path.
           ...(id === rootId
             ? {
-                classifyExhaustion,
+                recoverFailedRuns: true,
                 onPoolFallback: ({ runId, attempt, failed, next, remainingAfter, skipReason }) => {
                   runLogger(id, runId).warn("run_pool_fallback", {
                     attempt,
@@ -3995,10 +4055,10 @@ async function composeStart(
                 },
               }
             : {}),
-          // No worker-side fallback : fallbacks are root-only. A worker's
-          // quota exhaustion is not something it self-heals out of — it's a
-          // signal to the worker's parent, who judges what happens next (see
-          // the exhaustion-classified onRun failure notice below).
+          // No worker-side recovery: it is root-only (#1150). A worker's
+          // failed run is not something it self-heals out of — it's a signal
+          // to the worker's parent, who judges what happens next (see the
+          // factual onRun failure notice below).
           gate: (fn, candidates, responsive) => {
             // A remote target executes inside its follower and obtains that
             // follower's lock. Never make two independent instances contend
@@ -4334,9 +4394,6 @@ async function composeStart(
     log: (m) => console.warn(`[failure-sink] ${m}`),
     workersDir,
     principals: getRepositories().principals,
-    // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
-    // (who now owns the fallback judgment) can see the cause up front.
-    classify: classifyExhaustion,
     // #189: a child's failure wakes its parent past provider pacing, backed
     // off per child so a crash loop cannot hammer the parent.
     escalation: new FailureEscalationBackoff(),
@@ -4680,8 +4737,18 @@ async function composeStart(
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          runMaterial: {
+            local: runMaterial,
+            remote: (host, actorId, request) =>
+              followerHub
+                ? followerHub.materialRead(host, actorId, request)
+                : Promise.reject(
+                    new MaterialReadUnavailableError("offline", "no follower hub is listening")
+                  ),
+          },
           portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
+          inboxMetrics: getRepositories().inboxMetrics,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
             logger: log.child({ component: "reference-cache" }),
@@ -5288,6 +5355,31 @@ async function composeStart(
   };
   pruneRunPrompts();
   everyInterval("run prompt retention", pruneRunPrompts, 60 * 60 * 1000);
+  const sweepRunMaterial = () => {
+    try {
+      runMaterial.sweep();
+    } catch (err) {
+      runMaterialLog.warn("run_material_sweep_failed", { err });
+    }
+  };
+  sweepRunMaterial();
+  everyInterval("run material retention", sweepRunMaterial, RUN_MATERIAL_SWEEP_INTERVAL_MS);
+  // Inbox backlog for the Overview charts (#1018): one sample per UTC minute.
+  // Each tick samples only the current minute, if not yet sampled. Ticking
+  // four times a minute keeps a sample near its minute's start, and a timer up
+  // to 45 s late still lands in its minute; a minute with no tick, such as
+  // while the host is down, stays a gap.
+  const sampleInboxMetrics = () => {
+    try {
+      getRepositories().inboxMetrics.sampleIfDue();
+    } catch (err) {
+      log.warn("inbox_metrics_sample_failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+  sampleInboxMetrics();
+  everyInterval("inbox metric sampling", sampleInboxMetrics, 15 * 1000);
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
   // Acquired before the probe interval, so the interval stops first and no new

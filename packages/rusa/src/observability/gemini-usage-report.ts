@@ -1,13 +1,19 @@
 import { createHash } from "node:crypto";
 import {
   GEMINI_COUNT_FIELDS,
+  GEMINI_RETIRED_USAGE_PURPOSES,
   GEMINI_USAGE_EVENT,
   GEMINI_USAGE_PURPOSES,
   type GeminiCounts,
+  type GeminiRecordedUsagePurpose,
   type GeminiUsageRecord,
 } from "./gemini-usage.js";
 
 export const MAX_USAGE_LINE_BYTES = 64 * 1024;
+const RECORDED_USAGE_PURPOSES: readonly GeminiRecordedUsagePurpose[] = [
+  ...GEMINI_USAGE_PURPOSES,
+  ...GEMINI_RETIRED_USAGE_PURPOSES,
+];
 // Streaming bounds line memory; this cap also bounds exact deduplication memory.
 export const MAX_REPORT_ATTEMPTS = 1_000_000;
 
@@ -109,7 +115,7 @@ function parseUsage(value: unknown): GeminiUsageRecord | null {
     actorId === undefined ||
     runId === undefined ||
     (actorId === null && runId !== null) ||
-    !GEMINI_USAGE_PURPOSES.includes(r.purpose) ||
+    !RECORDED_USAGE_PURPOSES.includes(r.purpose) ||
     !["response", "error", "cancelled"].includes(r.outcome) ||
     !["complete", "partial", "missing"].includes(r.usage) ||
     typeof r.partial !== "boolean" ||

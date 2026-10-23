@@ -24,6 +24,7 @@ import type {
   AvailabilityHoldOrigin,
 } from "../db/repositories/availability-hold-repository.js";
 import type { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
+import type { InboxMetricRepository } from "../db/repositories/inbox-metric-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
@@ -48,6 +49,11 @@ import {
   type ResolvedReferenceWithEntity,
   resolveReferenceSync,
 } from "../references/resolve.js";
+import {
+  type RunMaterialReaderDeps,
+  readRunMaterial,
+} from "../remote-instances/leader-run-material.js";
+import type { RunMaterialKind } from "../remote-instances/run-material.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type {
   InboxEntry,
@@ -67,6 +73,7 @@ import { getDashboardRequestPrincipal } from "./auth.js";
 import {
   type HumanChatScope,
   humanChatViewer,
+  inboxEntryHiddenFrom,
   resolveHumanChatScope,
   viewingUserPrincipalId,
 } from "./human-chat-scope.js";
@@ -96,9 +103,16 @@ export interface DashboardDataDeps {
    * the operator clearing an entry the actor should not have to answer (#66).
    */
   inbox?: InboxRepository;
+  /** Per-minute inbox backlog summaries for the Overview charts (#1018). */
+  inboxMetrics?: Pick<InboxMetricRepository, "window">;
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  /**
+   * Retained run originals (#1020): the leader's own store and a read from a
+   * run's recorded execution host. Absent → only `run_prompts` is served.
+   */
+  runMaterial?: Pick<RunMaterialReaderDeps, "local" | "remote">;
   portableContext?: Pick<PortableContextStore, "load"> &
     Pick<PortableBriefStore, "listBriefRevisions">;
   /** Durable per-entry obligation associations for activity correlation. */
@@ -2571,15 +2585,41 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // Complete launch text is fetched on demand through the existing dashboard access path.
-  const runPromptMatch = /^\/api\/mesh\/runs\/([^/]+)\/prompt$/.exec(pathname);
-  if (runPromptMatch && req.method === "GET") {
-    const retained = deps.runPrompts?.getById(decodeURIComponent(runPromptMatch[1]));
-    if (!retained) {
-      sendJson(res, 404, { error: "prompt not retained" });
+  // Complete launch text and output are fetched on demand through the existing
+  // dashboard access path (#866); a bound run's originals come from the host
+  // recorded at its start (#1020). `?attempt=N` names one prompt attempt.
+  const runMaterialMatch = /^\/api\/mesh\/runs\/([^/]+)\/(prompt|output)$/.exec(pathname);
+  if (runMaterialMatch && req.method === "GET") {
+    const runId = decodeURIComponent(runMaterialMatch[1]);
+    const kind = runMaterialMatch[2] as RunMaterialKind;
+    const attemptParam = url.searchParams.get("attempt");
+    if (attemptParam !== null && (kind === "output" || !/^[1-9]\d{0,8}$/.test(attemptParam))) {
+      sendJson(res, 400, { error: "Invalid attempt" });
       return true;
     }
-    sendJson(res, 200, { prompt: retained.prompt });
+    const attempt = attemptParam === null ? undefined : Number(attemptParam);
+    const legacyPrompt = (id: string) => deps.runPrompts?.getById(id)?.prompt;
+    const actorId = deps.actorRuns?.getById(runId)?.actorId;
+    if (!actorId || !deps.runMaterial) {
+      const prompt = kind === "prompt" && attempt === undefined ? legacyPrompt(runId) : undefined;
+      if (prompt === undefined) sendJson(res, 404, { error: `${kind} not retained` });
+      else sendJson(res, 200, { prompt });
+      return true;
+    }
+    const response = await readRunMaterial(
+      {
+        ...deps.runMaterial,
+        binding: (owner, id) => meshEvents.getRunMaterialBinding(owner, id),
+        legacyPrompt,
+      },
+      actorId,
+      runId,
+      kind,
+      attempt
+    );
+    if (response.retryAfter !== undefined)
+      res.setHeader("Retry-After", String(response.retryAfter));
+    sendJson(res, response.status, response.body);
     return true;
   }
 
@@ -2626,6 +2666,20 @@ export async function handleMeshApiRequest(
         viewerScope()
       )
     );
+    return true;
+  }
+
+  // GET /api/mesh/inbox-metrics — prior three days of per-minute inbox backlog
+  // statistics across every live actor; only medians and maxima leave the
+  // server, the same for every viewer. Sizes and ages leave out human-chat
+  // messages, which the per-entry routes hide from other viewers (#590), so no
+  // statistic reveals that one arrived or when.
+  if (pathname === "/api/mesh/inbox-metrics") {
+    if (!deps.inboxMetrics) {
+      sendJson(res, 503, { error: "inbox metrics unavailable" });
+      return true;
+    }
+    sendJson(res, 200, deps.inboxMetrics.window());
     return true;
   }
 
@@ -2852,29 +2906,12 @@ export async function handleMeshApiRequest(
       if (!entry.handledAt) continue;
 
       const source = entry.source;
-      const { messageId, fromId } = entry.payload as { messageId?: unknown; fromId?: unknown };
+      const { messageId } = entry.payload as { messageId?: unknown };
       let referenceKey: string | undefined;
       if (typeof messageId === "string") {
         // A human's message is that human's conversation with the actor.
-        // Another viewer is shown nothing of it — not that it exists — and a
-        // legacy pointer gets its sender from the canonical mesh source. The
-        // inbox row is always the recipient's. Payload/source are hints only:
-        // the local canonical record remains the #590 visibility authority.
-        const sourceSender =
-          source.startsWith("mesh:") && source !== "mesh:unknown"
-            ? source.slice("mesh:".length)
-            : undefined;
-        const senderId = typeof fromId === "string" ? fromId : sourceSender;
-        if (senderId && !chatScope.canSee(senderId, entry.actorId)) continue;
-        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
-          meshChat: deps.meshChat,
-        });
-        if (
-          reference.entity?.type === "mesh_message" &&
-          !chatScope.canSee(reference.entity.senderId, reference.entity.recipientId)
-        ) {
-          continue;
-        }
+        // Another viewer is shown nothing of it — not that it exists.
+        if (inboxEntryHiddenFrom(entry, deps.meshChat, chatScope)) continue;
         referenceKey = `mesh:messages/${messageId}`;
       } else if (source.startsWith("github:") || source.startsWith("slack:")) {
         // Canonical external reference: resolve key after first paint.

@@ -57,7 +57,7 @@ afterEach(() => {
 });
 
 describe("Gemini usage logger and on-demand report", () => {
-  it("round-trips all ten active purposes through the real redacting JSON logger and deduplicates exports", async () => {
+  it("round-trips all nine active purposes through the real redacting JSON logger and deduplicates exports", async () => {
     const { lines, logger } = capture();
     for (const purpose of GEMINI_USAGE_PURPOSES)
       await observeGeminiRequest(purpose, "requested-model", async () => ({
@@ -88,12 +88,12 @@ describe("Gemini usage logger and on-demand report", () => {
       usage: "complete",
       counts: { input: 100, response: 20, thinking: 5, cachedInput: 40, toolInput: 2, total: 127 },
     });
-    expect(new Set(rows.slice(0, 10).map((r) => r.usage.attemptId)).size).toBe(10);
+    expect(new Set(rows.slice(0, 9).map((r) => r.usage.attemptId)).size).toBe(9);
     const report = await buildGeminiUsageReport(
       [source("first-α", lines.join("")), source("overlap", lines.slice(0, 3).join(""))],
       { ...window, gaps: ["Coordinator export begins after restart"] }
     );
-    expect(report.groups).toHaveLength(10);
+    expect(report.groups).toHaveLength(9);
     expect(report.duplicates).toBe(3);
     expect(report.unobservedPurposes).toEqual([]);
     expect(report.knownGaps).toEqual(["Coordinator export begins after restart"]);
@@ -331,5 +331,23 @@ describe("Gemini usage logger and on-demand report", () => {
     expect(report.sources[0]).toMatchObject({ malformed: 1, oversized: 1, invalidUsage: 2 });
     expect(report.groups[0].calls).toBe(1);
     expect(JSON.stringify(report)).not.toContain("PRIVATE BROKEN JSON");
+  });
+
+  it("keeps counting calls already recorded under a retired purpose, and never lists it as unobserved", async () => {
+    const { lines } = capture();
+    await observeGeminiRequest("quota_parse", "model", async () => ({ usageMetadata: metadata }));
+    const retired = JSON.parse(lines[0]);
+    retired.usage.purpose = "exhaustion_classification";
+    retired.usage.attemptId = "retired-attempt";
+    const report = await buildGeminiUsageReport(
+      [source("history", `${JSON.stringify(retired)}\n`)],
+      window
+    );
+    expect(GEMINI_USAGE_PURPOSES).not.toContain("exhaustion_classification");
+    expect(report.sources[0]).toMatchObject({ invalidUsage: 0 });
+    expect(report.groups).toMatchObject([
+      { purpose: "exhaustion_classification", calls: 1, totals: { input: { sum: 100 } } },
+    ]);
+    expect(report.unobservedPurposes).toEqual([...GEMINI_USAGE_PURPOSES]);
   });
 });

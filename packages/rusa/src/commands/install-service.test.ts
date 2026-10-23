@@ -33,6 +33,10 @@ import {
   resolveExecutableOnPath,
   resolveInstanceUnitPathEnv,
 } from "./service-instance.js";
+import {
+  START_FOLLOWER_UPDATE_LAUNCHER_ENV,
+  START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
+} from "./start-follower-launcher-contract.js";
 
 const base = {
   description: "Rusa",
@@ -72,6 +76,26 @@ describe("buildServiceUnit — self-update systemd policy ", () => {
     expect(unit).not.toContain("StartLimitBurst");
     expect(unit).not.toContain("OnFailure=");
     expect(unit).not.toContain("ExecStartPre=");
+  });
+
+  it("emits the supported launcher contract only with clean-exit restart", () => {
+    const unit = buildServiceUnit({
+      ...base,
+      restart: "always",
+      startFollowerUpdateLauncher: START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
+    });
+
+    expect(unit).toContain("Restart=always");
+    expect(unit).toContain(
+      `Environment=${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${START_FOLLOWER_UPDATE_LAUNCHER_VERSION}`
+    );
+    expect(() =>
+      buildServiceUnit({
+        ...base,
+        restart: "on-failure",
+        startFollowerUpdateLauncher: START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
+      })
+    ).toThrow("requires Restart=always");
   });
 
   it("logs to an append-to-file sink by default, or the journal when opted in", () => {
