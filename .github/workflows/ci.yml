@@ -11,7 +11,7 @@ concurrency:
 jobs:
   checks:
     name: Checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Backstop so no single hung step can hold the required check (and every
     # merge behind it) for GitHub's 6-hour default. A normal green run takes
     # well under 15 minutes; anything past 30 is a hang, and failing fast makes
