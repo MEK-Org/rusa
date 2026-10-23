@@ -2,6 +2,7 @@ import type { ActorRecord } from "../actor/actor-record.js";
 import type {
   ActorRecordPatch,
   ActorRepository,
+  ContextSelectionChange,
   ModelSelectionChange,
 } from "./actor-repository.js";
 
@@ -49,5 +50,26 @@ export class InMemoryActorRepository implements ActorRepository {
     // Mirror that fresh read when a test adapter applies a selection.
     const { modelClassError: _discardedProjection, ...stored } = existing;
     this.upsert({ ...stored, ...changes, id });
+  }
+
+  applyPendingSelections(
+    id: string,
+    changes: {
+      model?: ModelSelectionChange;
+      context?: ContextSelectionChange;
+    }
+  ): void {
+    const existing = this.records.get(id);
+    if (!existing)
+      throw new Error(
+        `InMemoryActorRepository: cannot apply pending selections on unknown actor '${id}'`
+      );
+    const { modelClassError: _discardedProjection, ...stored } = existing;
+    this.upsert({
+      ...stored,
+      ...(changes.context ?? {}),
+      ...(changes.model ?? {}),
+      id,
+    });
   }
 }

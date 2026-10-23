@@ -137,6 +137,8 @@ function setup(
     obligations?: MeshObligationPort;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
+    validateContext?: ActorMeshOptions["validateContext"];
+    ledgerCompactionAvailable?: boolean;
     configuredEventSources?: readonly string[];
     /** Defaults to an empty in-memory store; pass the boot union to test it. */
     eventSourceOwners?: EventSourceOwnerStore;
@@ -205,6 +207,8 @@ function setup(
     rootId: opts.rootId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
+    validateContext: opts.validateContext,
+    ledgerCompactionAvailable: opts.ledgerCompactionAvailable,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
@@ -874,6 +878,7 @@ describe("agent-execution MCP server", () => {
         "revoke_capability",
         "send_message",
         "set_thread_charter",
+        "set_actor_context",
         "set_actor_model",
         "set_event_source_config",
         "set_thread_title",
@@ -1110,6 +1115,7 @@ describe("agent-execution MCP server", () => {
         "retire_thread",
         "revoke_capability",
         "send_message",
+        "set_actor_context",
         "set_actor_model",
         "set_event_source_config",
         "spawn_thread",
@@ -4942,6 +4948,163 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       expect(updateRes.isError).toBe(true);
       expect((updateRes.content[0] as { text: string }).text).toMatch(
         new RegExp(`Cannot set model on retired thread: ${childId}`)
+      );
+    });
+
+    it("set_actor_context updates context mode via MCP tool", async () => {
+      const { mesh, registry } = setup();
+      const childId = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const res = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: childId,
+          context_mode: "brief",
+        },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect((res.content[0] as { text: string }).text).toMatch(
+        new RegExp(
+          `applied context mode update for ${childId} \\(native -> brief\\); resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content`
+        )
+      );
+      expect(registry.get(childId)?.context).toEqual({ type: "portable", mode: "brief" });
+    });
+
+    it("allows set_actor_context by direct child handle", async () => {
+      const { mesh, registry } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childId = mesh.spawn({
+        charter: "child",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childHandle = mesh.getActorHandle(childId);
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      const res = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: childHandle,
+          context_mode: "tail",
+        },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect((res.content[0] as { text: string }).text).toMatch(
+        /applied context mode update for .* \(native -> tail\); resumes retained ledger items and brief when present/
+      );
+      expect(registry.get(childId)?.context).toEqual({ type: "portable", mode: "tail" });
+    });
+
+    it("set_actor_context refuses root actor targeting", async () => {
+      const { mesh } = setup();
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+      const res = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: "root",
+          context_mode: "brief",
+        },
+      })) as CallToolResult;
+
+      expect(res.isError).toBe(true);
+      expect((res.content[0] as { text: string }).text).toMatch(
+        /Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision\./
+      );
+    });
+
+    it("set_actor_context differentiates unknown thread IDs from unknown child handles", async () => {
+      const { mesh } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      const unknownUuid = "11111111-2222-3333-4444-555555555555";
+      const idRes = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: unknownUuid,
+          context_mode: "brief",
+        },
+      })) as CallToolResult;
+      expect(idRes.isError).toBe(true);
+      expect((idRes.content[0] as { text: string }).text).toMatch(
+        new RegExp(`Cannot set context mode on unknown thread: ${unknownUuid}`)
+      );
+
+      const handleRes = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: "non-existent-handle",
+          context_mode: "brief",
+        },
+      })) as CallToolResult;
+      expect(handleRes.isError).toBe(true);
+      expect((handleRes.content[0] as { text: string }).text).toMatch(
+        /unknown child handle: "non-existent-handle"/
+      );
+    });
+
+    it("set_actor_context returns toolError on authority or validation failures", async () => {
+      const { mesh } = setup();
+      const childId = mesh.spawn({
+        charter: "child",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      // Self modification refused
+      const childClient = await connect(createAgentExecMcpServer(mesh, childId, "root"));
+      const selfRes = (await childClient.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: childId,
+          context_mode: "brief",
+        },
+      })) as CallToolResult;
+      expect(selfRes.isError).toBe(true);
+      expect((selfRes.content[0] as { text: string }).text).toMatch(
+        /cannot change its own context mode/
+      );
+
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const invalidRes = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: childId,
+          context_mode: "bogus",
+        },
+      })) as CallToolResult;
+      expect(invalidRes.isError).toBe(true);
+      expect((invalidRes.content[0] as { text: string }).text).toMatch(/unknown context selection/);
+
+      // Compaction model on non-ledger refused
+      const invalidCompaction = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: childId,
+          context_mode: "tail",
+          compaction_model: "gemini-flash",
+        },
+      })) as CallToolResult;
+      expect(invalidCompaction.isError).toBe(true);
+      expect((invalidCompaction.content[0] as { text: string }).text).toMatch(
+        /compactionModel is meaningless for tail mode/
       );
     });
 

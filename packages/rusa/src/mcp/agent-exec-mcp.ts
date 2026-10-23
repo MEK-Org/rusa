@@ -1038,6 +1038,84 @@ export function createAgentExecMcpServer(
     }
   );
 
+  server.registerTool(
+    "set_actor_context",
+    {
+      title: "Update an actor's context mode in-place",
+      description:
+        "Replace an existing actor's context mode in-place in the actor repository without service restart. " +
+        "Allowed for an ancestor of the target, or subtree admin. An actor cannot change its own mode, retired actors are refused, and the root actor is excluded in v1. " +
+        "If a run is in flight, it finishes on its current mode and the change applies and persists when that run ends; an idle or queued actor has the change applied and persisted immediately. " +
+        "Switching to native requires the actor to hold exactly one declared model entry and no class reference. " +
+        "Portable modes (ledger, tail, brief) preserve accumulated portable state; native-to-portable resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content; portable-to-native starts a fresh provider session while retaining portable state in the store.",
+      inputSchema: {
+        actor_id: z.string().describe("The actor's thread id (or direct child handle) to update."),
+        context_mode: z
+          .string()
+          .describe("The context mode to assign: one of 'native', 'ledger', 'tail', 'brief'."),
+        compaction_model: z
+          .string()
+          .optional()
+          .describe(
+            "Gemini model used to compact ledger context; only permitted when context_mode is ledger."
+          ),
+      },
+    },
+    async ({ actor_id, context_mode, compaction_model }) => {
+      try {
+        let targetId = actor_id;
+        const executeUpdate = (tid: string) => {
+          const targetRecord = mesh.actors.get(tid);
+          const oldMode =
+            targetRecord?.context?.type === "portable" ? targetRecord.context.mode : "native";
+          const outcome = mesh.setActorContext(tid, context_mode, selfId, {
+            compactionModel: compaction_model,
+          });
+          const resolved = resolveContextSelection(context_mode, {
+            compactionModel: compaction_model,
+          });
+          const newMode = resolved?.type === "portable" ? resolved.mode : "native";
+
+          let carryoverDetail = "";
+          if (oldMode === "native" && newMode !== "native") {
+            carryoverDetail =
+              "resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content";
+          } else if (oldMode !== "native" && newMode === "native") {
+            carryoverDetail =
+              "starts a fresh native provider session; retained portable state is preserved in the store";
+          } else {
+            carryoverDetail = "preserves retained portable state (ledger items and brief)";
+          }
+
+          return toolOk(
+            outcome === "staged"
+              ? `staged context mode update for ${tid} (${oldMode} -> ${newMode}); applies when its current run ends; ${carryoverDetail}`
+              : `applied context mode update for ${tid} (${oldMode} -> ${newMode}); ${carryoverDetail}`
+          );
+        };
+
+        try {
+          return executeUpdate(targetId);
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            err.message.startsWith("Cannot set context mode on unknown thread")
+          ) {
+            if (!UUID_REGEX.test(actor_id)) {
+              const child = mesh.resolveDirectChildHandle(selfId, actor_id);
+              targetId = child.id;
+              return executeUpdate(targetId);
+            }
+            throw err;
+          }
+          throw err;
+        }
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
   // ── Administrative management tools (#549) ── Gated two ways (defense in
   // depth, like the grant-gated `update` tool): each group is registered ONLY
   // when the endpoint's actor holds the named administrative capability as an

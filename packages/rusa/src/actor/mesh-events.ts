@@ -61,6 +61,10 @@ export type MeshEventKind =
   // `actorId` = the updated actor, `peerId` = the requester (parent or root),
   // `detail` = oldModel -> newModel summary.
   | "actor_model_set"
+  // An actor's context mode was updated in-place via set_actor_context.
+  // `actorId` = the updated actor, `payload` = { requester, oldMode, newMode, outcome },
+  // `detail` = oldMode -> newMode (applied|staged) summary.
+  | "actor_context_set"
   // A class-bound actor's model class could not be resolved, so its run was
   // refused rather than launched on a stale pool. `actorId` = the blocked
   // actor, `detail` = the resolution failure. Emitted once per distinct reason

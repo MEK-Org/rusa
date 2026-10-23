@@ -264,6 +264,26 @@ describe("model administration is grant-derived", () => {
   });
 });
 
+describe("context administration is grant-derived", () => {
+  it("lets an admin holder set any subtree context mode and refuses self and outside subtree", () => {
+    const { grants, mesh } = setup();
+    grants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: ACTOR_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    expect(() => mesh.setActorContext("steward-child", "brief", "0b2c3d4e-steward")).not.toThrow();
+    expect(() => mesh.setActorContext("0b2c3d4e-steward", "brief", "0b2c3d4e-steward")).toThrow(
+      /cannot change its own context mode/
+    );
+    expect(() => mesh.setActorContext("sibling", "brief", "0b2c3d4e-steward")).toThrow(/subtree/);
+    expect(() => mesh.setActorContext("other-child", "brief", "0b2c3d4e-steward")).toThrow(
+      /subtree/
+    );
+  });
+});
+
 describe("the configured actor's seeded access", () => {
   it("preserves every current administrative operation after the one-time seed", async () => {
     const { grants, mesh } = setup();

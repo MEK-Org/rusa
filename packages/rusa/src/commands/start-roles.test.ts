@@ -775,8 +775,9 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     // No prior run anywhere: the leader prompt is used byte for byte.
     expect(observedPrompts[0]).toBe(leaderBuilds[0].prompt);
     expect(runStarts()[0]?.injectRecord).toBeUndefined();
-    // Host context augments the prompt but never the leader-selected session.
-    expect(observedSessionIds[0]).toBe("leader-native-session");
+    // Admission snapshots the portable record, so the native session returned
+    // by the earlier beforeRun gate cannot leak into this provider attempt.
+    expect(observedSessionIds[0]).toBeUndefined();
 
     const wakeAndComplete = async (runs: number) => {
       pollCommands.push({ actorId: "actor-synthetic-1", message: { type: "wake" } });
@@ -847,7 +848,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       runStarts()[2]?.runId,
       run4Id,
     ]);
-    expect(observedSessionIds).toEqual(Array(5).fill("leader-native-session"));
+    expect(observedSessionIds).toEqual(Array(5).fill(undefined));
     expect(pollRequests).toBeGreaterThan(3);
 
     await handles.shutdown();

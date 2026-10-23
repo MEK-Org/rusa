@@ -688,7 +688,7 @@ export class Actor {
   /** The genuine-execution body of a run (everything after the beforeRun gate). */
   private async executeTurn(nudge: RunNudge): Promise<void> {
     let responsive = isResponsiveNudge(nudge);
-    const sessionId = this.opts.loadSessionId();
+    let sessionId: string | undefined;
     // The provider treats the actor's cwd as its private directory and shadows
     // everything beside it (see buildActorBwrapArgs). This object is just the
     // opt-in signal.
@@ -860,6 +860,7 @@ export class Actor {
       ) {
         this.interruptedWatermark = null;
       }
+      sessionId = this.opts.loadSessionId();
       built = this.opts.buildPrompt();
       const runId = this.currentRunId;
       if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);

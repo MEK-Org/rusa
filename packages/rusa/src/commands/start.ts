@@ -26,7 +26,12 @@ import {
   type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
-import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
+import type {
+  ActorRecord,
+  ContextConfig,
+  ExecutionConfig,
+  PortableContextConfig,
+} from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   defaultActorBootstrapCapabilities,
@@ -210,6 +215,7 @@ import type {
   AvailabilityHold,
   AvailabilityHoldOrigin,
 } from "../db/repositories/availability-hold-repository.js";
+import type { Repositories } from "../db/repositories/index.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -994,9 +1000,9 @@ function assemblePortableInjection(
   mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
-  onDeltaFallback: (error: unknown) => void = () => {}
+  onDeltaFallback: (error: unknown) => void = () => {},
+  repositories: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = getRepositories()
 ): PortableInjection {
-  const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
@@ -1083,18 +1089,26 @@ function assemblePortableInjection(
     : { readRunIds };
 }
 
-function assembleConfiguredPortableInjection(
+export function assembleConfiguredPortableInjection(
   record: ActorRecord,
   apiKey: string | null,
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
-  onDeltaFallback?: (error: unknown) => void
+  onDeltaFallback?: (error: unknown) => void,
+  repositories?: Pick<Repositories, "actorRuns" | "obligations" | "meshChat">
 ): PortableInjection | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
   }
-  return assemblePortableInjection(record.id, record.context.mode, store, journal, onDeltaFallback);
+  return assemblePortableInjection(
+    record.id,
+    record.context.mode,
+    store,
+    journal,
+    onDeltaFallback,
+    repositories
+  );
 }
 
 export async function compactPortableContext(input: {
@@ -3007,17 +3021,13 @@ async function composeStart(
       impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
     });
   };
-  const isPortableLedgerActor = (actorId: string): boolean => {
-    const context = actors.get(actorId)?.context;
-    return context?.type === "portable" && context.mode === "ledger";
-  };
-
   const compactPortableActorAfterRun = async (
     actorId: string,
-    runId: string
+    runId: string,
+    runContext?: ContextConfig
   ): Promise<PortableContextCompactionSummary | null> => {
-    const current = actors.get(actorId);
-    const context = current?.context?.type === "portable" ? current.context : undefined;
+    const current = runContext ?? actors.get(actorId)?.context;
+    const context = current?.type === "portable" ? current : undefined;
     const compactor = context?.mode === "ledger" ? compactorFor(context) : null;
     if (context?.mode !== "ledger" || !compactor) return null;
     try {
@@ -3191,6 +3201,7 @@ async function composeStart(
     // Which entry actually ran, for the failure-notice label. A declared pool
     // can move while idle, so this is captured at lifecycle start.
     let lastSelected = firstSelected;
+    let launchContext = actors.get(id)?.context;
     // A run bound to its execution host keeps its originals there; only an
     // unbound run's prompt goes to `run_prompts` (#1020).
     lifecycle.add(
@@ -3204,6 +3215,7 @@ async function composeStart(
     lifecycle.add({
       onStart: (event) => {
         lastSelected = event.selected;
+        launchContext = actors.get(id)?.context;
         mesh.clearSelection(id);
         const launchConfig = projectActorRunLaunchConfig(event.selected);
         runAccounting.begin(id, event.runId, launchConfig);
@@ -3299,10 +3311,9 @@ async function composeStart(
         // successor — which is what interrupted it — starts without waiting on
         // the compactor. The cursor is untouched; the sources stay in mesh_chat
         // and actor_runs, and the next ordinary run end folds them once.
+        const isLedgerRun = launchContext?.type === "portable" && launchContext.mode === "ledger";
         const deferred =
-          result.interrupted === true &&
-          isPortableLedgerActor(id) &&
-          portableJournalModeFor(id) === "delta";
+          result.interrupted === true && isLedgerRun && portableJournalModeFor(id) === "delta";
         if (deferred) {
           mesh.recordEvent({
             kind: "portable_context_compaction_deferred",
@@ -3315,7 +3326,10 @@ async function composeStart(
             }),
           });
         }
-        const compacted = deferred ? null : await compactPortableActorAfterRun(id, event.runId);
+        const compacted =
+          deferred || !isLedgerRun
+            ? null
+            : await compactPortableActorAfterRun(id, event.runId, launchContext);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",
@@ -3408,9 +3422,23 @@ async function composeStart(
       // class reference would otherwise pass through it untouched.
       const resolved = resolveModelClasses(modelClasses, modelConfig);
       const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
+      const effectiveContext = record.desiredContextConfig ?? record.context;
       return validateModelConfigPool(config, filled, {
-        portable: record.context?.type === "portable",
+        portable: effectiveContext?.type === "portable",
       });
+    },
+    validateContext: (record, context) => {
+      assertSpawnContextSupported(
+        { context },
+        { ledgerCompactionAvailable: portableContextApiKey !== null }
+      );
+      const effectivePool =
+        (record.desiredModelConfig as ProviderModelConfig[] | undefined) ?? record.modelConfig;
+      if (effectivePool && effectivePool.length > 0) {
+        validateModelConfigPool(config, effectivePool, {
+          portable: context.type === "portable",
+        });
+      }
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),

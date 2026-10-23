@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { resolveHandleLabels } from "../../actor/worker-prompt.js";
 
@@ -746,7 +747,7 @@ describe("SqliteActorRepository", () => {
     expect(() => repository.get("root")).toThrow(error);
   });
 
-  it("keeps a staged desired modelConfig pool in process memory, not the durable document", () => {
+  it("persists a staged desired modelConfig pool in the durable document", () => {
     repository.upsert(root);
     repository.patch("root", {
       desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
@@ -759,8 +760,9 @@ describe("SqliteActorRepository", () => {
       model_config: string;
     };
     expect(JSON.parse(row.model_config)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 5,
       entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
+      desiredEntries: [{ provider: "claude", model: "claude-opus" }],
     });
   });
 
@@ -779,7 +781,7 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("root")?.desiredModelConfig).toBeUndefined();
   });
 
-  it("keeps staged model-class provenance in the same process-local overlay", () => {
+  it("keeps staged model-class provenance durably across unrelated patches", () => {
     repository.upsert({ ...root, modelClass: "fast" });
     repository.patch("root", {
       desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
@@ -801,7 +803,7 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("root")?.desiredModelClass).toBeUndefined();
   });
 
-  it("loses a staged desired pool across a repository reopen", () => {
+  it("persists a staged desired pool across a repository reopen", () => {
     repository.upsert(root);
     repository.patch("root", {
       desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
@@ -811,7 +813,16 @@ describe("SqliteActorRepository", () => {
     ]);
 
     const reopened = new SqliteActorRepository(db);
-    expect(reopened.get("root")?.desiredModelConfig).toBeUndefined();
+    expect(reopened.get("root")?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus" },
+    ]);
+
+    const row = db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
+      model_config: string | null;
+    };
+    expect(JSON.parse(row.model_config ?? "null").desiredEntries).toEqual([
+      { provider: "claude", model: "claude-opus" },
+    ]);
   });
 
   it("does not advance process memory when the SQLite write rolls back", () => {
@@ -844,6 +855,182 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("root")?.desiredModelConfig).toEqual([
       { provider: "claude", model: "claude-opus" },
     ]);
+  });
+
+  it("persists a staged desired contextConfig in the durable document across reopen", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+
+    expect(repository.get("root")).toMatchObject({
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+    const row = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
+      context_config: string | null;
+    };
+    expect(JSON.parse(row.context_config ?? "null")).toEqual({
+      schemaVersion: 3,
+      type: "native",
+      sessionId: "session-1",
+      desired: { type: "portable", mode: "brief" },
+    });
+
+    const reopened = new SqliteActorRepository(db);
+    expect(reopened.get("root")?.desiredContextConfig).toEqual({
+      type: "portable",
+      mode: "brief",
+    });
+
+    repository.patch("root", { desiredContextConfig: undefined });
+    expect(repository.get("root")?.desiredContextConfig).toBeUndefined();
+    const clearedRow = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
+      context_config: string | null;
+    };
+    expect(JSON.parse(clearedRow.context_config ?? "null").desired).toBeUndefined();
+
+    const reopenedAfterClear = new SqliteActorRepository(db);
+    expect(reopenedAfterClear.get("root")?.desiredContextConfig).toBeUndefined();
+  });
+
+  it("preserves a staged desired contextConfig across unrelated patches and drops an explicit clear", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+    repository.patch("root", { title: "Renamed" });
+    expect(repository.get("root")).toMatchObject({
+      desiredContextConfig: { type: "portable", mode: "brief" },
+      title: "Renamed",
+    });
+
+    repository.patch("root", { desiredContextConfig: undefined });
+    expect(repository.get("root")?.desiredContextConfig).toBeUndefined();
+  });
+
+  it("uses new staged document versions while retaining strict legacy readers", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+
+    const row = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+    const model = JSON.parse(row.model_config);
+    const context = JSON.parse(row.context_config);
+
+    // These frozen v2/v1 readers model a binary from before staged selections.
+    // It must fail closed rather than accepting an unknown staged shape.
+    const oldModelReader = z
+      .object({
+        schemaVersion: z.literal(2),
+        entries: z.array(
+          z.object({
+            provider: z.string().min(1),
+            model: z.string().min(1),
+            effort: z.string().optional(),
+          })
+        ),
+      })
+      .strict();
+    const oldContextReader = z
+      .object({
+        schemaVersion: z.literal(1),
+        type: z.literal("native"),
+        sessionId: z.string().optional(),
+      })
+      .strict();
+    expect(oldModelReader.safeParse(model).success).toBe(false);
+    expect(oldContextReader.safeParse(context).success).toBe(false);
+
+    // The current repository consumes the new formats while still accepting
+    // unchanged v1/v2 records elsewhere in this suite.
+    expect(repository.get("root")).toMatchObject({
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+  });
+
+  it("preserves staged and legacy document text on incidental writes", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+    const staged = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+
+    repository.patch("root", { title: "Renamed" });
+    const afterTitle = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+    expect(afterTitle).toEqual(staged);
+
+    const legacyClass = '{ "schemaVersion": 4, "modelClass": "fast" }';
+    db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(legacyClass);
+    repository.patch("root", { charter: "Updated charter" });
+    expect(storedModelConfig("root")).toBe(legacyClass);
+  });
+
+  it("atomically applies pending model and context selections in one transaction", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+
+    const staged = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+
+    db.exec(`
+      CREATE TEMP TRIGGER synthetic_reject_context_clear BEFORE UPDATE ON actors
+      WHEN json_extract(OLD.context_config, '$.desired') IS NOT NULL
+       AND json_extract(NEW.context_config, '$.desired') IS NULL
+      BEGIN SELECT RAISE(ABORT, 'synthetic context clear failure'); END;
+    `);
+
+    expect(() =>
+      repository.applyPendingSelections("root", {
+        model: {
+          modelConfig: [{ provider: "claude", model: "claude-opus" }],
+          desiredModelConfig: undefined,
+          desiredModelClass: undefined,
+        },
+        context: {
+          context: { type: "portable", mode: "brief" },
+          desiredContextConfig: undefined,
+        },
+      })
+    ).toThrow(/synthetic context clear failure/);
+
+    const afterFailed = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+    expect(afterFailed).toEqual(staged);
+
+    db.exec("DROP TRIGGER synthetic_reject_context_clear;");
+
+    repository.applyPendingSelections("root", {
+      model: {
+        modelConfig: [{ provider: "claude", model: "claude-opus" }],
+        desiredModelConfig: undefined,
+        desiredModelClass: undefined,
+      },
+      context: {
+        context: { type: "portable", mode: "brief" },
+        desiredContextConfig: undefined,
+      },
+    });
+
+    const applied = repository.get("root");
+    expect(applied?.modelConfig).toEqual([{ provider: "claude", model: "claude-opus" }]);
+    expect(applied?.desiredModelConfig).toBeUndefined();
+    expect(applied?.context).toEqual({ type: "portable", mode: "brief" });
+    expect(applied?.desiredContextConfig).toBeUndefined();
   });
 
   it("migrates a pre-#169 singleton model_config document into a one-entry pool on read", () => {

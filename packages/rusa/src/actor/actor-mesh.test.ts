@@ -5,11 +5,15 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { assembleConfiguredPortableInjection } from "../commands/start.js";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
+import type { Repositories } from "../db/repositories/index.js";
+import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { DbPortableContextStore } from "../db/repositories/portable-context-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
@@ -62,6 +66,7 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import {
+  ACTOR_ADMIN_CAPABILITY,
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
   OBLIGATIONS_ADMIN_CAPABILITY,
@@ -402,6 +407,8 @@ function setup(
     seedRootGrants?: boolean;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
+    validateContext?: ActorMeshOptions["validateContext"];
+    ledgerCompactionAvailable?: boolean;
     onModelSet?: ActorMeshOptions["onModelSet"];
     onQueued?: ActorMeshOptions["onQueued"];
     createActor?: ActorMeshOptions["createActor"];
@@ -411,7 +418,7 @@ function setup(
     providerGate?: ActorMeshOptions["providerGate"];
     /** Any scheduler; a test passing a real one must not use the fake-only helpers. */
     scheduledMessages?: ScheduledMessageScheduler;
-    actors?: InMemoryActorRepository;
+    actors?: InMemoryActorRepository | SqliteActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
     handleForId?: (id: string) => string;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
@@ -470,6 +477,8 @@ function setup(
     handleForId: opts.handleForId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
+    validateContext: opts.validateContext,
+    ledgerCompactionAvailable: opts.ledgerCompactionAvailable,
     onModelSet: opts.onModelSet,
     onQueued: opts.onQueued,
     maxConcurrent: opts.maxConcurrent ?? 4,
@@ -618,7 +627,7 @@ function setup(
   const tick = () => vi.advanceTimersByTimeAsync(DEBOUNCE + 1);
   const fake = (id: string) => providers.get(id) as FakeProvider;
   return {
-    registry,
+    registry: registry as InMemoryActorRepository,
     mesh: testMesh,
     rawSpawn,
     providers,
@@ -6804,6 +6813,1141 @@ describe("ActorMesh", () => {
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
     await dynamicMeshSetup.tick();
     expect(providerBExecuted).toBe(true);
+  });
+
+  describe("setActorContext", () => {
+    it("enforces authority: ancestor, admin subtree, self, retired, unknown", () => {
+      const { mesh, registry, capabilityGrants } = setup();
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const sibling = mesh.spawn({
+        charter: "sibling",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      // 1. Ancestor can set context mode
+      const outcome = mesh.setActorContext(child, "brief", parent);
+      expect(outcome).toBe("applied");
+      expect(registry.get(child)?.context).toEqual({ type: "portable", mode: "brief" });
+
+      // 2. Root (ancestor) can set context mode
+      mesh.setActorContext(child, "tail", "root");
+      expect(registry.get(child)?.context).toEqual({ type: "portable", mode: "tail" });
+
+      // 3. Admin holder can set context mode in its own subtree
+      capabilityGrants.grant({
+        actorId: sibling,
+        capability: ACTOR_ADMIN_CAPABILITY,
+        grantedBy: "root",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      const siblingChild = mesh.spawn({
+        charter: "sibling child",
+        parentId: sibling,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      mesh.setActorContext(siblingChild, "brief", sibling);
+      expect(registry.get(siblingChild)?.context).toEqual({ type: "portable", mode: "brief" });
+
+      // 4. Admin holder cannot set context mode outside its subtree
+      expect(() => mesh.setActorContext(child, "brief", sibling)).toThrow(/in its own subtree/);
+
+      // 5. Actor cannot set its own context mode (even if admin)
+      expect(() => mesh.setActorContext(sibling, "brief", sibling)).toThrow(
+        /cannot change its own context mode/
+      );
+      expect(() => mesh.setActorContext(child, "brief", child)).toThrow(
+        /cannot change its own context mode/
+      );
+
+      // 6. Non-ancestor non-admin cannot set context mode
+      expect(() => mesh.setActorContext(sibling, "brief", parent)).toThrow(/not an ancestor/);
+
+      // 7. Retired thread is refused
+      const toRetire = mesh.spawn({
+        charter: "retiring",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      mesh.retire(toRetire);
+      expect(() => mesh.setActorContext(toRetire, "brief", "root")).toThrow(/retired thread/);
+
+      // 8. Unknown thread is refused
+      expect(() => mesh.setActorContext("unknown-id", "brief", "root")).toThrow(/unknown thread/);
+    });
+
+    it("enforces validation: unknown mode, compaction model on non-ledger, ledger without compaction, native with multi-entry or class", () => {
+      const { mesh, registry } = setup({
+        ledgerCompactionAvailable: false,
+      });
+
+      const singleModel = mesh.spawn({
+        charter: "single model",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+
+      // 1. Unknown mode
+      expect(() => mesh.setActorContext(singleModel, "invalid-mode", "root")).toThrow(
+        /unknown context selection/
+      );
+
+      // 2. Compaction model on non-ledger mode
+      expect(() =>
+        mesh.setActorContext(singleModel, "native", "root", { compactionModel: "gemini-model" })
+      ).toThrow(/compactionModel is meaningless for native context/);
+      expect(() =>
+        mesh.setActorContext(singleModel, "tail", "root", { compactionModel: "gemini-model" })
+      ).toThrow(/compactionModel is meaningless for tail mode/);
+      expect(() =>
+        mesh.setActorContext(singleModel, "brief", "root", { compactionModel: "gemini-model" })
+      ).toThrow(/compactionModel is meaningless for brief mode/);
+
+      // 3. Ledger without compaction
+      expect(() => mesh.setActorContext(singleModel, "ledger", "root")).toThrow(
+        /portable ledger mode needs a Gemini API key for compaction/
+      );
+
+      // 4. Native with multi-entry pool
+      const multiModel = mesh.spawn({
+        charter: "multi model",
+        parentId: "root",
+        modelConfig: [
+          { provider: "claude", model: "claude-sonnet-5" },
+          { provider: "claude", model: "claude-opus-4-8" },
+        ],
+        context: { type: "portable", mode: "tail" },
+      });
+      expect(() => mesh.setActorContext(multiModel, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a multi-entry model pool.*narrow the pool first with set_actor_model/
+      );
+
+      // 5. Native with model class reference
+      const classModel = mesh.spawn({
+        charter: "class model",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      registry.setModelSelection(classModel, { modelClass: "fast-tier" });
+      expect(() => mesh.setActorContext(classModel, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a model class reference.*narrow the pool first with set_actor_model/
+      );
+
+      // 6. Native with single declared entry succeeds
+      expect(() => mesh.setActorContext(singleModel, "native", "root")).not.toThrow();
+      expect(registry.get(singleModel)?.context).toEqual({ type: "native" });
+    });
+
+    it("handles staged vs immediate application and emits actor_context_set", async () => {
+      const events: MeshEventInput[] = [];
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        sharedProvider: deferredRunProvider,
+        events: (event) => events.push(event),
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      // 1. Idle actor applies immediately
+      const appliedOutcome = testSetup.mesh.setActorContext(worker, "tail", "root");
+      expect(appliedOutcome).toBe("applied");
+      expect(testSetup.registry.get(worker)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toBeUndefined();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "actor_context_set",
+          actorId: worker,
+          detail: "native -> tail (applied)",
+          payload: JSON.stringify({
+            requester: "root",
+            oldMode: "native",
+            newMode: "tail",
+            outcome: "applied",
+          }),
+        })
+      );
+
+      // 2. Running actor stages update and applies at run end
+      testSetup.mesh.sendMessage(worker, "start run", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      const stagedOutcome = testSetup.mesh.setActorContext(worker, "brief", "root");
+      expect(stagedOutcome).toBe("staged");
+      // Still on tail while running
+      expect(testSetup.registry.get(worker)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "brief",
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "actor_context_set",
+          actorId: worker,
+          detail: "tail -> brief (staged)",
+          payload: JSON.stringify({
+            requester: "root",
+            oldMode: "tail",
+            newMode: "brief",
+            outcome: "staged",
+          }),
+        })
+      );
+
+      // Release run
+      releaseDeferred();
+      await testSetup.tick();
+
+      // Now applied after run end
+      expect(testSetup.registry.get(worker)?.context).toEqual({ type: "portable", mode: "brief" });
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toBeUndefined();
+    });
+
+    it("manages state across context transitions (portable-to-portable, native-to-portable, portable-to-native)", () => {
+      const { mesh, registry } = setup();
+
+      // Native actor with sessionId
+      const actor = mesh.spawn({
+        charter: "transition actor",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+        conversationId: "conv-native-123",
+      });
+      expect(registry.get(actor)?.sessionId).toBe("conv-native-123");
+
+      // Native -> Portable: drops sessionId (invoked stateless)
+      mesh.setActorContext(actor, "brief", "root");
+      expect(registry.get(actor)?.context).toEqual({ type: "portable", mode: "brief" });
+      expect(registry.get(actor)?.sessionId).toBeUndefined();
+
+      // Portable -> Portable: preserves portable state
+      mesh.setActorContext(actor, "tail", "root");
+      expect(registry.get(actor)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(registry.get(actor)?.sessionId).toBeUndefined();
+
+      // Portable -> Native: starts fresh native session (sessionId stays undefined)
+      mesh.setActorContext(actor, "native", "root");
+      expect(registry.get(actor)?.context).toEqual({ type: "native" });
+      expect(registry.get(actor)?.sessionId).toBeUndefined();
+    });
+
+    it("refuses root actor context mode changes in v1", () => {
+      const { mesh } = setup();
+      expect(() => mesh.setActorContext("root", "brief", "root")).toThrow(
+        /Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision\./
+      );
+    });
+
+    it("persists staged context mode and model changes durably across restart and applies before next launch", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        actors: actorRepo,
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      testSetup.mesh.sendMessage(worker, "work", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      const contextOutcome = testSetup.mesh.setActorContext(worker, "tail", "root");
+      expect(contextOutcome).toBe("staged");
+
+      const modelOutcome = testSetup.mesh.setActorModel(
+        worker,
+        { provider: "codex", model: "gpt-5.6-sol" },
+        "root"
+      );
+      expect(modelOutcome).toBe("staged");
+
+      const rawRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      const parsedContext = JSON.parse(rawRow.context_config);
+      const parsedModel = JSON.parse(rawRow.model_config);
+      expect(parsedContext.schemaVersion).toBe(3);
+      expect(parsedContext.desired).toEqual({ type: "portable", mode: "tail" });
+      expect(parsedModel.schemaVersion).toBe(5);
+      expect(parsedModel.desiredEntries).toEqual([{ provider: "codex", model: "gpt-5.6-sol" }]);
+
+      const reopenedRepo = new SqliteActorRepository(db);
+      const reloadedWorker = reopenedRepo.get(worker);
+      expect(reloadedWorker?.context).toEqual({ type: "native" });
+      expect(reloadedWorker?.modelConfig).toEqual([
+        { provider: "claude", model: "claude-sonnet-5" },
+      ]);
+      expect(reloadedWorker?.desiredContextConfig).toEqual({ type: "portable", mode: "tail" });
+      expect(reloadedWorker?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+
+      const freshSetup = setup({
+        actors: reopenedRepo,
+      });
+
+      const canRun = freshSetup.mesh.prepareRun(worker);
+      expect(canRun).toBe(true);
+
+      const launchedWorker = reopenedRepo.get(worker);
+      expect(launchedWorker?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(launchedWorker?.desiredContextConfig).toBeUndefined();
+      expect(launchedWorker?.modelConfig).toEqual([{ provider: "codex", model: "gpt-5.6-sol" }]);
+      expect(launchedWorker?.desiredModelConfig).toBeUndefined();
+
+      const clearedRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      expect(JSON.parse(clearedRow.context_config)).toMatchObject({
+        schemaVersion: 1,
+        type: "portable",
+      });
+      expect(JSON.parse(clearedRow.context_config).desired).toBeUndefined();
+      expect(JSON.parse(clearedRow.model_config)).toMatchObject({ schemaVersion: 2 });
+      expect(JSON.parse(clearedRow.model_config).desiredEntries).toBeUndefined();
+
+      releaseDeferred();
+    });
+
+    it("preserves other dimension when repeatedly setting model or context while staged", async () => {
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      testSetup.mesh.sendMessage(worker, "run", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      testSetup.mesh.setActorContext(worker, "tail", "root");
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+
+      testSetup.mesh.setActorModel(
+        worker,
+        { provider: "claude", model: "claude-opus-4-8" },
+        "root"
+      );
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+      expect(testSetup.registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "claude", model: "claude-opus-4-8" },
+      ]);
+
+      testSetup.mesh.setActorModel(worker, { provider: "codex", model: "gpt-5.6-sol" }, "root");
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+      expect(testSetup.registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+
+      testSetup.mesh.setActorContext(worker, "brief", "root");
+      expect(testSetup.registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "brief",
+      });
+      expect(testSetup.registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+
+      releaseDeferred();
+    });
+
+    it("clears old class binding for effective-target validation when concrete pool is staged", async () => {
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      testSetup.registry.setModelSelection(worker, { modelClass: "fast-tier" });
+
+      testSetup.mesh.sendMessage(worker, "run", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      // Stage a concrete single-entry pool
+      const modelOutcome = testSetup.mesh.setActorModel(
+        worker,
+        { provider: "claude", model: "claude-sonnet-5" },
+        "root"
+      );
+      expect(modelOutcome).toBe("staged");
+
+      // Staged native context must not throw old-class refusal because the staged
+      // concrete pool clears the active class binding for effective target validation
+      const contextOutcome = testSetup.mesh.setActorContext(worker, "native", "root");
+      expect(contextOutcome).toBe("staged");
+
+      expect(testSetup.mesh.validateCombinedEffectiveTarget(worker)).toBe(true);
+
+      releaseDeferred();
+      await testSetup.tick();
+
+      const updated = testSetup.registry.get(worker);
+      expect(updated?.modelClass).toBeUndefined();
+      expect(updated?.modelConfig).toEqual([{ provider: "claude", model: "claude-sonnet-5" }]);
+      expect(updated?.context).toEqual({ type: "native" });
+      expect(updated?.desiredModelConfig).toBeUndefined();
+      expect(updated?.desiredContextConfig).toBeUndefined();
+    });
+
+    it("atomically applies and clears combined durable target at run boundary", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        actors: actorRepo,
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      testSetup.mesh.sendMessage(worker, "work", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      expect(testSetup.mesh.setActorContext(worker, "tail", "root")).toBe("staged");
+      expect(
+        testSetup.mesh.setActorModel(worker, { provider: "codex", model: "gpt-5.6-sol" }, "root")
+      ).toBe("staged");
+
+      // Verify staged rows in DB before boundary
+      const preRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      const preModelJson = preRow.model_config;
+      const preContextJson = preRow.context_config;
+
+      // Install synthetic SQLite trigger that fails only when pending context is cleared
+      db.exec(`
+        CREATE TEMP TRIGGER synthetic_reject_context_clear BEFORE UPDATE ON actors
+        WHEN json_extract(OLD.context_config, '$.desired') IS NOT NULL
+         AND json_extract(NEW.context_config, '$.desired') IS NULL
+        BEGIN SELECT RAISE(ABORT, 'synthetic context clear failure'); END;
+      `);
+
+      // Attempt prepareRun: must throw due to trigger abort
+      const reopenedRepo = new SqliteActorRepository(db);
+      const onModelSetSpy = vi.fn();
+      const events: MeshEventInput[] = [];
+      const freshSetup = setup({
+        actors: reopenedRepo,
+        onModelSet: onModelSetSpy,
+        events: (e) => events.push(e),
+      });
+
+      expect(() => freshSetup.mesh.prepareRun(worker)).toThrow(/synthetic context clear failure/);
+
+      // Verify that failure left BOTH active and pending dimensions completely unchanged in the DB
+      const failedRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      expect(failedRow.model_config).toBe(preModelJson);
+      expect(failedRow.context_config).toBe(preContextJson);
+
+      const workerAfterFail = reopenedRepo.get(worker);
+      expect(workerAfterFail?.modelConfig).toEqual([
+        { provider: "claude", model: "claude-sonnet-5" },
+      ]);
+      expect(workerAfterFail?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+      expect(workerAfterFail?.context).toEqual({ type: "native" });
+      expect(workerAfterFail?.desiredContextConfig).toEqual({ type: "portable", mode: "tail" });
+
+      // No callbacks or events published when boundary write aborted
+      expect(onModelSetSpy).not.toHaveBeenCalled();
+      const modelSetEvents = events.filter((e) => e.kind === "actor_model_set");
+      expect(modelSetEvents).toHaveLength(0);
+
+      // Drop the synthetic trigger and retry
+      db.exec("DROP TRIGGER synthetic_reject_context_clear;");
+
+      const retrySuccess = freshSetup.mesh.prepareRun(worker);
+      expect(retrySuccess).toBe(true);
+
+      // Verify both dimensions are now transitioned in DB
+      const appliedRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      expect(JSON.parse(appliedRow.context_config)).toMatchObject({
+        schemaVersion: 1,
+        type: "portable",
+        mode: "tail",
+      });
+      expect(JSON.parse(appliedRow.context_config).desired).toBeUndefined();
+      expect(JSON.parse(appliedRow.model_config)).toMatchObject({
+        schemaVersion: 2,
+        entries: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      });
+      expect(JSON.parse(appliedRow.model_config).desiredEntries).toBeUndefined();
+
+      // Callbacks and events published after successful durable transition
+      expect(onModelSetSpy).toHaveBeenCalledTimes(1);
+      const postEvents = events.filter((e) => e.kind === "actor_model_set");
+      expect(postEvents).toHaveLength(1);
+
+      releaseDeferred();
+    });
+
+    it("preserves scheduling for unchanged native actor bound to a single-entry model class while refusing transition to native while holding a class", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const classRepo = new ModelClassRepository(db);
+      classRepo.upsert(
+        "default-class",
+        [{ provider: "claude", model: "claude-sonnet-5" }],
+        new Date().toISOString()
+      );
+      classRepo.upsert(
+        "worker-class",
+        [{ provider: "claude", model: "claude-sonnet-5" }],
+        new Date().toISOString()
+      );
+      const actorRepo = new SqliteActorRepository(db, undefined, classRepo);
+
+      // Root is native and bound to a model class
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelClass: "default-class",
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh, registry } = setup({
+        actors: actorRepo,
+        validateModel: (_record, input) => {
+          if (isModelClassReference(input)) {
+            const resolved = classRepo.get(input.class);
+            if (!resolved) throw new Error(`unresolved class ${input.class}`);
+            return resolved.modelConfig;
+          }
+          return Array.isArray(input)
+            ? (input as ProviderModelConfig[])
+            : ([input] as ProviderModelConfig[]);
+        },
+      });
+
+      // 1. Unchanged native actor with a model class is schedulable and runs without refusal
+      expect(mesh.validateCombinedEffectiveTarget("root")).toBe(true);
+      expect(mesh.prepareRun("root")).toBe(true);
+
+      // 2. A portable actor bound to a model class is refused when attempting to switch to native
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      registry.setModelSelection(worker, { modelClass: "worker-class" });
+
+      expect(() => mesh.setActorContext(worker, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a model class reference/
+      );
+
+      // 3. If a transition to native was somehow pending while holding a class, validateCombinedEffectiveTarget rejects it
+      registry.patch(worker, {
+        desiredContextConfig: { type: "native" },
+      });
+      expect(mesh.validateCombinedEffectiveTarget(worker)).toBe(false);
+      expect(mesh.prepareRun(worker)).toBe(false);
+    });
+
+    it("enforces symmetric candidate validation in both staging orders between native transition and model class, preserving pending dimensions on refusal", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const classRepo = new ModelClassRepository(db);
+      classRepo.upsert(
+        "worker-class",
+        [{ provider: "claude", model: "claude-sonnet-5" }],
+        new Date().toISOString()
+      );
+      const actorRepo = new SqliteActorRepository(db, undefined, classRepo);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const d = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        actors: actorRepo,
+        sharedProvider: d.provider,
+        validateModel: (_record, input) => {
+          if (isModelClassReference(input)) {
+            const resolved = classRepo.get(input.class);
+            if (!resolved) throw new Error(`unresolved class ${input.class}`);
+            return resolved.modelConfig;
+          }
+          return Array.isArray(input)
+            ? (input as ProviderModelConfig[])
+            : ([input] as ProviderModelConfig[]);
+        },
+      });
+
+      // Order A: setActorContext("native") staged first, then setActorModel({ class: "..." }) staged second
+      const workerA = mesh.spawn({
+        charter: "workerA",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      mesh.sendMessage(workerA, "run A", "root");
+      await tick();
+      expect(mesh.activeRunState(workerA)?.phase).toBe("running");
+
+      expect(mesh.setActorContext(workerA, "native", "root")).toBe("staged");
+      expect(registry.get(workerA)?.desiredContextConfig).toEqual({ type: "native" });
+
+      expect(() => mesh.setActorModel(workerA, { class: "worker-class" }, "root")).toThrow(
+        /Cannot set a model class reference on actor .* while a transition to native context is pending/
+      );
+      // Refusal leaves pending dimensions intact
+      expect(registry.get(workerA)?.desiredContextConfig).toEqual({ type: "native" });
+      expect(registry.get(workerA)?.desiredModelClass).toBeUndefined();
+      expect(registry.get(workerA)?.desiredModelConfig).toBeUndefined();
+
+      // Order B: setActorModel({ class: "..." }) staged first, then setActorContext("native") staged second
+      const workerB = mesh.spawn({
+        charter: "workerB",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      mesh.sendMessage(workerB, "run B", "root");
+      await tick();
+      expect(mesh.activeRunState(workerB)?.phase).toBe("running");
+
+      expect(mesh.setActorModel(workerB, { class: "worker-class" }, "root")).toBe("staged");
+      expect(registry.get(workerB)?.desiredModelClass).toBe("worker-class");
+
+      expect(() => mesh.setActorContext(workerB, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a model class reference/
+      );
+      // Refusal leaves pending dimensions intact
+      expect(registry.get(workerB)?.desiredModelClass).toBe("worker-class");
+      expect(registry.get(workerB)?.desiredContextConfig).toBeUndefined();
+
+      d.releaseAll();
+      await tick();
+    });
+
+    it("accepts the same single-entry native target in either staging order when the running actor starts portable", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const d = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        actors: actorRepo,
+        sharedProvider: d.provider,
+      });
+      const nativeTarget = [{ provider: "gemini", model: "gemini-2.5-flash" }];
+
+      // Order A: native first, then the single concrete target provider.
+      const workerA = mesh.spawn({
+        charter: "portable worker A",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+        conversationId: "portable-session-a",
+      });
+      mesh.sendMessage(workerA, "run A", "root");
+      await tick();
+      expect(mesh.activeRunState(workerA)?.phase).toBe("running");
+
+      expect(mesh.setActorContext(workerA, "native", "root")).toBe("staged");
+      expect(mesh.setActorModel(workerA, nativeTarget, "root")).toBe("staged");
+
+      // Order B: the same target provider first, then native.
+      const workerB = mesh.spawn({
+        charter: "portable worker B",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+        conversationId: "portable-session-b",
+      });
+      mesh.sendMessage(workerB, "run B", "root");
+      await tick();
+      expect(mesh.activeRunState(workerB)?.phase).toBe("running");
+
+      expect(mesh.setActorModel(workerB, nativeTarget, "root")).toBe("staged");
+      expect(mesh.setActorContext(workerB, "native", "root")).toBe("staged");
+
+      d.releaseAll();
+      await tick();
+
+      for (const worker of [workerA, workerB]) {
+        const record = registry.get(worker);
+        expect(record).toMatchObject({
+          context: { type: "native" },
+          modelConfig: nativeTarget,
+        });
+        expect(record?.sessionId).toBeUndefined();
+        expect(record?.desiredContextConfig).toBeUndefined();
+        expect(record?.desiredModelConfig).toBeUndefined();
+      }
+    });
+
+    it("refuses staged native reversal after staged cross-provider model on running native actor, preserving pending dimensions on refusal", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const d = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        actors: actorRepo,
+        sharedProvider: d.provider,
+      });
+
+      const worker = mesh.spawn({
+        charter: "native worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+        conversationId: "sess-claude-1",
+      });
+      expect(registry.get(worker)?.sessionId).toBe("sess-claude-1");
+
+      mesh.sendMessage(worker, "run", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("running");
+
+      // 1. Running native actor stages portable context (e.g. tail)
+      expect(mesh.setActorContext(worker, "tail", "root")).toBe("staged");
+      expect(registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+
+      // 2. Stages cross-provider model (allowed because effective context is temporarily portable)
+      expect(
+        mesh.setActorModel(worker, [{ provider: "gemini", model: "gemini-2.5-flash" }], "root")
+      ).toBe("staged");
+      expect(registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "gemini", model: "gemini-2.5-flash" },
+      ]);
+
+      // 3. Reversing back to native while cross-provider model is staged is refused
+      expect(() => mesh.setActorContext(worker, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while a cross-provider model change is staged \(claude -> gemini\)/
+      );
+
+      // Refusal leaves both pending dimensions intact
+      expect(registry.get(worker)?.desiredContextConfig).toEqual({
+        type: "portable",
+        mode: "tail",
+      });
+      expect(registry.get(worker)?.desiredModelConfig).toEqual([
+        { provider: "gemini", model: "gemini-2.5-flash" },
+      ]);
+
+      d.releaseAll();
+      await tick();
+    });
+
+    it("preserves modelConfig updates and single-entry class binding for unchanged native actors absent context transition", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const classRepo = new ModelClassRepository(db);
+      classRepo.upsert(
+        "claude-class",
+        [{ provider: "claude", model: "claude-sonnet-5" }],
+        new Date().toISOString()
+      );
+      const actorRepo = new SqliteActorRepository(db, undefined, classRepo);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh, registry } = setup({
+        actors: actorRepo,
+        validateModel: (_record, input) => {
+          if (isModelClassReference(input)) {
+            const resolved = classRepo.get(input.class);
+            if (!resolved) throw new Error(`unresolved class ${input.class}`);
+            return resolved.modelConfig;
+          }
+          return Array.isArray(input)
+            ? (input as ProviderModelConfig[])
+            : ([input] as ProviderModelConfig[]);
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "native worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      // 1. Updating model to another model on the same provider succeeds
+      mesh.setActorModel(worker, [{ provider: "claude", model: "claude-opus-4" }], "root");
+      expect(registry.get(worker)?.modelConfig).toEqual([
+        { provider: "claude", model: "claude-opus-4" },
+      ]);
+
+      // 2. Binding to a single-entry same-provider model class succeeds
+      mesh.setActorModel(worker, { class: "claude-class" }, "root");
+      expect(registry.get(worker)?.modelClass).toBe("claude-class");
+
+      // 3. Effective target validation and scheduling succeed
+      expect(mesh.validateCombinedEffectiveTarget(worker)).toBe(true);
+      expect(mesh.prepareRun(worker)).toBe(true);
+    });
+
+    it("resumes retained portable ledger items and brief across portable -> native -> portable", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+      const contextStore = new DbPortableContextStore(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh } = setup({
+        actors: actorRepo,
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      const initialSnapshot = {
+        schemaVersion: 4 as const,
+        actorId: worker,
+        generation: 1,
+        updatedAt: "2026-10-22T10:00:00.000Z",
+        lastFoldedSourceId: "chat-1",
+        compactor: null,
+        items: [
+          {
+            id: "item-1",
+            kind: "decision" as const,
+            priority: "must" as const,
+            status: "active" as const,
+            statement: "Durable knowledge",
+            evidence: [
+              {
+                eventId: "event-1",
+                sender: "root",
+                ts: "2026-10-22T10:00:00.000Z",
+                quote: "Durable knowledge quote",
+              },
+            ],
+            updatedAt: "2026-10-22T10:00:00.000Z",
+          },
+        ],
+        brief: {
+          text: "Persistent guidance",
+          generation: 1,
+          updatedAt: "2026-10-22T10:00:00.000Z",
+        },
+      };
+      contextStore.save(initialSnapshot);
+
+      expect(contextStore.load(worker).items).toHaveLength(1);
+      expect(contextStore.load(worker).brief?.text).toBe("Persistent guidance");
+
+      const mockRepos: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = {
+        actorRuns: { listRecentCompleted: () => [] } as unknown as Repositories["actorRuns"],
+        obligations: { listOwned: () => [] } as unknown as Repositories["obligations"],
+        meshChat: { listReceivedForActor: () => [] } as unknown as Repositories["meshChat"],
+      };
+
+      // 1. Initial portable ledger mode: prompt injection includes durable intent ledger
+      const workerBefore = actorRepo.get(worker);
+      expect(workerBefore).toBeDefined();
+      const ledgerInj = workerBefore
+        ? assembleConfiguredPortableInjection(
+            workerBefore,
+            "dummy-api-key",
+            contextStore,
+            "window",
+            undefined,
+            mockRepos
+          )
+        : undefined;
+      expect(ledgerInj?.priorContext).toContain("### Durable intent");
+      expect(ledgerInj?.priorContext).toContain("Durable knowledge");
+      const ledgerPrompt = buildWorkerPrompt(
+        workerBefore?.charter ?? "",
+        {
+          threadId: worker,
+          parentId: "root",
+          handles: [],
+          gitIdentity: resolveMeshGitIdentity({
+            name: "SiliconFamiliar",
+            email: "siliconfamiliar@gmail.com",
+          }),
+        },
+        ledgerInj?.priorContext
+      );
+      expect(ledgerPrompt).toContain("Durable knowledge");
+
+      // 2. Switch to native: prompt injection is omitted
+      mesh.setActorContext(worker, "native", "root");
+      expect(actorRepo.get(worker)?.context).toEqual({ type: "native" });
+      expect(actorRepo.get(worker)?.sessionId).toBeUndefined();
+
+      const retainedInNative = contextStore.load(worker);
+      expect(retainedInNative.items).toEqual(initialSnapshot.items);
+      expect(retainedInNative.brief).toEqual(initialSnapshot.brief);
+
+      const workerInNative = actorRepo.get(worker);
+      expect(workerInNative).toBeDefined();
+      const nativeInj = workerInNative
+        ? assembleConfiguredPortableInjection(
+            workerInNative,
+            "dummy-api-key",
+            contextStore,
+            "window",
+            undefined,
+            mockRepos
+          )
+        : undefined;
+      expect(nativeInj).toBeUndefined();
+      const nativePrompt = buildWorkerPrompt(
+        workerInNative?.charter ?? "",
+        {
+          threadId: worker,
+          parentId: "root",
+          handles: [],
+          gitIdentity: resolveMeshGitIdentity({
+            name: "SiliconFamiliar",
+            email: "siliconfamiliar@gmail.com",
+          }),
+        },
+        nativeInj?.priorContext
+      );
+      expect(nativePrompt).not.toContain("Durable knowledge");
+      expect(nativePrompt).not.toContain("Persistent guidance");
+
+      // 3. Switch to brief: prompt injection resumes with retained brief
+      mesh.setActorContext(worker, "brief", "root");
+      expect(actorRepo.get(worker)?.context).toEqual({ type: "portable", mode: "brief" });
+      const resumed = contextStore.load(worker);
+      expect(resumed.items).toEqual(initialSnapshot.items);
+      expect(resumed.brief).toEqual(initialSnapshot.brief);
+
+      const workerInBrief = actorRepo.get(worker);
+      expect(workerInBrief).toBeDefined();
+      const briefInj = workerInBrief
+        ? assembleConfiguredPortableInjection(
+            workerInBrief,
+            "dummy-api-key",
+            contextStore,
+            "window",
+            undefined,
+            mockRepos
+          )
+        : undefined;
+      expect(briefInj?.priorContext).toContain("## Durable brief");
+      expect(briefInj?.priorContext).toContain("Persistent guidance");
+      const briefPrompt = buildWorkerPrompt(
+        workerInBrief?.charter ?? "",
+        {
+          threadId: worker,
+          parentId: "root",
+          handles: [],
+          gitIdentity: resolveMeshGitIdentity({
+            name: "SiliconFamiliar",
+            email: "siliconfamiliar@gmail.com",
+          }),
+        },
+        briefInj?.priorContext
+      );
+      expect(briefPrompt).toContain("Persistent guidance");
+      expect(briefPrompt).not.toContain("Durable knowledge");
+    });
+
+    it("starts with empty portable state and drops sessionId when switching native -> portable from empty", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+      const contextStore = new DbPortableContextStore(db);
+
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh } = setup({
+        actors: actorRepo,
+      });
+
+      const worker = mesh.spawn({
+        charter: "native worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+        conversationId: "session-native-999",
+      });
+      expect(actorRepo.get(worker)?.sessionId).toBe("session-native-999");
+
+      const mockRepos: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = {
+        actorRuns: { listRecentCompleted: () => [] } as unknown as Repositories["actorRuns"],
+        obligations: { listOwned: () => [] } as unknown as Repositories["obligations"],
+        meshChat: { listReceivedForActor: () => [] } as unknown as Repositories["meshChat"],
+      };
+
+      const workerNative = actorRepo.get(worker);
+      expect(workerNative).toBeDefined();
+      const nativeInj = workerNative
+        ? assembleConfiguredPortableInjection(
+            workerNative,
+            "dummy-api-key",
+            contextStore,
+            "window",
+            undefined,
+            mockRepos
+          )
+        : undefined;
+      expect(nativeInj).toBeUndefined();
+
+      mesh.setActorContext(worker, "tail", "root");
+      expect(actorRepo.get(worker)?.context).toEqual({ type: "portable", mode: "tail" });
+      expect(actorRepo.get(worker)?.sessionId).toBeUndefined();
+
+      const state = contextStore.load(worker);
+      expect(state.items).toEqual([]);
+      expect(state.brief).toBeNull();
+
+      const workerTail = actorRepo.get(worker);
+      expect(workerTail).toBeDefined();
+      const tailInj = workerTail
+        ? assembleConfiguredPortableInjection(
+            workerTail,
+            "dummy-api-key",
+            contextStore,
+            "window",
+            undefined,
+            mockRepos
+          )
+        : undefined;
+      expect(tailInj?.priorContext).toBeUndefined();
+    });
   });
 
   // #199/#652: a tuple set while an actor is queued/idle applies immediately,
