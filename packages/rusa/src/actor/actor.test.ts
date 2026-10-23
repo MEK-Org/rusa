@@ -227,6 +227,39 @@ describe("Actor", () => {
     );
   });
 
+  it("preserves a launched provider failure when its signal is aborted", async () => {
+    const provider = new FakeProvider(
+      (opts) =>
+        new Promise<RunResult>((_resolve, reject) => {
+          opts.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("adapter failure details")),
+            { once: true }
+          );
+        })
+    );
+    const seen: RunResult[] = [];
+    const actor = makeActor({ onRunEnd: (result) => seen.push(result) }, provider);
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(provider.calls).toHaveLength(1);
+
+    actor.interrupt("operator");
+    await flush();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      interrupted: true,
+      failure: { message: "adapter failure details" },
+    });
+    expect(seen[0]?.output).toContain("adapter failure details");
+  });
+
   it("keeps active attempt attribution on its launched model when a later model is staged", async () => {
     let runCount = 0;
     const attempts: RawProviderModelConfig[] = [];
