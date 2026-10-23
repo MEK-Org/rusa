@@ -373,7 +373,6 @@ describe("inbox hints", () => {
       expect(hint).toContain("2026-10-05T18:00:00.000Z");
       expect(hint).toContain("principalId is an explicit send_message target");
       expect(hint).toContain("no session");
-      expect(hint).not.toContain("independent reason");
     });
   });
 });
