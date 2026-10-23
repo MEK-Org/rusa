@@ -308,13 +308,10 @@ class FakeApi extends DashboardApi {
   }
 
   int chatRoomEntryCallCount = 0;
-  DashboardApiException? chatRoomEntryError;
 
   @override
   Future<void> enterChatRoom() async {
     chatRoomEntryCallCount++;
-    final error = chatRoomEntryError;
-    if (error != null) throw error;
   }
 
   /// What `/api/mesh/references` answers (#940); a ref missing here comes
