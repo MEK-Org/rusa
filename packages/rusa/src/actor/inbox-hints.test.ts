@@ -353,4 +353,26 @@ describe("inbox hints", () => {
       expect(hinted[1].hint).toBe(hinted[0].hint);
     });
   });
+
+  describe("Room entry notices", () => {
+    it("adds a factual hint for a Room entry notice", () => {
+      const hint = resolveInboxHint(
+        makeEntry({
+          source: "room:entry",
+          payload: {
+            type: "room.human_entry",
+            version: 1,
+            priority: "responsive",
+            interruption: "join",
+            episodeId: "ep-1",
+            principalId: "human-matt",
+            enteredAt: "2026-10-05T18:00:00.000Z",
+          },
+        })
+      );
+      expect(hint).toContain("2026-10-05T18:00:00.000Z");
+      expect(hint).toContain("principalId is an explicit send_message target");
+      expect(hint).toContain("no session");
+    });
+  });
 });

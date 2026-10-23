@@ -51,6 +51,7 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { RoomEntryService } from "../voice/room-entry.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
@@ -7048,11 +7049,14 @@ describe("ActorMesh", () => {
       expect(registry.get(actor)?.sessionId).toBeUndefined();
     });
 
-    it("refuses root actor context mode changes in v1", () => {
-      const { mesh } = setup();
-      expect(() => mesh.setActorContext("root", "brief", "root")).toThrow(
-        /Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision\./
+    it("keeps context validation when the configured root switches itself", () => {
+      const { mesh, registry } = setup({ ledgerCompactionAvailable: false });
+      expect(() => mesh.setActorContext("root", "ledger", "root")).toThrow(/Gemini API key/);
+      registry.setModelSelection("root", { modelClass: "root-tier" });
+      expect(() => mesh.setActorContext("root", "native", "root")).toThrow(
+        /holds a model class reference/
       );
+      expect(registry.get("root")?.desiredContextConfig).toBeUndefined();
     });
 
     it("persists staged context mode and model changes durably across restart and applies before next launch", async () => {
@@ -11296,6 +11300,37 @@ describe("ActorMesh", () => {
         expect(t.admissions.get(participant)).toEqual([false, true]);
         await vi.advanceTimersByTimeAsync(10_000);
         expect(t.runs.get(participant)).toBe(2);
+      });
+
+      it("reaches running participants from a real entry through the append seam alone", async () => {
+        const t = setupTwoRunningActors();
+        const first = t.mesh.spawn({ charter: "first", parentId: "root" });
+        const second = t.mesh.spawn({ charter: "second", parentId: "root" });
+        await t.startRun(first);
+        await t.startRun(second);
+        const rooms = new RoomEntryService({
+          inbox: t.inboxStore,
+          roster: () => [first, second],
+        });
+
+        rooms.enter({ principalId: "human-1" });
+        await vi.advanceTimersByTimeAsync(0);
+
+        for (const actorId of [first, second]) {
+          expect(t.signals.get(actorId)?.aborted).toBe(false);
+          expect(t.runs.get(actorId)).toBe(1);
+          expect(t.unhandledResponsive(actorId)).toHaveLength(1);
+        }
+        expect(t.preemptions()).toEqual([]);
+
+        for (const actorId of [first, second]) {
+          t.resolvers.get(actorId)?.({ success: true, exitCode: 0, output: "finished" });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        for (const actorId of [first, second]) {
+          expect(t.runs.get(actorId)).toBe(2);
+          expect(t.admissions.get(actorId)).toEqual([false, true]);
+        }
       });
 
       it("promotes a queued run without preempting or adding a follow-up", async () => {

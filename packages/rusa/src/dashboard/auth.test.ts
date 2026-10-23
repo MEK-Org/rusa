@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RoomEntryEnterResult } from "../voice/room-entry.js";
 
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
@@ -100,6 +101,13 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   let server: ReturnType<typeof createServer>;
   let origin: string;
   const interrupt = vi.fn(() => ({ interrupted: true, status: "interrupted" }));
+  const roomEntry = {
+    enter: vi.fn<() => RoomEntryEnterResult>(() => ({
+      status: "entered",
+      notified: true,
+      episodeId: "ep",
+    })),
+  };
   beforeEach(async () => {
     now = Date.now();
     serial = 0;
@@ -138,6 +146,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
           meshEvents,
           principals,
           mesh: { interrupt },
+          roomEntry,
         } as unknown as DashboardDataDeps,
         null,
         auth
@@ -153,7 +162,12 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     db.close();
     vi.useRealTimers();
   });
-  const post = async (path: string, cookie?: string, extra: Record<string, string> = {}) => {
+  const post = async (
+    path: string,
+    cookie?: string,
+    extra: Record<string, string> = {},
+    body = JSON.stringify({ idToken: "id-token" })
+  ) => {
     const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
       headers: { "X-Rusa-CSRF-Bootstrap": "1", ...(cookie ? { Cookie: cookie } : {}) },
     });
@@ -167,7 +181,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
         "X-Rusa-CSRF": csrfCookie.slice(csrfCookie.indexOf("=") + 1),
         ...extra,
       },
-      body: JSON.stringify({ idToken: "id-token" }),
+      body,
     });
   };
   async function login(): Promise<string> {
@@ -907,6 +921,28 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
   });
 
+  it("binds Room entry routes to the verified principal without a caller-supplied identity (#829)", async () => {
+    expect((await post("/api/mesh/chat-room/entry")).status).toBe(401);
+    const cookie = await login();
+    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    if (!user) throw new Error("Expected durable user");
+    const entered = await post("/api/mesh/chat-room/entry", cookie, {}, "not a JSON payload");
+    expect(entered.status).toBe(200);
+    expect(await entered.json()).toMatchObject({ status: "entered", episodeId: "ep" });
+    expect(roomEntry.enter).toHaveBeenCalledExactlyOnceWith({ principalId: user.id });
+
+    roomEntry.enter.mockReturnValueOnce({
+      status: "unavailable",
+      reason: "notice delivery failed",
+    });
+    const unavailable = await post("/api/mesh/chat-room/entry", cookie, {}, "");
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({
+      status: "unavailable",
+      reason: "notice delivery failed",
+    });
+  });
+
   it.each([
     "auth/argument-error",
     "auth/quota-exceeded",
@@ -1000,6 +1036,13 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       const base = `http://127.0.0.1:${(local.address() as AddressInfo).port}`;
       expect(await (await fetch(`${base}/api/auth/config`)).json()).toEqual({ enabled: false });
       expect((await fetch(`${base}/api/dashboard/config`)).status).toBe(200);
+      // No authenticated principal means no Room entry episodes and no notices (#829).
+      const entry = await fetch(`${base}/api/mesh/chat-room/entry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId: "tab" }),
+      });
+      expect(await entry.json()).toEqual({ status: "disabled" });
     } finally {
       local.closeAllConnections();
       await new Promise<void>((resolve) => local.close(() => resolve()));

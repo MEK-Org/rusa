@@ -5007,9 +5007,49 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       expect(registry.get(childId)?.context).toEqual({ type: "portable", mode: "tail" });
     });
 
-    it("set_actor_context refuses root actor targeting", async () => {
-      const { mesh } = setup();
-      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    it.each([
+      "root",
+      "a1111111-1111-4111-8111-111111111111",
+    ])("set_actor_context lets configured root %s switch itself by id or alias", async (configuredId) => {
+      const { mesh, registry } = setup({ rootId: configuredId });
+      const client = await connect(createAgentExecMcpServer(mesh, configuredId, configuredId));
+
+      for (const [actor_id, oldMode, context_mode] of [
+        [configuredId, "native", "tail"],
+        ["root", "tail", "brief"],
+      ]) {
+        const res = (await client.callTool({
+          name: "set_actor_context",
+          arguments: { actor_id, context_mode },
+        })) as CallToolResult;
+
+        expect(res.isError).toBeFalsy();
+        expect(res.content[0]).toMatchObject({
+          text: expect.stringContaining(
+            `applied context mode update for ${configuredId} (${oldMode} -> ${context_mode})`
+          ),
+        });
+        expect(registry.get(configuredId)?.context).toEqual({
+          type: "portable",
+          mode: context_mode,
+        });
+      }
+    });
+
+    it("set_actor_context refuses other actors targeting the configured root", async () => {
+      const { mesh, registry, capabilityGrants } = setup();
+      const child = mesh.spawn({
+        charter: "admin child",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      capabilityGrants.grant({
+        actorId: child,
+        capability: ACTOR_ADMIN_CAPABILITY,
+        grantedBy: "root",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, child, "root"));
 
       const res = (await client.callTool({
         name: "set_actor_context",
@@ -5021,8 +5061,9 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
       expect(res.isError).toBe(true);
       expect((res.content[0] as { text: string }).text).toMatch(
-        /Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision\./
+        /only the configured root can change its own context mode/
       );
+      expect(registry.get("root")?.context).toBeUndefined();
     });
 
     it("set_actor_context differentiates unknown thread IDs from unknown child handles", async () => {

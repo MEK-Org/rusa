@@ -62,6 +62,7 @@ import type {
   InboxRepository,
 } from "../repositories/inbox-repository.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
+import type { RoomEntryService } from "../voice/room-entry.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
 import {
@@ -125,6 +126,11 @@ export interface DashboardDataDeps {
    * is changed only by the `room-admin` tools, never through this API.
    */
   chatRoom?: Pick<ChatRoomService, "participants">;
+  /**
+   * Chat Room entry notifier (#829). Only a verified durable principal can
+   * enter; auth-disabled local mode answers `disabled`.
+   */
+  roomEntry?: Pick<RoomEntryService, "enter">;
   /** Root-authorized commands exposed to trusted dashboard operators. */
   rootControl?: RootControlService;
   /** The authenticated operator's actor-forest boundary (#1003). */
@@ -667,6 +673,34 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+/**
+ * Room entry (#829): `POST /api/mesh/chat-room/entry` announces one human
+ * entering the Room. Identity is the verified request principal; the endpoint
+ * has no caller-supplied entry identity or session state. Without a verified
+ * durable principal — auth-disabled local mode — entry is `disabled` and
+ * nothing is recorded.
+ */
+async function handleRoomEntryRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathname: string,
+  deps: DashboardDataDeps | null
+): Promise<boolean> {
+  if (pathname !== "/api/mesh/chat-room/entry") return false;
+  const principal = getDashboardRequestPrincipal(req);
+  if (!principal) {
+    sendJson(res, 200, { status: "disabled" });
+    return true;
+  }
+  if (!deps?.roomEntry) {
+    sendJson(res, 503, { status: "unavailable", reason: "room entry unavailable" });
+    return true;
+  }
+  const result = deps.roomEntry.enter({ principalId: principal.id });
+  sendJson(res, result.status === "unavailable" ? 503 : 200, result);
+  return true;
+}
+
 /** Parse a comma-separated `actors` param into a de-duped, capped list. */
 function parseActors(url: URL): string[] {
   const raw = url.searchParams.get("actors");
@@ -929,8 +963,8 @@ export function requireOperatorPrincipal(
 
 /**
  * The participant set a `/api/mesh/chat` query may read (#590). The viewer's
- * durable id is always included, so an actor selection reads the viewer's
- * conversation with each actor. Other users and unknown participants are
+ * durable id is included for a single-actor selection. Two selected actors
+ * read only their exchange (#1158). Other users and unknown participants are
  * refused. An unidentified viewer reads only known actor↔actor traffic.
  */
 export function resolveChatQueryActors(
@@ -943,7 +977,9 @@ export function resolveChatQueryActors(
   }
   const mine = scope.viewerIds;
   const result = new Set(actors.filter((id) => !mine.has(id)));
-  for (const id of mine) result.add(id);
+  if (result.size === 1) {
+    for (const id of mine) result.add(id);
+  }
   return { ok: true, actors: [...result] };
 }
 
@@ -1026,6 +1062,7 @@ export async function handleMeshApiRequest(
     (resolvedScope ??= resolveHumanChatScope(req, deps?.principals));
 
   if (req.method === "POST") {
+    if (await handleRoomEntryRequest(req, res, pathname, deps)) return true;
     if (pathname === "/api/mesh/actors") {
       if (!deps?.rootControl) {
         sendJson(res, 503, { error: "root control unavailable" });

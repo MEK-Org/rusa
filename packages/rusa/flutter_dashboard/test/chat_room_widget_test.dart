@@ -76,6 +76,17 @@ void main() {
     );
   });
 
+  testWidgets('announces one deliberate Room entry, not roster polls', (
+    tester,
+  ) async {
+    await pumpRoom(tester);
+    expect(api.chatRoomEntryCallCount, 1);
+
+    await tester.pump(const Duration(seconds: 10));
+    await tester.pump();
+    expect(api.chatRoomEntryCallCount, 1);
+  });
+
   testWidgets('tiles show the avatar and name only, not the voice', (
     tester,
   ) async {
