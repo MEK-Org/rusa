@@ -37,6 +37,7 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { type InjectRecord, PORTABLE_CONTEXT_MAX_BYTES } from "../actor/portable-context.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import {
   emptyPortableContextState,
@@ -5480,6 +5481,138 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await client.close();
     mesh.retire(workerId);
     await vi.waitFor(async () => expect((await fetch(url)).status).toBe(404));
+  });
+
+  it.each([
+    "run end",
+    "restart",
+  ])("switches the configured root to brief through MCP at %s", async (boundary) => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "tail" },
+        },
+      }),
+      "utf8"
+    );
+    const boot = async () => {
+      let ready: { mesh: ActorMesh; root: Actor } | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = { mesh: handles.mesh, root: handles.root as Actor };
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!ready) throw new Error("configured root not ready");
+      return ready;
+    };
+    const { mesh, root } = await boot();
+    expect(rootId).not.toBe("root");
+    const store = getRepositories().portableContext;
+    const state = seedPortableBriefState(store.load(rootId), "2026-10-23T00:00:00.000Z");
+    state.generation = 2;
+    state.lastFoldedSourceId = "retained-ledger-cursor";
+    state.items = [
+      {
+        id: "retained-root-guidance",
+        kind: "decision",
+        priority: "must",
+        status: "active",
+        statement: "Retain this root ledger guidance across the mode switch.",
+        evidence: [
+          {
+            eventId: "retained-ledger-cursor",
+            sender: "operator",
+            ts: "2026-10-23T00:00:00.000Z",
+            quote: "Retain this root ledger guidance.",
+          },
+        ],
+        updatedAt: "2026-10-23T00:00:00.000Z",
+      },
+    ];
+    store.save(state);
+    store.commitBrief({
+      actorId: rootId,
+      expectedGeneration: state.brief?.generation ?? 0,
+      text: "## WHAT\n\nROOT_BRIEF_SWITCH_MARKER\n\n## HOW\n\n## DOMAIN\n",
+      at: "2026-10-23T00:00:00.000Z",
+      actingPrincipal: rootId,
+    });
+    const retained = store.load(rootId);
+    const rootOpts = (root as unknown as { opts: Pick<ActorOptions, "buildPrompt" | "mcpServers"> })
+      .opts;
+    const launchedPrompt = rootOpts.buildPrompt().prompt;
+    expect(launchedPrompt).not.toContain("ROOT_BRIEF_SWITCH_MARKER");
+    const runId = await startLifecycleRun(root, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const running = vi.spyOn(root, "isRunning", "get").mockReturnValue(true);
+    const meshUrl = rootOpts.mcpServers.find((server) => server.name === "mesh")?.url;
+    if (!meshUrl) throw new Error("root mesh server missing");
+    const client = new Client({ name: "root-context-switch", version: "0.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(meshUrl)));
+    try {
+      const result = (await client.callTool({
+        name: "set_actor_context",
+        arguments: { actor_id: "root", context_mode: "brief" },
+      })) as CallToolResult;
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0]).toMatchObject({
+        text: expect.stringContaining(`staged context mode update for ${rootId} (tail -> brief)`),
+      });
+    } finally {
+      await client.close();
+    }
+    expect(mesh.actors.get(rootId)?.context).toEqual({ type: "portable", mode: "tail" });
+    expect(mesh.actors.get(rootId)?.desiredContextConfig).toEqual({
+      type: "portable",
+      mode: "brief",
+    });
+    expect(rootOpts.buildPrompt().prompt).not.toContain("ROOT_BRIEF_SWITCH_MARKER");
+    expect(store.load(rootId)).toEqual(retained);
+    running.mockReturnValue(false);
+
+    if (boundary === "run end") {
+      await endLifecycleRun(root, runId, { success: true, output: "completed", exitCode: 0 });
+      expect(mesh.actors.get(rootId)?.context).toEqual({ type: "portable", mode: "brief" });
+      expect(mesh.actors.get(rootId)?.desiredContextConfig).toBeUndefined();
+      expect(rootOpts.buildPrompt().prompt).toContain("ROOT_BRIEF_SWITCH_MARKER");
+    }
+    await shutdownFn?.();
+    shutdownFn = undefined;
+    // Reopen before service boot: pending context must be durable even when
+    // the run-end callback never ran, and config still says tail.
+    initDb(homeDir);
+    const reopened = getRepositories().actors.get(rootId);
+    expect(reopened?.context).toEqual({
+      type: "portable",
+      mode: boundary === "restart" ? "tail" : "brief",
+    });
+    expect(reopened?.desiredContextConfig).toEqual(
+      boundary === "restart" ? { type: "portable", mode: "brief" } : undefined
+    );
+    closeDb();
+    const restarted = await boot();
+    expect(restarted.mesh.prepareRun(rootId)).toBe(true);
+    expect(restarted.mesh.actors.get(rootId)?.context).toEqual({ type: "portable", mode: "brief" });
+    expect(restarted.mesh.actors.get(rootId)?.desiredContextConfig).toBeUndefined();
+    const nextOpts = (restarted.root as unknown as { opts: Pick<ActorOptions, "buildPrompt"> })
+      .opts;
+    expect(nextOpts.buildPrompt().prompt).toContain("ROOT_BRIEF_SWITCH_MARKER");
+    expect(getRepositories().portableContext.load(rootId)).toEqual(retained);
   });
 
   it("keeps the root brief mount from durable context after config is edited", async () => {
