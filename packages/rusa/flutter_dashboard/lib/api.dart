@@ -114,6 +114,20 @@ class DashboardApi {
         .toList();
   }
 
+  /// Announces this authenticated dashboard's deliberate entry to the Chat
+  /// Room. The server, rather than the browser, binds the human principal and
+  /// applies the local cooldown before notifying current participants.
+  Future<void> enterChatRoom() async {
+    final uri = _u('/api/mesh/chat-room/entry');
+    final res = await _client.post(
+      uri,
+      headers: {'Accept': 'application/json'},
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
   /// `GET /api/mesh/recent-activity` → newest-first activity items (#664).
   Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
     final json = await _getJson(

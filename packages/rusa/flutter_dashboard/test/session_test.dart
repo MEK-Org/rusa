@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/session.dart';
+import 'package:rusa_dashboard/session_client.dart';
 
 class _User implements SessionUser {
   _User(this.token, {String? uid, this.photoUrl, this.displayName, this.email})
@@ -66,11 +67,15 @@ class _Client extends http.BaseClient {
 
   final List<http.Response> _responses;
   final paths = <String>[];
+  final methods = <String>[];
+  final requestHeaders = <Map<String, String>>[];
   final requestBodies = <String>[];
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     paths.add(request.url.path);
+    methods.add(request.method);
+    requestHeaders.add(Map.of(request.headers));
     if (request is http.Request) requestBodies.add(request.body);
     if (_responses.isEmpty) {
       throw StateError('Unexpected request: ${request.url}');
@@ -82,6 +87,17 @@ class _Client extends http.BaseClient {
       headers: response.headers,
     );
   }
+}
+
+class _AuthenticatedSession implements SessionRequestState {
+  @override
+  bool get authenticationEnabled => true;
+
+  @override
+  String? get csrfToken => 'csrf-token';
+
+  @override
+  Future<void> requireAuthentication() async {}
 }
 
 void main() {
@@ -106,6 +122,26 @@ void main() {
       'model': 'gpt-5.6-sol',
       'contextMode': 'brief',
     });
+  });
+
+  test('Room entry posts through the authenticated CSRF boundary', () async {
+    final client = _Client([
+      http.Response('{"token":"csrf-token"}', 200),
+      http.Response('{"status":"entered"}', 200),
+    ]);
+    final api = DashboardApi(
+      base: Uri.parse('http://localhost:3000'),
+      client: client,
+      session: _AuthenticatedSession(),
+    );
+
+    await api.enterChatRoom();
+
+    expect(client.paths, ['/api/auth/csrf', '/api/mesh/chat-room/entry']);
+    expect(client.methods, ['GET', 'POST']);
+    expect(client.requestHeaders[0]['X-Rusa-CSRF-Bootstrap'], '1');
+    expect(client.requestHeaders[1]['X-Rusa-CSRF'], 'csrf-token');
+    expect(client.requestBodies.last, '');
   });
 
   test(

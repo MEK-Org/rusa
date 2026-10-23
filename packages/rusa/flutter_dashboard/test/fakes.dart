@@ -307,6 +307,13 @@ class FakeApi extends DashboardApi {
     return chatRoomParticipants;
   }
 
+  int chatRoomEntryCallCount = 0;
+
+  @override
+  Future<void> enterChatRoom() async {
+    chatRoomEntryCallCount++;
+  }
+
   /// What `/api/mesh/references` answers (#940); a ref missing here comes
   /// back unavailable, as the server answers a ref it cannot resolve.
   Map<String, ReferenceDto> referencesResult = {};

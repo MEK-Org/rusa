@@ -1,3 +1,4 @@
+import { ROOM_HUMAN_ENTRY_PAYLOAD_TYPE } from "../repositories/inbox-interruption.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import type { ChatContextWindow } from "./inbox-chat-context.js";
 import type { InboxOpenQuestions } from "./inbox-open-questions.js";
@@ -55,6 +56,11 @@ export const GCHAT_LINK_GUIDANCE =
  */
 export function resolveInboxHint(entry: InboxEntry): string | undefined {
   const { source, payload } = entry;
+
+  if (payload.type === ROOM_HUMAN_ENTRY_PAYLOAD_TYPE) {
+    const enteredAt = typeof payload.enteredAt === "string" ? ` at ${payload.enteredAt}` : "";
+    return `A human entered the Chat Room${enteredAt}. This is an entry notice, not a direct message from them. Its principalId is an explicit send_message target, but it carries no session and does not establish ongoing presence.`;
+  }
 
   // Voice needs its own contract before the general mesh-message branch:
   // speech is lossy and silence reads as a dropped conversation.

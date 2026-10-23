@@ -51,6 +51,7 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { RoomEntryService } from "../voice/room-entry.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
@@ -11296,6 +11297,37 @@ describe("ActorMesh", () => {
         expect(t.admissions.get(participant)).toEqual([false, true]);
         await vi.advanceTimersByTimeAsync(10_000);
         expect(t.runs.get(participant)).toBe(2);
+      });
+
+      it("reaches running participants from a real entry through the append seam alone", async () => {
+        const t = setupTwoRunningActors();
+        const first = t.mesh.spawn({ charter: "first", parentId: "root" });
+        const second = t.mesh.spawn({ charter: "second", parentId: "root" });
+        await t.startRun(first);
+        await t.startRun(second);
+        const rooms = new RoomEntryService({
+          inbox: t.inboxStore,
+          roster: () => [first, second],
+        });
+
+        rooms.enter({ principalId: "human-1" });
+        await vi.advanceTimersByTimeAsync(0);
+
+        for (const actorId of [first, second]) {
+          expect(t.signals.get(actorId)?.aborted).toBe(false);
+          expect(t.runs.get(actorId)).toBe(1);
+          expect(t.unhandledResponsive(actorId)).toHaveLength(1);
+        }
+        expect(t.preemptions()).toEqual([]);
+
+        for (const actorId of [first, second]) {
+          t.resolvers.get(actorId)?.({ success: true, exitCode: 0, output: "finished" });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        for (const actorId of [first, second]) {
+          expect(t.runs.get(actorId)).toBe(2);
+          expect(t.admissions.get(actorId)).toEqual([false, true]);
+        }
       });
 
       it("promotes a queued run without preempting or adding a follow-up", async () => {
