@@ -2084,8 +2084,8 @@ void main() {
     },
   );
 
-  test('conversation: live SSE dedupes message_sent + message_received for the '
-      'same messageId — each message renders exactly once ', () async {
+  test('conversation: live SSE keeps only the selected actors and dedupes '
+      'sent/received echoes', () async {
     final api = FakeApi()
       ..threadsResult = [
         makeThread('a', parent: 'root', created: 't1'),
@@ -2121,10 +2121,35 @@ void main() {
     );
     await pumpEventQueue();
 
-    // After the fix: only message_sent passes the kind guard → length 1.
-    // Without the fix: both events pass the event-id dedup → length 2.
-    expect(store.conversation.value.chat.length, 1);
-    expect(store.conversation.value.chat.first.id, 'msg-1');
+    // Human traffic with either selected actor and messages involving an
+    // unselected actor do not enter the live conversation.
+    for (final pair in [
+      ('00000000-0000-4000-8000-000000000001', 'a'),
+      ('b', '00000000-0000-4000-8000-000000000001'),
+      ('a', 'other'),
+      ('other', 'b'),
+    ]) {
+      stream.meshCtrl.add(
+        makeEvent(
+          'outside-${pair.$1}-${pair.$2}',
+          'message_sent',
+          actor: pair.$1,
+          payload:
+              '{"messageId":"outside-${pair.$1}-${pair.$2}","to":"${pair.$2}"}',
+        ),
+      );
+    }
+    stream.meshCtrl.add(
+      makeEvent(
+        'reverse-evt',
+        'message_sent',
+        actor: 'b',
+        payload: '{"messageId":"msg-2","to":"a"}',
+      ),
+    );
+    await pumpEventQueue();
+
+    expect(store.conversation.value.chat.map((m) => m.id), ['msg-2', 'msg-1']);
 
     await store.dispose();
   });

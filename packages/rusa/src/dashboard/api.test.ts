@@ -1129,16 +1129,13 @@ describe("handleMeshApiRequest", () => {
         expect(JSON.parse(feed.res.body).events).toEqual([]);
       });
 
-      it("leaves actor↔actor chat untouched by the human pairing", async () => {
+      it("keeps the sole local user's messages out of a two-actor selection", async () => {
         actors.upsert(rec(UUID_A, null, "active"));
         actors.upsert(rec(UUID_B, UUID_A, "active"));
-        principals.createUser({
-          email: "second@example.com",
-          createdAt: "2026-06-22T00:00:00.000Z",
-        });
         meshChat.record({ senderId: UUID_A, recipientId: UUID_B, body: "down" });
         meshChat.record({ senderId: UUID_B, recipientId: UUID_A, body: "up" });
         meshChat.record({ senderId: LOCAL_USER, recipientId: UUID_A, body: "human" });
+        meshChat.record({ senderId: UUID_B, recipientId: LOCAL_USER, body: "human reply" });
         const { res } = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${UUID_B}`);
         expect(res.statusCode).toBe(200);
         expect(chatBodies(res)).toEqual(["down", "up"]);
