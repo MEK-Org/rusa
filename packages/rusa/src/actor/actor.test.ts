@@ -189,6 +189,77 @@ describe("Actor", () => {
     expect(attempts).toEqual([{ provider: provider.providerName, model: "gpt-5.6-terra" }]);
   });
 
+  it.each([
+    [
+      "the stall watchdog",
+      (_actor: Actor) => vi.advanceTimersByTimeAsync(WATCHDOG_STALL_TIMEOUT_MS),
+    ],
+    ["a manual interrupt", (actor: Actor) => actor.interrupt("operator")],
+    ["responsive preemption", (actor: Actor) => actor.preemptForResponsive()],
+  ] as const)("does not launch a provider after %s cancels its attempt acknowledgement", async (_label, stop) => {
+    const provider = new FakeProvider();
+    const onRunEnd = vi.fn();
+    let acknowledgementSignal: AbortSignal | undefined;
+    const actor = makeActor(
+      {
+        onRunEnd,
+        onProviderAttempt: (_attempt, signal?: AbortSignal) => {
+          acknowledgementSignal = signal;
+          return new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+      provider
+    );
+
+    actor.requestRun({ priority: "responsive" });
+    await flush();
+
+    expect(acknowledgementSignal).toBeDefined();
+    await stop(actor);
+    await flush();
+
+    expect(provider.calls).toHaveLength(0);
+    expect(onRunEnd).toHaveBeenCalledTimes(1);
+    expect(onRunEnd).toHaveBeenLastCalledWith(
+      expect.objectContaining({ success: false, cancelled: true, exitCode: 143 })
+    );
+  });
+
+  it("preserves a launched provider failure when its signal is aborted", async () => {
+    const provider = new FakeProvider(
+      (opts) =>
+        new Promise<RunResult>((_resolve, reject) => {
+          opts.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("adapter failure details")),
+            { once: true }
+          );
+        })
+    );
+    const seen: RunResult[] = [];
+    const actor = makeActor({ onRunEnd: (result) => seen.push(result) }, provider);
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(provider.calls).toHaveLength(1);
+
+    actor.interrupt("operator");
+    await flush();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      interrupted: true,
+      failure: { message: "adapter failure details" },
+    });
+    expect(seen[0]?.output).toContain("adapter failure details");
+  });
+
   it("keeps active attempt attribution on its launched model when a later model is staged", async () => {
     let runCount = 0;
     const attempts: RawProviderModelConfig[] = [];

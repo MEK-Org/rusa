@@ -96,8 +96,30 @@ export function createActorRuntime(
   }
   const pending = new Map<
     number,
-    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+    {
+      resolve: (value: unknown) => void;
+      reject: (error: Error) => void;
+      removeAbortListener?: () => void;
+    }
   >();
+
+  function takePending(id: number) {
+    const call = pending.get(id);
+    if (!call) return undefined;
+    pending.delete(id);
+    call.removeAbortListener?.();
+    return call;
+  }
+
+  function rejectPending(id: number, error: Error): void {
+    takePending(id)?.reject(error);
+  }
+
+  function cancellationError(signal: AbortSignal): Error {
+    return signal.reason instanceof Error
+      ? signal.reason
+      : new Error("Provider attempt acknowledgement cancelled");
+  }
 
   function reportLocalAccountingFailure(
     phase: "start" | "prompt" | "terminal",
@@ -162,11 +184,28 @@ export function createActorRuntime(
     return result;
   }
 
-  function request<T>(payload: Request): { id: number; result: Promise<T> } {
+  function request<T>(payload: Request, signal?: AbortSignal): { id: number; result: Promise<T> } {
     const id = ++sequence;
     if (stopping) return { id, result: Promise.reject(new Error("Actor is stopping")) };
+    if (signal?.aborted) return { id, result: Promise.reject(cancellationError(signal)) };
     const result = new Promise<T>((resolve, reject) => {
-      pending.set(id, { resolve: (value) => resolve(value as T), reject });
+      const call: {
+        resolve: (value: unknown) => void;
+        reject: (error: Error) => void;
+        removeAbortListener?: () => void;
+      } = { resolve: (value: unknown) => resolve(value as T), reject };
+      pending.set(id, call);
+      if (signal) {
+        const cancel = () => rejectPending(id, cancellationError(signal));
+        call.removeAbortListener = () => signal.removeEventListener("abort", cancel);
+        signal.addEventListener("abort", cancel, { once: true });
+        // An abort can race with listener installation. Do not send a request
+        // that the Actor has already cancelled.
+        if (signal.aborted) {
+          cancel();
+          return;
+        }
+      }
       send({ type: "request", requestId: id, request: payload });
     });
     return { id, result };
@@ -182,10 +221,9 @@ export function createActorRuntime(
         bootstrap.resumeAdmission && pendingAdmission && pending.has(pendingAdmission.id)
           ? pendingAdmission
           : undefined;
-      for (const [id, call] of pending) {
+      for (const [id] of pending) {
         if (id === resumed?.id) continue;
-        call.reject(new Error(COORDINATOR_RECONNECTED_ERROR));
-        pending.delete(id);
+        rejectPending(id, new Error(COORDINATOR_RECONNECTED_ERROR));
       }
       if (bootstrap.mcpServers) {
         mcpServers.splice(0, mcpServers.length, ...bootstrap.mcpServers);
@@ -417,9 +455,8 @@ export function createActorRuntime(
             // reply, so Actor.cancelQueuedRun keeps this opportunity for resume.
             cancel: () => {
               if (providerStarted) return false;
-              const call = leaderCancelling ? pending.get(admission.id) : undefined;
+              const call = leaderCancelling ? takePending(admission.id) : undefined;
               if (!call) return false;
-              pending.delete(admission.id);
               call.reject(new RunStartCancelledError());
               return true;
             },
@@ -580,15 +617,18 @@ export function createActorRuntime(
       // this is pending rejects it and fails the admitted run before launch, by
       // design: the provider's writes go through that leader, so launching
       // anyway would lose their attribution.
-      onProviderAttempt: (provider) =>
-        request<void>({
-          op: "providerAttempt",
-          attempt: {
-            provider: provider.providerName,
-            model: provider.model,
-            effort: provider.effort,
+      onProviderAttempt: (provider, signal) =>
+        request<void>(
+          {
+            op: "providerAttempt",
+            attempt: {
+              provider: provider.providerName,
+              model: provider.model,
+              effort: provider.effort,
+            },
           },
-        }).result,
+          signal
+        ).result,
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
       onRuntimeStateChanged: (state) => {
         lastRuntimeState = state;
@@ -607,9 +647,8 @@ export function createActorRuntime(
     stopping = true;
     actor?.interrupt("instance-actor-retirement");
     actor?.close();
-    for (const call of pending.values())
-      call.reject(new Error("Coordinator disconnected or stopped actor"));
-    pending.clear();
+    for (const id of [...pending.keys()])
+      rejectPending(id, new Error("Coordinator disconnected or stopped actor"));
     finishClose();
   }
 
@@ -626,8 +665,7 @@ export function createActorRuntime(
         modelConfigGeneration = message.generation;
         break;
       case "reply": {
-        const call = pending.get(message.requestId);
-        pending.delete(message.requestId);
+        const call = takePending(message.requestId);
         if (message.error) call?.reject(new Error(message.error));
         else call?.resolve(message.value);
         break;
