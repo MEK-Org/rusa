@@ -162,7 +162,12 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     db.close();
     vi.useRealTimers();
   });
-  const post = async (path: string, cookie?: string, extra: Record<string, string> = {}) => {
+  const post = async (
+    path: string,
+    cookie?: string,
+    extra: Record<string, string> = {},
+    body = JSON.stringify({ idToken: "id-token" })
+  ) => {
     const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
       headers: { "X-Rusa-CSRF-Bootstrap": "1", ...(cookie ? { Cookie: cookie } : {}) },
     });
@@ -176,7 +181,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
         "X-Rusa-CSRF": csrfCookie.slice(csrfCookie.indexOf("=") + 1),
         ...extra,
       },
-      body: JSON.stringify({ idToken: "id-token" }),
+      body,
     });
   };
   async function login(): Promise<string> {
@@ -917,27 +922,11 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   });
 
   it("binds Room entry routes to the verified principal without a caller-supplied identity (#829)", async () => {
-    const send = async (path: string, cookie: string, body: string) => {
-      const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
-        headers: { "X-Rusa-CSRF-Bootstrap": "1", Cookie: cookie },
-      });
-      const csrfCookie = bootstrap.headers.getSetCookie()[0].split(";")[0];
-      return fetch(origin + path, {
-        method: "POST",
-        headers: {
-          Origin: origin,
-          "Content-Type": "application/json",
-          Cookie: `${cookie}; ${csrfCookie}`,
-          "X-Rusa-CSRF": csrfCookie.slice(csrfCookie.indexOf("=") + 1),
-        },
-        body,
-      });
-    };
     expect((await post("/api/mesh/chat-room/entry")).status).toBe(401);
     const cookie = await login();
     const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
     if (!user) throw new Error("Expected durable user");
-    const entered = await send("/api/mesh/chat-room/entry", cookie, "not a JSON payload");
+    const entered = await post("/api/mesh/chat-room/entry", cookie, {}, "not a JSON payload");
     expect(entered.status).toBe(200);
     expect(await entered.json()).toMatchObject({ status: "entered", episodeId: "ep" });
     expect(roomEntry.enter).toHaveBeenCalledExactlyOnceWith({ principalId: user.id });
@@ -946,7 +935,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       status: "unavailable",
       reason: "notice delivery failed",
     });
-    const unavailable = await send("/api/mesh/chat-room/entry", cookie, "");
+    const unavailable = await post("/api/mesh/chat-room/entry", cookie, {}, "");
     expect(unavailable.status).toBe(503);
     expect(await unavailable.json()).toEqual({
       status: "unavailable",

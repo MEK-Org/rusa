@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:rxdart/rxdart.dart';
 
+import '../api.dart';
 import '../chat_room_controller.dart';
 import '../models.dart';
 import '../store.dart';
@@ -49,9 +50,16 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
   Future<void> _announceEntry() async {
     try {
       await widget.store.api.enterChatRoom();
-    } catch (_) {
+    } catch (error) {
       // Entry notices are best-effort; the roster remains usable if the
       // dashboard cannot reach the authenticated endpoint.
+      assert(() {
+        final detail = error is DashboardApiException
+            ? 'HTTP ${error.status}'
+            : error.runtimeType.toString();
+        debugPrint('Chat Room entry notice failed ($detail).');
+        return true;
+      }());
     }
   }
 

@@ -59,7 +59,7 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
 
   if (payload.type === ROOM_HUMAN_ENTRY_PAYLOAD_TYPE) {
     const enteredAt = typeof payload.enteredAt === "string" ? ` at ${payload.enteredAt}` : "";
-    return `A human entered the Chat Room${enteredAt}. This is an entry notice, not a direct message from them, and it carries no recipient or session for a response. Send a message only when you have an explicit target and an independent reason to contact it.`;
+    return `A human entered the Chat Room${enteredAt}. This is an entry notice, not a direct message from them. Its principalId is an explicit send_message target, but it carries no session and does not establish ongoing presence.`;
   }
 
   // Voice needs its own contract before the general mesh-message branch:
