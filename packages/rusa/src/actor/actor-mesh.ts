@@ -5521,8 +5521,8 @@ export class ActorMesh {
   /**
    * Update an actor's context mode in-place.
    *
-   * Same authority rule as setActorModel: ancestor or subtree admin, an actor cannot change
-   * its own mode, retired actors are refused.
+   * Ancestor or subtree admin authority, with self changes limited to the configured
+   * root. Retired actors are refused.
    *
    * A switch to native is refused while the actor holds a multi-entry pool or class reference.
    * Staged for running actors; applied immediately for idle or queued actors.
@@ -5539,15 +5539,16 @@ export class ActorMesh {
     if (!record) {
       throw new Error(`Cannot set context mode on unknown thread: ${id}`);
     }
-    if (id === this.rootId || id === "root" || !record.parentId) {
+    const rootSelfUpdate = id === this.rootId && requestedBy === id;
+    if (!rootSelfUpdate && (id === this.rootId || id === "root" || !record.parentId)) {
       throw new Error(
-        `Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision.`
+        `Cannot set context mode on root actor ${id}: only the configured root can change its own context mode.`
       );
     }
     if (record.status === "retired") {
       throw new Error(`Cannot set context mode on retired thread: ${id}`);
     }
-    if (requestedBy === id) {
+    if (requestedBy === id && !rootSelfUpdate) {
       throw new Error(
         `Cannot set context mode: an actor cannot change its own context mode (${id})`
       );

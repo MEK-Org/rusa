@@ -7049,11 +7049,14 @@ describe("ActorMesh", () => {
       expect(registry.get(actor)?.sessionId).toBeUndefined();
     });
 
-    it("refuses root actor context mode changes in v1", () => {
-      const { mesh } = setup();
-      expect(() => mesh.setActorContext("root", "brief", "root")).toThrow(
-        /Cannot change root actor context mode via MCP in v1; root context mode remains an operator decision\./
+    it("keeps context validation when the configured root switches itself", () => {
+      const { mesh, registry } = setup({ ledgerCompactionAvailable: false });
+      expect(() => mesh.setActorContext("root", "ledger", "root")).toThrow(/Gemini API key/);
+      registry.setModelSelection("root", { modelClass: "root-tier" });
+      expect(() => mesh.setActorContext("root", "native", "root")).toThrow(
+        /holds a model class reference/
       );
+      expect(registry.get("root")?.desiredContextConfig).toBeUndefined();
     });
 
     it("persists staged context mode and model changes durably across restart and applies before next launch", async () => {

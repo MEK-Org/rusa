@@ -1044,7 +1044,7 @@ export function createAgentExecMcpServer(
       title: "Update an actor's context mode in-place",
       description:
         "Replace an existing actor's context mode in-place in the actor repository without service restart. " +
-        "Allowed for an ancestor of the target, or subtree admin. An actor cannot change its own mode, retired actors are refused, and the root actor is excluded in v1. " +
+        "Allowed for an ancestor of the target, or subtree admin. The configured root may change its own mode; other actors cannot change their own mode or the root's mode. Retired actors are refused. " +
         "If a run is in flight, it finishes on its current mode and the change applies and persists when that run ends; an idle or queued actor has the change applied and persisted immediately. " +
         "Switching to native requires the actor to hold exactly one declared model entry and no class reference. " +
         "Portable modes (ledger, tail, brief) preserve accumulated portable state; native-to-portable resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content; portable-to-native starts a fresh provider session while retaining portable state in the store.",
@@ -1063,7 +1063,7 @@ export function createAgentExecMcpServer(
     },
     async ({ actor_id, context_mode, compaction_model }) => {
       try {
-        let targetId = actor_id;
+        let targetId = mesh.resolveActorId(actor_id);
         const executeUpdate = (tid: string) => {
           const targetRecord = mesh.actors.get(tid);
           const oldMode =
