@@ -294,7 +294,10 @@ describe("human chat isolation (#590)", () => {
     return { status: res.status, body: text ? (JSON.parse(text) as T) : (null as T) };
   }
 
-  type ChatPage = { chat: Array<{ senderId: string; recipientId: string; body: string }> };
+  type ChatPage = {
+    chat: Array<{ senderId: string; recipientId: string; body: string }>;
+    nextCursor: number | null;
+  };
   type EventPage = { events: Array<{ kind: string; actorId: string | null; body: string | null }> };
   type WindowPage = EventPage & { hasMore: boolean };
   type InboxPage = {
@@ -550,17 +553,31 @@ describe("human chat isolation (#590)", () => {
     record(ACTOR, PEER, "root to child");
     record(PEER, ACTOR, "child to root");
 
-    // A two-actor query reads the pair plus the viewer's own side with each of
-    // them, as #469 established — never the other human's side.
-    for (const [who, own] of [
-      [a, ["alice asks", "reply to alice"]],
-      [b, ["bob asks", "reply to bob"]],
-    ] as const) {
+    record(a.id, PEER, "alice asks peer");
+    record(PEER, a.id, "peer replies to alice");
+    record(b.id, PEER, "bob asks peer");
+    record(PEER, b.id, "peer replies to bob");
+
+    // Selecting two actors reads only their exchange, for either viewer.
+    for (const who of [a, b]) {
       const view = await getJson<ChatPage>(`/api/mesh/chat?actors=${ACTOR},${PEER}`, who.cookie);
       expect(view.status).toBe(200);
-      expect(view.body.chat.map((m) => m.body).sort()).toEqual(
-        ["child to root", "root to child", ...own].sort()
+      expect(view.body.chat.map((m) => m.body).sort()).toEqual(["child to root", "root to child"]);
+
+      // Older history uses the same pair filter even when human messages
+      // were stored more recently than the actors' exchange.
+      const first = await getJson<ChatPage>(
+        `/api/mesh/chat?actors=${ACTOR},${PEER}&limit=1`,
+        who.cookie
       );
+      expect(first.body.chat.map((m) => m.body)).toEqual(["child to root"]);
+      expect(first.body.nextCursor).not.toBeNull();
+      const older = await getJson<ChatPage>(
+        `/api/mesh/chat?actors=${ACTOR},${PEER}&limit=1&before=${first.body.nextCursor}`,
+        who.cookie
+      );
+      expect(older.body.chat.map((m) => m.body)).toEqual(["root to child"]);
+      expect(older.body.nextCursor).toBeNull();
     }
   });
 

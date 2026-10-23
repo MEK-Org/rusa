@@ -1098,6 +1098,7 @@ describe("handleMeshApiRequest", () => {
 
       it("refuses to guess which of several local users a human-scoped chat belongs to", async () => {
         actors.upsert(rec(UUID_A, null, "active"));
+        actors.upsert(rec(UUID_B, UUID_A, "active"));
         const other = principals.createUser({
           email: "second@example.com",
           createdAt: "2026-06-22T00:00:00.000Z",
@@ -1123,22 +1124,24 @@ describe("handleMeshApiRequest", () => {
         // conversation with no identity to match it against.
         const named = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${other}`);
         expect(named.res.statusCode).toBe(403);
+        meshChat.record({ senderId: UUID_A, recipientId: UUID_B, body: "down" });
+        meshChat.record({ senderId: UUID_B, recipientId: UUID_A, body: "up" });
+        const pair = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${UUID_B}`);
+        expect(pair.res.statusCode).toBe(200);
+        expect(chatBodies(pair.res)).toEqual(["down", "up"]);
         // The actor's event feed still answers, minus every human's message events.
         const feed = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A}`);
         expect(feed.res.statusCode).toBe(200);
         expect(JSON.parse(feed.res.body).events).toEqual([]);
       });
 
-      it("leaves actor↔actor chat untouched by the human pairing", async () => {
+      it("keeps the sole local user's messages out of a two-actor selection", async () => {
         actors.upsert(rec(UUID_A, null, "active"));
         actors.upsert(rec(UUID_B, UUID_A, "active"));
-        principals.createUser({
-          email: "second@example.com",
-          createdAt: "2026-06-22T00:00:00.000Z",
-        });
         meshChat.record({ senderId: UUID_A, recipientId: UUID_B, body: "down" });
         meshChat.record({ senderId: UUID_B, recipientId: UUID_A, body: "up" });
         meshChat.record({ senderId: LOCAL_USER, recipientId: UUID_A, body: "human" });
+        meshChat.record({ senderId: UUID_B, recipientId: LOCAL_USER, body: "human reply" });
         const { res } = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${UUID_B}`);
         expect(res.statusCode).toBe(200);
         expect(chatBodies(res)).toEqual(["down", "up"]);

@@ -963,8 +963,8 @@ export function requireOperatorPrincipal(
 
 /**
  * The participant set a `/api/mesh/chat` query may read (#590). The viewer's
- * durable id is always included, so an actor selection reads the viewer's
- * conversation with each actor. Other users and unknown participants are
+ * durable id is included for a single-actor selection. Two selected actors
+ * read only their exchange (#1158). Other users and unknown participants are
  * refused. An unidentified viewer reads only known actor↔actor traffic.
  */
 export function resolveChatQueryActors(
@@ -977,7 +977,9 @@ export function resolveChatQueryActors(
   }
   const mine = scope.viewerIds;
   const result = new Set(actors.filter((id) => !mine.has(id)));
-  for (const id of mine) result.add(id);
+  if (result.size === 1) {
+    for (const id of mine) result.add(id);
+  }
   return { ok: true, actors: [...result] };
 }
 
