@@ -141,6 +141,41 @@ void main() {
       expect(find.textContaining('Session:'), findsNothing);
     });
 
+    testWidgets('shows sub-two-day provider resets in hours beside the pacing cadence', (
+      tester,
+    ) async {
+      final weekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: 6.25,
+        status: 'available',
+        headline: true,
+        windowMs: 48 * 3600 * 1000,
+        resetAtIso: now.add(const Duration(hours: 45)).toIso8601String(),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: QuotaTooltip(
+              providerName: 'Claude',
+              windows: [weekly],
+              throttle: const QuotaThrottleDto(
+                intervalSeconds: 600,
+                expired: false,
+                buckets: [],
+                updatedAt: '2026-09-29T12:00:00.000Z',
+              ),
+              now: now,
+            ),
+          ),
+        ),
+      );
+
+      expect(find.textContaining('Resets in 45 hours'), findsOneWidget);
+      expect(find.textContaining('Pacing: every 10 minutes'), findsOneWidget);
+    });
+
     testWidgets('renders unknown lane with truthful n/a indicators', (
       tester,
     ) async {
