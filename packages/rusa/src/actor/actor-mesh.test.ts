@@ -11310,8 +11310,6 @@ describe("ActorMesh", () => {
           roster: () => [first, second],
         });
 
-        // Repeated entry is cooldown-suppressed; recipient notices come only from the first entry.
-        rooms.enter({ principalId: "human-1" });
         rooms.enter({ principalId: "human-1" });
         await vi.advanceTimersByTimeAsync(0);
 

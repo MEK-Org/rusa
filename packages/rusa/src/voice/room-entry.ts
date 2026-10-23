@@ -13,7 +13,7 @@ export const ROOM_ENTRY_SOURCE = "room:entry";
 export const ROOM_ENTRY_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
 /** The deterministic notice id for one recipient of one entry notification. */
-export function roomEntryNoticeId(episodeId: string, actorId: string): string {
+function roomEntryNoticeId(episodeId: string, actorId: string): string {
   return `room-entry:${episodeId}:${actorId}`;
 }
 
@@ -25,13 +25,13 @@ export interface RoomEntryClient {
 export type RoomEntryEnterResult =
   | { status: "entered"; notified: true; episodeId: string }
   | { status: "entered"; notified: false; reason: "cooldown"; remainingMs: number }
+  | { status: "entered"; notified: false; reason: "empty_roster" }
   | { status: "unavailable"; reason: "notice delivery failed" };
 
 export interface RoomEntryServiceDeps {
   inbox: Pick<InboxRepository, "append">;
   /** Active Room participants right now: the server roster, never a client list. */
   roster: () => readonly string[];
-  cooldownMs?: number;
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -45,25 +45,29 @@ export interface RoomEntryServiceDeps {
  */
 export class RoomEntryService {
   private readonly lastNotifiedAt = new Map<string, number>();
-  private readonly cooldownMs: number;
   private readonly now: () => number;
 
   constructor(private readonly deps: RoomEntryServiceDeps) {
-    this.cooldownMs = deps.cooldownMs ?? ROOM_ENTRY_COOLDOWN_MS;
     this.now = deps.now ?? (() => Date.now());
   }
 
   enter(client: RoomEntryClient): RoomEntryEnterResult {
     const now = this.now();
     const last = this.lastNotifiedAt.get(client.principalId);
-    if (last !== undefined && now - last < this.cooldownMs) {
-      const remainingMs = Math.max(0, this.cooldownMs - (now - last));
+    if (last !== undefined && now - last < ROOM_ENTRY_COOLDOWN_MS) {
+      const remainingMs = Math.max(0, ROOM_ENTRY_COOLDOWN_MS - (now - last));
       return { status: "entered", notified: false, reason: "cooldown", remainingMs };
     }
 
     const episodeId = randomUUID();
     const enteredAt = new Date(now).toISOString();
     const participants = this.deps.roster();
+
+    // There was nobody to notify, so no delivery occurred and the next entry
+    // must remain eligible rather than being hidden by a cooldown.
+    if (participants.length === 0) {
+      return { status: "entered", notified: false, reason: "empty_roster" };
+    }
 
     const inputs: InboxAppendInput[] = participants.map((actorId) => ({
       id: roomEntryNoticeId(episodeId, actorId),
@@ -80,13 +84,11 @@ export class RoomEntryService {
       },
     }));
 
-    if (inputs.length > 0) {
-      try {
-        this.deps.inbox.append(inputs);
-      } catch (err) {
-        this.deps.log?.(`failed to append room entry notices: ${String(err)}`);
-        return { status: "unavailable", reason: "notice delivery failed" };
-      }
+    try {
+      this.deps.inbox.append(inputs);
+    } catch (err) {
+      this.deps.log?.(`failed to append room entry notices: ${String(err)}`);
+      return { status: "unavailable", reason: "notice delivery failed" };
     }
 
     // Only a delivered notice starts the retry cooldown. A failed append must

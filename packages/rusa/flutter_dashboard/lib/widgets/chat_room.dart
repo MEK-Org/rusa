@@ -40,7 +40,19 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
   @override
   void initState() {
     super.initState();
+    unawaited(_announceEntry());
     _watch();
+  }
+
+  /// Opening the Room is the deliberate client-side entry transition. Roster
+  /// polling stays read-only, so refreshes never create extra inbox work.
+  Future<void> _announceEntry() async {
+    try {
+      await widget.store.api.enterChatRoom();
+    } catch (_) {
+      // Entry notices are best-effort; the roster remains usable if the
+      // dashboard cannot reach the authenticated endpoint.
+    }
   }
 
   @override

@@ -21,7 +21,6 @@ describe("RoomEntryService", () => {
 
   const createService = (opts?: {
     roster?: () => readonly string[];
-    cooldownMs?: number;
     log?: (msg: string) => void;
   }) => {
     return new RoomEntryService({
@@ -32,7 +31,6 @@ describe("RoomEntryService", () => {
         },
       },
       roster: opts?.roster ?? (() => ["actor-1", "actor-2"]),
-      cooldownMs: opts?.cooldownMs,
       now: () => clock,
       log: opts?.log,
     });
@@ -102,12 +100,22 @@ describe("RoomEntryService", () => {
     expect(appends).toHaveLength(appendCount);
   });
 
-  it("handles empty roster without creating appends", () => {
-    const service = createService({ roster: () => [] });
-    const result = service.enter({ principalId: "human-matt" });
-    if (result.status !== "entered" || !result.notified) throw new Error("expected notified entry");
-    expect(result.notified).toBe(true);
-    expect(appends).toHaveLength(0);
+  it("notifies a roster that becomes non-empty after an empty entry", () => {
+    let roster: string[] = [];
+    const service = createService({ roster: () => roster });
+    expect(service.enter({ principalId: "human-matt" })).toEqual({
+      status: "entered",
+      notified: false,
+      reason: "empty_roster",
+    });
+    roster = ["actor-1"];
+    clock += 60_000;
+    expect(service.enter({ principalId: "human-matt" })).toMatchObject({
+      status: "entered",
+      notified: true,
+    });
+    expect(appends).toHaveLength(1);
+    expect(appends[0]?.actorId).toBe("actor-1");
   });
 
   it("returns unavailable after an append error and permits a retry before the cooldown", () => {

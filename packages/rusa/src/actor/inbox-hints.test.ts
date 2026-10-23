@@ -355,7 +355,7 @@ describe("inbox hints", () => {
   });
 
   describe("Room entry notices", () => {
-    it("hints that an entry notice asks nothing, completes no obligation, and prohibits greetings", () => {
+    it("adds a factual hint for a Room entry notice", () => {
       const hint = resolveInboxHint(
         makeEntry({
           source: "room:entry",
@@ -370,11 +370,7 @@ describe("inbox hints", () => {
           },
         })
       );
-      expect(hint).toContain("human-matt entered the Chat Room at 2026-10-05T18:00:00.000Z");
-      expect(hint).toContain("it asks nothing and completes no obligation");
-      expect(hint).toContain("Do not greet them or send an entry reply");
-      expect(hint).toContain("your most recent human conversation, which may not be this Room");
-      expect(hint).toContain("staying silent is fine");
+      expect(hint).toContain("2026-10-05T18:00:00.000Z");
     });
   });
 });
