@@ -6,11 +6,21 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import {
+  createRunReceipt,
+  runReceiptDigest,
+  serializeRunReceipt,
+} from "../db/repositories/run-receipt.js";
+import { InstanceRunReceiptRepository } from "../db/repositories/run-receipt-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import type { RunTokenUsage } from "../providers/token-accounting.js";
 import type { RunResult } from "../providers/types.js";
+import { ActorHandle } from "../remote-instances/actor-handle.js";
+import { RemoteInstance } from "../remote-instances/remote-instance.js";
 import { type ActorFactoryContext, ActorMesh, type MeshActor } from "./actor-mesh.js";
+import type { ActorRecord } from "./actor-record.js";
 import { analyzeTokenRecords, applyTokenRecordsBackfill } from "./backfill-run-token-records.js";
-import { createRunAccounting } from "./run-accounting.js";
+import { createRunAccounting, projectActorRunLaunchConfig } from "./run-accounting.js";
 
 const MODEL_CONFIG = createActorRunModelConfig({
   provider: "codex",
@@ -379,5 +389,201 @@ describe("run_token_records run identity", () => {
       expect(rowA.run_id).toBe(runId);
       expect(rowB.run_id).toBe(runId);
     });
+  });
+});
+
+describe("run_token_records for a remote run whose end the host did not observe (#1119)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "rusa-token-remote-"));
+    initDb(tmpDir);
+  });
+
+  afterEach(() => {
+    closeDb();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const usage = (uncachedInput: number): RunTokenUsage => ({
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    scrapedAt: "2026-10-20T08:30:00.000Z",
+    uncachedInput,
+    cacheRead: 0,
+    output: 10,
+    reasoning: null,
+    response: null,
+  });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /**
+   * A real mesh hosting a worker on a remote instance, with the leader's
+   * production accounting: the mesh's own lifecycle records token usage, and
+   * receipt-backed runs close only from the host's receipt.
+   */
+  function remoteWorker(runReceipts: boolean) {
+    const db = getDb();
+    const actorRecords = new SqliteActorRepository(db);
+    const runs = new ActorRunRepository(db);
+    const leaderReceipts = new InstanceRunReceiptRepository(db);
+    const accounting = createRunAccounting(
+      () => runs,
+      () => leaderReceipts
+    );
+    actorRecords.upsert({
+      id: "root",
+      charter: "Root",
+      parentId: null,
+      executionConfig: { unsandboxed: true },
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+    const remote = new RemoteInstance("host-a", process.platform, process.pid);
+    remote.runReceipts = runReceipts;
+    const handles: ActorHandle[] = [];
+    const mesh = new ActorMesh({
+      actors: actorRecords,
+      rootId: "root",
+      createActor: (ctx) => {
+        ctx.lifecycle.add({
+          onStart: (event) =>
+            accounting.begin(
+              ctx.record.id,
+              event.runId,
+              projectActorRunLaunchConfig(event.selected),
+              event.durableHost
+            ),
+          onEnd: (event) => {
+            if (event.terminal.kind === "result") {
+              accounting.complete(ctx.record.id, event.runId, event.terminal.result);
+            } else if (event.terminal.started) {
+              accounting.abandon(ctx.record.id, event.runId, event.terminal.reason);
+            }
+          },
+        });
+        const handle = new ActorHandle({
+          host: remote.createHost(ctx.record.id),
+          bootstrap: { id: ctx.record.id, cwd: tmpDir },
+          context: ctx,
+          snapshot: () => ({ record: ctx.getRecord() as ActorRecord, prompt: "fixture" }),
+          saveSession: () => {},
+          onFailure: () => {},
+        });
+        handles.push(handle);
+        return handle;
+      },
+    });
+    const workerId = mesh.spawn({
+      charter: "remote worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    const send = async (message: Parameters<RemoteInstance["receive"]>[0]["message"]) => {
+      remote.receive({ actorId: workerId, message });
+      await settle();
+    };
+    const start = (runId: string) =>
+      send({
+        type: "runStart",
+        runId,
+        responsive: false,
+        selected: { provider: "codex", model: "gpt-5.6-sol" },
+      });
+    const complete = (requestId: number, result: RunResult) =>
+      send({ type: "request", requestId, request: { op: "complete", result } });
+    const tokens = () =>
+      db
+        .prepare("SELECT run_id, uncached_input FROM run_token_records ORDER BY uncached_input")
+        .all();
+    const leaderRun = (runId: string) =>
+      db.prepare("SELECT outcome, output FROM actor_runs WHERE id = ?").get(runId);
+    const close = () => {
+      for (const handle of handles) handle.close();
+      remote.close();
+    };
+    return { workerId, leaderReceipts, send, start, complete, tokens, leaderRun, close };
+  }
+
+  it("records usage from an unproven end once, with its run, and leaves the outcome to the receipt", async () => {
+    const w = remoteWorker(true);
+    try {
+      await w.send({ type: "ready", pid: 4242 });
+      await w.start("run-1");
+      const unproven: RunResult = {
+        success: false,
+        exitCode: -1,
+        output: "stall watchdog",
+        termination: "unproven",
+        tokenUsage: usage(100),
+      };
+      await w.complete(1, unproven);
+      expect(w.tokens()).toEqual([{ run_id: "run-1", uncached_input: 100 }]);
+      expect(w.leaderRun("run-1")).toEqual({ outcome: null, output: null });
+
+      // A duplicate delivery of the same end, by request or by event, counts nothing more.
+      await w.complete(2, unproven);
+      await w.send({ type: "result", result: unproven });
+      expect(w.tokens()).toEqual([{ run_id: "run-1", uncached_input: 100 }]);
+
+      // The genuine terminal arrives as the host's receipt; it books no usage.
+      const receipt = serializeRunReceipt(
+        createRunReceipt({
+          instanceId: "host-a",
+          runId: "run-1",
+          actorId: w.workerId,
+          endedAt: "2026-10-20T09:00:00.000Z",
+          outcome: "completed",
+          success: false,
+          exitCode: 1,
+          output: "genuine",
+        })
+      );
+      expect(
+        w.leaderReceipts.apply("host-a", {
+          runId: "run-1",
+          receipt,
+          digest: runReceiptDigest(receipt),
+        }).outcome
+      ).toEqual({ status: "applied", actorRunClosed: true });
+      expect(w.leaderRun("run-1")).toEqual({ outcome: "completed", output: "genuine" });
+      expect(w.tokens()).toEqual([{ run_id: "run-1", uncached_input: 100 }]);
+
+      // The next run, observed, is attributed to itself.
+      await w.start("run-2");
+      await w.complete(3, {
+        success: true,
+        exitCode: 0,
+        output: "observed",
+        termination: "observed",
+        tokenUsage: usage(200),
+      });
+      expect(w.tokens()).toEqual([
+        { run_id: "run-1", uncached_input: 100 },
+        { run_id: "run-2", uncached_input: 200 },
+      ]);
+      expect(w.leaderRun("run-2")).toEqual({ outcome: null, output: null });
+    } finally {
+      w.close();
+    }
+  });
+
+  it("keeps the legacy contract: a host without receipts ends the run with its result", async () => {
+    const w = remoteWorker(false);
+    try {
+      await w.send({ type: "ready", pid: 4242 });
+      await w.start("run-1");
+      await w.complete(1, {
+        success: false,
+        exitCode: -1,
+        output: "legacy",
+        termination: "unproven",
+        tokenUsage: usage(100),
+      });
+      expect(w.tokens()).toEqual([{ run_id: "run-1", uncached_input: 100 }]);
+      expect(w.leaderRun("run-1")).toEqual({ outcome: "completed", output: "legacy" });
+    } finally {
+      w.close();
+    }
   });
 });

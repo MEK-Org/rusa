@@ -5,9 +5,11 @@ import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
+import type { HostTerminalWrite } from "../db/repositories/run-receipt-repository.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
+import type { RunTermination } from "../providers/types.js";
 import {
   FollowerEventAcceptanceFailedError,
   type FollowerEventBatch,
@@ -19,6 +21,7 @@ import {
 import { createFollowerFileOps } from "../remote-instances/follower-file-ops.js";
 import type { FollowerCommand, FollowerEvent } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
+import { FollowerReceiptOutbox } from "../remote-instances/follower-receipt-outbox.js";
 import { isFullCommitSha } from "../remote-instances/follower-update-validation.js";
 import {
   executeFollowerUpdate,
@@ -30,6 +33,7 @@ import {
   type EventTransferCapability,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
+  type RunReceiptsCapability,
 } from "../remote-instances/protocol.js";
 import { FollowerRunMaterial } from "../remote-instances/run-material.js";
 import type { ResourceScope } from "../runtime/resource-scope.js";
@@ -158,6 +162,22 @@ function resolveFollowerToken(config: RusaConfig): string {
   throw new Error("A follower's leader peer entry requires token or tokenFile");
 }
 
+/** Logged run IDs per report; the count is always exact. */
+const UNRESOLVED_RUNS_LOGGED = 20;
+
+/** Report receipt-backed runs left open because nothing observed them end (#1020). */
+function logUnresolvedRuns(
+  log: Logger,
+  event: string,
+  unresolved: Array<{ runId: string; instanceId: string }>
+): void {
+  if (unresolved.length === 0) return;
+  log.warn(event, {
+    runs: unresolved.length,
+    sample: unresolved.slice(0, UNRESOLVED_RUNS_LOGGED),
+  });
+}
+
 export async function composeFollowerStart(
   config: RusaConfig,
   opts: RunStartOptions | undefined,
@@ -198,8 +218,20 @@ export async function composeFollowerStart(
 
   const identity = instanceIdentityOf(config);
   if (identity.role !== "follower") throw new Error("Follower start requires a leader peer");
-  const repos = getRepositories("follower");
+  const repos = getRepositories("follower", { instanceId: identity.instanceId });
   log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
+  const runReceipts = repos.runReceipts;
+  if (!runReceipts) throw new Error("Follower run receipts require an instance identity");
+  // Runs an earlier process left open are recovered before any new work
+  // (#1020). One opened without the receipt contract closes locally as
+  // before. A receipt-backed one stays open with no receipt: its provider ran
+  // in a detached process group that may have outlived that process, so a
+  // restart does not establish that it ended.
+  const recovered = runReceipts.recoverOpen("host restarted before run completion");
+  if (recovered.local > 0) {
+    log.warn("follower_unterminated_runs_recovered", { runs: recovered.local });
+  }
+  logUnresolvedRuns(log, "follower_receipt_runs_unresolved", recovered.unresolved);
 
   // An e2e composition must never reset and rebuild the checkout running it.
   const release: StartFollowerRelease = opts?.e2e
@@ -282,6 +314,47 @@ export async function composeFollowerStart(
     throw new FollowerHttpError(`Leader /events: HTTP ${response.status}`, response.status);
   }
 
+  /** Whether the current registration negotiated durable run receipts. */
+  let receiptsNegotiated = false;
+  const receiptOutbox = new FollowerReceiptOutbox(
+    runReceipts,
+    (receipts) => post("/receipts", { receipts }),
+    log
+  );
+
+  /** Deliver a committed receipt, or report a run left open for want of evidence. */
+  function afterTerminal(
+    runId: string,
+    termination: RunTermination | undefined,
+    write: HostTerminalWrite
+  ): HostTerminalWrite {
+    if (write === "receipt") void flushReceipts();
+    if (write === "unresolved") {
+      log.warn("follower_receipt_run_unresolved", {
+        runId,
+        termination: termination ?? "unreported",
+      });
+    }
+    return write;
+  }
+
+  /** A delivery failed in transport; the poll loop retries it. */
+  let receiptRetryPending = false;
+
+  async function flushReceipts(): Promise<void> {
+    if (stopped || !session || !receiptsNegotiated) return;
+    try {
+      receiptRetryPending = false;
+      await receiptOutbox.flush();
+    } catch (err) {
+      receiptRetryPending = true;
+      log.warn("follower_receipt_flush_failed", { err });
+      if (err instanceof FollowerHttpError && err.status === 410) {
+        session = "";
+      }
+    }
+  }
+
   async function flush(): Promise<void> {
     // A 410 clears the registration before the poll loop can obtain its next
     // session. Keep queued bytes local during that gap; an empty session is
@@ -337,7 +410,27 @@ export async function composeFollowerStart(
     opts?.e2e?.followerProviderFactory,
     {
       requireReconciliation: true,
-      repositories: repos,
+      // Each committed terminal schedules delivery of the receipt it wrote.
+      repositories: Object.freeze({
+        ...repos,
+        // A run opened while receipts are negotiated owes the leader one.
+        actorRuns: Object.freeze({
+          ...repos.actorRuns,
+          start: (opts: Parameters<typeof repos.actorRuns.start>[0]) => {
+            if (!receiptsNegotiated) return repos.actorRuns.start(opts);
+            const id = opts.id ?? randomUUID();
+            runReceipts.start({ ...opts, id });
+            return id;
+          },
+        }),
+        runReceipts: Object.freeze({
+          ...runReceipts,
+          complete: (...args: Parameters<typeof runReceipts.complete>) =>
+            afterTerminal(args[0], args[3], runReceipts.complete(...args)),
+          abandon: (...args: Parameters<typeof runReceipts.abandon>) =>
+            afterTerminal(args[0], args[3], runReceipts.abandon(...args)),
+        }),
+      }),
       // Provider executable settings are host-local. The leader still owns
       // the admitted provider/model tuple carried in each actor Bootstrap.
       providerOptions: { providers: config.providers },
@@ -363,8 +456,10 @@ export async function composeFollowerStart(
       // A terminal write can fail after a provider has unwound and removed its
       // Actor from the instance. Reconcile open local rows even after a
       // quiescent drain; the transport is already stopped, so the durable row
-      // and local log are the shutdown receipt.
-      const markedInterrupted = repos.actorRuns.abandonOpen(abandonReason);
+      // and local log are the shutdown receipt. A receipt-backed run still
+      // open was not seen to end and stays unresolved for the next process.
+      const recovery = runReceipts.recoverOpen(abandonReason);
+      const markedInterrupted = recovery.local;
       if (!drain.quiesced) {
         log.warn("follower_shutdown_drain_timed_out", {
           ...drain,
@@ -376,6 +471,7 @@ export async function composeFollowerStart(
           markedInterrupted,
         });
       }
+      logUnresolvedRuns(log, "follower_shutdown_receipt_runs_unresolved", recovery.unresolved);
     } catch (err) {
       // The database disposer will run after this resource regardless. This
       // is the only observable receipt when the reconciliation itself cannot
@@ -396,6 +492,7 @@ export async function composeFollowerStart(
         leaderToken?: string;
         eventTransfer?: EventTransferCapability;
         boundedExecution?: BoundedExecutionCapability;
+        runReceipts?: RunReceiptsCapability;
       }>("/register", {
         platform: process.platform,
         pid: process.pid,
@@ -404,6 +501,7 @@ export async function composeFollowerStart(
         // The leader's update reconciliation compares this with its target.
         ...(release.runningSha ? { commitSha: release.runningSha } : {}),
         boundedExecution: runMaterial.offer,
+        runReceipts: { version: 1 },
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
@@ -424,6 +522,9 @@ export async function composeFollowerStart(
       session = reg.session;
       if (reg.leaderToken) leaderToken = reg.leaderToken;
       runMaterial.accept(reg.boundedExecution);
+      // Receipts are durable and leader-independent: whatever the previous
+      // registration left unacknowledged is delivered on this one.
+      receiptsNegotiated = reg.runReceipts?.version === 1;
       eventTransfer = httpEventTransferSender(
         reg.eventTransfer,
         (fragment) => request("/events/transfer", fragment),
@@ -437,7 +538,9 @@ export async function composeFollowerStart(
         leader: leaderUrl.origin,
         session,
         instanceId: identity.instanceId,
+        runReceipts: receiptsNegotiated,
       });
+      void flushReceipts();
       return true;
     } catch (err) {
       log.warn("follower_registration_failed", {
@@ -551,6 +654,7 @@ export async function composeFollowerStart(
         }
         try {
           if (eventQueue.hasPending && !eventQueue.isFlushing) void flush();
+          if (receiptRetryPending || receiptOutbox.retryDue()) void flushReceipts();
           const commands = await post<FollowerCommand[]>(
             "/poll",
             { parkedEvent: eventQueue.parkedHead ?? null },

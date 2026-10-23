@@ -14,6 +14,7 @@ import { widenToWal } from "./wal.js";
 let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
 let followerRepositories: FollowerRepositories | null = null;
+let followerHostInstanceId: string | undefined;
 let currentRepositoriesRole: InstanceRole | null = null;
 
 export type TaskStatus = "queued" | "in_progress" | "done" | "blocked";
@@ -85,10 +86,18 @@ export function getDb(): Database.Database {
  */
 export function getRepositories(): Repositories;
 export function getRepositories(role: "leader"): Repositories;
-export function getRepositories(role: "follower"): FollowerRepositories;
-export function getRepositories(role: InstanceRole): Repositories | FollowerRepositories;
 export function getRepositories(
-  role: InstanceRole = "leader"
+  role: "follower",
+  host?: { instanceId: string }
+): FollowerRepositories;
+export function getRepositories(role: InstanceRole): Repositories | FollowerRepositories;
+/**
+ * A follower composition passes its configured instance ID (`host`) on first
+ * access, which binds its run terminals to durable receipts (#1020).
+ */
+export function getRepositories(
+  role: InstanceRole = "leader",
+  host?: { instanceId: string }
 ): Repositories | FollowerRepositories {
   if (currentRepositoriesRole !== null && currentRepositoriesRole !== role) {
     throw new Error(
@@ -96,7 +105,14 @@ export function getRepositories(
     );
   }
   if (role === "follower") {
-    if (!followerRepositories) followerRepositories = createFollowerRepositories(getDb());
+    if (!followerRepositories) {
+      followerRepositories = createFollowerRepositories(getDb(), host);
+      followerHostInstanceId = host?.instanceId;
+    } else if (host && host.instanceId !== followerHostInstanceId) {
+      throw new Error(
+        `Follower repositories already bound to instance "${followerHostInstanceId ?? "(none)"}"`
+      );
+    }
     currentRepositoriesRole = role;
     return followerRepositories;
   }
@@ -115,6 +131,7 @@ export function closeDb(): void {
   }
   repositories = null;
   followerRepositories = null;
+  followerHostInstanceId = undefined;
   currentRepositoriesRole = null;
 }
 

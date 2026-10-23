@@ -16,6 +16,7 @@ import type {
   CodingProvider,
   McpServerSpec,
   RunResult,
+  RunTermination,
   SandboxOptions,
 } from "../providers/types.js";
 import {
@@ -240,6 +241,11 @@ export interface RunAbandon {
    * Whether the inner start bracket already opened for this run.
    */
   started: boolean;
+  /**
+   * The settled provider call's termination evidence, when one settled
+   * (#1119); a leader reads it only for a receipt-backed run.
+   */
+  termination?: RunTermination;
 }
 
 /** Why a run opportunity ended without a result. */
@@ -301,6 +307,11 @@ export class Actor {
   private killable = true;
   private coalesceAborted = false;
   private coalesceAbortController?: AbortController;
+  /**
+   * Termination evidence from the provider call this run settled, carried to
+   * the abandonment hook (#1119). Unset when no provider call settled.
+   */
+  private runTermination?: RunTermination;
   /** Handle for this actor's provider run while it is waiting to start. */
   private pendingStart?: RunStartHandle<RunResult>;
   /** True when the last wake was gated off by {@link ActorOptions.beforeRun} (nothing ran). */
@@ -624,6 +635,7 @@ export class Actor {
     this.lastRunSkipped = false;
     this.runEndReported = false;
     this.runStartReported = false;
+    this.runTermination = undefined;
     const runId = randomUUID();
     this.currentRunId = runId;
     this.currentRunStartTime = new Date();
@@ -681,7 +693,12 @@ export class Actor {
     await this.lifecycle.emit("onEnd", {
       actorId: this.id,
       runId,
-      terminal: { kind: "abandoned", reason, started: this.runStartReported },
+      terminal: {
+        kind: "abandoned",
+        reason,
+        started: this.runStartReported,
+        ...(this.runTermination ? { termination: this.runTermination } : {}),
+      },
     });
   }
 
@@ -977,6 +994,7 @@ export class Actor {
       clearTimers();
     }
 
+    this.runTermination = result.termination;
     if (this.coalesceAborted) return;
     this.coalesceAbortController = undefined;
 
@@ -1050,7 +1068,36 @@ export class Actor {
       }
       return runProvider(primary);
     }
-    const result = await this.attemptPoolEntry(runId, selected, runProvider);
+    // A run's termination is observed only if every provider process it
+    // launched was (#1119): a recovery attempt does not prove that an earlier
+    // one ended. An entry that could not be constructed launched nothing, so
+    // it does not bear on the evidence.
+    let unproven = false;
+    let observed = false;
+    const attemptProvider = async (
+      entry: RawProviderModelConfig,
+      recoveryContext?: string
+    ): Promise<RunResult> => {
+      const attempt = await this.attemptPoolEntry(runId, entry, runProvider, recoveryContext);
+      // A provider-selection failure never entered runProvider, so it cannot
+      // make an otherwise fully observed chain unproven; missing evidence
+      // from a process that did run stays unproven.
+      if (attempt.termination === "observed") {
+        observed = true;
+      } else if (attempt.failure?.stage !== "provider-selection") {
+        unproven = true;
+      }
+      return attempt;
+    };
+    const withEvidence = (composed: RunResult): RunResult => {
+      if (unproven) return { ...composed, termination: "unproven" };
+      // A pool with only selection failures or skipped entries started no
+      // provider process, so it cannot manufacture observed termination.
+      if (observed) return { ...composed, termination: "observed" };
+      return composed;
+    };
+
+    const result = await attemptProvider(selected);
     if (result.success || this.stoppedOnPurpose(result)) return result;
     // The chain excludes the failed entry by value, not by position: the gate
     // may have launched a later pool entry (earliest-available-first), and
@@ -1097,13 +1144,12 @@ export class Actor {
       this.opts.log?.(
         `\n[PoolFallback] ${describeModelConfigEntry(failed)} failed; trying next configured pool entry ${describeModelConfigEntry(entry)}\n`
       );
-      const recoveryResult = await this.attemptPoolEntry(
-        runId,
+      const recoveryResult = await attemptProvider(
         entry,
-        runProvider,
         formatRecoveryContext({ runId, entry, failures })
       );
-      if (recoveryResult.success || this.stoppedOnPurpose(recoveryResult)) return recoveryResult;
+      if (recoveryResult.success || this.stoppedOnPurpose(recoveryResult))
+        return withEvidence(recoveryResult);
       failures.push({ entry: { ...entry }, result: recoveryResult });
       failed = entry;
       lastResult = recoveryResult;
@@ -1115,13 +1161,13 @@ export class Actor {
     // own line: typing the aggregate would pin a later entry's capacity
     // rejection on the selected one.
     const sole = failures.length === 1 ? failures[0]?.result.failure : undefined;
-    return {
+    return withEvidence({
       success: false,
       output: formatRecoveryChainFailure({ failures, skipped }),
       exitCode: lastResult.exitCode || 1,
       sessionId: lastResult.sessionId,
       ...(sole?.kind === "provider-capacity" ? { failure: sole } : {}),
-    };
+    });
   }
 
   /**

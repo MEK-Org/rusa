@@ -4,10 +4,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import type { FollowerRunReceipts } from "../db/repositories/index.js";
+import {
+  HostRunReceiptRepository,
+  InstanceRunReceiptRepository,
+  RUN_RECEIPT_CONFLICTS_MAX_PER_INSTANCE,
+} from "../db/repositories/run-receipt-repository.js";
 import type { Logger } from "../observability/logger.js";
 import { FollowerEventQueue } from "./follower-event-queue.js";
-import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
+import { type FollowerEvent, FollowerHub, type FollowerHubOptions } from "./follower-hub.js";
+import { FollowerReceiptOutbox } from "./follower-receipt-outbox.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { FOLLOWER_HTTP_BODY_LIMIT_BYTES, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 import {
@@ -41,6 +50,7 @@ async function setup(options?: {
   logger?: Logger;
   triggerStore?: FollowerUpdateTriggerStore;
   allowedFollowerIds?: string[];
+  runReceipts?: FollowerHubOptions["runReceipts"];
 }) {
   const token = randomBytes(32).toString("hex");
   const hub = new FollowerHub(token, options);
@@ -1395,5 +1405,352 @@ describe("bounded execution and material reads (#1020)", () => {
       attempt: 3,
     });
     expect(await reply({ kind: "output" }, { status: "missing" })).toEqual({ status: "missing" });
+  });
+});
+
+describe("durable run receipts on the gateway (#1020, #1119 run-ID ruling)", () => {
+  // The decision table lives in run-receipt-repository.test.ts; this covers
+  // the gateway's wiring of it.
+  const modelConfig = { version: 1 as const, provider: "codex", model: "gpt-5.5" };
+
+  async function receiptSetup() {
+    const leaderDb = new Database(":memory:");
+    runMigrations(leaderDb);
+    const hostDb = new Database(":memory:");
+    runMigrations(hostDb);
+    const store = new InstanceRunReceiptRepository(leaderDb);
+    const records: Array<{ level: string; event: string; fields?: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      debug: (event, fields) => records.push({ level: "debug", event, fields }),
+      info: (event, fields) => records.push({ level: "info", event, fields }),
+      warn: (event, fields) => records.push({ level: "warn", event, fields }),
+      error: (event, fields) => records.push({ level: "error", event, fields }),
+      child: () => logger,
+    };
+    const h = await setup({
+      logger,
+      runReceipts: { apply: (id, envelope) => store.apply(id, envelope) },
+    });
+    const host = new HostRunReceiptRepository(hostDb, "mac");
+    const finish = (runId: string, output = "done") => {
+      host.start({ id: runId, actorId: "actor-1", modelConfig });
+      host.complete(runId, "actor-1", { success: true, exitCode: 0, output }, "observed");
+    };
+    const pending = () => host.listUnacked(0, 100).map((entry) => entry.envelope);
+    const registerOffering = async (id = "mac", generation = `${id}-gen`) => {
+      const response = await h.post("/register", {
+        id,
+        platform: "linux",
+        pid: 1,
+        generation,
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        runReceipts: { version: 1 },
+      });
+      expect(response.status).toBe(200);
+      return (await response.json()) as { session: string; runReceipts?: unknown };
+    };
+    return { ...h, leaderDb, store, records, host, finish, pending, registerOffering };
+  }
+
+  it("negotiates receipts only with an offering follower, and only for its live session", async () => {
+    const h = await receiptSetup();
+    const first = await h.registerOffering();
+    expect(first.runReceipts).toEqual({ version: 1 });
+    expect(h.hub.createHost("mac", "actor-1").durableHost).toBe("mac");
+
+    const legacy = await h.register("older");
+    expect((legacy as Record<string, unknown>).runReceipts).toBeUndefined();
+    expect(h.hub.createHost("older", "actor-2").durableHost).toBeUndefined();
+    expect(
+      (await h.post("/receipts", { id: "older", session: legacy.session, receipts: [] })).status
+    ).toBe(409);
+
+    // A superseded generation can no longer deliver.
+    await h.registerOffering("mac", "mac-gen-2");
+    expect(
+      (await h.post("/receipts", { id: "mac", session: first.session, receipts: [] })).status
+    ).toBe(410);
+  });
+
+  it("does not negotiate receipts without a leader store", async () => {
+    const h = await setup();
+    const response = await h.post("/register", {
+      id: "mac",
+      platform: "linux",
+      pid: 1,
+      generation: "mac-gen",
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      runReceipts: { version: 1 },
+    });
+    expect(((await response.json()) as Record<string, unknown>).runReceipts).toBeUndefined();
+  });
+
+  it("answers each receipt by run ID and logs conflicts and refusals", async () => {
+    const h = await receiptSetup();
+    const { session } = await h.registerOffering();
+    h.store.startRun({ runId: "run-1", instanceId: "mac", actorId: "actor-1", modelConfig });
+    h.finish("run-1", "first");
+    h.finish("run-9");
+    const [first, unknown] = h.pending();
+    const response = await h.post("/receipts", {
+      id: "mac",
+      session,
+      receipts: [
+        first,
+        first,
+        unknown,
+        { ...first, runId: "run-2", digest: "0".repeat(64) },
+        { runId: "run-3" },
+      ],
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      results: [
+        { runId: "run-1", status: "applied" },
+        { runId: "run-1", status: "duplicate" },
+        { runId: "run-9", status: "conflict", kind: "unknown_run" },
+        { runId: "run-2", status: "invalid" },
+        { runId: "run-3", status: "invalid" },
+      ],
+    });
+    expect(h.records.find((r) => r.event === "instance_receipt_conflict")).toMatchObject({
+      level: "warn",
+      fields: { followerId: "mac", runId: "run-9", kind: "unknown_run" },
+    });
+    expect(h.records.filter((r) => r.event === "instance_receipt_invalid")).toHaveLength(2);
+    expect(h.leaderDb.prepare("SELECT id, outcome, output FROM actor_runs").all()).toEqual([
+      { id: "run-1", outcome: "completed", output: "first" },
+    ]);
+  });
+
+  it("refuses a conflict beyond the bound with a distinct error log, storing nothing", async () => {
+    const h = await receiptSetup();
+    const { session } = await h.registerOffering();
+    const insert = h.leaderDb.prepare(
+      `INSERT INTO instance_receipt_conflicts
+         (instance_id, run_id, kind, digest, receipt, received_at)
+       VALUES ('mac', ?, 'unknown_run', 'd', 'r', 't')`
+    );
+    h.leaderDb.transaction(() => {
+      for (let n = 1; n <= RUN_RECEIPT_CONFLICTS_MAX_PER_INSTANCE; n++) insert.run(`stored-${n}`);
+    })();
+    h.finish("run-9");
+    const response = await h.post("/receipts", { id: "mac", session, receipts: h.pending() });
+    expect(await response.json()).toEqual({ results: [{ runId: "run-9", status: "invalid" }] });
+    expect(h.records.filter((r) => r.event === "instance_receipt_conflict_limit")).toEqual([
+      {
+        level: "error",
+        event: "instance_receipt_conflict_limit",
+        fields: { followerId: "mac", runId: "run-9", kind: "unknown_run" },
+      },
+    ]);
+    expect(
+      h.leaderDb.prepare("SELECT COUNT(*) AS n FROM instance_receipt_conflicts").get()
+    ).toEqual({ n: RUN_RECEIPT_CONFLICTS_MAX_PER_INSTANCE });
+  });
+
+  it("redelivers, as the same bytes, a receipt whose reply was lost, and acknowledges it once answered", async () => {
+    const h = await receiptSetup();
+    const { session } = await h.registerOffering();
+    h.store.startRun({ runId: "run-1", instanceId: "mac", actorId: "actor-1", modelConfig });
+    h.finish("run-1");
+    const posted: unknown[][] = [];
+    let loseReply = true;
+    const outbox = new FollowerReceiptOutbox(
+      h.host,
+      async (receipts) => {
+        posted.push(receipts);
+        const response = await h.post("/receipts", { id: "mac", session, receipts });
+        if (loseReply) {
+          loseReply = false;
+          throw new Error("receipts reply lost");
+        }
+        return response.json();
+      },
+      captureLogger([])
+    );
+    await expect(outbox.flush()).rejects.toThrow("receipts reply lost");
+    // The leader applied it; this host never heard, so it stays pending.
+    expect(h.leaderDb.prepare("SELECT outcome FROM actor_runs").get()).toEqual({
+      outcome: "completed",
+    });
+    expect(h.pending().map((e) => e.runId)).toEqual(["run-1"]);
+
+    await outbox.flush();
+    expect(posted).toHaveLength(2);
+    expect(posted[1]).toEqual(posted[0]);
+    expect(h.pending()).toEqual([]);
+    expect(h.records.filter((r) => r.event === "instance_receipt_applied")).toHaveLength(1);
+  });
+
+  it("keeps delivering past a receipt the leader refuses, which stays pending for the next pass", async () => {
+    const h = await receiptSetup();
+    for (const runId of ["run-1", "run-2", "run-3"]) {
+      h.store.startRun({ runId, instanceId: "mac", actorId: "actor-1", modelConfig });
+      h.finish(runId);
+    }
+    // run-1's bytes arrive corrupted on every attempt, so the leader refuses it.
+    const { session } = await h.registerOffering();
+    const posted: string[][] = [];
+    const outbox = new FollowerReceiptOutbox(
+      h.host,
+      async (receipts) => {
+        posted.push(receipts.map((r) => r.runId));
+        const sent = receipts.map((r) =>
+          r.runId === "run-1" ? { ...r, digest: "0".repeat(64) } : r
+        );
+        return (await h.post("/receipts", { id: "mac", session, receipts: sent })).json();
+      },
+      captureLogger([]),
+      { maxReceipts: 1 }
+    );
+    await outbox.flush();
+    expect(posted).toEqual([["run-1"], ["run-2"], ["run-3"]]);
+    expect(h.pending().map((e) => e.runId)).toEqual(["run-1"]);
+    posted.length = 0;
+    await outbox.flush();
+    expect(posted).toEqual([["run-1"]]);
+    expect(h.leaderDb.prepare("SELECT id FROM actor_runs WHERE outcome IS NULL").all()).toEqual([
+      { id: "run-1" },
+    ]);
+  });
+  it("delivers, in the same pass, a receipt committed while earlier ones are acknowledged and dropped", async () => {
+    const h = await receiptSetup();
+    const { session } = await h.registerOffering();
+    for (const runId of ["run-1", "run-2", "run-3", "run-4"]) {
+      h.store.startRun({ runId, instanceId: "mac", actorId: "actor-1", modelConfig });
+    }
+    h.finish("run-1");
+    h.finish("run-2");
+    h.finish("run-3");
+    const posted: string[][] = [];
+    const outbox = new FollowerReceiptOutbox(
+      h.host,
+      async (receipts) => {
+        posted.push(receipts.map((receipt) => receipt.runId));
+        // run-1 and run-2 are already dropped when run-3 is in flight; run-4
+        // commits now, behind every id this pass has handed out.
+        if (receipts[0].runId === "run-3") h.finish("run-4");
+        return (await h.post("/receipts", { id: "mac", session, receipts })).json();
+      },
+      captureLogger([]),
+      { maxReceipts: 1 }
+    );
+    await outbox.flush();
+    expect(posted).toEqual([["run-1"], ["run-2"], ["run-3"], ["run-4"]]);
+    expect(h.pending()).toEqual([]);
+    expect(
+      h.leaderDb.prepare("SELECT id FROM actor_runs WHERE outcome = 'completed' ORDER BY id").all()
+    ).toEqual([{ id: "run-1" }, { id: "run-2" }, { id: "run-3" }, { id: "run-4" }]);
+  });
+
+  it("delivers a receipt committed after a pass's last page read, before that pass settles", async () => {
+    const h = await receiptSetup();
+    const { session } = await h.registerOffering();
+    for (const runId of ["run-1", "run-2"]) {
+      h.store.startRun({ runId, instanceId: "mac", actorId: "actor-1", modelConfig });
+    }
+    h.finish("run-1");
+    let outbox: FollowerReceiptOutbox | undefined;
+    let committed = false;
+    // The pass's final page read comes back empty; run-2 commits, and its flush
+    // is requested, in the window before the pass settles.
+    const receipts: FollowerRunReceipts = {
+      start: (...args) => h.host.start(...args),
+      complete: (...args) => h.host.complete(...args),
+      abandon: (...args) => h.host.abandon(...args),
+      recoverOpen: (...args) => h.host.recoverOpen(...args),
+      markAcked: (...args) => h.host.markAcked(...args),
+      listUnacked: (afterId, limit) => {
+        const page = h.host.listUnacked(afterId, limit);
+        if (page.length === 0 && afterId > 0 && !committed) {
+          committed = true;
+          queueMicrotask(() => {
+            h.finish("run-2");
+            void outbox?.flush();
+          });
+        }
+        return page;
+      },
+    };
+    const posted: string[][] = [];
+    outbox = new FollowerReceiptOutbox(
+      receipts,
+      async (batch) => {
+        posted.push(batch.map((receipt) => receipt.runId));
+        return (await h.post("/receipts", { id: "mac", session, receipts: batch })).json();
+      },
+      captureLogger([])
+    );
+    await outbox.flush();
+    expect(committed).toBe(true);
+    expect(posted).toEqual([["run-1"], ["run-2"]]);
+    expect(h.pending()).toEqual([]);
+  });
+
+  it("retries a refusal that clears on its own after a fixed delay, never while a pass runs", async () => {
+    const h = await receiptSetup();
+    const { session } = await h.registerOffering();
+    // At the conflict bound, run-9's receipt overtaking its run start is
+    // refused, unstored, so the run's start has nothing to apply.
+    const insert = h.leaderDb.prepare(
+      `INSERT INTO instance_receipt_conflicts
+         (instance_id, run_id, kind, digest, receipt, received_at)
+       VALUES ('mac', ?, 'unknown_run', 'd', 'r', 't')`
+    );
+    h.leaderDb.transaction(() => {
+      for (let n = 1; n <= RUN_RECEIPT_CONFLICTS_MAX_PER_INSTANCE; n++) insert.run(`stored-${n}`);
+    })();
+    h.finish("run-9");
+    let now = 0;
+    let posts = 0;
+    let hold: Promise<void> | undefined;
+    const outbox = new FollowerReceiptOutbox(
+      h.host,
+      async (receipts) => {
+        posts += 1;
+        await hold;
+        return (await h.post("/receipts", { id: "mac", session, receipts })).json();
+      },
+      captureLogger([]),
+      { refusedRetryMs: 1_000 },
+      () => now
+    );
+    expect(outbox.retryDue()).toBe(false);
+    // Every refusing pass waits the same delay.
+    for (let pass = 0; pass < 3; pass++) {
+      await outbox.flush();
+      expect(outbox.retryDue()).toBe(false);
+      now += 999;
+      expect(outbox.retryDue()).toBe(false);
+      now += 1;
+      expect(outbox.retryDue()).toBe(true);
+    }
+    expect(posts).toBe(3);
+
+    // A due retry starts a pass; while it waits on the leader, it is not due again.
+    let release!: () => void;
+    hold = new Promise((resolve) => (release = resolve));
+    const inFlight = outbox.flush();
+    now += 5_000;
+    expect(outbox.retryDue()).toBe(false);
+    release();
+    await inFlight;
+    hold = undefined;
+    expect(posts).toBe(4);
+    expect(outbox.retryDue()).toBe(false);
+    now += 1_000;
+    expect(outbox.retryDue()).toBe(true);
+    expect(h.pending().map((e) => e.runId)).toEqual(["run-9"]);
+
+    // The run starts; the next due pass applies the receipt and stops retrying.
+    h.store.startRun({ runId: "run-9", instanceId: "mac", actorId: "actor-1", modelConfig });
+    await outbox.flush();
+    expect(h.pending()).toEqual([]);
+    expect(h.leaderDb.prepare("SELECT outcome FROM actor_runs WHERE id = 'run-9'").get()).toEqual({
+      outcome: "completed",
+    });
+    now += 60_000;
+    expect(outbox.retryDue()).toBe(false);
   });
 });

@@ -30,6 +30,10 @@ import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
 import { RunPromptRepository } from "./run-prompt-repository.js";
+import {
+  HostRunReceiptRepository,
+  InstanceRunReceiptRepository,
+} from "./run-receipt-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 import {
   type InboxListenerErrorHandler,
@@ -50,11 +54,26 @@ export interface FollowerRepositories {
     "start" | "complete" | "abandon" | "abandonOpen" | "listRecentCompleted"
   >;
   readonly runPrompts: Pick<RunPromptRepository, "recordForActor">;
+  /**
+   * Run terminals bound to this host's configured instance ID, each committed
+   * with its durable receipt for the leader (#1020). Present only when the
+   * composition supplies that identity; `rusa start` always does.
+   */
+  readonly runReceipts?: FollowerRunReceipts;
 }
 
-export function createFollowerRepositories(db: Database.Database): FollowerRepositories {
+export type FollowerRunReceipts = Pick<
+  HostRunReceiptRepository,
+  "start" | "complete" | "abandon" | "recoverOpen" | "listUnacked" | "markAcked"
+>;
+
+export function createFollowerRepositories(
+  db: Database.Database,
+  host?: { instanceId: string }
+): FollowerRepositories {
   const runs = new ActorRunRepository(db);
   const prompts = new RunPromptRepository(db);
+  const receipts = host ? new HostRunReceiptRepository(db, host.instanceId) : undefined;
   return Object.freeze({
     actorRuns: Object.freeze({
       start: (opts) => runs.start(opts),
@@ -66,6 +85,20 @@ export function createFollowerRepositories(db: Database.Database): FollowerRepos
     runPrompts: Object.freeze({
       recordForActor: (actorId, runId, prompt) => prompts.recordForActor(actorId, runId, prompt),
     } satisfies FollowerRepositories["runPrompts"]),
+    ...(receipts
+      ? {
+          runReceipts: Object.freeze({
+            start: (opts) => receipts.start(opts),
+            complete: (runId, actorId, result, termination, endedAt) =>
+              receipts.complete(runId, actorId, result, termination, endedAt),
+            abandon: (runId, actorId, reason, termination, endedAt) =>
+              receipts.abandon(runId, actorId, reason, termination, endedAt),
+            recoverOpen: (reason, endedAt) => receipts.recoverOpen(reason, endedAt),
+            listUnacked: (afterId, limit) => receipts.listUnacked(afterId, limit),
+            markAcked: (runIds) => receipts.markAcked(runIds),
+          } satisfies FollowerRunReceipts),
+        }
+      : {}),
   });
 }
 
@@ -109,6 +142,7 @@ export class Repositories {
   readonly portableContext: DbPortableContextStore;
   readonly principals: PrincipalRepository;
   readonly referenceCache: ReferenceCacheRepository;
+  readonly runReceipts: InstanceRunReceiptRepository;
 
   constructor(db: Database.Database) {
     this.runPrompts = new RunPromptRepository(db);
@@ -152,6 +186,7 @@ export class Repositories {
     this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
     this.portableContext = new DbPortableContextStore(db);
     this.referenceCache = new ReferenceCacheRepository(db);
+    this.runReceipts = new InstanceRunReceiptRepository(db);
   }
 
   /**

@@ -1475,8 +1475,18 @@ async function composeStart(
   if (recoveredOpenRuns > 0) {
     log.warn("unterminated_runs_recovered", { runs: recoveredOpenRuns });
   }
+  // A follower's receipt-backed run ends only by its receipt (#1119); a
+  // leader restart leaves it open and says so.
+  const unresolvedRemoteRuns = getRepositories().runReceipts.unresolvedRuns(20);
+  if (unresolvedRemoteRuns.runs > 0) {
+    log.warn("instance_receipt_runs_unresolved", unresolvedRemoteRuns);
+  }
 
-  const runAccounting = createRunAccounting(() => getRepositories().actorRuns);
+  const runAccounting = createRunAccounting(
+    () => getRepositories().actorRuns,
+    () => getRepositories().runReceipts,
+    log
+  );
   const inboxFocusResolver = new InboxFocusResolver(
     getRepositories().inboxFocus,
     getRepositories().obligations,
@@ -3076,6 +3086,11 @@ async function composeStart(
       logger: log,
       triggerStore: followerTriggerStore,
       allowedFollowerIds,
+      // Followers that can commit durable run receipts report their terminals
+      // through this store rather than the transport (#1020).
+      runReceipts: {
+        apply: (instanceId, envelope) => getRepositories().runReceipts.apply(instanceId, envelope),
+      },
     });
     await followerHub.listen(config.followers.bind, config.followers.port);
     const hub = followerHub;
@@ -3226,7 +3241,7 @@ async function composeStart(
         launchContext = actors.get(id)?.context;
         mesh.clearSelection(id);
         const launchConfig = projectActorRunLaunchConfig(event.selected);
-        runAccounting.begin(id, event.runId, launchConfig);
+        runAccounting.begin(id, event.runId, launchConfig, event.durableHost);
       },
       onEnd: (event) => {
         if (event.terminal.kind === "abandoned") {
@@ -3283,16 +3298,22 @@ async function composeStart(
       onEnd: async (event) => {
         activeRunSelections.delete(id);
         if (event.terminal.kind === "abandoned") {
+          const { unresolved } = event.terminal;
           runLogger(id, event.runId).warn("run_abandoned", {
             reason: event.terminal.reason,
             started: event.terminal.started,
+            ...(unresolved ? { termination: "unresolved" } : {}),
           });
+          // A released claim, not a durable completion: an unresolved
+          // receipt-backed run keeps both durable rows open (#1119 ruling).
           mesh.recordEvent({
             kind: "run_abandoned",
             actorId: id,
             detail: event.terminal.reason,
+            body: unresolved?.cause,
             payload: JSON.stringify({
               started: event.terminal.started,
+              ...(unresolved ? { termination: "unresolved" as const } : {}),
             } satisfies RunAbandonedPayload),
           });
           return;
