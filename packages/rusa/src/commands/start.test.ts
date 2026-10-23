@@ -5590,6 +5590,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(mesh.actors.get(rootId)?.context).toEqual({ type: "portable", mode: "brief" });
       expect(mesh.actors.get(rootId)?.desiredContextConfig).toBeUndefined();
       expect(rootOpts.buildPrompt().prompt).toContain("ROOT_BRIEF_SWITCH_MARKER");
+      expect(store.load(rootId)).toEqual(retained);
+      return;
     }
     await shutdownFn?.();
     shutdownFn = undefined;
@@ -5597,13 +5599,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // the run-end callback never ran, and config still says tail.
     initDb(homeDir);
     const reopened = getRepositories().actors.get(rootId);
-    expect(reopened?.context).toEqual({
-      type: "portable",
-      mode: boundary === "restart" ? "tail" : "brief",
-    });
-    expect(reopened?.desiredContextConfig).toEqual(
-      boundary === "restart" ? { type: "portable", mode: "brief" } : undefined
-    );
+    expect(reopened?.context).toEqual({ type: "portable", mode: "tail" });
+    expect(reopened?.desiredContextConfig).toEqual({ type: "portable", mode: "brief" });
     closeDb();
     const restarted = await boot();
     expect(restarted.mesh.prepareRun(rootId)).toBe(true);

@@ -5014,14 +5014,25 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       const { mesh, registry } = setup({ rootId: configuredId });
       const client = await connect(createAgentExecMcpServer(mesh, configuredId, configuredId));
 
-      for (const actor_id of [configuredId, "root"]) {
+      for (const [actor_id, oldMode, context_mode] of [
+        [configuredId, "native", "tail"],
+        ["root", "tail", "brief"],
+      ]) {
         const res = (await client.callTool({
           name: "set_actor_context",
-          arguments: { actor_id, context_mode: "brief" },
+          arguments: { actor_id, context_mode },
         })) as CallToolResult;
 
         expect(res.isError).toBeFalsy();
-        expect(registry.get(configuredId)?.context).toEqual({ type: "portable", mode: "brief" });
+        expect(res.content[0]).toMatchObject({
+          text: expect.stringContaining(
+            `applied context mode update for ${configuredId} (${oldMode} -> ${context_mode})`
+          ),
+        });
+        expect(registry.get(configuredId)?.context).toEqual({
+          type: "portable",
+          mode: context_mode,
+        });
       }
     });
 

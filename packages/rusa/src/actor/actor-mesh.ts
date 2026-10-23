@@ -5522,7 +5522,7 @@ export class ActorMesh {
    * Update an actor's context mode in-place.
    *
    * Ancestor or subtree admin authority, with self changes limited to the configured
-   * root acting on operator direction. Retired actors are refused.
+   * root. Retired actors are refused.
    *
    * A switch to native is refused while the actor holds a multi-entry pool or class reference.
    * Staged for running actors; applied immediately for idle or queued actors.
