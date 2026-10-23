@@ -2194,6 +2194,51 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     expect(h.events.filter((e) => e.actorId === id && e.event.type === "runStart")).toHaveLength(1);
   });
 
+  it("drops a cancelled provider acknowledgement and ignores its late reply before the next wake", async () => {
+    const providerRun = vi.fn(async () => ({ success: true, output: "acknowledged", exitCode: 0 }));
+    const h = setup({
+      providerFactory: (_bridge, _options, selected) => ({
+        name: "acknowledgement-fixture",
+        providerName: "acknowledgement-fixture",
+        model: selected?.model,
+        run: providerRun,
+      }),
+    });
+    const held: Parameters<typeof h.remote.receive>[0][] = [];
+    const receive = h.remote.receive.bind(h.remote);
+    h.remote.receive = (event) => {
+      if (event.message.type === "request" && event.message.request.op === "providerAttempt") {
+        held.push(event);
+        return;
+      }
+      receive(event);
+    };
+
+    const id = h.spawn("Wait for the leader to acknowledge this provider attempt");
+    await waitUntil(() => held.length === 1 && runStarts(h, id).length === 1);
+    expect(providerRun).not.toHaveBeenCalled();
+
+    expect(h.mesh.interrupt(id, h.user.id)).toEqual({ interrupted: true });
+    await waitUntil(() => runResults(h, id).length === 1);
+    expect(providerRun).not.toHaveBeenCalled();
+    expect(runResults(h, id)[0]).toMatchObject({
+      event: { type: "result", result: { success: false, cancelled: true, exitCode: 143 } },
+    });
+
+    // The reply still reaches the leader, but the follower has already removed
+    // the request from its pending map, so it cannot revive a cancelled launch.
+    h.remote.receive = receive;
+    for (const event of held.splice(0)) receive(event);
+    await delay(25);
+    expect(providerRun).not.toHaveBeenCalled();
+    expect(runResults(h, id)).toHaveLength(1);
+
+    h.dispatchNormal(id, "test:acknowledged-successor");
+    await waitUntil(() => runResults(h, id).length === 2);
+    expect(providerRun).toHaveBeenCalledTimes(1);
+    expect(h.failures).toEqual([]);
+  });
+
   describe("operator interrupt and halt cancellation (#607)", () => {
     const queuedRunId = (h: ReturnType<typeof setup>, id: string) => {
       const queued = h.events.find((e) => e.actorId === id && e.event.type === "queued")?.event;

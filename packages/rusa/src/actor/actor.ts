@@ -205,7 +205,7 @@ export interface ActorOptions {
    * promise settles, so a hook that publishes the attempt elsewhere can confirm
    * it is installed before the provider can act under it.
    */
-  onProviderAttempt?: (provider: ProviderAttempt) => void | Promise<void>;
+  onProviderAttempt?: (provider: ProviderAttempt, signal?: AbortSignal) => void | Promise<void>;
   /**
    * Prepare one provider invocation after its prompt is assembled, before
    * `onProviderAttempt` and the adapter. A rejection prevents that provider
@@ -779,7 +779,13 @@ export class Actor {
       startWatchdogTimers();
       try {
         const promptAttempt = await this.opts.beforeProviderAttempt?.({ runId });
-        await this.opts.onProviderAttempt?.(provider);
+        await this.opts.onProviderAttempt?.(provider, attempt.signal);
+        // An acknowledgement can be held while either watchdog or an explicit
+        // interruption stops this attempt. Do not let its eventual completion
+        // cross that cancellation boundary and spawn a provider anyway.
+        if (attempt.signal.aborted) {
+          return { success: false, ...formatSigtermResult("", attempt.signal) };
+        }
         const result = await provider.run({
           prompt,
           onPromptLaunched: (prompt) => {
@@ -821,6 +827,14 @@ export class Actor {
           attributeAbort(result, attempt.signal);
         }
         return result;
+      } catch (error) {
+        // A cancellation-aware pre-launch hook rejects when its acknowledgement
+        // is withdrawn. Keep the normal terminal-attribution path rather than
+        // treating that expected cancellation as an unclassified hook failure.
+        if (attempt.signal.aborted) {
+          return { success: false, ...formatSigtermResult("", attempt.signal) };
+        }
+        throw error;
       } finally {
         clearTimers();
         abortController.signal.removeEventListener("abort", stop);

@@ -189,6 +189,44 @@ describe("Actor", () => {
     expect(attempts).toEqual([{ provider: provider.providerName, model: "gpt-5.6-terra" }]);
   });
 
+  it.each([
+    [
+      "the stall watchdog",
+      (_actor: Actor) => vi.advanceTimersByTimeAsync(WATCHDOG_STALL_TIMEOUT_MS),
+    ],
+    ["a manual interrupt", (actor: Actor) => actor.interrupt("operator")],
+    ["responsive preemption", (actor: Actor) => actor.preemptForResponsive()],
+  ] as const)("does not launch a provider after %s cancels its attempt acknowledgement", async (_label, stop) => {
+    const provider = new FakeProvider();
+    const onRunEnd = vi.fn();
+    let acknowledgementSignal: AbortSignal | undefined;
+    const actor = makeActor(
+      {
+        onRunEnd,
+        onProviderAttempt: (_attempt, signal?: AbortSignal) => {
+          acknowledgementSignal = signal;
+          return new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+      provider
+    );
+
+    actor.requestRun({ priority: "responsive" });
+    await flush();
+
+    expect(acknowledgementSignal).toBeDefined();
+    await stop(actor);
+    await flush();
+
+    expect(provider.calls).toHaveLength(0);
+    expect(onRunEnd).toHaveBeenCalledTimes(1);
+    expect(onRunEnd).toHaveBeenLastCalledWith(
+      expect.objectContaining({ success: false, cancelled: true, exitCode: 143 })
+    );
+  });
+
   it("keeps active attempt attribution on its launched model when a later model is staged", async () => {
     let runCount = 0;
     const attempts: RawProviderModelConfig[] = [];
