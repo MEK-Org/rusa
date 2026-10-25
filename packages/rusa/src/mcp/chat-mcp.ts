@@ -5,7 +5,9 @@ import { z } from "zod";
 import { generateHandle } from "../actor/handle-generator.js";
 import { isGchatThreadHead } from "../actor/inbox-hints.js";
 import {
+  type ChatAttachmentDataRef,
   type ChatClient,
+  type ChatSendMessageAttachment,
   type ChatSpace,
   MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
@@ -583,7 +585,8 @@ export function createChatWriteMcpServer(
                 .describe("Attachment resource name returned by upload_attachment"),
               attachmentDataRef: z
                 .object({
-                  resourceName: z.string(),
+                  resourceName: z.string().optional(),
+                  attachmentUploadToken: z.string().optional(),
                 })
                 .optional()
                 .describe("Attachment data ref object returned by upload_attachment"),
@@ -614,21 +617,28 @@ export function createChatWriteMcpServer(
         if (!isAllowed(spaceName)) {
           throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
-        const normalizedAttachments: Array<{
-          attachmentDataRef: { resourceName: string };
-          resourceName?: string;
-        }> = [];
+        const normalizedAttachments: ChatSendMessageAttachment[] = [];
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {
-            if (att.attachmentDataRef?.resourceName) {
-              normalizedAttachments.push({
-                attachmentDataRef: { resourceName: att.attachmentDataRef.resourceName },
-              });
-            } else if (att.resourceName) {
-              normalizedAttachments.push({
-                attachmentDataRef: { resourceName: att.resourceName },
-                resourceName: att.resourceName,
-              });
+            if (att.attachmentDataRef !== undefined) {
+              const rawToken = att.attachmentDataRef.attachmentUploadToken;
+              const rawResource = att.attachmentDataRef.resourceName;
+              const hasToken = rawToken !== undefined && rawToken.trim().length > 0;
+              const hasResource = rawResource !== undefined && rawResource.trim().length > 0;
+              if (!hasToken && !hasResource) {
+                throw new Error(
+                  "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
+                );
+              }
+              const dataRef: ChatAttachmentDataRef = {};
+              if (rawToken !== undefined && hasToken) dataRef.attachmentUploadToken = rawToken;
+              if (rawResource !== undefined && hasResource) dataRef.resourceName = rawResource;
+              normalizedAttachments.push({ attachmentDataRef: dataRef });
+            } else if (att.resourceName !== undefined) {
+              if (att.resourceName.trim().length === 0) {
+                throw new Error("malformed attachment reference: resourceName must not be empty");
+              }
+              normalizedAttachments.push({ attachmentDataRef: { resourceName: att.resourceName } });
             } else if (att.filePath) {
               const confinedPath = await resolveAttachmentPath(workDir, att.filePath);
               const buf = await readBoundedRegularFile(
@@ -669,6 +679,10 @@ export function createChatWriteMcpServer(
                 mimeType
               );
               normalizedAttachments.push(uploaded);
+            } else {
+              throw new Error(
+                "malformed attachment reference: attachment must provide attachmentDataRef, resourceName, filePath, or contentBase64"
+              );
             }
           }
         }
