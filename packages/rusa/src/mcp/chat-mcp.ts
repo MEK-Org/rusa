@@ -625,32 +625,22 @@ export function createChatWriteMcpServer(
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {
             const hasDataRef = att.attachmentDataRef !== undefined;
-            const refToken =
-              att.attachmentDataRef?.attachmentUploadToken?.trim() ||
-              att.attachmentUploadToken?.trim();
-            const refResource =
-              att.attachmentDataRef?.resourceName?.trim() || att.resourceName?.trim();
+            const rawToken =
+              att.attachmentDataRef?.attachmentUploadToken ?? att.attachmentUploadToken;
+            const rawResource = att.attachmentDataRef?.resourceName ?? att.resourceName;
+            const hasToken = rawToken !== undefined && rawToken.trim().length > 0;
+            const hasResource = rawResource !== undefined && rawResource.trim().length > 0;
 
-            if (hasDataRef) {
-              if (!refToken && !refResource) {
-                throw new Error(
-                  "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
-                );
-              }
+            if (hasDataRef && !hasToken && !hasResource) {
+              throw new Error(
+                "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
+              );
+            }
+
+            if (hasDataRef || hasToken || hasResource) {
               const dataRef: ChatAttachmentDataRef = {};
-              if (refToken) dataRef.attachmentUploadToken = refToken;
-              if (refResource) dataRef.resourceName = refResource;
-              normalizedAttachments.push({
-                attachmentDataRef: dataRef,
-                ...(att.resourceName ? { resourceName: att.resourceName } : {}),
-                ...(att.attachmentUploadToken
-                  ? { attachmentUploadToken: att.attachmentUploadToken }
-                  : {}),
-              });
-            } else if (refToken || refResource) {
-              const dataRef: ChatAttachmentDataRef = {};
-              if (refToken) dataRef.attachmentUploadToken = refToken;
-              if (refResource) dataRef.resourceName = refResource;
+              if (rawToken && hasToken) dataRef.attachmentUploadToken = rawToken;
+              if (rawResource && hasResource) dataRef.resourceName = rawResource;
               normalizedAttachments.push({
                 attachmentDataRef: dataRef,
                 ...(att.resourceName ? { resourceName: att.resourceName } : {}),

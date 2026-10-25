@@ -453,6 +453,20 @@ describe("chat MCP server", () => {
     expect(fake.messages[0]?.attachment?.[0]?.attachmentDataRef).toEqual({
       attachmentUploadToken: "fake-upload-token-1",
     });
+
+    // Validates nonemptiness with trim while preserving original token characters unchanged
+    const sendOpaque = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "opaque token",
+        attachments: [{ attachmentDataRef: { attachmentUploadToken: "  opaque-token-exact  " } }],
+      },
+    })) as CallToolResult;
+    expect(sendOpaque.isError).toBeFalsy();
+    expect(fake.sent[1]?.attachments?.[0]?.attachmentDataRef?.attachmentUploadToken).toBe(
+      "  opaque-token-exact  "
+    );
   });
 
   it("supports direct attachmentUploadToken and dual references in send_message attachments", async () => {
@@ -509,33 +523,48 @@ describe("chat MCP server", () => {
   });
 
   it("handles inline filePath and contentBase64 uploads when upload returns token-only response", async () => {
-    const fake = new FakeChatClient({ uploadResponseMode: "token" });
-    const client = await connect(
-      createChatWriteMcpServer("test", fake, {
-        allowedSpaces: ["spaces/A"],
-        actorHandle: "actor-handle",
-      })
-    );
+    const tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "chat-mcp-token-upload-")));
+    try {
+      const filePath = join(tmpDir, "report.txt");
+      writeFileSync(filePath, Buffer.from("disk payload bytes"));
 
-    const res = (await client.callTool({
-      name: "send_message",
-      arguments: {
-        spaceName: "spaces/A",
-        text: "inline upload message",
-        attachments: [
-          {
-            contentBase64: Buffer.from("payload bytes").toString("base64"),
-            filename: "payload.bin",
-          },
-        ],
-      },
-    })) as CallToolResult;
-    expect(res.isError).toBeFalsy();
-    expect(fake.sent[0]?.attachments).toEqual([
-      {
-        attachmentDataRef: { attachmentUploadToken: "fake-upload-token-1" },
-      },
-    ]);
+      const fake = new FakeChatClient({ uploadResponseMode: "token" });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          actorHandle: "actor-handle",
+          workDir: tmpDir,
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "inline upload message",
+          attachments: [
+            {
+              contentBase64: Buffer.from("base64 payload bytes").toString("base64"),
+              filename: "payload.bin",
+            },
+            {
+              filePath,
+            },
+          ],
+        },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(fake.sent[0]?.attachments).toEqual([
+        {
+          attachmentDataRef: { attachmentUploadToken: "fake-upload-token-1" },
+        },
+        {
+          attachmentDataRef: { attachmentUploadToken: "fake-upload-token-2" },
+        },
+      ]);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   it("rejects malformed attachment references in send_message", async () => {
