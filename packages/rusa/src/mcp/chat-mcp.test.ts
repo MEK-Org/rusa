@@ -410,6 +410,204 @@ describe("chat MCP server", () => {
     });
   });
 
+  it("forwards token-only upload result into send_message with unchanged reference", async () => {
+    const fake = new FakeChatClient({ uploadResponseMode: "token" });
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["spaces/A"],
+        actorHandle: "actor-handle",
+      })
+    );
+    const uploadRes = (await client.callTool({
+      name: "upload_attachment",
+      arguments: {
+        spaceName: "spaces/A",
+        filename: "doc.txt",
+        contentBase64: Buffer.from("hello world").toString("base64"),
+        mimeType: "text/plain",
+      },
+    })) as CallToolResult;
+    expect(uploadRes.isError).toBeFalsy();
+    const uploadData = JSON.parse(textOf(uploadRes)) as {
+      attachmentDataRef: { attachmentUploadToken: string; resourceName?: string };
+    };
+    expect(uploadData).toEqual({
+      attachmentDataRef: { attachmentUploadToken: "fake-upload-token-1" },
+    });
+    expect(uploadData.attachmentDataRef.resourceName).toBeUndefined();
+
+    const sendRes = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "hello with token",
+        attachments: [{ attachmentDataRef: uploadData.attachmentDataRef }],
+      },
+    })) as CallToolResult;
+    expect(sendRes.isError).toBeFalsy();
+    expect(fake.sent[0]?.attachments).toEqual([
+      {
+        attachmentDataRef: { attachmentUploadToken: "fake-upload-token-1" },
+      },
+    ]);
+    expect(fake.messages[0]?.attachment?.[0]?.attachmentDataRef).toEqual({
+      attachmentUploadToken: "fake-upload-token-1",
+    });
+  });
+
+  it("supports direct attachmentUploadToken and dual references in send_message attachments", async () => {
+    const fake = new FakeChatClient();
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["spaces/A"],
+        actorHandle: "actor-handle",
+      })
+    );
+
+    // Direct attachmentUploadToken on attachment object
+    const res1 = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "direct token",
+        attachments: [{ attachmentUploadToken: "synthetic-token-direct" }],
+      },
+    })) as CallToolResult;
+    expect(res1.isError).toBeFalsy();
+    expect(fake.sent[0]?.attachments).toEqual([
+      {
+        attachmentDataRef: { attachmentUploadToken: "synthetic-token-direct" },
+        attachmentUploadToken: "synthetic-token-direct",
+      },
+    ]);
+
+    // Dual reference containing both resourceName and attachmentUploadToken
+    const res2 = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "dual ref",
+        attachments: [
+          {
+            attachmentDataRef: {
+              resourceName: "spaces/A/attachments/RES1",
+              attachmentUploadToken: "synthetic-token-dual",
+            },
+          },
+        ],
+      },
+    })) as CallToolResult;
+    expect(res2.isError).toBeFalsy();
+    expect(fake.sent[1]?.attachments).toEqual([
+      {
+        attachmentDataRef: {
+          resourceName: "spaces/A/attachments/RES1",
+          attachmentUploadToken: "synthetic-token-dual",
+        },
+      },
+    ]);
+  });
+
+  it("handles inline filePath and contentBase64 uploads when upload returns token-only response", async () => {
+    const fake = new FakeChatClient({ uploadResponseMode: "token" });
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["spaces/A"],
+        actorHandle: "actor-handle",
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "inline upload message",
+        attachments: [
+          {
+            contentBase64: Buffer.from("payload bytes").toString("base64"),
+            filename: "payload.bin",
+          },
+        ],
+      },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(fake.sent[0]?.attachments).toEqual([
+      {
+        attachmentDataRef: { attachmentUploadToken: "fake-upload-token-1" },
+      },
+    ]);
+  });
+
+  it("rejects malformed attachment references in send_message", async () => {
+    const fake = new FakeChatClient();
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["spaces/A"],
+        actorHandle: "actor-handle",
+      })
+    );
+
+    // Empty attachmentDataRef object
+    const resEmptyDataRef = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "msg",
+        attachments: [{ attachmentDataRef: {} }],
+      },
+    })) as CallToolResult;
+    expect(resEmptyDataRef.isError).toBe(true);
+    expect(textOf(resEmptyDataRef)).toContain("malformed attachment reference");
+
+    // Whitespace/empty fields in attachmentDataRef
+    const resWhitespaceDataRef = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "msg",
+        attachments: [{ attachmentDataRef: { resourceName: "   ", attachmentUploadToken: "" } }],
+      },
+    })) as CallToolResult;
+    expect(resWhitespaceDataRef.isError).toBe(true);
+    expect(textOf(resWhitespaceDataRef)).toContain("malformed attachment reference");
+
+    // Empty resourceName string
+    const resEmptyResource = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "msg",
+        attachments: [{ resourceName: "   " }],
+      },
+    })) as CallToolResult;
+    expect(resEmptyResource.isError).toBe(true);
+    expect(textOf(resEmptyResource)).toContain("malformed attachment reference");
+
+    // Empty attachmentUploadToken string
+    const resEmptyToken = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "msg",
+        attachments: [{ attachmentUploadToken: "" }],
+      },
+    })) as CallToolResult;
+    expect(resEmptyToken.isError).toBe(true);
+    expect(textOf(resEmptyToken)).toContain("malformed attachment reference");
+
+    // Empty attachment object (no file source and no reference)
+    const resEmptyAttachment = (await client.callTool({
+      name: "send_message",
+      arguments: {
+        spaceName: "spaces/A",
+        text: "msg",
+        attachments: [{}],
+      },
+    })) as CallToolResult;
+    expect(resEmptyAttachment.isError).toBe(true);
+    expect(textOf(resEmptyAttachment)).toContain("malformed attachment reference");
+  });
+
   it("rejects malformed or loose attachment resource names on download_attachment", async () => {
     const fake = new FakeChatClient();
     const client = await connect(createChatReadMcpServer(fake));

@@ -1,4 +1,9 @@
-import type { ChatAttachment, ChatMessage, ChatSpaceMember } from "./types.js";
+import type {
+  ChatAttachment,
+  ChatAttachmentDataRef,
+  ChatMessage,
+  ChatSpaceMember,
+} from "./types.js";
 
 /**
  * Parsing for Google Workspace Events `google.workspace.chat.message.v1.created`
@@ -28,7 +33,7 @@ interface RawAttachment {
   name?: string;
   contentName?: string;
   contentType?: string;
-  attachmentDataRef?: { resourceName?: string };
+  attachmentDataRef?: ChatAttachmentDataRef;
   driveDataRef?: { driveFileId?: string };
   thumbnailUri?: string;
   downloadUri?: string;

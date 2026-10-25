@@ -28,6 +28,8 @@ export const MEDIA_TOKEN_RE = /^media\/.+$/;
 export interface ChatAttachmentDataRef {
   /** Resource name for the uploaded attachment media. */
   resourceName?: string;
+  /** Upload token for creating/updating messages with uploaded data. */
+  attachmentUploadToken?: string;
 }
 
 export interface ChatDriveDataRef {
@@ -164,6 +166,8 @@ export interface ChatSpaceMemberPage {
 export interface ChatSendMessageAttachment {
   /** Resource name of an uploaded attachment. */
   resourceName?: string;
+  /** Upload token of an uploaded attachment. */
+  attachmentUploadToken?: string;
   /** Attachment data reference object. */
   attachmentDataRef?: ChatAttachmentDataRef;
 }
@@ -174,9 +178,7 @@ export interface ChatSendMessageOptions {
 }
 
 export interface ChatUploadAttachmentResult {
-  attachmentDataRef: {
-    resourceName: string;
-  };
+  attachmentDataRef: ChatAttachmentDataRef;
 }
 
 /** Chat actions performed as the authenticated user. */

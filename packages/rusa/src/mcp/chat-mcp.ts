@@ -5,7 +5,9 @@ import { z } from "zod";
 import { generateHandle } from "../actor/handle-generator.js";
 import { isGchatThreadHead } from "../actor/inbox-hints.js";
 import {
+  type ChatAttachmentDataRef,
   type ChatClient,
+  type ChatSendMessageAttachment,
   type ChatSpace,
   MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
@@ -581,9 +583,14 @@ export function createChatWriteMcpServer(
                 .string()
                 .optional()
                 .describe("Attachment resource name returned by upload_attachment"),
+              attachmentUploadToken: z
+                .string()
+                .optional()
+                .describe("Attachment upload token returned by upload_attachment"),
               attachmentDataRef: z
                 .object({
-                  resourceName: z.string(),
+                  resourceName: z.string().optional(),
+                  attachmentUploadToken: z.string().optional(),
                 })
                 .optional()
                 .describe("Attachment data ref object returned by upload_attachment"),
@@ -614,20 +621,42 @@ export function createChatWriteMcpServer(
         if (!isAllowed(spaceName)) {
           throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
-        const normalizedAttachments: Array<{
-          attachmentDataRef: { resourceName: string };
-          resourceName?: string;
-        }> = [];
+        const normalizedAttachments: ChatSendMessageAttachment[] = [];
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {
-            if (att.attachmentDataRef?.resourceName) {
+            const hasDataRef = att.attachmentDataRef !== undefined;
+            const refToken =
+              att.attachmentDataRef?.attachmentUploadToken?.trim() ||
+              att.attachmentUploadToken?.trim();
+            const refResource =
+              att.attachmentDataRef?.resourceName?.trim() || att.resourceName?.trim();
+
+            if (hasDataRef) {
+              if (!refToken && !refResource) {
+                throw new Error(
+                  "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
+                );
+              }
+              const dataRef: ChatAttachmentDataRef = {};
+              if (refToken) dataRef.attachmentUploadToken = refToken;
+              if (refResource) dataRef.resourceName = refResource;
               normalizedAttachments.push({
-                attachmentDataRef: { resourceName: att.attachmentDataRef.resourceName },
+                attachmentDataRef: dataRef,
+                ...(att.resourceName ? { resourceName: att.resourceName } : {}),
+                ...(att.attachmentUploadToken
+                  ? { attachmentUploadToken: att.attachmentUploadToken }
+                  : {}),
               });
-            } else if (att.resourceName) {
+            } else if (refToken || refResource) {
+              const dataRef: ChatAttachmentDataRef = {};
+              if (refToken) dataRef.attachmentUploadToken = refToken;
+              if (refResource) dataRef.resourceName = refResource;
               normalizedAttachments.push({
-                attachmentDataRef: { resourceName: att.resourceName },
-                resourceName: att.resourceName,
+                attachmentDataRef: dataRef,
+                ...(att.resourceName ? { resourceName: att.resourceName } : {}),
+                ...(att.attachmentUploadToken
+                  ? { attachmentUploadToken: att.attachmentUploadToken }
+                  : {}),
               });
             } else if (att.filePath) {
               const confinedPath = await resolveAttachmentPath(workDir, att.filePath);
@@ -669,6 +698,10 @@ export function createChatWriteMcpServer(
                 mimeType
               );
               normalizedAttachments.push(uploaded);
+            } else {
+              throw new Error(
+                "malformed attachment reference: attachment must provide attachmentDataRef, resourceName, attachmentUploadToken, filePath, or contentBase64"
+              );
             }
           }
         }
