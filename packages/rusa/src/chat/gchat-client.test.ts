@@ -565,45 +565,25 @@ describe("GchatClient reads", () => {
 
     const res = await new GchatClient(credentialsDir()).send("spaces/A", "message with att", {
       threadName: "spaces/A/threads/T1",
-      attachments: [{ attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } }],
+      attachments: [
+        { attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } },
+        { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
+      ],
     });
 
     expect(res).toEqual({ name: "spaces/A/messages/M1" });
     const postBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as {
       text: string;
       thread?: { name: string };
-      attachment?: Array<{ attachmentDataRef?: { resourceName: string } }>;
+      attachment?: Array<{ attachmentDataRef?: Record<string, string> }>;
     };
     expect(postBody).toEqual({
       text: "message with att",
       thread: { name: "spaces/A/threads/T1" },
-      attachment: [{ attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } }],
+      attachment: [
+        { attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } },
+        { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
+      ],
     });
-  });
-
-  it("sends a message with attachmentUploadToken mapped onto attachmentDataRef", async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
-          status: 200,
-        })
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ name: "spaces/A/messages/M1" }), { status: 200 })
-      );
-
-    const res = await new GchatClient(credentialsDir()).send("spaces/A", "token attachment", {
-      attachments: [{ attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } }],
-    });
-
-    expect(res).toEqual({ name: "spaces/A/messages/M1" });
-    const postBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as {
-      text: string;
-      attachment?: Array<{ attachmentDataRef?: { attachmentUploadToken?: string } }>;
-    };
-    expect(postBody.attachment).toEqual([
-      { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
-    ]);
   });
 });
