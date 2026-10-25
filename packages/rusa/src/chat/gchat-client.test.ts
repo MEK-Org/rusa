@@ -408,39 +408,6 @@ describe("GchatClient reads", () => {
     expect(headers["content-type"]).toContain("multipart/related; boundary=");
   });
 
-  it("uploads an attachment returning token-only attachmentDataRef", async () => {
-    const fileBytes = Buffer.from("hello world");
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
-          status: 200,
-        })
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            attachmentDataRef: { attachmentUploadToken: "synthetic-token-upload-1" },
-          }),
-          { status: 200 }
-        )
-      );
-
-    const res = await new GchatClient(credentialsDir()).uploadAttachment(
-      "spaces/A",
-      "doc.txt",
-      fileBytes,
-      "text/plain"
-    );
-
-    expect(res).toEqual({
-      attachmentDataRef: { attachmentUploadToken: "synthetic-token-upload-1" },
-    });
-    expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "https://chat.googleapis.com/upload/v1/spaces/A/attachments:upload?upload_type=multipart"
-    );
-  });
-
   it("rejects downloadAttachmentStream if Content-Length exceeds maxSizeBytes", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
@@ -627,10 +594,7 @@ describe("GchatClient reads", () => {
       );
 
     const res = await new GchatClient(credentialsDir()).send("spaces/A", "token attachment", {
-      attachments: [
-        { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
-        { attachmentUploadToken: "synthetic-token-direct-1" },
-      ],
+      attachments: [{ attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } }],
     });
 
     expect(res).toEqual({ name: "spaces/A/messages/M1" });
@@ -640,7 +604,6 @@ describe("GchatClient reads", () => {
     };
     expect(postBody.attachment).toEqual([
       { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
-      { attachmentDataRef: { attachmentUploadToken: "synthetic-token-direct-1" } },
     ]);
   });
 });

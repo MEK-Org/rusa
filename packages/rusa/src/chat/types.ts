@@ -166,8 +166,6 @@ export interface ChatSpaceMemberPage {
 export interface ChatSendMessageAttachment {
   /** Resource name of an uploaded attachment. */
   resourceName?: string;
-  /** Upload token of an uploaded attachment. */
-  attachmentUploadToken?: string;
   /** Attachment data reference object. */
   attachmentDataRef?: ChatAttachmentDataRef;
 }

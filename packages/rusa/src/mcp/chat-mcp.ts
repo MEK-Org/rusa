@@ -583,10 +583,6 @@ export function createChatWriteMcpServer(
                 .string()
                 .optional()
                 .describe("Attachment resource name returned by upload_attachment"),
-              attachmentUploadToken: z
-                .string()
-                .optional()
-                .describe("Attachment upload token returned by upload_attachment"),
               attachmentDataRef: z
                 .object({
                   resourceName: z.string().optional(),
@@ -624,30 +620,25 @@ export function createChatWriteMcpServer(
         const normalizedAttachments: ChatSendMessageAttachment[] = [];
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {
-            const hasDataRef = att.attachmentDataRef !== undefined;
-            const rawToken =
-              att.attachmentDataRef?.attachmentUploadToken ?? att.attachmentUploadToken;
-            const rawResource = att.attachmentDataRef?.resourceName ?? att.resourceName;
-            const hasToken = rawToken !== undefined && rawToken.trim().length > 0;
-            const hasResource = rawResource !== undefined && rawResource.trim().length > 0;
-
-            if (hasDataRef && !hasToken && !hasResource) {
-              throw new Error(
-                "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
-              );
-            }
-
-            if (hasDataRef || hasToken || hasResource) {
+            if (att.attachmentDataRef !== undefined) {
+              const rawToken = att.attachmentDataRef.attachmentUploadToken;
+              const rawResource = att.attachmentDataRef.resourceName;
+              const hasToken = rawToken !== undefined && rawToken.trim().length > 0;
+              const hasResource = rawResource !== undefined && rawResource.trim().length > 0;
+              if (!hasToken && !hasResource) {
+                throw new Error(
+                  "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
+                );
+              }
               const dataRef: ChatAttachmentDataRef = {};
-              if (rawToken && hasToken) dataRef.attachmentUploadToken = rawToken;
-              if (rawResource && hasResource) dataRef.resourceName = rawResource;
-              normalizedAttachments.push({
-                attachmentDataRef: dataRef,
-                ...(att.resourceName ? { resourceName: att.resourceName } : {}),
-                ...(att.attachmentUploadToken
-                  ? { attachmentUploadToken: att.attachmentUploadToken }
-                  : {}),
-              });
+              if (rawToken !== undefined && hasToken) dataRef.attachmentUploadToken = rawToken;
+              if (rawResource !== undefined && hasResource) dataRef.resourceName = rawResource;
+              normalizedAttachments.push({ attachmentDataRef: dataRef });
+            } else if (att.resourceName !== undefined) {
+              if (att.resourceName.trim().length === 0) {
+                throw new Error("malformed attachment reference: resourceName must not be empty");
+              }
+              normalizedAttachments.push({ attachmentDataRef: { resourceName: att.resourceName } });
             } else if (att.filePath) {
               const confinedPath = await resolveAttachmentPath(workDir, att.filePath);
               const buf = await readBoundedRegularFile(
@@ -690,7 +681,7 @@ export function createChatWriteMcpServer(
               normalizedAttachments.push(uploaded);
             } else {
               throw new Error(
-                "malformed attachment reference: attachment must provide attachmentDataRef, resourceName, attachmentUploadToken, filePath, or contentBase64"
+                "malformed attachment reference: attachment must provide attachmentDataRef, resourceName, filePath, or contentBase64"
               );
             }
           }

@@ -1,7 +1,6 @@
 import { basename } from "node:path";
 import {
   type ChatAttachment,
-  type ChatAttachmentDataRef,
   type ChatClient,
   type ChatMessage,
   type ChatMessagePage,
@@ -44,11 +43,11 @@ export class FakeChatSource implements ChatSource {
 export class FakeChatClient implements ChatClient {
   readonly maxDownloadSizeBytes: number;
   readonly maxUploadSizeBytes: number;
-  uploadResponseMode?: "resourceName" | "token" | "both";
+  uploadResponseMode?: "resourceName" | "token";
 
   constructor(options?: {
     maxSizeBytes?: number;
-    uploadResponseMode?: "resourceName" | "token" | "both";
+    uploadResponseMode?: "resourceName" | "token";
   }) {
     this.maxDownloadSizeBytes = Math.min(
       options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
@@ -252,16 +251,13 @@ export class FakeChatClient implements ChatClient {
         name: resourceName,
         contentName: filename,
         contentType: mimeType,
-        attachmentDataRef: { resourceName, attachmentUploadToken },
+        attachmentDataRef: { resourceName },
         source: "UPLOADED_CONTENT",
       },
       data: buf,
     });
     if (this.uploadResponseMode === "token") {
       return { attachmentDataRef: { attachmentUploadToken } };
-    }
-    if (this.uploadResponseMode === "both") {
-      return { attachmentDataRef: { resourceName, attachmentUploadToken } };
     }
     return { attachmentDataRef: { resourceName } };
   }
@@ -280,23 +276,15 @@ export class FakeChatClient implements ChatClient {
     const msgName = `${spaceName}/messages/fake-${this.sent.length}`;
     const attachmentsList: ChatAttachment[] = (opts?.attachments ?? []).map((att) => {
       const ref = att.attachmentDataRef?.resourceName ?? att.resourceName;
-      const token = att.attachmentDataRef?.attachmentUploadToken ?? att.attachmentUploadToken;
+      const token = att.attachmentDataRef?.attachmentUploadToken;
       const uploaded = this.uploadedAttachments.find(
         (u) => (ref && u.resourceName === ref) || (token && u.attachmentUploadToken === token)
       );
-      const dataRef: ChatAttachmentDataRef | undefined =
-        att.attachmentDataRef ??
-        (ref || token
-          ? {
-              ...(ref ? { resourceName: ref } : {}),
-              ...(token ? { attachmentUploadToken: token } : {}),
-            }
-          : undefined);
       return {
         name: `${msgName}/attachments/${ref?.split("/").pop() ?? token ?? "att"}`,
         contentName: uploaded?.filename,
         contentType: uploaded?.mimeType,
-        attachmentDataRef: dataRef,
+        attachmentDataRef: att.attachmentDataRef ?? (ref ? { resourceName: ref } : undefined),
         source: "UPLOADED_CONTENT",
       };
     });

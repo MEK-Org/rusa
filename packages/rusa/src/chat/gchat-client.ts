@@ -313,9 +313,6 @@ export class GchatClient implements ChatClient {
       body.attachment = opts.attachments.map((a) => {
         if (a.attachmentDataRef) return { attachmentDataRef: a.attachmentDataRef };
         if (a.resourceName) return { attachmentDataRef: { resourceName: a.resourceName } };
-        if (a.attachmentUploadToken) {
-          return { attachmentDataRef: { attachmentUploadToken: a.attachmentUploadToken } };
-        }
         return a;
       });
     }
