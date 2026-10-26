@@ -336,7 +336,7 @@ class DashboardStore {
   /// the chat UI then simply renders no walkie toggle.
   final WalkieDeps? walkie;
 
-  /// Avatar file-picker platform dep , wired by the web entrypoint.
+  /// Avatar file-picker platform dep , wired by the platform bootstrap.
   /// Null means unsupported (headless harnesses/tests) — `pickAndUploadAvatar`
   /// then reports a clear error instead of picking a file.
   final AvatarFilePicker? avatarFilePicker;
