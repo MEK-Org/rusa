@@ -11,6 +11,7 @@ import 'package:google_sign_in_android/google_sign_in_android.dart';
 import 'package:google_sign_in_android/src/messages.g.dart';
 
 import 'package:rusa_dashboard/io_firebase_auth.dart';
+import 'package:rusa_dashboard/session.dart';
 
 const _googleChannel =
     'dev.flutter.pigeon.google_sign_in_android.GoogleSignInApi';
@@ -153,10 +154,10 @@ void main() {
         googleServerClientId: '',
       ),
       throwsA(
-        isA<StateError>().having(
-          (e) => e.message,
-          'message',
-          contains('RUSA_GOOGLE_SERVER_CLIENT_ID'),
+        isA<DashboardConfigurationError>().having(
+          (e) => e.missingDefine,
+          'missingDefine',
+          'RUSA_GOOGLE_SERVER_CLIENT_ID',
         ),
       ),
     );
