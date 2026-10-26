@@ -3,11 +3,12 @@ import 'package:intl/intl.dart';
 import '../models.dart';
 import '../theme.dart';
 
-/// Formats a relative reset duration, e.g. "2 days", "25 minutes", "1 hour".
+/// Formats a relative reset duration, e.g. "2 days", "45 hours",
+/// "25 minutes", "1 hour". A reset within two days stays in hours so it does
+/// not hide the denominator of the ring's pacing position.
 String formatRelativeResetDuration(Duration diff) {
-  if (diff.inDays >= 1) {
-    final days = diff.inDays;
-    return '$days ${days == 1 ? 'day' : 'days'}';
+  if (diff.inHours >= 48) {
+    return '${diff.inDays} days';
   }
   if (diff.inHours >= 1) {
     final hours = diff.inHours;
