@@ -284,8 +284,9 @@ class FirebaseDashboardSession extends DashboardSession {
       );
       if (response.statusCode != 200) {
         await _auth.signOut();
-        if (response.statusCode == 409)
+        if (response.statusCode == 409) {
           throw const DashboardAccountSetupError();
+        }
         throw StateError('Sign in denied');
       }
       // A successful response only proves the server attempted to set the
