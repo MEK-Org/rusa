@@ -60,5 +60,4 @@ WalkieDeps? platformCreateWalkieDeps(
 ) =>
     null;
 
-AvatarFilePicker platformCreateAvatarFilePicker() =>
-    const NoopAvatarFilePicker();
+AvatarFilePicker? platformCreateAvatarFilePicker() => null;

@@ -19,11 +19,3 @@ class PickedAvatarImage {
   final Uint8List bytes;
   final String contentType;
 }
-
-/// Fallback avatar picker when running without a file picker (headless tests / mobile).
-class NoopAvatarFilePicker implements AvatarFilePicker {
-  const NoopAvatarFilePicker();
-
-  @override
-  Future<PickedAvatarImage?> pickImage() async => null;
-}
