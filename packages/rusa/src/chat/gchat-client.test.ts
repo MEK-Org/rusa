@@ -565,19 +565,25 @@ describe("GchatClient reads", () => {
 
     const res = await new GchatClient(credentialsDir()).send("spaces/A", "message with att", {
       threadName: "spaces/A/threads/T1",
-      attachments: [{ attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } }],
+      attachments: [
+        { attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } },
+        { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
+      ],
     });
 
     expect(res).toEqual({ name: "spaces/A/messages/M1" });
     const postBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as {
       text: string;
       thread?: { name: string };
-      attachment?: Array<{ attachmentDataRef?: { resourceName: string } }>;
+      attachment?: Array<{ attachmentDataRef?: Record<string, string> }>;
     };
     expect(postBody).toEqual({
       text: "message with att",
       thread: { name: "spaces/A/threads/T1" },
-      attachment: [{ attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } }],
+      attachment: [
+        { attachmentDataRef: { resourceName: "spaces/A/attachments/RES1" } },
+        { attachmentDataRef: { attachmentUploadToken: "synthetic-token-send-1" } },
+      ],
     });
   });
 });
