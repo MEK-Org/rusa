@@ -1,43 +1,32 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_web_plugins/url_strategy.dart';
-import 'package:web/web.dart' as web;
 
 import 'api.dart';
 import 'app.dart';
 import 'breakpoints.dart';
-import 'avatar_upload_web.dart';
 import 'dashboard_title.dart';
 import 'iu/iu_reports_view.dart';
 import 'iu/iu_tree_view.dart';
-import 'sse.dart';
+import 'platform_bootstrap.dart';
 import 'store.dart';
 import 'session.dart';
-import 'session_events_web.dart';
-import 'session_web.dart';
 import 'theme.dart';
-import 'voice_web.dart';
-import 'web_actor_hierarchy_cache.dart';
-import 'web_obligations_cache.dart';
-import 'web_quota_cache.dart';
-import 'web_tree_preferences_cache.dart';
 import 'widgets/dashboard_body.dart';
 
-/// The live actor-mesh viewer dashboard (an issue). Reads the PR2 Data API +
+/// The live actor-mesh viewer dashboard. Reads the PR2 Data API +
 /// SSE stream and renders the locked V1.4.0 design: an alive-actor tree on the
 /// left and the selected actor's Events / Live Output on the right.
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  usePathUrlStrategy();
+  platformInit();
   // Read the served shell's title before the first frame — see
   // `dashboard_title.dart` for why MaterialApp would otherwise overwrite it.
   runApp(
     RusaDashboardApp(
-      title: resolveDashboardTitle(web.document.title),
-      bootstrapSession: bootstrapDashboardSession,
-      browserHooksBuilder: (session) =>
-          DashboardSessionBrowserHooks(session).dispose,
+      title: resolveDashboardTitle(platformDocumentTitle),
+      bootstrapSession: platformBootstrapSession,
+      browserHooksBuilder: platformBrowserHooksBuilder,
       pageBuilder: (context, session) => DashboardPage(session: session),
     ),
   );
@@ -60,17 +49,17 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void initState() {
     super.initState();
-    _api = DashboardApi(session: widget.session);
+    _api = platformCreateDashboardApi(widget.session);
     _store = DashboardStore(
       api: _api,
-      stream: WebEventSourceStream(widget.session),
-      quotaCache: WebQuotaCache(),
-      treePreferencesCache: WebTreePreferencesCache(),
-      actorHierarchyCache: WebActorHierarchyCache(),
-      obligationsCache: WebObligationsCache(),
+      stream: platformCreateMeshStream(widget.session, _api.base),
+      quotaCache: platformCreateQuotaCache(),
+      treePreferencesCache: platformCreateTreePreferencesCache(),
+      actorHierarchyCache: platformCreateActorHierarchyCache(),
+      obligationsCache: platformCreateObligationsCache(),
       operatorDisplayName: widget.session.operatorDisplayName,
-      walkie: webWalkieDeps(_api, widget.session),
-      avatarFilePicker: WebAvatarFilePicker(),
+      walkie: platformCreateWalkieDeps(_api, widget.session),
+      avatarFilePicker: platformCreateAvatarFilePicker(),
     );
     // Opens the SSE stream before the initial /threads fetch (seam-safe).
     _ready = _store.init();
@@ -90,8 +79,8 @@ class _DashboardPageState extends State<DashboardPage> {
         children: [
           // The header nav (inside DashboardBody) switches between the Actors
           // dashboard and the IU route; within IU, its own switch picks the
-          // node or the report sub-view . Both IU bodies are injected
-          // here — the web entrypoint — so DashboardBody stays free of the
+          // node or the report sub-view. Both IU bodies are injected
+          // here so DashboardBody stays free of the
           // web-only glass-goals imports and renders headlessly in the
           // screenshot harness.
           Expanded(

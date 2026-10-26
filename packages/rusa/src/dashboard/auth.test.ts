@@ -19,6 +19,7 @@ import {
   createDashboardAuth,
   DashboardAuth,
   getDashboardRequestPrincipal,
+  isSameOrigin,
   SESSION_COOKIE,
   SESSION_MS,
   STREAM_IDLE_MS,
@@ -862,6 +863,24 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     ]) {
       expect((await post(path, cookie, { Origin: other })).status).toBe(403);
     }
+  });
+
+  it("recognizes Android emulator loopback 10.0.2.2 as same-origin when host matches", () => {
+    const req = {
+      headers: {
+        origin: "http://10.0.2.2:3000",
+        host: "10.0.2.2:3000",
+      },
+    } as unknown as IncomingMessage;
+    expect(isSameOrigin(req)).toBe(true);
+
+    const crossHost = {
+      headers: {
+        origin: "http://10.0.2.2:3000",
+        host: "localhost:3000",
+      },
+    } as unknown as IncomingMessage;
+    expect(isSameOrigin(crossHost)).toBe(false);
   });
 
   it("rejects revoked users within the cache bound and rejects duplicate cookies", async () => {

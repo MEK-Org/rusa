@@ -79,7 +79,7 @@ export function isSameOrigin(req: IncomingMessage): boolean {
       origin.host === req.headers.host &&
       (origin.protocol === "https:" ||
         (origin.protocol === "http:" &&
-          ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname))) &&
+          ["localhost", "127.0.0.1", "[::1]", "10.0.2.2"].includes(origin.hostname))) &&
       req.headers["sec-fetch-site"] !== "cross-site"
     );
   } catch {
