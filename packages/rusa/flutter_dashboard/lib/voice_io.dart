@@ -141,8 +141,7 @@ class IoVoicePlayer implements VoicePlayer {
   final http.Client _client;
   final Uri _baseUrl;
   final AudioPlayer Function() _createPlayer;
-  AudioPlayer? _player;
-  Completer<void>? _done;
+  _IoPlayback? _active;
 
   /// A device app has no autoplay policy to unlock.
   @override
@@ -151,63 +150,103 @@ class IoVoicePlayer implements VoicePlayer {
   @override
   Future<void> play(String url) async {
     stop();
-    final done = Completer<void>();
-    _done = done;
+    final playback = _IoPlayback();
+    _active = playback;
+    AudioPlayer? player;
+    StreamSubscription<void>? completion;
+    Future<void>? nativePlay;
     try {
       final response = await _client.get(_baseUrl.resolve(url));
       // Stopped while fetching: a skipped announcement still counts as played.
-      if (done.isCompleted) return;
+      if (playback.done.isCompleted) return;
       if (response.statusCode != 200) {
         throw StateError(
           'announcement audio unavailable (${response.statusCode})',
         );
       }
-      final player = _player ??= _createPlayer();
+      final ownedPlayer = _createPlayer();
+      player = ownedPlayer;
+      playback.player = ownedPlayer;
       void fail(Object error, [StackTrace? stackTrace]) {
-        if (!done.isCompleted) done.completeError(error, stackTrace);
+        playback.fail(error, stackTrace);
       }
 
-      // Native decode/playback failures arrive on the player's event stream.
-      final completion = player.onPlayerComplete.listen((_) {
-        if (!done.isCompleted) done.complete();
-      }, onError: fail);
-      try {
-        // Raced against [done] so a stop while the source is still preparing
-        // returns at once instead of after the plugin's prepare timeout.
-        unawaited(
-          player
-              .play(
-                BytesSource(
-                  response.bodyBytes,
-                  mimeType: response.headers['content-type'],
-                ),
-              )
-              .then((_) {
-                // The plugin drops a stop that lands while its resume call is
-                // in flight (it re-marks the player as playing afterwards), so
-                // re-issue it unless a newer announcement has the player.
-                if (done.isCompleted && _done == null) {
-                  unawaited(player.stop().catchError((_) {}));
-                }
-              }, onError: fail),
-        );
-        await done.future;
-      } finally {
-        await completion.cancel();
-      }
+      // This player belongs to exactly this announcement. A skipped A can
+      // finish preparing late, but it can never resume, stop, or complete B.
+      completion = ownedPlayer.onPlayerComplete.listen(
+        (_) => playback.complete(),
+        onError: fail,
+      );
+      final started = ownedPlayer.play(
+        BytesSource(
+          response.bodyBytes,
+          mimeType: response.headers['content-type'],
+        ),
+      );
+      nativePlay = started;
+      unawaited(
+        started.then((_) {
+          // Some Android players drop a stop during resume. Reissue it for this
+          // announcement only, before its player is disposed.
+          if (playback.stopped) _ignore(ownedPlayer.stop());
+        }, onError: fail),
+      );
+      await playback.done.future;
     } finally {
-      if (_done == done) _done = null;
+      await completion?.cancel();
+      if (_active == playback) _active = null;
+      if (player != null) {
+        unawaited(_disposePlayer(player, nativePlay, playback.stopped));
+      }
     }
   }
 
   @override
   void stop() {
-    final player = _player;
-    if (player != null) unawaited(player.stop().catchError((_) {}));
-    final done = _done;
-    _done = null;
-    if (done != null && !done.isCompleted) done.complete();
+    _active?.stop();
   }
+
+  Future<void> _disposePlayer(
+    AudioPlayer player,
+    Future<void>? nativePlay,
+    bool stopped,
+  ) async {
+    // A stop may resolve this wrapper before the plugin's source/resume future
+    // settles. Keep ownership until then, then reissue that play's stop and
+    // release its native resources. No later announcement shares this player.
+    try {
+      await nativePlay;
+    } catch (_) {}
+    if (stopped) await _ignore(player.stop());
+    await _ignore(player.dispose());
+  }
+}
+
+class _IoPlayback {
+  final done = Completer<void>();
+  AudioPlayer? player;
+  bool stopped = false;
+
+  void complete() {
+    if (!done.isCompleted) done.complete();
+  }
+
+  void fail(Object error, [StackTrace? stackTrace]) {
+    if (!done.isCompleted) done.completeError(error, stackTrace);
+  }
+
+  void stop() {
+    stopped = true;
+    final current = player;
+    if (current != null) _ignore(current.stop());
+    complete();
+  }
+}
+
+Future<void> _ignore(Future<void> future) async {
+  try {
+    await future;
+  } catch (_) {}
 }
 
 /// Keeps the screen on while walkie mode is on. Android keeps the flag for

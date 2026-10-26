@@ -323,6 +323,9 @@ class DashboardStore {
   /// here instead of `Uri.base`, which is a file: URI on non-web hosts.
   Uri get apiBase => _api.base;
 
+  /// Headers for avatars that Flutter fetches outside [DashboardApi].
+  Map<String, String> avatarHeaders(Uri url) => _api.imageHeaders(url);
+
   List<ObligationTreeDto>? _cachedObligationTrees;
   String? _cachedObligationPrincipal;
 

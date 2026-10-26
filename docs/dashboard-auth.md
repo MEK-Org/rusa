@@ -183,6 +183,17 @@ the same subject. A retained Firebase credential cannot revive a Rusa session
 that has expired after five idle days: the user must sign in again. Initial
 session creation requires a Google authentication within the last five minutes.
 
+On Android, the same Rusa session and CSRF cookies are retained across an
+ordinary app-process restart in `flutter_secure_storage` rather than regular
+preferences. The record is encrypted by Android Keystore-backed storage and is
+keyed to the full configured server origin, so a development server cannot read
+or reuse a production server's cookie. On startup the app restores that record
+only after it has fetched an enabled public auth configuration, then verifies it
+with `GET /api/auth/session`; a missing, expired, or refused cookie signs out as
+usual. Logout and any 401 expiry clear the encrypted record before the next
+restart. Android backup is disabled for the app so an encrypted record is not
+restored onto another device without its Keystore key.
+
 Open the profile avatar in the dashboard's upper-right corner and choose **Log out**.
 The avatar uses your Firebase profile photo, with a person-icon fallback.
 Logout clears the Rusa cookie and signs out

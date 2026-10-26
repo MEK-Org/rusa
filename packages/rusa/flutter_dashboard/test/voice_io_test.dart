@@ -91,29 +91,49 @@ class _FakeAudioPlugin {
   final calls = <MethodCall>[];
   bool completeOnResume = true;
   final _resumed = StreamController<void>.broadcast();
-  MockStreamHandlerEventSink? _events;
+  final _events = <String, MockStreamHandlerEventSink>{};
+  final _resumeGates = <String, Completer<void>>{};
 
   Future<void> get resumed => _resumed.stream.first;
   List<String> get methods => [for (final c in calls) c.method];
 
+  Future<void> resumedFor(String playerId) => _resumed.stream.first;
+
+  void holdResume(String playerId) {
+    _resumeGates[playerId] = Completer<void>();
+  }
+
+  void releaseResume(String playerId) {
+    _resumeGates.remove(playerId)?.complete();
+  }
+
   Future<Object?> _handle(MethodCall call) async {
     calls.add(call);
     final args = call.arguments as Map<Object?, Object?>;
+    final playerId = args['playerId'] as String?;
     switch (call.method) {
       case 'create':
+        final createdPlayerId = args['playerId']! as String;
         _messenger.setMockStreamHandler(
-          EventChannel('xyz.luan/audioplayers/events/${args['playerId']}'),
-          MockStreamHandler.inline(onListen: (_, sink) => _events = sink),
+          EventChannel('xyz.luan/audioplayers/events/$createdPlayerId'),
+          MockStreamHandler.inline(
+            onListen: (_, sink) => _events[createdPlayerId] = sink,
+          ),
         );
       case 'setSourceBytes':
         scheduleMicrotask(
-          () => _events!.success({'event': 'audio.onPrepared', 'value': true}),
+          () => _events[playerId]!.success({
+            'event': 'audio.onPrepared',
+            'value': true,
+          }),
         );
       case 'resume':
         _resumed.add(null);
+        final gate = _resumeGates[playerId];
+        if (gate != null) await gate.future;
         if (completeOnResume) {
           scheduleMicrotask(
-            () => _events!.success({'event': 'audio.onComplete'}),
+            () => _events[playerId]!.success({'event': 'audio.onComplete'}),
           );
         }
     }
@@ -259,6 +279,66 @@ void main() {
         await play;
         await pumpEventQueue();
         expect(plugin.methods, contains('stop'));
+      },
+    );
+
+    test(
+      'late preparation of a skipped clip cannot stop the next clip',
+      () async {
+        final session = _session(
+          MockClient(
+            (_) async => http.Response.bytes(
+              audio,
+              200,
+              headers: {'content-type': 'audio/wav'},
+            ),
+          ),
+        );
+        var sequence = 0;
+        final p = IoVoicePlayer(
+          client: session.client,
+          baseUrl: session.baseUrl,
+          createPlayer: () => AudioPlayer(playerId: 'announcer-${++sequence}'),
+        );
+        plugin.holdResume('announcer-1');
+
+        final firstResumed = plugin.resumedFor('announcer-1');
+        final first = p.play('/api/mesh/voice/audio/a');
+        await firstResumed;
+        p.stop();
+        await first;
+
+        final secondResumed = plugin.resumedFor('announcer-2');
+        final second = p.play('/api/mesh/voice/audio/b');
+        await secondResumed;
+        await second;
+        await pumpEventQueue();
+
+        // AudioPlayer.dispose may stop its own finished player. What matters is
+        // that releasing A's delayed native resume cannot send another stop to
+        // B after B has already been started and completed.
+        int stopsFor(String playerId) => plugin.calls
+            .where(
+              (call) =>
+                  call.method == 'stop' &&
+                  (call.arguments as Map<Object?, Object?>)['playerId'] ==
+                      playerId,
+            )
+            .length;
+        final secondStopsBeforeLateFirst = stopsFor('announcer-2');
+
+        plugin.releaseResume('announcer-1');
+        await pumpEventQueue();
+
+        expect(stopsFor('announcer-2'), secondStopsBeforeLateFirst);
+        final disposed = plugin.calls
+            .where((call) => call.method == 'dispose')
+            .map(
+              (call) =>
+                  (call.arguments as Map<Object?, Object?>)['playerId']
+                      as String,
+            );
+        expect(disposed, containsAll(['announcer-1', 'announcer-2']));
       },
     );
 

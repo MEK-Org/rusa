@@ -18,6 +18,14 @@ class DashboardAccountSetupError implements Exception {
       'This Google account is not linked to this dashboard. Ask the dashboard administrator to check the account setup.';
 }
 
+/// A startup failure whose safe, operator-actionable detail may be rendered.
+/// Arbitrary platform and Firebase errors remain opaque to the dashboard.
+class DashboardConfigurationError implements Exception {
+  const DashboardConfigurationError(this.missingDefine);
+
+  final String missingDefine;
+}
+
 enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {
@@ -108,7 +116,7 @@ class FirebaseDashboardSession extends DashboardSession {
     this._auth, {
     http.Client? client,
     String? Function()? csrfToken,
-    void Function()? clearDashboardCaches,
+    FutureOr<void> Function()? clearDashboardCaches,
     Future<String?> Function()? applyBranding,
     Duration idleDuration = sessionIdleDuration,
     Uri? baseUrl,
@@ -127,7 +135,7 @@ class FirebaseDashboardSession extends DashboardSession {
   /// null and use the page origin; device builds pass the configured server.
   final Uri? _baseUrl;
   final String? Function() _csrfToken;
-  final void Function() _clearDashboardCaches;
+  final FutureOr<void> Function() _clearDashboardCaches;
   final Future<String?> Function() _applyBranding;
   final Duration _idleDuration;
   StreamSubscription<SessionUser?>? _authSubscription;
@@ -276,7 +284,8 @@ class FirebaseDashboardSession extends DashboardSession {
       );
       if (response.statusCode != 200) {
         await _auth.signOut();
-        if (response.statusCode == 409) throw const DashboardAccountSetupError();
+        if (response.statusCode == 409)
+          throw const DashboardAccountSetupError();
         throw StateError('Sign in denied');
       }
       // A successful response only proves the server attempted to set the
@@ -357,7 +366,7 @@ class FirebaseDashboardSession extends DashboardSession {
     _expiring = true;
     try {
       _setError(null);
-      _clearDashboardCaches();
+      await _clearDashboardCaches();
       _idleTimer?.cancel();
       _setIdle(true);
       await _auth.signOut();

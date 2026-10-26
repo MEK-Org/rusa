@@ -90,9 +90,13 @@ Future<DashboardSession> bootstrapIoDashboardSession({
   Uri? baseUrl,
   http.Client Function()? clientFactory,
   IoSessionAuthFactory authFactory = initializeNativeFirebaseAuth,
+  IoSessionCredentialStorage? credentialStorage,
 }) async {
   final resolvedBaseUrl = baseUrl ?? resolveIoServerBaseUrl();
-  final cookieJar = IoSessionCookieJar();
+  final cookieJar = IoSessionCookieJar(
+    origin: resolvedBaseUrl,
+    storage: credentialStorage,
+  );
   final client = IoSessionClient(
     baseUrl: resolvedBaseUrl,
     cookieJar: cookieJar,
@@ -121,6 +125,9 @@ Future<DashboardSession> bootstrapIoDashboardSession({
   if (config['enabled'] != true || firebase is! Map<String, dynamic>) {
     throw StateError('Dashboard authentication configuration is unavailable');
   }
+  // The public config fetch needs no session. Restore only for an enabled
+  // dashboard, immediately before Firebase's restored-user check runs.
+  await cookieJar.restore();
   final session = IoFirebaseDashboardSession(
     await authFactory(firebase),
     client: client,

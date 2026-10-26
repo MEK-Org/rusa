@@ -9,6 +9,7 @@ import 'package:rusa_dashboard/io_session.dart';
 import 'package:rusa_dashboard/io_session_client.dart';
 import 'package:rusa_dashboard/io_sse.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/platform_bootstrap_io.dart';
 import 'package:rusa_dashboard/session.dart';
 
 /// A client whose [close] actually kills it, like package:http's IOClient.
@@ -185,6 +186,30 @@ void main() {
       expect(captured?.headers.containsKey('Origin'), isFalse);
       expect(captured?.headers.containsKey('Cookie'), isFalse);
     });
+
+    test('projects current cookies only for same-origin framework fetches', () {
+      final baseUrl = Uri.parse('https://dashboard.example.test');
+      final client = IoSessionClient(
+        inner: MockClient((_) async => http.Response('', 200)),
+        baseUrl: baseUrl,
+        cookieJar: IoSessionCookieJar(
+          initialSessionCookie: 'sess123',
+          initialCsrfToken: 'csrf456',
+        ),
+      );
+
+      expect(
+        client.headersFor(baseUrl.resolve('/api/mesh/avatar/worker.png')),
+        {
+          'Origin': 'https://dashboard.example.test',
+          'Cookie': '__Host-rusa_session=sess123; __Host-rusa_csrf=csrf456',
+        },
+      );
+      expect(
+        client.headersFor(Uri.parse('https://other.example/avatar.png')),
+        isEmpty,
+      );
+    });
   });
 
   group('IoDashboardSession', () {
@@ -210,6 +235,43 @@ void main() {
   group('IoFirebaseDashboardSession', () {
     final baseUrl = Uri.parse('https://dashboard.example.test');
 
+    test(
+      'page API disposal does not close the session before a later sign-in',
+      () async {
+        final auth = _Auth();
+        final inner = _CloseEnforcingClient(
+          MockClient((request) async {
+            if (request.url.path == '/api/auth/csrf') {
+              return http.Response(
+                '{}',
+                200,
+                headers: {
+                  'set-cookie': '__Host-rusa_csrf=csrf-1; Path=/; Secure',
+                },
+              );
+            }
+            return http.Response(
+              '{}',
+              200,
+              headers: {
+                'set-cookie': '__Host-rusa_session=session-1; Path=/; Secure',
+              },
+            );
+          }),
+        );
+        final session = _firebaseSession(baseUrl, inner, auth: auth);
+        final api = platformCreateDashboardApi(session);
+
+        await session.signIn();
+        await session.signOut();
+        api.close(); // DashboardPage / DashboardStore disposal after sign-out.
+        await session.signIn();
+
+        expect(session.status, DashboardSessionStatus.signedIn);
+        session.dispose();
+      },
+    );
+
     test('starts signedOut without a restored Firebase user', () {
       final session = _firebaseSession(
         baseUrl,
@@ -220,59 +282,56 @@ void main() {
       expect(session.status, DashboardSessionStatus.signedOut);
     });
 
-    test(
-      'signIn exchanges the Google ID token at the configured server and '
-      'requires the retained cookie',
-      () async {
-        final requests = <http.Request>[];
-        final session = _firebaseSession(
-          baseUrl,
-          MockClient((req) async {
-            requests.add(req);
-            switch (req.url.path) {
-              case '/api/auth/csrf':
-                return http.Response(
-                  '{"ok":true}',
-                  200,
-                  headers: {'set-cookie': '__Host-rusa_csrf=pre; Path=/'},
-                );
-              case '/api/auth/session' when req.method == 'POST':
-                return http.Response(
-                  '{"authenticated":true}',
-                  200,
-                  headers: {
-                    'set-cookie':
-                        '__Host-rusa_session=sess; Path=/; HttpOnly, '
-                        '__Host-rusa_csrf=bound; Path=/',
-                  },
-                );
-              case '/api/auth/session':
-                return req.headers['Cookie']?.contains(
-                          '__Host-rusa_session=sess',
-                        ) ==
-                        true
-                    ? http.Response('{"authenticated":true}', 200)
-                    : http.Response('unauthorized', 401);
-            }
-            return http.Response('Not found', 404);
-          }),
-        );
+    test('signIn exchanges the Google ID token at the configured server and '
+        'requires the retained cookie', () async {
+      final requests = <http.Request>[];
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async {
+          requests.add(req);
+          switch (req.url.path) {
+            case '/api/auth/csrf':
+              return http.Response(
+                '{"ok":true}',
+                200,
+                headers: {'set-cookie': '__Host-rusa_csrf=pre; Path=/'},
+              );
+            case '/api/auth/session' when req.method == 'POST':
+              return http.Response(
+                '{"authenticated":true}',
+                200,
+                headers: {
+                  'set-cookie':
+                      '__Host-rusa_session=sess; Path=/; HttpOnly, '
+                      '__Host-rusa_csrf=bound; Path=/',
+                },
+              );
+            case '/api/auth/session':
+              return req.headers['Cookie']?.contains(
+                        '__Host-rusa_session=sess',
+                      ) ==
+                      true
+                  ? http.Response('{"authenticated":true}', 200)
+                  : http.Response('unauthorized', 401);
+          }
+          return http.Response('Not found', 404);
+        }),
+      );
 
-        await session.signIn();
+      await session.signIn();
 
-        final exchange = requests.singleWhere(
-          (r) => r.method == 'POST' && r.url.path == '/api/auth/session',
-        );
-        expect(exchange.url.origin, baseUrl.origin);
-        expect(jsonDecode(exchange.body), {'idToken': 'google-id-token'});
-        expect(exchange.headers['Origin'], baseUrl.origin);
-        expect(exchange.headers['X-Rusa-CSRF'], 'pre');
-        expect(requests.last.method, 'GET');
-        expect(requests.last.url.path, '/api/auth/session');
-        expect(session.status, DashboardSessionStatus.signedIn);
-        expect(session.csrfToken, 'bound');
-      },
-    );
+      final exchange = requests.singleWhere(
+        (r) => r.method == 'POST' && r.url.path == '/api/auth/session',
+      );
+      expect(exchange.url.origin, baseUrl.origin);
+      expect(jsonDecode(exchange.body), {'idToken': 'google-id-token'});
+      expect(exchange.headers['Origin'], baseUrl.origin);
+      expect(exchange.headers['X-Rusa-CSRF'], 'pre');
+      expect(requests.last.method, 'GET');
+      expect(requests.last.url.path, '/api/auth/session');
+      expect(session.status, DashboardSessionStatus.signedIn);
+      expect(session.csrfToken, 'bound');
+    });
 
     test('signIn fails and stays signedOut when the server refuses', () async {
       final auth = _Auth();
@@ -408,32 +467,34 @@ void main() {
       },
     );
 
-    test('a restored Firebase user without a live server session signs out',
-        () async {
-      final auth = _Auth(_User('restored'));
-      final mock = MockClient((req) async {
-        if (req.url.path == '/api/auth/config') {
-          return http.Response(
-            jsonEncode({'enabled': true, 'firebase': <String, dynamic>{}}),
-            200,
-          );
-        }
-        if (req.url.path == '/api/auth/session') {
-          return http.Response('unauthorized', 401);
-        }
-        return http.Response('Not found', 404);
-      });
+    test(
+      'a restored Firebase user without a live server session signs out',
+      () async {
+        final auth = _Auth(_User('restored'));
+        final mock = MockClient((req) async {
+          if (req.url.path == '/api/auth/config') {
+            return http.Response(
+              jsonEncode({'enabled': true, 'firebase': <String, dynamic>{}}),
+              200,
+            );
+          }
+          if (req.url.path == '/api/auth/session') {
+            return http.Response('unauthorized', 401);
+          }
+          return http.Response('Not found', 404);
+        });
 
-      final session = await bootstrapIoDashboardSession(
-        baseUrl: Uri.parse('http://localhost:3000'),
-        clientFactory: () => mock,
-        authFactory: (_) async => auth,
-      );
-      await Future<void>.delayed(Duration.zero);
+        final session = await bootstrapIoDashboardSession(
+          baseUrl: Uri.parse('http://localhost:3000'),
+          clientFactory: () => mock,
+          authFactory: (_) async => auth,
+        );
+        await Future<void>.delayed(Duration.zero);
 
-      expect(session.status, DashboardSessionStatus.signedOut);
-      expect(auth.signOutCount, 1);
-    });
+        expect(session.status, DashboardSessionStatus.signedOut);
+        expect(auth.signOutCount, 1);
+      },
+    );
 
     test('throws StateError when enabled auth has no Firebase config', () {
       final mock = MockClient((req) async {
@@ -480,43 +541,43 @@ void main() {
       );
     });
 
-    test('throws StateError when auth config has missing or non-boolean enabled',
-        () async {
-      for (final invalidBody in [
-        '{}',
-        '{"enabled":"true"}',
-        '{"enabled":null}',
-        '{"enabled":1}',
-      ]) {
-        final mock = MockClient((req) async {
-          if (req.url.path == '/api/auth/config') {
-            return http.Response(invalidBody, 200);
-          }
-          return http.Response('Not found', 404);
-        });
+    test(
+      'throws StateError when auth config has missing or non-boolean enabled',
+      () async {
+        for (final invalidBody in [
+          '{}',
+          '{"enabled":"true"}',
+          '{"enabled":null}',
+          '{"enabled":1}',
+        ]) {
+          final mock = MockClient((req) async {
+            if (req.url.path == '/api/auth/config') {
+              return http.Response(invalidBody, 200);
+            }
+            return http.Response('Not found', 404);
+          });
 
-        expect(
-          bootstrapIoDashboardSession(
-            baseUrl: Uri.parse('http://localhost:3000'),
-            clientFactory: () => mock,
-          ),
-          throwsA(isA<StateError>()),
-        );
-      }
-    });
+          expect(
+            bootstrapIoDashboardSession(
+              baseUrl: Uri.parse('http://localhost:3000'),
+              clientFactory: () => mock,
+            ),
+            throwsA(isA<StateError>()),
+          );
+        }
+      },
+    );
   });
 
   group('IoEventSourceStream', () {
     IoDashboardSession makeSession(Uri baseUrl) => IoDashboardSession(
-          client: IoSessionClient(
-            inner: MockClient(
-              (req) async => http.Response('Not found', 404),
-            ),
-            baseUrl: baseUrl,
-          ),
-          baseUrl: baseUrl,
-          cookieJar: IoSessionCookieJar(),
-        );
+      client: IoSessionClient(
+        inner: MockClient((req) async => http.Response('Not found', 404)),
+        baseUrl: baseUrl,
+      ),
+      baseUrl: baseUrl,
+      cookieJar: IoSessionCookieJar(),
+    );
 
     /// A factory handing each connection a fresh close-enforcing client over
     /// a fresh SSE controller, recording every controller in [controllers].
@@ -524,16 +585,16 @@ void main() {
       List<StreamController<List<int>>> controllers,
     ) {
       return () => _CloseEnforcingClient(
-            MockClient.streaming((req, _) async {
-              final controller = StreamController<List<int>>();
-              controllers.add(controller);
-              return http.StreamedResponse(
-                controller.stream,
-                200,
-                headers: {'content-type': 'text/event-stream'},
-              );
-            }),
+        MockClient.streaming((req, _) async {
+          final controller = StreamController<List<int>>();
+          controllers.add(controller);
+          return http.StreamedResponse(
+            controller.stream,
+            200,
+            headers: {'content-type': 'text/event-stream'},
           );
+        }),
+      );
     }
 
     test('parses SSE frames and ignores comments', () async {
@@ -586,7 +647,8 @@ void main() {
         'text': 'Hello from Android test\n',
       };
 
-      final ssePayload = ': connected\n\n'
+      final ssePayload =
+          ': connected\n\n'
           ': heartbeat\n\n'
           'event: mesh_event\n'
           'data: ${jsonEncode(sampleMeshEvent)}\n\n'
@@ -606,184 +668,192 @@ void main() {
       await controller.close();
     });
 
-    test('survives a second connect (actor switch) with close-enforcing clients',
-        () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final controllers = <StreamController<List<int>>>[];
+    test(
+      'survives a second connect (actor switch) with close-enforcing clients',
+      () async {
+        final baseUrl = Uri.parse('http://localhost:3000');
+        final controllers = <StreamController<List<int>>>[];
 
-      final stream = IoEventSourceStream(
-        session: makeSession(baseUrl),
-        baseUrl: baseUrl,
-        clientFactory: connectionFactory(controllers),
-      );
+        final stream = IoEventSourceStream(
+          session: makeSession(baseUrl),
+          baseUrl: baseUrl,
+          clientFactory: connectionFactory(controllers),
+        );
 
-      final events = <MeshEvent>[];
-      stream.meshEvents.listen(events.add);
+        final events = <MeshEvent>[];
+        stream.meshEvents.listen(events.add);
 
-      stream.connect(['actor-a']);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(controllers.length, 1);
+        stream.connect(['actor-a']);
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(controllers.length, 1);
 
-      // Actor switch: connect() #1's client is closed. With the old shared
-      // client this threw 'Client is already closed' here and on every send.
-      stream.connect(['actor-b']);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(controllers.length, 2);
+        // Actor switch: connect() #1's client is closed. With the old shared
+        // client this threw 'Client is already closed' here and on every send.
+        stream.connect(['actor-b']);
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(controllers.length, 2);
 
-      controllers.last.add(utf8.encode(_meshEventFrame));
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+        controllers.last.add(utf8.encode(_meshEventFrame));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
 
-      expect(events.length, 1);
-      expect(events.first.id, 'evt-1');
+        expect(events.length, 1);
+        expect(events.first.id, 'evt-1');
 
-      stream.dispose();
-      for (final controller in controllers) {
-        if (!controller.isClosed) await controller.close();
-      }
-    });
+        stream.dispose();
+        for (final controller in controllers) {
+          if (!controller.isClosed) await controller.close();
+        }
+      },
+    );
 
-    test('reconnects with a fresh client after the server drops the stream',
-        () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final controllers = <StreamController<List<int>>>[];
+    test(
+      'reconnects with a fresh client after the server drops the stream',
+      () async {
+        final baseUrl = Uri.parse('http://localhost:3000');
+        final controllers = <StreamController<List<int>>>[];
 
-      final stream = IoEventSourceStream(
-        session: makeSession(baseUrl),
-        baseUrl: baseUrl,
-        clientFactory: connectionFactory(controllers),
-      );
+        final stream = IoEventSourceStream(
+          session: makeSession(baseUrl),
+          baseUrl: baseUrl,
+          clientFactory: connectionFactory(controllers),
+        );
 
-      final events = <MeshEvent>[];
-      stream.meshEvents.listen(events.add);
+        final events = <MeshEvent>[];
+        stream.meshEvents.listen(events.add);
 
-      stream.connect(['actor-a']);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(controllers.length, 1);
+        stream.connect(['actor-a']);
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(controllers.length, 1);
 
-      await controllers.first.close();
-      // The transport retries on a timer after a genuine drop.
-      await Future<void>.delayed(const Duration(milliseconds: 2500));
-      expect(controllers.length, 2);
+        await controllers.first.close();
+        // The transport retries on a timer after a genuine drop.
+        await Future<void>.delayed(const Duration(milliseconds: 2500));
+        expect(controllers.length, 2);
 
-      controllers.last.add(utf8.encode(_meshEventFrame));
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      expect(events.length, 1);
+        controllers.last.add(utf8.encode(_meshEventFrame));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(events.length, 1);
 
-      stream.dispose();
-      for (final controller in controllers) {
-        if (!controller.isClosed) await controller.close();
-      }
-    });
+        stream.dispose();
+        for (final controller in controllers) {
+          if (!controller.isClosed) await controller.close();
+        }
+      },
+    );
 
-    test('session_idle frame closes the stream and visit() reopens it',
-        () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final controllers = <StreamController<List<int>>>[];
+    test(
+      'session_idle frame closes the stream and visit() reopens it',
+      () async {
+        final baseUrl = Uri.parse('http://localhost:3000');
+        final controllers = <StreamController<List<int>>>[];
 
-      // The server idles only authenticated streams; visit() renews.
-      final session = _firebaseSession(
-        baseUrl,
-        MockClient((req) async => http.Response('{"ok":true}', 200)),
-        auth: _Auth(_User('restored')),
-        cookieJar: IoSessionCookieJar(initialCsrfToken: 'csrf'),
-      );
-      final stream = IoEventSourceStream(
-        session: session,
-        baseUrl: baseUrl,
-        clientFactory: connectionFactory(controllers),
-      );
+        // The server idles only authenticated streams; visit() renews.
+        final session = _firebaseSession(
+          baseUrl,
+          MockClient((req) async => http.Response('{"ok":true}', 200)),
+          auth: _Auth(_User('restored')),
+          cookieJar: IoSessionCookieJar(initialCsrfToken: 'csrf'),
+        );
+        final stream = IoEventSourceStream(
+          session: session,
+          baseUrl: baseUrl,
+          clientFactory: connectionFactory(controllers),
+        );
 
-      stream.connect(['actor-a']);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(controllers.length, 1);
+        stream.connect(['actor-a']);
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(controllers.length, 1);
 
-      controllers.first.add(
-        utf8.encode('event: session_idle\ndata: {}\n\n'),
-      );
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      expect(session.isIdle, isTrue);
+        controllers.first.add(utf8.encode('event: session_idle\ndata: {}\n\n'));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(session.isIdle, isTrue);
 
-      // An idle session must not blind-reconnect.
-      await Future<void>.delayed(const Duration(milliseconds: 2500));
-      expect(controllers.length, 1);
+        // An idle session must not blind-reconnect.
+        await Future<void>.delayed(const Duration(milliseconds: 2500));
+        expect(controllers.length, 1);
 
-      await session.visit();
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(controllers.length, 2);
+        await session.visit();
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(controllers.length, 2);
 
-      stream.dispose();
-      for (final controller in controllers) {
-        if (!controller.isClosed) await controller.close();
-      }
-    });
+        stream.dispose();
+        for (final controller in controllers) {
+          if (!controller.isClosed) await controller.close();
+        }
+      },
+    );
 
-    test('auth_required frame prompts re-authentication without reconnecting',
-        () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final controllers = <StreamController<List<int>>>[];
+    test(
+      'auth_required frame prompts re-authentication without reconnecting',
+      () async {
+        final baseUrl = Uri.parse('http://localhost:3000');
+        final controllers = <StreamController<List<int>>>[];
 
-      final session = _firebaseSession(
-        baseUrl,
-        MockClient((req) async => http.Response('{"ok":true}', 200)),
-        auth: _Auth(_User('restored')),
-      );
-      expect(session.status, DashboardSessionStatus.signedIn);
-      final stream = IoEventSourceStream(
-        session: session,
-        baseUrl: baseUrl,
-        clientFactory: connectionFactory(controllers),
-      );
+        final session = _firebaseSession(
+          baseUrl,
+          MockClient((req) async => http.Response('{"ok":true}', 200)),
+          auth: _Auth(_User('restored')),
+        );
+        expect(session.status, DashboardSessionStatus.signedIn);
+        final stream = IoEventSourceStream(
+          session: session,
+          baseUrl: baseUrl,
+          clientFactory: connectionFactory(controllers),
+        );
 
-      stream.connect([]);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(controllers.length, 1);
+        stream.connect([]);
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(controllers.length, 1);
 
-      controllers.first.add(
-        utf8.encode('event: auth_required\ndata: {}\n\n'),
-      );
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      expect(session.status, DashboardSessionStatus.signedOut);
+        controllers.first.add(
+          utf8.encode('event: auth_required\ndata: {}\n\n'),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(session.status, DashboardSessionStatus.signedOut);
 
-      await Future<void>.delayed(const Duration(milliseconds: 2500));
-      expect(controllers.length, 1);
+        await Future<void>.delayed(const Duration(milliseconds: 2500));
+        expect(controllers.length, 1);
 
-      stream.dispose();
-      for (final controller in controllers) {
-        if (!controller.isClosed) await controller.close();
-      }
-    });
+        stream.dispose();
+        for (final controller in controllers) {
+          if (!controller.isClosed) await controller.close();
+        }
+      },
+    );
 
-    test('401 response prompts re-authentication without reconnecting',
-        () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      var connections = 0;
+    test(
+      '401 response prompts re-authentication without reconnecting',
+      () async {
+        final baseUrl = Uri.parse('http://localhost:3000');
+        var connections = 0;
 
-      final session = _firebaseSession(
-        baseUrl,
-        MockClient((req) async => http.Response('{"ok":true}', 200)),
-        auth: _Auth(_User('restored')),
-      );
-      expect(session.status, DashboardSessionStatus.signedIn);
-      final stream = IoEventSourceStream(
-        session: session,
-        baseUrl: baseUrl,
-        clientFactory: () => _CloseEnforcingClient(
-          MockClient((req) async {
-            connections++;
-            return http.Response('unauthorized', 401);
-          }),
-        ),
-      );
+        final session = _firebaseSession(
+          baseUrl,
+          MockClient((req) async => http.Response('{"ok":true}', 200)),
+          auth: _Auth(_User('restored')),
+        );
+        expect(session.status, DashboardSessionStatus.signedIn);
+        final stream = IoEventSourceStream(
+          session: session,
+          baseUrl: baseUrl,
+          clientFactory: () => _CloseEnforcingClient(
+            MockClient((req) async {
+              connections++;
+              return http.Response('unauthorized', 401);
+            }),
+          ),
+        );
 
-      stream.connect([]);
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      expect(connections, 1);
-      expect(session.status, DashboardSessionStatus.signedOut);
+        stream.connect([]);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(connections, 1);
+        expect(session.status, DashboardSessionStatus.signedOut);
 
-      await Future<void>.delayed(const Duration(milliseconds: 2500));
-      expect(connections, 1);
+        await Future<void>.delayed(const Duration(milliseconds: 2500));
+        expect(connections, 1);
 
-      stream.dispose();
-    });
+        stream.dispose();
+      },
+    );
   });
 }

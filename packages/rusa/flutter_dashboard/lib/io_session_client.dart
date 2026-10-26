@@ -1,19 +1,59 @@
 import 'package:http/http.dart' as http;
 
+/// The session credentials tied to one configured dashboard origin.
+class IoSessionCredentials {
+  const IoSessionCredentials({
+    required this.sessionCookie,
+    required this.csrfToken,
+  });
+
+  final String? sessionCookie;
+  final String? csrfToken;
+}
+
+/// Persistent storage for the device-only cookie jar. Implementations must
+/// scope keys to [origin] and encrypt their values at rest.
+abstract interface class IoSessionCredentialStorage {
+  Future<IoSessionCredentials?> read(Uri origin);
+
+  Future<void> write(Uri origin, IoSessionCredentials credentials);
+
+  Future<void> delete(Uri origin);
+}
+
 /// In-memory cookie jar for the dashboard session cookies on non-web hosts.
 class IoSessionCookieJar {
-  IoSessionCookieJar({String? initialSessionCookie, String? initialCsrfToken})
-      : sessionCookie = initialSessionCookie,
-        csrfToken = initialCsrfToken;
+  IoSessionCookieJar({
+    String? initialSessionCookie,
+    String? initialCsrfToken,
+    this.origin,
+    this.storage,
+  }) : sessionCookie = initialSessionCookie,
+       csrfToken = initialCsrfToken;
 
   String? sessionCookie;
   String? csrfToken;
+  final Uri? origin;
+  final IoSessionCredentialStorage? storage;
 
-  void updateFromHeaders(Map<String, String> headers) {
+  /// Hydrates an authenticated session before Firebase's restored-user check.
+  /// A record for another origin is never read through this jar.
+  Future<void> restore() async {
+    final origin = this.origin;
+    final storage = this.storage;
+    if (origin == null || storage == null) return;
+    final stored = await storage.read(origin);
+    if (stored == null) return;
+    sessionCookie = stored.sessionCookie;
+    csrfToken = stored.csrfToken;
+  }
+
+  Future<void> updateFromHeaders(Map<String, String> headers) async {
     // Both lower and mixed case header lookup
     final raw = headers['set-cookie'] ?? headers['Set-Cookie'];
     if (raw == null || raw.isEmpty) return;
     _parseSetCookie(raw);
+    await _persist();
   }
 
   void _parseSetCookie(String raw) {
@@ -23,7 +63,9 @@ class IoSessionCookieJar {
       final trimmed = part.trim();
       if (trimmed.isEmpty) continue;
       final semiIndex = trimmed.indexOf(';');
-      final cookiePair = semiIndex != -1 ? trimmed.substring(0, semiIndex).trim() : trimmed;
+      final cookiePair = semiIndex != -1
+          ? trimmed.substring(0, semiIndex).trim()
+          : trimmed;
       if (cookiePair.startsWith('__Host-rusa_session=')) {
         final val = cookiePair.substring('__Host-rusa_session='.length);
         sessionCookie = val.isEmpty ? null : val;
@@ -45,9 +87,26 @@ class IoSessionCookieJar {
     return parts.isEmpty ? null : parts.join('; ');
   }
 
-  void clear() {
+  Future<void> clear() async {
     sessionCookie = null;
     csrfToken = null;
+    final origin = this.origin;
+    final storage = this.storage;
+    if (origin != null && storage != null) await storage.delete(origin);
+  }
+
+  Future<void> _persist() async {
+    final origin = this.origin;
+    final storage = this.storage;
+    if (origin == null || storage == null) return;
+    if (sessionCookie == null && csrfToken == null) {
+      await storage.delete(origin);
+      return;
+    }
+    await storage.write(
+      origin,
+      IoSessionCredentials(sessionCookie: sessionCookie, csrfToken: csrfToken),
+    );
   }
 }
 
@@ -60,8 +119,8 @@ class IoSessionClient extends http.BaseClient {
     http.Client? inner,
     required this.baseUrl,
     IoSessionCookieJar? cookieJar,
-  })  : _inner = inner ?? http.Client(),
-        cookieJar = cookieJar ?? IoSessionCookieJar();
+  }) : _inner = inner ?? http.Client(),
+       cookieJar = cookieJar ?? IoSessionCookieJar();
 
   final http.Client _inner;
   final Uri baseUrl;
@@ -74,6 +133,18 @@ class IoSessionClient extends http.BaseClient {
       url.scheme == baseUrl.scheme &&
       url.host == baseUrl.host &&
       url.port == baseUrl.port;
+
+  /// Headers for a framework-owned same-origin fetch, such as [Image.network].
+  /// Those fetches cannot use this [http.Client], so callers need this narrow
+  /// projection of the current jar rather than a second, divergent transport.
+  /// Never return credentials for a different origin.
+  Map<String, String> headersFor(Uri url) {
+    if (!_isSameOrigin(url)) return const {};
+    final headers = <String, String>{'Origin': origin};
+    final cookieHeader = cookieJar.buildCookieHeader();
+    if (cookieHeader != null) headers['Cookie'] = cookieHeader;
+    return headers;
+  }
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -102,7 +173,7 @@ class IoSessionClient extends http.BaseClient {
 
     // Save any set cookies (home origin only — see _isSameOrigin).
     if (sameOrigin) {
-      cookieJar.updateFromHeaders(response.headers);
+      await cookieJar.updateFromHeaders(response.headers);
     }
 
     return response;
@@ -110,4 +181,20 @@ class IoSessionClient extends http.BaseClient {
 
   @override
   void close() => _inner.close();
+}
+
+/// A non-owning view of a client owned by a longer-lived dashboard session.
+/// A page-scoped [DashboardApi] may close its wrappers without invalidating the
+/// session's sign-in, refresh, logout, or the next page it builds.
+class NonClosingHttpClient extends http.BaseClient {
+  NonClosingHttpClient(this._inner);
+
+  final http.Client _inner;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      _inner.send(request);
+
+  @override
+  void close() {}
 }

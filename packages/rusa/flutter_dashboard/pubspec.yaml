@@ -73,6 +73,9 @@ dependencies:
   audioplayers: ^6.7.1
   wakelock_plus: ^1.7.0
   path_provider: ^2.1.6
+  # Retains the server session and CSRF cookies across Android process restart
+  # using Android Keystore-backed encryption; never use regular preferences.
+  flutter_secure_storage: ^11.2.0
 
 # goals_widgets declares these overrides, but pub IGNORES a non-root package's
 # dependency_overrides — so the root (this app) must replicate them or resolution

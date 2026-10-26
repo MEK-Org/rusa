@@ -108,16 +108,10 @@ Future<SessionAuth> initializeNativeFirebaseAuth(
   String googleServerClientId = _googleServerClientId,
 }) async {
   if (androidAppId.isEmpty) {
-    throw StateError(
-      'This dashboard build has no Firebase Android app ID; rebuild with '
-      '--dart-define=RUSA_FIREBASE_ANDROID_APP_ID=<app id>',
-    );
+    throw const DashboardConfigurationError('RUSA_FIREBASE_ANDROID_APP_ID');
   }
   if (googleServerClientId.isEmpty) {
-    throw StateError(
-      'This dashboard build has no Google web client ID; rebuild with '
-      '--dart-define=RUSA_GOOGLE_SERVER_CLIENT_ID=<client id>',
-    );
+    throw const DashboardConfigurationError('RUSA_GOOGLE_SERVER_CLIENT_ID');
   }
   final messagingSenderId = firebase['messagingSenderId'];
   await Firebase.initializeApp(

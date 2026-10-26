@@ -60,9 +60,11 @@ class ActorAvatar extends StatelessWidget {
               '/api/mesh/avatar/$id.png${version > 0 ? '?v=$version' : ''}',
             )
             .toString();
+        final imageHeaders = store?.avatarHeaders(Uri.parse(url));
 
         final image = Image.network(
           url,
+          headers: imageHeaders,
           // A new version (upload, manual generate, or lazy `ready`) must start
           // from a clean image state rather than inherit the previous URL's
           // error, so the replacement image fades in instead of snapping.
@@ -294,8 +296,12 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                                   '/api/mesh/avatar/${widget.id}.png${version > 0 ? '?v=$version' : ''}',
                                 )
                                 .toString();
+                            final imageHeaders = widget.store?.avatarHeaders(
+                              Uri.parse(url),
+                            );
                             return Image.network(
                               url,
+                              headers: imageHeaders,
                               fit: BoxFit.contain,
                               gaplessPlayback: true,
                               loadingBuilder: (_, child, progress) =>
