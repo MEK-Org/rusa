@@ -133,16 +133,16 @@ void main() {
     await tester.tap(find.byType(ActorAvatar));
     await tester.pump();
     expect(find.byType(AvatarLightbox), findsOneWidget);
-    final images = tester.widgetList<Image>(find.byType(Image));
-    expect(
-      images.any(
-        (image) =>
-            image.image is NetworkImage &&
-            (image.image as NetworkImage).headers?['Cookie'] ==
-                '__Host-rusa_session=session-1',
+    final lightboxImage = tester.widget<Image>(
+      find.descendant(
+        of: find.byType(AvatarLightbox),
+        matching: find.byType(Image),
       ),
-      isTrue,
     );
+    expect((lightboxImage.image as NetworkImage).headers, {
+      'Origin': 'https://dashboard.example.test',
+      'Cookie': '__Host-rusa_session=session-1',
+    });
   });
 
   testWidgets(

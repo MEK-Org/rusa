@@ -1,3 +1,7 @@
+import 'dart:async';
+
+import 'package:flutter/widgets.dart';
+
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'app.dart';
@@ -26,8 +30,13 @@ Future<DashboardSession> platformBootstrapSession() =>
       credentialStorage: SecureIoSessionCredentialStorage(),
     );
 
+// Returning the app to the foreground is a visit, as the browser's
+// visibilitychange is: it renews an idled session and lets its streams reopen.
 DashboardSessionHooksDisposer Function(DashboardSession session)?
-get platformBrowserHooksBuilder => null;
+get platformBrowserHooksBuilder =>
+    (session) => AppLifecycleListener(
+      onResume: () => unawaited(session.visit()),
+    ).dispose;
 
 DashboardApi platformCreateDashboardApi(DashboardSession session) {
   if (session case final IoSessionTransport transport) {

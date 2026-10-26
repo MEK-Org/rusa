@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -783,6 +784,64 @@ void main() {
         }
       },
     );
+
+    testWidgets('returning to the foreground renews an idled session and '
+        'reopens its stream', (tester) async {
+      await tester.runAsync(() async {
+        final baseUrl = Uri.parse('http://localhost:3000');
+        final controllers = <StreamController<List<int>>>[];
+        final renewals = <String>[];
+        final session = _firebaseSession(
+          baseUrl,
+          MockClient((req) async {
+            if (req.url.path == '/api/auth/refresh') renewals.add(req.method);
+            return http.Response('{"ok":true}', 200);
+          }),
+          auth: _Auth(_User('restored')),
+          cookieJar: IoSessionCookieJar(initialCsrfToken: 'csrf'),
+        );
+        final disposeHooks = platformBrowserHooksBuilder!(session);
+        final stream = IoEventSourceStream(
+          session: session,
+          baseUrl: baseUrl,
+          clientFactory: connectionFactory(controllers),
+        );
+
+        stream.connect(['actor-a']);
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        controllers.first.add(utf8.encode('event: session_idle\ndata: {}\n\n'));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(session.isIdle, isTrue);
+        expect(controllers.length, 1);
+
+        // Background, then foreground the same screen with no navigation.
+        for (final state in [
+          AppLifecycleState.inactive,
+          AppLifecycleState.hidden,
+          AppLifecycleState.paused,
+          AppLifecycleState.hidden,
+          AppLifecycleState.inactive,
+        ]) {
+          tester.binding.handleAppLifecycleStateChanged(state);
+        }
+        expect(renewals, isEmpty);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        expect(renewals, ['POST']);
+        expect(session.isIdle, isFalse);
+        expect(controllers.length, 2);
+
+        disposeHooks();
+        stream.dispose();
+        session.dispose();
+        for (final controller in controllers) {
+          if (!controller.isClosed) await controller.close();
+        }
+      });
+    });
 
     test(
       'auth_required frame prompts re-authentication without reconnecting',
