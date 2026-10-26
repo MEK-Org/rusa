@@ -1,19 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:http/http.dart' as http;
+
 import 'io_session_client.dart';
 import 'session.dart';
+import 'session_client.dart';
 
 /// Resolves the default server base URL on non-web platforms.
-/// Defaults to http://10.0.2.2:3000 on Android (loopback alias for the host workstation)
-/// or can be configured via `--dart-define=RUSA_SERVER_URL=...`.
+/// Defaults to http://localhost:3000; from an Android emulator or a
+/// USB-connected device, `adb reverse tcp:3000 tcp:3000` forwards the
+/// workstation's server to the device loopback. Override with
+/// `--dart-define=RUSA_SERVER_URL=...` (e.g. http://10.0.2.2:3000 for the
+/// emulator NAT alias, or a LAN host).
 Uri resolveIoServerBaseUrl() {
   const fromEnv = String.fromEnvironment('RUSA_SERVER_URL');
   if (fromEnv.isNotEmpty) {
     return Uri.parse(fromEnv);
   }
-  // Standard Android emulator loopback alias to host
-  return Uri.parse('http://10.0.2.2:3000');
+  return Uri.parse('http://localhost:3000');
 }
 
 /// A [DashboardSession] for IO (Android / VM) environments.
@@ -23,7 +28,9 @@ class IoDashboardSession extends DashboardSession {
     required this.baseUrl,
     required this.cookieJar,
     this.authEnabled = false,
-  });
+  }) : _status = authEnabled
+            ? DashboardSessionStatus.signedOut
+            : DashboardSessionStatus.local;
 
   final IoSessionClient client;
   final Uri baseUrl;
@@ -32,7 +39,7 @@ class IoDashboardSession extends DashboardSession {
 
   bool _isIdle = false;
   String? _errorMessage;
-  DashboardSessionStatus _status = DashboardSessionStatus.local;
+  DashboardSessionStatus _status;
 
   @override
   bool get authenticationEnabled => authEnabled;
@@ -88,7 +95,10 @@ class IoDashboardSession extends DashboardSession {
   @override
   Future<void> signOut() async {
     try {
-      await client.post(
+      // Route the logout POST through SessionClient so it bootstraps
+      // /api/auth/csrf and carries X-Rusa-CSRF exactly like the web
+      // dashboard's authenticated writes (a bare post is rejected 403).
+      await SessionClient(client, this).post(
         baseUrl.resolve('/api/auth/logout'),
         headers: {'Accept': 'application/json'},
       );
@@ -134,36 +144,49 @@ class IoDashboardSession extends DashboardSession {
 }
 
 /// Bootstraps an IO session against the configured server.
-Future<DashboardSession> bootstrapIoDashboardSession([Uri? overrideBaseUrl]) async {
-  final baseUrl = overrideBaseUrl ?? resolveIoServerBaseUrl();
+///
+/// Mirrors the web bootstrap: transport errors propagate raw and a non-200
+/// answer or malformed config throws [StateError], so the app renders its
+/// startup error with a retry either way — it never silently degrades to a
+/// local session. [clientFactory] is a test seam for injecting a mock
+/// transport.
+Future<DashboardSession> bootstrapIoDashboardSession({
+  Uri? baseUrl,
+  http.Client Function()? clientFactory,
+}) async {
+  final resolvedBaseUrl = baseUrl ?? resolveIoServerBaseUrl();
   final cookieJar = IoSessionCookieJar();
-  final client = IoSessionClient(baseUrl: baseUrl, cookieJar: cookieJar);
+  final client = IoSessionClient(
+    baseUrl: resolvedBaseUrl,
+    cookieJar: cookieJar,
+    inner: clientFactory?.call(),
+  );
 
-  try {
-    final response = await client.get(
-      baseUrl.resolve('/api/auth/config'),
-      headers: {'Accept': 'application/json'},
+  final response = await client.get(
+    resolvedBaseUrl.resolve('/api/auth/config'),
+    headers: {'Accept': 'application/json'},
+  );
+  if (response.statusCode != 200) {
+    throw StateError('Dashboard authentication configuration is unavailable');
+  }
+  final config = jsonDecode(response.body);
+  if (config is! Map<String, dynamic>) {
+    throw StateError('Dashboard authentication configuration is unavailable');
+  }
+  if (config['enabled'] == true) {
+    final session = IoDashboardSession(
+      client: client,
+      baseUrl: resolvedBaseUrl,
+      cookieJar: cookieJar,
+      authEnabled: true,
     );
-    if (response.statusCode == 200) {
-      final config = jsonDecode(response.body);
-      if (config is Map<String, dynamic> && config['enabled'] == true) {
-        final session = IoDashboardSession(
-          client: client,
-          baseUrl: baseUrl,
-          cookieJar: cookieJar,
-          authEnabled: true,
-        );
-        await session.checkSession();
-        return session;
-      }
-    }
-  } catch (_) {
-    // If the server cannot be reached during cold bootstrap, default to local session.
+    await session.checkSession();
+    return session;
   }
 
   return IoDashboardSession(
     client: client,
-    baseUrl: baseUrl,
+    baseUrl: resolvedBaseUrl,
     cookieJar: cookieJar,
     authEnabled: false,
   );

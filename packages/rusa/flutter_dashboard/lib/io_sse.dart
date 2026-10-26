@@ -3,23 +3,37 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'io_session.dart';
+import 'io_session_client.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
 import 'session.dart';
 
 /// Dart IO implementation of [MeshStreamSource] for Android / VM environments.
 /// Streams Server-Sent Events (SSE) over standard HTTP chunked transfer.
+///
+/// Each connection owns a fresh [http.Client] created by the factory so a
+/// reconnect never reuses a closed one. The default factory builds an
+/// [IoSessionClient] sharing the session's cookie jar (Origin + cookies are
+/// its job, not this class's); tests inject a factory returning their mock.
+///
+/// Reconnect policy mirrors the web [SessionEventSource]: transport drops and
+/// non-401 refusals retry on a timer, while `session_idle`, `auth_required`
+/// and `401` close the stream and wait for the session or the store instead
+/// of blind reconnects.
 class IoEventSourceStream implements MeshStreamSource {
   IoEventSourceStream({
     required DashboardSession session,
     required this.baseUrl,
-    http.Client? client,
+    http.Client Function()? clientFactory,
   })  : _session = session,
-        _client = client ?? http.Client();
+        _clientFactory = clientFactory {
+    _session.addListener(_onSessionChanged);
+    _wasIdle = _session.isIdle;
+  }
 
   final DashboardSession _session;
   final Uri baseUrl;
-  final http.Client _client;
+  final http.Client Function()? _clientFactory;
 
   final _mesh = StreamController<MeshEvent>.broadcast();
   final _live = StreamController<LiveOutputChunk>.broadcast();
@@ -32,6 +46,7 @@ class IoEventSourceStream implements MeshStreamSource {
   StreamSubscription<String>? _lineSubscription;
   Timer? _reconnectTimer;
   bool _disposed = false;
+  bool _wasIdle = false;
   List<String> _currentActors = const [];
 
   @override
@@ -51,9 +66,25 @@ class IoEventSourceStream implements MeshStreamSource {
   void connect(List<String> actors) {
     _currentActors = List.unmodifiable(actors);
     _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     _closeActiveStream();
-    if (_disposed) return;
-    _openStream();
+    if (_disposed || _session.isIdle) return;
+    unawaited(_openStream());
+  }
+
+  /// Mirrors the web SessionEventSource: an idle session closes every stream,
+  /// and becoming active again (visit) reopens them.
+  void _onSessionChanged() {
+    final isIdle = _session.isIdle;
+    if (isIdle == _wasIdle) return;
+    _wasIdle = isIdle;
+    if (isIdle) {
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
+      _closeActiveStream();
+    } else {
+      connect(_currentActors);
+    }
   }
 
   void _closeActiveStream() {
@@ -63,32 +94,31 @@ class IoEventSourceStream implements MeshStreamSource {
     _activeStreamClient = null;
   }
 
+  http.Client _newConnectionClient() {
+    final factory = _clientFactory;
+    if (factory != null) return factory();
+    final session = _session;
+    if (session is IoDashboardSession) {
+      return IoSessionClient(baseUrl: baseUrl, cookieJar: session.cookieJar);
+    }
+    return http.Client();
+  }
+
   Future<void> _openStream() async {
-    if (_disposed) return;
+    if (_disposed || _session.isIdle) return;
 
     final qs = _currentActors.isEmpty
         ? ''
         : '?actors=${Uri.encodeQueryComponent(_currentActors.join(','))}';
     final streamUri = baseUrl.resolve('/api/mesh/stream$qs');
-    final origin =
-        '${baseUrl.scheme}://${baseUrl.host}${baseUrl.hasPort ? ':${baseUrl.port}' : ''}';
 
-    final client = _client;
+    final client = _newConnectionClient();
     _activeStreamClient = client;
 
     try {
       final request = http.Request('GET', streamUri);
       request.headers['Accept'] = 'text/event-stream';
       request.headers['Cache-Control'] = 'no-cache';
-      request.headers['Origin'] = origin;
-
-      final session = _session;
-      if (session is IoDashboardSession) {
-        final cookie = session.cookieJar.buildCookieHeader();
-        if (cookie != null) {
-          request.headers['Cookie'] = cookie;
-        }
-      }
 
       final response = await client.send(request);
 
@@ -98,12 +128,18 @@ class IoEventSourceStream implements MeshStreamSource {
       }
 
       if (response.statusCode == 401) {
-        await _session.requireAuthentication();
-        _scheduleReconnect();
+        // A dead session is settled by requireAuthentication, not by retrying:
+        // the next connect() (selection change or re-login) reopens the stream.
+        _reconnectTimer?.cancel();
+        _reconnectTimer = null;
+        _closeActiveStream();
+        unawaited(_session.requireAuthentication());
         return;
       }
 
       if (response.statusCode != 200) {
+        client.close();
+        _activeStreamClient = null;
         _scheduleReconnect();
         return;
       }
@@ -148,6 +184,10 @@ class IoEventSourceStream implements MeshStreamSource {
         cancelOnError: true,
       );
     } catch (_) {
+      if (_disposed || _activeStreamClient != client) {
+        client.close();
+        return;
+      }
       _scheduleReconnect();
     }
   }
@@ -179,9 +219,14 @@ class IoEventSourceStream implements MeshStreamSource {
           _avatarUpdates.add(AvatarGenerationUpdate.fromJson(json));
           break;
         case 'session_idle':
+          // The session listener closes the stream synchronously; no reconnect.
           _session.idleFromServer();
           break;
         case 'auth_required':
+          // Same as the web transport: disconnect and prompt, never retry blind.
+          _reconnectTimer?.cancel();
+          _reconnectTimer = null;
+          _closeActiveStream();
           unawaited(_session.requireAuthentication());
           break;
       }
@@ -206,8 +251,8 @@ class IoEventSourceStream implements MeshStreamSource {
     _disposed = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _session.removeListener(_onSessionChanged);
     _closeActiveStream();
-    _client.close();
     _mesh.close();
     _live.close();
     _elided.close();

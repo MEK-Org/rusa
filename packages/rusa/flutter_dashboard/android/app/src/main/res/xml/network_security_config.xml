@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The sideloaded dashboard talks to the workstation's rusa server over plain
+  HTTP, but only on the loopback aliases (adb reverse / emulator NAT).
+  Every other host requires TLS. Keep this list limited to loopback hosts.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

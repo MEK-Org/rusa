@@ -34,8 +34,6 @@ DashboardSessionHooksDisposer Function(DashboardSession session)?
     get platformBrowserHooksBuilder =>
         (session) => DashboardSessionBrowserHooks(session).dispose;
 
-Uri platformServerBaseUrl() => Uri.base;
-
 DashboardApi platformCreateDashboardApi(DashboardSession session) =>
     DashboardApi(base: Uri.base, session: session);
 

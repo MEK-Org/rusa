@@ -23,8 +23,6 @@ Future<DashboardSession> platformBootstrapSession() =>
 DashboardSessionHooksDisposer Function(DashboardSession session)?
     get platformBrowserHooksBuilder => null;
 
-Uri platformServerBaseUrl() => resolveIoServerBaseUrl();
-
 DashboardApi platformCreateDashboardApi(DashboardSession session) {
   if (session is IoDashboardSession) {
     return DashboardApi(

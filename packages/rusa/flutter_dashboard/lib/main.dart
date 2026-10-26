@@ -6,6 +6,7 @@ import 'api.dart';
 import 'app.dart';
 import 'breakpoints.dart';
 import 'dashboard_title.dart';
+import 'io_session.dart';
 import 'iu/iu_reports_view.dart';
 import 'iu/iu_tree_view.dart';
 import 'platform_bootstrap.dart';
@@ -118,8 +119,16 @@ class _DashboardPageState extends State<DashboardPage> {
                   onNavigation: widget.session.visit,
                   profilePhotoUrl: widget.session.profilePhotoUrl,
                   store: _store,
-                  understandingBuilder: (_) =>
-                      IuTreeBody(session: widget.session),
+                  understandingBuilder: (_) {
+                    final session = widget.session;
+                    return IuTreeBody(
+                      session: session,
+                      baseUrl: _api.base,
+                      client: session is IoDashboardSession
+                          ? session.client
+                          : null,
+                    );
+                  },
                   reportsBuilder: (_) => IuReportsBody(store: _store),
                 );
               },

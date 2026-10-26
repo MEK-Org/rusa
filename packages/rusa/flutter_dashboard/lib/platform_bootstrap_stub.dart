@@ -19,8 +19,6 @@ Future<DashboardSession> platformBootstrapSession() =>
 DashboardSessionHooksDisposer Function(DashboardSession session)?
     get platformBrowserHooksBuilder => null;
 
-Uri platformServerBaseUrl() => Uri.base;
-
 DashboardApi platformCreateDashboardApi(DashboardSession session) =>
     DashboardApi(session: session);
 

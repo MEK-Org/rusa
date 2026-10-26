@@ -317,6 +317,12 @@ class DashboardStore {
   final ActorHierarchyCache _actorHierarchyCache;
   final ObligationsCache _obligationsCache;
   final String _hierarchyScope;
+
+  /// The origin every dashboard request resolves against. Widgets that load
+  /// server assets outside [DashboardApi] (e.g. avatar images) resolve them
+  /// here instead of `Uri.base`, which is a file: URI on non-web hosts.
+  Uri get apiBase => _api.base;
+
   List<ObligationTreeDto>? _cachedObligationTrees;
   String? _cachedObligationPrincipal;
 

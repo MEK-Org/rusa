@@ -49,11 +49,13 @@ class ActorAvatar extends StatelessWidget {
       stream: store?.avatarEpoch,
       initialData: 0,
       builder: (context, _) {
-        // Relative to the page origin (Uri.base) so the same build works on
-        // localhost and behind `tailscale serve`, matching DashboardApi.
+        // Relative to the dashboard's API origin (store.apiBase — Uri.base on
+        // web, the configured server on Android) so the same build works on
+        // localhost, behind `tailscale serve`, and on non-web hosts, matching
+        // DashboardApi.
         final version = store?.avatarVersion(id) ?? 0;
         final generating = store?.isAvatarGenerating(id) ?? false;
-        final url = Uri.base
+        final url = (store?.apiBase ?? Uri.base)
             .resolve(
               '/api/mesh/avatar/$id.png${version > 0 ? '?v=$version' : ''}',
             )
@@ -287,7 +289,7 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                           builder: (context, _) {
                             final version =
                                 widget.store?.avatarVersion(widget.id) ?? 0;
-                            final url = Uri.base
+                            final url = (widget.store?.apiBase ?? Uri.base)
                                 .resolve(
                                   '/api/mesh/avatar/${widget.id}.png${version > 0 ? '?v=$version' : ''}',
                                 )

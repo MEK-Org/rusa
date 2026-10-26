@@ -52,7 +52,9 @@ class IoSessionCookieJar {
 }
 
 /// An [http.Client] that persists dashboard session cookies and injects an Origin
-/// header matching [baseUrl] on every request.
+/// header matching [baseUrl] on every request to [baseUrl]'s own origin.
+/// Cross-origin requests pass through untouched: the session cookie and a
+/// matching Origin are only meaningful (and only safe to attach) at home.
 class IoSessionClient extends http.BaseClient {
   IoSessionClient({
     http.Client? inner,
@@ -68,29 +70,40 @@ class IoSessionClient extends http.BaseClient {
   String get origin =>
       '${baseUrl.scheme}://${baseUrl.host}${baseUrl.hasPort ? ':${baseUrl.port}' : ''}';
 
+  bool _isSameOrigin(Uri url) =>
+      url.scheme == baseUrl.scheme &&
+      url.host == baseUrl.host &&
+      url.port == baseUrl.port;
+
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    // Ensure Origin header is present for CSRF / same-origin checks.
-    if (!request.headers.containsKey('Origin') &&
-        !request.headers.containsKey('origin')) {
-      request.headers['Origin'] = origin;
-    }
+    final sameOrigin = _isSameOrigin(request.url);
 
-    // Attach persisted cookies.
-    final cookieHeader = cookieJar.buildCookieHeader();
-    if (cookieHeader != null) {
-      final existing = request.headers['Cookie'] ?? request.headers['cookie'];
-      if (existing == null || existing.isEmpty) {
-        request.headers['Cookie'] = cookieHeader;
-      } else if (!existing.contains('__Host-rusa_')) {
-        request.headers['Cookie'] = '$existing; $cookieHeader';
+    if (sameOrigin) {
+      // Ensure Origin header is present for CSRF / same-origin checks.
+      if (!request.headers.containsKey('Origin') &&
+          !request.headers.containsKey('origin')) {
+        request.headers['Origin'] = origin;
+      }
+
+      // Attach persisted cookies.
+      final cookieHeader = cookieJar.buildCookieHeader();
+      if (cookieHeader != null) {
+        final existing = request.headers['Cookie'] ?? request.headers['cookie'];
+        if (existing == null || existing.isEmpty) {
+          request.headers['Cookie'] = cookieHeader;
+        } else if (!existing.contains('__Host-rusa_')) {
+          request.headers['Cookie'] = '$existing; $cookieHeader';
+        }
       }
     }
 
     final response = await _inner.send(request);
 
-    // Save any set cookies.
-    cookieJar.updateFromHeaders(response.headers);
+    // Save any set cookies (home origin only — see _isSameOrigin).
+    if (sameOrigin) {
+      cookieJar.updateFromHeaders(response.headers);
+    }
 
     return response;
   }
