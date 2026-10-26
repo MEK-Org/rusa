@@ -12,6 +12,7 @@ import 'package:wakelock_plus_platform_interface/messages.g.dart';
 import 'package:rusa_dashboard/io_session.dart';
 import 'package:rusa_dashboard/io_session_client.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/session_client.dart';
 import 'package:rusa_dashboard/voice_io.dart';
 import 'package:rusa_dashboard/voice_platform.dart';
 
@@ -30,6 +31,19 @@ IoDashboardSession _session(http.Client inner) {
     baseUrl: _baseUrl,
     cookieJar: jar,
   );
+}
+
+class _ExpiringSession implements SessionRequestState {
+  bool expired = false;
+
+  @override
+  bool get authenticationEnabled => true;
+
+  @override
+  String? get csrfToken => null;
+
+  @override
+  Future<void> requireAuthentication() async => expired = true;
 }
 
 /// The `record` plugin's method channel, with the recorder's state event
@@ -349,6 +363,26 @@ void main() {
         player().play('/api/mesh/voice/audio/gone'),
         throwsStateError,
       );
+      expect(plugin.methods, isNot(contains('setSourceBytes')));
+    });
+
+    test('an audio 401 expires the dashboard session', () async {
+      final session = _session(
+        MockClient((_) async => http.Response('unauthorized', 401)),
+      );
+      final expiring = _ExpiringSession();
+      final p = IoVoicePlayer(
+        client: session.client,
+        baseUrl: session.baseUrl,
+        session: expiring,
+      );
+
+      await expectLater(
+        p.play('/api/mesh/voice/audio/expired'),
+        throwsStateError,
+      );
+
+      expect(expiring.expired, isTrue);
       expect(plugin.methods, isNot(contains('setSourceBytes')));
     });
   });

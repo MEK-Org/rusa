@@ -128,8 +128,16 @@ Future<DashboardSession> bootstrapIoDashboardSession({
   // The public config fetch needs no session. Restore only for an enabled
   // dashboard, immediately before Firebase's restored-user check runs.
   await cookieJar.restore();
+  final auth = await authFactory(firebase);
+  // Firebase can restore its own identity after an ordinary process restart,
+  // but without the server cookie that identity cannot enter the dashboard.
+  // Clear it before `start` publishes signedIn, rather than mounting a page
+  // that would immediately send unauthenticated requests and be torn down.
+  if (auth.currentUser != null && cookieJar.sessionCookie == null) {
+    await auth.signOut();
+  }
   final session = IoFirebaseDashboardSession(
-    await authFactory(firebase),
+    auth,
     client: client,
     baseUrl: resolvedBaseUrl,
     cookieJar: cookieJar,

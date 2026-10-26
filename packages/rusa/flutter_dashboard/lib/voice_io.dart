@@ -13,6 +13,7 @@ import 'io_session.dart';
 import 'io_session_events.dart';
 import 'models.dart';
 import 'session.dart';
+import 'session_client.dart';
 import 'voice_platform.dart';
 
 /// Device implementations of the `voice_platform.dart` seams, the Android
@@ -30,7 +31,11 @@ WalkieDeps ioWalkieDeps(
 ) => WalkieDeps(
   api: api,
   recorder: IoVoiceRecorder(),
-  player: IoVoicePlayer(client: transport.client, baseUrl: transport.baseUrl),
+  player: IoVoicePlayer(
+    client: transport.client,
+    baseUrl: transport.baseUrl,
+    session: session,
+  ),
   wakeLock: IoScreenWakeLock(),
   createStream: () =>
       IoVoiceStream(session: session, baseUrl: transport.baseUrl),
@@ -95,14 +100,19 @@ class IoVoiceRecorder implements VoiceRecorder {
     _recorder = null;
     final expectedPath = _path;
     _path = null;
+    File? file;
     try {
       final path = await recorder.stop() ?? expectedPath;
       if (path == null) throw StateError('recording produced no file');
-      final file = File(path);
+      file = File(path);
       final bytes = await file.readAsBytes();
-      await file.delete();
       return RecordedAudio(bytes: bytes, mimeType: _kRecordMime);
     } finally {
+      if (file != null) {
+        try {
+          await file.delete();
+        } catch (_) {}
+      }
       await recorder.dispose();
     }
   }
@@ -133,8 +143,9 @@ class IoVoicePlayer implements VoicePlayer {
   IoVoicePlayer({
     required http.Client client,
     required Uri baseUrl,
+    SessionRequestState? session,
     AudioPlayer Function()? createPlayer,
-  }) : _client = client,
+  }) : _client = session == null ? client : SessionClient(client, session),
        _baseUrl = baseUrl,
        _createPlayer = createPlayer ?? AudioPlayer.new;
 

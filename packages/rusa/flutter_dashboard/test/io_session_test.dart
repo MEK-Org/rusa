@@ -468,18 +468,17 @@ void main() {
     );
 
     test(
-      'a restored Firebase user without a live server session signs out',
+      'a restored Firebase user without a retained server cookie signs out before mounting',
       () async {
         final auth = _Auth(_User('restored'));
+        final requests = <http.Request>[];
         final mock = MockClient((req) async {
+          requests.add(req);
           if (req.url.path == '/api/auth/config') {
             return http.Response(
               jsonEncode({'enabled': true, 'firebase': <String, dynamic>{}}),
               200,
             );
-          }
-          if (req.url.path == '/api/auth/session') {
-            return http.Response('unauthorized', 401);
           }
           return http.Response('Not found', 404);
         });
@@ -489,10 +488,12 @@ void main() {
           clientFactory: () => mock,
           authFactory: (_) async => auth,
         );
-        await Future<void>.delayed(Duration.zero);
 
         expect(session.status, DashboardSessionStatus.signedOut);
         expect(auth.signOutCount, 1);
+        expect(requests.map((request) => request.url.path), [
+          '/api/auth/config',
+        ]);
       },
     );
 
