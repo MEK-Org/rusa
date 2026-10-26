@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
+import 'package:rusa_dashboard/app.dart';
 import 'package:rusa_dashboard/io_session.dart';
 import 'package:rusa_dashboard/io_session_client.dart';
 import 'package:rusa_dashboard/io_sse.dart';
@@ -226,13 +228,35 @@ void main() {
       expect(session.status, DashboardSessionStatus.signedOut);
       await expectLater(
         () => session.signIn(),
-        throwsA(isA<StateError>()),
+        throwsA(isA<DashboardSignInUnsupportedError>()),
       );
       expect(session.status, DashboardSessionStatus.signedOut);
-      expect(
-        session.errorMessage,
-        'Google sign-in is not supported on this device build.',
+      expect(session.errorMessage, DashboardSignInUnsupportedError.message);
+    });
+
+    testWidgets('the sign-in page explains unsupported sign-in', (
+      tester,
+    ) async {
+      final baseUrl = Uri.parse('http://localhost:3000');
+      final jar = IoSessionCookieJar();
+      final session = IoDashboardSession(
+        client: IoSessionClient(
+          inner: MockClient((req) async => http.Response('Not found', 404)),
+          baseUrl: baseUrl,
+          cookieJar: jar,
+        ),
+        baseUrl: baseUrl,
+        cookieJar: jar,
+        authEnabled: true,
       );
+
+      await tester.pumpWidget(MaterialApp(home: SignInPage(session: session)));
+      await tester.tap(find.text('Sign in with Google'));
+      await tester.pumpAndSettle();
+
+      expect(find.text(DashboardSignInUnsupportedError.message), findsOneWidget);
+      expect(find.textContaining('Check your connection'), findsNothing);
+      expect(session.status, DashboardSessionStatus.signedOut);
     });
   });
 

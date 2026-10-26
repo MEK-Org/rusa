@@ -18,6 +18,15 @@ class DashboardAccountSetupError implements Exception {
       'This Google account is not linked to this dashboard. Ask the dashboard administrator to check the account setup.';
 }
 
+/// This build has no way to obtain a Google credential, so retrying cannot
+/// help; the sign-in page shows [message] instead of connection advice.
+class DashboardSignInUnsupportedError implements Exception {
+  const DashboardSignInUnsupportedError();
+
+  static const message =
+      'Google sign-in is not supported on this device build.';
+}
+
 enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {

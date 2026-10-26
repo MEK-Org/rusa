@@ -269,6 +269,10 @@ class _SignInPageState extends State<SignInPage> {
       if (mounted) {
         setState(() => _error = DashboardAccountSetupError.message);
       }
+    } on DashboardSignInUnsupportedError {
+      if (mounted) {
+        setState(() => _error = DashboardSignInUnsupportedError.message);
+      }
     } catch (_) {
       if (mounted) {
         setState(

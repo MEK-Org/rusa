@@ -90,9 +90,9 @@ class IoDashboardSession extends DashboardSession {
     if (!authEnabled) return;
     // Native authentication / token exchange against /api/auth/session is not yet
     // implemented on this platform build. Keep the session signedOut, report the error,
-    // and throw so SignInPage surfaces the failure rather than mounting a credential-less dashboard.
-    setError('Google sign-in is not supported on this device build.');
-    throw StateError('Google sign-in is not supported on this device build.');
+    // and throw so SignInPage shows that explanation rather than mounting a credential-less dashboard.
+    setError(DashboardSignInUnsupportedError.message);
+    throw const DashboardSignInUnsupportedError();
   }
 
   @override
