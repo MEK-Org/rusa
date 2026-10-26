@@ -124,9 +124,10 @@ class _DashboardPageState extends State<DashboardPage> {
                     return IuTreeBody(
                       session: session,
                       baseUrl: _api.base,
-                      client: session is IoDashboardSession
-                          ? session.client
-                          : null,
+                      client: switch (session) {
+                        final IoSessionTransport transport => transport.client,
+                        _ => null,
+                      },
                     );
                   },
                   reportsBuilder: (_) => IuReportsBody(store: _store),

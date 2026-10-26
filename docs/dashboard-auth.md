@@ -124,6 +124,39 @@ email allowlist before issuing a Firebase session cookie. There is no Rusa regis
 or invitation flow. Firebase may create its own provider account during Google
 sign-in; that does not grant access to Rusa.
 
+## Android dashboard sign-in
+
+The Android dashboard build uses the same Google sign-in, session cookie, CSRF,
+renewal, idle and logout policy as the browser; the server is unchanged. The
+native Firebase SDK opens Google's account chooser in a browser tab and returns
+a Firebase ID token, which the app exchanges at `POST /api/auth/session` exactly
+as the browser does, sending the configured server's `Origin`. Sign-in fails
+closed when the server refuses the token or the session cookie is not retained.
+
+The server serves the Firebase *Web* app's public configuration; a native client
+must identify as an Android app in the same Firebase project. One-time operator
+setup, in the Firebase Console (Project Settings → General → Your apps):
+
+1. Add an Android app with package name `org.mek.rusa.dashboard`.
+2. Register the SHA-1 and SHA-256 fingerprints of the key that signs the APK
+   (`./gradlew signingReport` in `packages/rusa/flutter_dashboard/android`).
+   Release builds sign with the keystore named by `android/key.properties`; without
+   one they fall back to this machine's debug key, whose fingerprint differs per
+   machine, so register the key you will actually distribute with.
+3. Build with that Android app's ID and the dashboard's HTTPS origin:
+
+```sh
+flutter build apk --release \
+  --dart-define=RUSA_SERVER_URL=https://dashboard.example.com \
+  --dart-define=RUSA_FIREBASE_ANDROID_APP_ID=1:000000000000:android:0000000000000000
+```
+
+A build without `RUSA_FIREBASE_ANDROID_APP_ID` fails at startup against an
+authenticated server with an error naming the missing define, rather than
+offering a sign-in that cannot succeed. As on the web, do not commit a
+`google-services.json` or generated Firebase options. Admission is the same email
+allowlist; registering the Android app grants no additional access.
+
 ## Visits, inactivity, and logout
 
 The cookie expires five days after the last successful visit/navigation

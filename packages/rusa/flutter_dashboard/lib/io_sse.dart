@@ -97,9 +97,8 @@ class IoEventSourceStream implements MeshStreamSource {
   http.Client _newConnectionClient() {
     final factory = _clientFactory;
     if (factory != null) return factory();
-    final session = _session;
-    if (session is IoDashboardSession) {
-      return IoSessionClient(baseUrl: baseUrl, cookieJar: session.cookieJar);
+    if (_session case final IoSessionTransport transport) {
+      return IoSessionClient(baseUrl: baseUrl, cookieJar: transport.cookieJar);
     }
     return http.Client();
   }

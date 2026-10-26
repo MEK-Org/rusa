@@ -24,10 +24,10 @@ DashboardSessionHooksDisposer Function(DashboardSession session)?
     get platformBrowserHooksBuilder => null;
 
 DashboardApi platformCreateDashboardApi(DashboardSession session) {
-  if (session is IoDashboardSession) {
+  if (session case final IoSessionTransport transport) {
     return DashboardApi(
-      client: session.client,
-      base: session.baseUrl,
+      client: transport.client,
+      base: transport.baseUrl,
       session: session,
     );
   }

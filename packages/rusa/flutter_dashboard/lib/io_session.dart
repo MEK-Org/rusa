@@ -1,11 +1,10 @@
-import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'io_firebase_auth.dart';
 import 'io_session_client.dart';
 import 'session.dart';
-import 'session_client.dart';
 
 /// Resolves the default server base URL on non-web platforms.
 /// Defaults to http://localhost:3000; from an Android emulator or a
@@ -21,130 +20,64 @@ Uri resolveIoServerBaseUrl() {
   return Uri.parse('http://localhost:3000');
 }
 
-/// A [DashboardSession] for IO (Android / VM) environments.
-class IoDashboardSession extends DashboardSession {
+/// The device transport a dashboard session carries: the configured server
+/// and the cookie-holding client every dashboard request must share.
+abstract interface class IoSessionTransport {
+  IoSessionClient get client;
+  Uri get baseUrl;
+  IoSessionCookieJar get cookieJar;
+}
+
+/// Unauthenticated local mode on IO (Android / VM), as [LocalDashboardSession]
+/// is on web, plus the device transport.
+class IoDashboardSession extends LocalDashboardSession
+    implements IoSessionTransport {
   IoDashboardSession({
     required this.client,
     required this.baseUrl,
     required this.cookieJar,
-    this.authEnabled = false,
-  }) : _status = authEnabled
-            ? DashboardSessionStatus.signedOut
-            : DashboardSessionStatus.local;
+  });
 
+  @override
   final IoSessionClient client;
+  @override
   final Uri baseUrl;
+  @override
   final IoSessionCookieJar cookieJar;
-  final bool authEnabled;
-
-  bool _isIdle = false;
-  String? _errorMessage;
-  DashboardSessionStatus _status;
-
-  @override
-  bool get authenticationEnabled => authEnabled;
-
-  @override
-  String? get csrfToken => cookieJar.csrfToken;
-
-  @override
-  bool get isIdle => _isIdle;
-
-  @override
-  String? get profilePhotoUrl => null;
-
-  @override
-  String get operatorDisplayName => 'Operator';
-
-  @override
-  String? get browserTitle => null;
-
-  @override
-  String? get errorMessage => _errorMessage;
-
-  @override
-  DashboardSessionStatus get status => authEnabled ? _status : DashboardSessionStatus.local;
-
-  void setStatus(DashboardSessionStatus status) {
-    if (_status != status) {
-      _status = status;
-      notifyListeners();
-    }
-  }
-
-  void setError(String? error) {
-    if (_errorMessage != error) {
-      _errorMessage = error;
-      notifyListeners();
-    }
-  }
-
-  @override
-  Future<void> requireAuthentication() async {
-    if (!authEnabled) return;
-    setStatus(DashboardSessionStatus.signedOut);
-  }
-
-  @override
-  Future<void> signIn() async {
-    if (!authEnabled) return;
-    // Native authentication / token exchange against /api/auth/session is not yet
-    // implemented on this platform build. Keep the session signedOut, report the error,
-    // and throw so SignInPage shows that explanation rather than mounting a credential-less dashboard.
-    setError(DashboardSignInUnsupportedError.message);
-    throw const DashboardSignInUnsupportedError();
-  }
-
-  @override
-  Future<void> signOut() async {
-    try {
-      // Route the logout POST through SessionClient so it bootstraps
-      // /api/auth/csrf and carries X-Rusa-CSRF exactly like the web
-      // dashboard's authenticated writes (a bare post is rejected 403).
-      await SessionClient(client, this).post(
-        baseUrl.resolve('/api/auth/logout'),
-        headers: {'Accept': 'application/json'},
-      );
-    } catch (_) {
-      // Best-effort logout
-    } finally {
-      cookieJar.clear();
-      setStatus(DashboardSessionStatus.signedOut);
-    }
-  }
-
-  @override
-  Future<void> visit() async {
-    if (_isIdle) {
-      _isIdle = false;
-      notifyListeners();
-    }
-  }
-
-  @override
-  void idleFromServer() {
-    if (!_isIdle) {
-      _isIdle = true;
-      notifyListeners();
-    }
-  }
-
-  @override
-  Future<void> checkSession() async {
-    if (!authEnabled) return;
-    try {
-      final res = await client.get(
-        baseUrl.resolve('/api/auth/session'),
-        headers: {'Accept': 'application/json'},
-      );
-      if (res.statusCode == 401) {
-        await requireAuthentication();
-      } else if (res.statusCode == 200) {
-        setStatus(DashboardSessionStatus.signedIn);
-      }
-    } catch (_) {}
-  }
 }
+
+/// Authenticated mode on IO. The sign-in, session-retention, renewal, idle and
+/// logout policy is the web dashboard's [FirebaseDashboardSession]; only the
+/// Google credential source and the cookie transport are device-specific.
+class IoFirebaseDashboardSession extends FirebaseDashboardSession
+    implements IoSessionTransport {
+  IoFirebaseDashboardSession(
+    super.auth, {
+    required this.client,
+    required this.baseUrl,
+    required this.cookieJar,
+    super.idleDuration,
+  }) : super(
+         client: client,
+         baseUrl: baseUrl,
+         csrfToken: () => cookieJar.csrfToken,
+         // A browser drops an expired session cookie; the device jar is the
+         // only dashboard state IO keeps, so expiry and logout clear it.
+         clearDashboardCaches: cookieJar.clear,
+       );
+
+  @override
+  final IoSessionClient client;
+  @override
+  final Uri baseUrl;
+  @override
+  final IoSessionCookieJar cookieJar;
+}
+
+/// Creates the native Firebase credential source from the server's public
+/// Firebase client configuration (see `io_firebase_auth.dart`).
+typedef IoSessionAuthFactory =
+    Future<SessionAuth> Function(Map<String, dynamic> firebase);
 
 /// Bootstraps an IO session against the configured server.
 ///
@@ -156,6 +89,7 @@ class IoDashboardSession extends DashboardSession {
 Future<DashboardSession> bootstrapIoDashboardSession({
   Uri? baseUrl,
   http.Client Function()? clientFactory,
+  IoSessionAuthFactory authFactory = initializeNativeFirebaseAuth,
 }) async {
   final resolvedBaseUrl = baseUrl ?? resolveIoServerBaseUrl();
   final cookieJar = IoSessionCookieJar();
@@ -181,18 +115,18 @@ Future<DashboardSession> bootstrapIoDashboardSession({
       client: client,
       baseUrl: resolvedBaseUrl,
       cookieJar: cookieJar,
-      authEnabled: false,
     );
   }
-  if (config['enabled'] == true) {
-    final session = IoDashboardSession(
-      client: client,
-      baseUrl: resolvedBaseUrl,
-      cookieJar: cookieJar,
-      authEnabled: true,
-    );
-    await session.checkSession();
-    return session;
+  final firebase = config['firebase'];
+  if (config['enabled'] != true || firebase is! Map<String, dynamic>) {
+    throw StateError('Dashboard authentication configuration is unavailable');
   }
-  throw StateError('Dashboard authentication configuration is unavailable');
+  final session = IoFirebaseDashboardSession(
+    await authFactory(firebase),
+    client: client,
+    baseUrl: resolvedBaseUrl,
+    cookieJar: cookieJar,
+  );
+  session.start();
+  return session;
 }

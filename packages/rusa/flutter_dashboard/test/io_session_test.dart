@@ -1,12 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
-import 'package:rusa_dashboard/app.dart';
 import 'package:rusa_dashboard/io_session.dart';
 import 'package:rusa_dashboard/io_session_client.dart';
 import 'package:rusa_dashboard/io_sse.dart';
@@ -35,6 +33,66 @@ class _CloseEnforcingClient extends http.BaseClient {
     _closed = true;
     _inner.close();
   }
+}
+
+class _User implements SessionUser {
+  _User(this.token);
+
+  final String token;
+
+  @override
+  String get uid => 'uid-$token';
+
+  @override
+  String? get photoUrl => null;
+
+  @override
+  String? get displayName => null;
+
+  @override
+  String? get email => null;
+
+  @override
+  Future<String> getIdToken({bool forceRefresh = false}) async => token;
+}
+
+class _Auth implements SessionAuth {
+  _Auth([this.currentUser]);
+
+  @override
+  SessionUser? currentUser;
+  final changes = StreamController<SessionUser?>.broadcast();
+  int signOutCount = 0;
+
+  @override
+  Stream<SessionUser?> authStateChanges() => changes.stream;
+
+  @override
+  Future<SessionUser> signInWithGoogle() async =>
+      currentUser = _User('google-id-token');
+
+  @override
+  Future<void> signOut() async {
+    signOutCount++;
+    currentUser = null;
+  }
+}
+
+/// A Firebase-mode session over [inner], already signed in when [auth] holds
+/// a restored user.
+IoFirebaseDashboardSession _firebaseSession(
+  Uri baseUrl,
+  http.Client inner, {
+  _Auth? auth,
+  IoSessionCookieJar? cookieJar,
+}) {
+  final jar = cookieJar ?? IoSessionCookieJar();
+  return IoFirebaseDashboardSession(
+    auth ?? _Auth(),
+    client: IoSessionClient(inner: inner, baseUrl: baseUrl, cookieJar: jar),
+    baseUrl: baseUrl,
+    cookieJar: jar,
+  )..start();
 }
 
 const _meshEventFrame =
@@ -141,121 +199,160 @@ void main() {
         ),
         baseUrl: baseUrl,
         cookieJar: jar,
-        authEnabled: false,
       );
 
       expect(session.authenticationEnabled, isFalse);
       expect(session.status, DashboardSessionStatus.local);
       expect(session.operatorDisplayName, 'Operator');
     });
+  });
 
-    test('authenticated mode starts signedOut, not local', () {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final jar = IoSessionCookieJar();
-      final session = IoDashboardSession(
-        client: IoSessionClient(
-          inner: MockClient((req) async => http.Response('Not found', 404)),
-          baseUrl: baseUrl,
-          cookieJar: jar,
-        ),
-        baseUrl: baseUrl,
-        cookieJar: jar,
-        authEnabled: true,
+  group('IoFirebaseDashboardSession', () {
+    final baseUrl = Uri.parse('https://dashboard.example.test');
+
+    test('starts signedOut without a restored Firebase user', () {
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async => http.Response('Not found', 404)),
       );
 
+      expect(session.authenticationEnabled, isTrue);
       expect(session.status, DashboardSessionStatus.signedOut);
     });
 
-    test('authenticated mode sign out bootstraps CSRF and clears cookies',
-        () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
+    test(
+      'signIn exchanges the Google ID token at the configured server and '
+      'requires the retained cookie',
+      () async {
+        final requests = <http.Request>[];
+        final session = _firebaseSession(
+          baseUrl,
+          MockClient((req) async {
+            requests.add(req);
+            switch (req.url.path) {
+              case '/api/auth/csrf':
+                return http.Response(
+                  '{"ok":true}',
+                  200,
+                  headers: {'set-cookie': '__Host-rusa_csrf=pre; Path=/'},
+                );
+              case '/api/auth/session' when req.method == 'POST':
+                return http.Response(
+                  '{"authenticated":true}',
+                  200,
+                  headers: {
+                    'set-cookie':
+                        '__Host-rusa_session=sess; Path=/; HttpOnly, '
+                        '__Host-rusa_csrf=bound; Path=/',
+                  },
+                );
+              case '/api/auth/session':
+                return req.headers['Cookie']?.contains(
+                          '__Host-rusa_session=sess',
+                        ) ==
+                        true
+                    ? http.Response('{"authenticated":true}', 200)
+                    : http.Response('unauthorized', 401);
+            }
+            return http.Response('Not found', 404);
+          }),
+        );
+
+        await session.signIn();
+
+        final exchange = requests.singleWhere(
+          (r) => r.method == 'POST' && r.url.path == '/api/auth/session',
+        );
+        expect(exchange.url.origin, baseUrl.origin);
+        expect(jsonDecode(exchange.body), {'idToken': 'google-id-token'});
+        expect(exchange.headers['Origin'], baseUrl.origin);
+        expect(exchange.headers['X-Rusa-CSRF'], 'pre');
+        expect(requests.last.method, 'GET');
+        expect(requests.last.url.path, '/api/auth/session');
+        expect(session.status, DashboardSessionStatus.signedIn);
+        expect(session.csrfToken, 'bound');
+      },
+    );
+
+    test('signIn fails and stays signedOut when the server refuses', () async {
+      final auth = _Auth();
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async {
+          if (req.url.path == '/api/auth/csrf') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {'set-cookie': '__Host-rusa_csrf=pre; Path=/'},
+            );
+          }
+          return http.Response('unauthorized', 401);
+        }),
+        auth: auth,
+      );
+
+      await expectLater(session.signIn(), throwsA(isA<StateError>()));
+      expect(session.status, DashboardSessionStatus.signedOut);
+      expect(auth.signOutCount, 1);
+    });
+
+    test('signIn fails when the session cookie is not retained', () async {
+      final auth = _Auth();
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async {
+          if (req.url.path == '/api/auth/csrf') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {'set-cookie': '__Host-rusa_csrf=pre; Path=/'},
+            );
+          }
+          if (req.method == 'POST') {
+            return http.Response('{"authenticated":true}', 200);
+          }
+          return http.Response('unauthorized', 401);
+        }),
+        auth: auth,
+      );
+
+      await expectLater(session.signIn(), throwsA(isA<StateError>()));
+      expect(session.status, DashboardSessionStatus.signedOut);
+      expect(auth.signOutCount, 1);
+    });
+
+    test('sign out bootstraps CSRF and clears cookies', () async {
       final jar = IoSessionCookieJar(
         initialSessionCookie: 'session_xyz',
         initialCsrfToken: 'csrf_xyz',
       );
-
       String? csrfHeader;
-      final mock = MockClient((req) async {
-        if (req.url.path == '/api/auth/csrf') {
-          return http.Response(
-            jsonEncode({'ok': true}),
-            200,
-            headers: {
-              'set-cookie': '__Host-rusa_csrf=fresh_csrf; Path=/; Secure',
-            },
-          );
-        }
-        if (req.url.path == '/api/auth/logout') {
-          csrfHeader = req.headers['X-Rusa-CSRF'] ?? req.headers['x-rusa-csrf'];
-          return http.Response(jsonEncode({'ok': true}), 200);
-        }
-        return http.Response('Not found', 404);
-      });
-
-      final client = IoSessionClient(
-        inner: mock,
-        baseUrl: baseUrl,
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async {
+          if (req.url.path == '/api/auth/csrf') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {'set-cookie': '__Host-rusa_csrf=fresh_csrf; Path=/'},
+            );
+          }
+          if (req.url.path == '/api/auth/logout') {
+            csrfHeader = req.headers['X-Rusa-CSRF'];
+            return http.Response('{"ok":true}', 200);
+          }
+          return http.Response('{"authenticated":true}', 200);
+        }),
+        auth: _Auth(_User('restored')),
         cookieJar: jar,
       );
-      final session = IoDashboardSession(
-        client: client,
-        baseUrl: baseUrl,
-        cookieJar: jar,
-        authEnabled: true,
-      );
+      expect(session.status, DashboardSessionStatus.signedIn);
 
       await session.signOut();
+
       expect(csrfHeader, 'fresh_csrf');
       expect(jar.sessionCookie, isNull);
       expect(jar.csrfToken, isNull);
-      expect(session.status, DashboardSessionStatus.signedOut);
-    });
-
-    test('signIn throws and stays signedOut when auth is enabled', () async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final jar = IoSessionCookieJar();
-      final session = IoDashboardSession(
-        client: IoSessionClient(
-          inner: MockClient((req) async => http.Response('Not found', 404)),
-          baseUrl: baseUrl,
-          cookieJar: jar,
-        ),
-        baseUrl: baseUrl,
-        cookieJar: jar,
-        authEnabled: true,
-      );
-
-      expect(session.status, DashboardSessionStatus.signedOut);
-      await expectLater(
-        () => session.signIn(),
-        throwsA(isA<DashboardSignInUnsupportedError>()),
-      );
-      expect(session.status, DashboardSessionStatus.signedOut);
-      expect(session.errorMessage, DashboardSignInUnsupportedError.message);
-    });
-
-    testWidgets('the sign-in page explains unsupported sign-in', (
-      tester,
-    ) async {
-      final baseUrl = Uri.parse('http://localhost:3000');
-      final jar = IoSessionCookieJar();
-      final session = IoDashboardSession(
-        client: IoSessionClient(
-          inner: MockClient((req) async => http.Response('Not found', 404)),
-          baseUrl: baseUrl,
-          cookieJar: jar,
-        ),
-        baseUrl: baseUrl,
-        cookieJar: jar,
-        authEnabled: true,
-      );
-
-      await tester.pumpWidget(MaterialApp(home: SignInPage(session: session)));
-      await tester.tap(find.text('Sign in with Google'));
-      await tester.pumpAndSettle();
-
-      expect(find.text(DashboardSignInUnsupportedError.message), findsOneWidget);
-      expect(find.textContaining('Check your connection'), findsNothing);
       expect(session.status, DashboardSessionStatus.signedOut);
     });
   });
@@ -278,11 +375,48 @@ void main() {
       expect(session.status, DashboardSessionStatus.local);
     });
 
-    test('returns a signedOut session when auth is enabled without a cookie',
+    test(
+      'initializes native auth from the served Firebase config when enabled',
+      () async {
+        Map<String, dynamic>? firebaseConfig;
+        final mock = MockClient((req) async {
+          if (req.url.path == '/api/auth/config') {
+            return http.Response(
+              jsonEncode({
+                'enabled': true,
+                'firebase': {'apiKey': 'key', 'projectId': 'project'},
+              }),
+              200,
+            );
+          }
+          return http.Response('Not found', 404);
+        });
+
+        final session = await bootstrapIoDashboardSession(
+          baseUrl: Uri.parse('http://localhost:3000'),
+          clientFactory: () => mock,
+          authFactory: (firebase) async {
+            firebaseConfig = firebase;
+            return _Auth();
+          },
+        );
+
+        expect(firebaseConfig, {'apiKey': 'key', 'projectId': 'project'});
+        expect(session, isA<IoFirebaseDashboardSession>());
+        expect(session.authenticationEnabled, isTrue);
+        expect(session.status, DashboardSessionStatus.signedOut);
+      },
+    );
+
+    test('a restored Firebase user without a live server session signs out',
         () async {
+      final auth = _Auth(_User('restored'));
       final mock = MockClient((req) async {
         if (req.url.path == '/api/auth/config') {
-          return http.Response(jsonEncode({'enabled': true}), 200);
+          return http.Response(
+            jsonEncode({'enabled': true, 'firebase': <String, dynamic>{}}),
+            200,
+          );
         }
         if (req.url.path == '/api/auth/session') {
           return http.Response('unauthorized', 401);
@@ -293,10 +427,27 @@ void main() {
       final session = await bootstrapIoDashboardSession(
         baseUrl: Uri.parse('http://localhost:3000'),
         clientFactory: () => mock,
+        authFactory: (_) async => auth,
       );
+      await Future<void>.delayed(Duration.zero);
 
-      expect(session.authenticationEnabled, isTrue);
       expect(session.status, DashboardSessionStatus.signedOut);
+      expect(auth.signOutCount, 1);
+    });
+
+    test('throws StateError when enabled auth has no Firebase config', () {
+      final mock = MockClient((req) async {
+        return http.Response(jsonEncode({'enabled': true}), 200);
+      });
+
+      expect(
+        bootstrapIoDashboardSession(
+          baseUrl: Uri.parse('http://localhost:3000'),
+          clientFactory: () => mock,
+          authFactory: (_) async => _Auth(),
+        ),
+        throwsA(isA<StateError>()),
+      );
     });
 
     test('throws StateError when the server is unreachable', () {
@@ -529,7 +680,13 @@ void main() {
       final baseUrl = Uri.parse('http://localhost:3000');
       final controllers = <StreamController<List<int>>>[];
 
-      final session = makeSession(baseUrl);
+      // The server idles only authenticated streams; visit() renews.
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async => http.Response('{"ok":true}', 200)),
+        auth: _Auth(_User('restored')),
+        cookieJar: IoSessionCookieJar(initialCsrfToken: 'csrf'),
+      );
       final stream = IoEventSourceStream(
         session: session,
         baseUrl: baseUrl,
@@ -565,17 +722,12 @@ void main() {
       final baseUrl = Uri.parse('http://localhost:3000');
       final controllers = <StreamController<List<int>>>[];
 
-      final jar = IoSessionCookieJar();
-      final session = IoDashboardSession(
-        client: IoSessionClient(
-          inner: MockClient((req) async => http.Response('Not found', 404)),
-          baseUrl: baseUrl,
-          cookieJar: jar,
-        ),
-        baseUrl: baseUrl,
-        cookieJar: jar,
-        authEnabled: true,
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async => http.Response('{"ok":true}', 200)),
+        auth: _Auth(_User('restored')),
       );
+      expect(session.status, DashboardSessionStatus.signedIn);
       final stream = IoEventSourceStream(
         session: session,
         baseUrl: baseUrl,
@@ -606,17 +758,12 @@ void main() {
       final baseUrl = Uri.parse('http://localhost:3000');
       var connections = 0;
 
-      final jar = IoSessionCookieJar();
-      final session = IoDashboardSession(
-        client: IoSessionClient(
-          inner: MockClient((req) async => http.Response('Not found', 404)),
-          baseUrl: baseUrl,
-          cookieJar: jar,
-        ),
-        baseUrl: baseUrl,
-        cookieJar: jar,
-        authEnabled: true,
+      final session = _firebaseSession(
+        baseUrl,
+        MockClient((req) async => http.Response('{"ok":true}', 200)),
+        auth: _Auth(_User('restored')),
       );
+      expect(session.status, DashboardSessionStatus.signedIn);
       final stream = IoEventSourceStream(
         session: session,
         baseUrl: baseUrl,
