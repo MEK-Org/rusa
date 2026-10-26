@@ -208,6 +208,32 @@ void main() {
       expect(jar.csrfToken, isNull);
       expect(session.status, DashboardSessionStatus.signedOut);
     });
+
+    test('signIn throws and stays signedOut when auth is enabled', () async {
+      final baseUrl = Uri.parse('http://localhost:3000');
+      final jar = IoSessionCookieJar();
+      final session = IoDashboardSession(
+        client: IoSessionClient(
+          inner: MockClient((req) async => http.Response('Not found', 404)),
+          baseUrl: baseUrl,
+          cookieJar: jar,
+        ),
+        baseUrl: baseUrl,
+        cookieJar: jar,
+        authEnabled: true,
+      );
+
+      expect(session.status, DashboardSessionStatus.signedOut);
+      await expectLater(
+        () => session.signIn(),
+        throwsA(isA<StateError>()),
+      );
+      expect(session.status, DashboardSessionStatus.signedOut);
+      expect(
+        session.errorMessage,
+        'Google sign-in is not supported on this device build.',
+      );
+    });
   });
 
   group('bootstrapIoDashboardSession', () {
@@ -277,6 +303,31 @@ void main() {
         ),
         throwsA(isA<StateError>()),
       );
+    });
+
+    test('throws StateError when auth config has missing or non-boolean enabled',
+        () async {
+      for (final invalidBody in [
+        '{}',
+        '{"enabled":"true"}',
+        '{"enabled":null}',
+        '{"enabled":1}',
+      ]) {
+        final mock = MockClient((req) async {
+          if (req.url.path == '/api/auth/config') {
+            return http.Response(invalidBody, 200);
+          }
+          return http.Response('Not found', 404);
+        });
+
+        expect(
+          bootstrapIoDashboardSession(
+            baseUrl: Uri.parse('http://localhost:3000'),
+            clientFactory: () => mock,
+          ),
+          throwsA(isA<StateError>()),
+        );
+      }
     });
   });
 

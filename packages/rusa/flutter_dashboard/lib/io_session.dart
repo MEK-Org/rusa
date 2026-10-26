@@ -87,9 +87,12 @@ class IoDashboardSession extends DashboardSession {
 
   @override
   Future<void> signIn() async {
-    // In local or sideloaded APK mode, sign-in is typically initialized via Google auth or
-    // session token exchange if auth is enabled.
-    setStatus(DashboardSessionStatus.signedIn);
+    if (!authEnabled) return;
+    // Native authentication / token exchange against /api/auth/session is not yet
+    // implemented on this platform build. Keep the session signedOut, report the error,
+    // and throw so SignInPage surfaces the failure rather than mounting a credential-less dashboard.
+    setError('Google sign-in is not supported on this device build.');
+    throw StateError('Google sign-in is not supported on this device build.');
   }
 
   @override
@@ -173,6 +176,14 @@ Future<DashboardSession> bootstrapIoDashboardSession({
   if (config is! Map<String, dynamic>) {
     throw StateError('Dashboard authentication configuration is unavailable');
   }
+  if (config['enabled'] == false) {
+    return IoDashboardSession(
+      client: client,
+      baseUrl: resolvedBaseUrl,
+      cookieJar: cookieJar,
+      authEnabled: false,
+    );
+  }
   if (config['enabled'] == true) {
     final session = IoDashboardSession(
       client: client,
@@ -183,11 +194,5 @@ Future<DashboardSession> bootstrapIoDashboardSession({
     await session.checkSession();
     return session;
   }
-
-  return IoDashboardSession(
-    client: client,
-    baseUrl: resolvedBaseUrl,
-    cookieJar: cookieJar,
-    authEnabled: false,
-  );
+  throw StateError('Dashboard authentication configuration is unavailable');
 }
