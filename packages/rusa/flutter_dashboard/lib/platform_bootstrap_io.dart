@@ -2,6 +2,7 @@ import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'app.dart';
 import 'avatar_platform.dart';
+import 'avatar_upload_io.dart';
 import 'io_session.dart';
 import 'io_sse.dart';
 import 'mesh_stream.dart';
@@ -60,4 +61,5 @@ WalkieDeps? platformCreateWalkieDeps(
 ) =>
     null;
 
-AvatarFilePicker? platformCreateAvatarFilePicker() => null;
+AvatarFilePicker? platformCreateAvatarFilePicker() =>
+    const IoAvatarFilePicker();

@@ -46,6 +46,8 @@ dependencies:
   # Renders the operator-supplied antler/tree SVG brand mark (issue #412) in
   # the dashboard header; Flutter's built-in Image has no SVG support.
   flutter_svg: ^2.2.0
+  # The Android avatar upload picker (#1171); the browser uses <input type=file>.
+  file_selector: ^1.1.0
   # Resizable sidebars (#897). The fork glass goals uses; declared exactly as
   # goals_widgets declares it, since pub needs one description per package.
   multi_split_view:
@@ -95,6 +97,8 @@ dev_dependencies:
   google_sign_in_android: ^7.2.11
   firebase_core_platform_interface: ^8.1.1
   firebase_auth_platform_interface: ^9.1.0
+  # The avatar picker test answers this plugin's platform channel directly.
+  file_selector_android: ^0.5.2+6
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
