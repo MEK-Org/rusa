@@ -64,6 +64,12 @@ dependencies:
     path: ../../../third_party/glass_goals_devkit/packages/goals_ui_core
   goals_widgets:
     path: ../../../third_party/glass_goals_devkit/packages/goals_widgets
+  # Android walkie mode (voice_io.dart): microphone capture, announcement
+  # playback, the screen wake lock, and the recorder's scratch directory.
+  record: ^6.2.1
+  audioplayers: ^6.7.1
+  wakelock_plus: ^1.7.0
+  path_provider: ^2.1.6
 
 # goals_widgets declares these overrides, but pub IGNORES a non-root package's
 # dependency_overrides — so the root (this app) must replicate them or resolution
@@ -84,6 +90,8 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   fake_async: ^1.3.3
+  # voice_io_test.dart answers the wake lock's pigeon channel with its codec.
+  wakelock_plus_platform_interface: ^1.6.0
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is

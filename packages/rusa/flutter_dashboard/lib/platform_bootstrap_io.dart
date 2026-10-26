@@ -9,6 +9,7 @@ import 'obligations_cache.dart';
 import 'quota_cache.dart';
 import 'session.dart';
 import 'tree_preferences_cache.dart';
+import 'voice_io.dart';
 import 'voice_platform.dart';
 
 void platformInit() {
@@ -58,6 +59,6 @@ WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
   DashboardSession session,
 ) =>
-    null;
+    session is IoDashboardSession ? ioWalkieDeps(api, session) : null;
 
 AvatarFilePicker? platformCreateAvatarFilePicker() => null;
