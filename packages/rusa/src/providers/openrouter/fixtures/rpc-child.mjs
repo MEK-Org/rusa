@@ -6,7 +6,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
-const mode = process.argv[2];
+const mode = process.env.RUSA_TEST_PEER_MODE;
+const progressPath = process.env.RUSA_TEST_PEER_MARKER;
 if (process.env.PI_CODING_AGENT_DIR) {
   const settings = JSON.parse(
     await readFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), "utf8")
@@ -65,6 +66,29 @@ lines.on("line", (line) => {
         : undefined;
   emit({ type: "response", id: command.id, command: command.type, success: true, data });
   if (command.type !== "prompt") return;
+  emit({ type: "turn_start" });
+  if (progressPath) {
+    writeFileSync(progressPath, JSON.stringify({ pid: process.pid, stage: "prompt-progress" }));
+  }
+  if (mode === "wait") {
+    emit({ type: "message_update", assistantMessageEvent: { type: "text_delta" } });
+    return;
+  }
+  if (mode === "failure") {
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        provider: "openrouter",
+        model: "vendor/fixed-model",
+        stopReason: "error",
+        content: [{ type: "text", text: "synthetic provider failure" }],
+        usage: { input: 3, output: 2 },
+      },
+    });
+    emit({ type: "agent_settled" });
+    return;
+  }
   emit({
     type: "message_end",
     message: {

@@ -10,7 +10,7 @@ import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { routeRunFailure } from "../../actor/failure-sink.js";
-import { OpenRouterProvider, openRouterTimeoutMs } from "./provider.js";
+import { OpenRouterProvider } from "./provider.js";
 
 vi.mock("../../config/loader.js", () => ({
   loadConfig: () => ({ github: { account: "test" }, providers: {}, gitBridge: false }),
@@ -22,7 +22,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-async function fixture() {
+async function fixture(options: { peerMode?: "failure" | "wait" } = {}) {
   const root = await mkdtemp(join(tmpdir(), "openrouter-provider-test-"));
   roots.push(root);
   const apiKeyPath = join(root, "auth.json");
@@ -42,9 +42,10 @@ async function fixture() {
   const executableRoot = await mkdtemp(join(process.cwd(), ".openrouter-host-probe-"));
   roots.push(executableRoot);
   const piCommand = join(executableRoot, "pi");
+  const peerMarkerPath = join(root, "peer-progress.json");
   await writeFile(
     piCommand,
-    `#!/bin/sh\nexec '${process.execPath}' '${fileURLToPath(new URL("./fixtures/rpc-child.mjs", import.meta.url))}' "$@"\n`,
+    `#!/bin/sh\nRUSA_TEST_PEER_MODE='${options.peerMode ?? "settle"}' RUSA_TEST_PEER_MARKER='${peerMarkerPath}' exec '${process.execPath}' '${fileURLToPath(new URL("./fixtures/rpc-child.mjs", import.meta.url))}' "$@"\n`,
     { mode: 0o700 }
   );
   const config = {
@@ -56,11 +57,48 @@ async function fixture() {
   };
   return {
     root,
+    peerMarkerPath,
     apiKeyPath,
     config,
     provider: new OpenRouterProvider("test", config, "vendor/fixed-model"),
   };
 }
+
+async function waitForPeerProgress(path: string): Promise<{ pid: number; stage: string }> {
+  let progress: { pid: number; stage: string } | undefined;
+  await vi.waitFor(
+    async () => {
+      progress = JSON.parse(await readFile(path, "utf8")) as { pid: number; stage: string };
+      expect(progress).toMatchObject({ stage: "prompt-progress" });
+    },
+    { timeout: 10_000 }
+  );
+  if (!progress) throw new Error("synthetic peer did not report prompt progress");
+  return progress;
+}
+
+function createOpenRouterActor(
+  root: string,
+  provider: OpenRouterProvider,
+  lifecycle: ReturnType<typeof createActorLifecycle>,
+  options: { id?: string; log?: (chunk: string) => void; timeoutMs?: number } = {}
+): Actor {
+  return new Actor({
+    id: options.id ?? "child",
+    cwd: root,
+    modelConfig: [{ provider: "openrouter", model: "vendor/fixed-model" }],
+    resolveProvider: () => provider,
+    mcpServers: [],
+    loadSessionId: () => undefined,
+    saveSessionId: () => {},
+    buildPrompt: () => ({ prompt: "synthetic peer" }),
+    debounceMs: 0,
+    lifecycle,
+    log: options.log,
+    timeoutMs: options.timeoutMs,
+  });
+}
+
 it("requires opt-in and refuses native sessions before inference", async () => {
   const { root, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "");
@@ -73,11 +111,6 @@ it("requires opt-in and refuses native sessions before inference", async () => {
       session: { id: "native-session" },
     })
   ).rejects.toThrow(/fresh runs/);
-});
-
-it("honors the actor-supplied subprocess backstop instead of imposing an adapter cap", () => {
-  expect(openRouterTimeoutMs({ timeoutMs: 3_630_000 })).toBe(3_630_000);
-  expect(openRouterTimeoutMs({})).toBe(120_000);
 });
 
 it("returns full shared interruption attribution when the synthetic peer is cancelled", async () => {
@@ -98,22 +131,196 @@ it("returns full shared interruption attribution when the synthetic peer is canc
   });
 });
 
-it("carries a real adapter preemption through the actor into the failure sink", async () => {
-  const { root, provider } = await fixture();
+it("honors a supplied in-flight deadline after peer protocol progress", async () => {
+  const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
+  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+  const controller = new AbortController();
+  let progressed!: () => void;
+  const progress = new Promise<void>((resolve) => {
+    progressed = resolve;
+  });
+  let settled = false;
+  let run: ReturnType<OpenRouterProvider["run"]> | undefined;
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    run = provider.run({
+      cwd: root,
+      prompt: "wait for deadline",
+      timeoutMs: 180_000,
+      signal: controller.signal,
+      onChunk: () => {
+        void readFile(peerMarkerPath, "utf8").then(
+          () => progressed(),
+          () => {}
+        );
+      },
+    });
+    void run.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+    await progress;
+    const peer = JSON.parse(await readFile(peerMarkerPath, "utf8")) as { pid: number };
+    await vi.advanceTimersByTimeAsync(120_001);
+    expect(settled).toBe(false);
+    expect(() => process.kill(peer.pid, 0)).not.toThrow();
+
+    controller.abort("interrupt:deadline-test");
+    await expect(run).resolves.toMatchObject({
+      success: false,
+      cancelled: true,
+      interrupted: true,
+      interruptSource: "deadline-test",
+    });
+  } finally {
+    if (!controller.signal.aborted) controller.abort("interrupt:deadline-test-cleanup");
+    await run?.catch(() => {});
+    vi.useRealTimers();
+  }
+}, 15_000);
+
+it.each([
+  ["responsive preemption", "responsive-notification"],
+  ["human interruption", "operator"],
+] as const)(
+  "suppresses a %s after real peer progress",
+  async (_label, source) => {
+    const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
+    vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+    const notices: string[] = [];
+    let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
+    const lifecycle = createActorLifecycle([
+      {
+        onEnd: async (event) => {
+          if (event.terminal.kind !== "result") return;
+          ended = event.terminal.result;
+          await routeRunFailure(
+            {
+              actors: {
+                get: () =>
+                  (source === "operator"
+                    ? { id: "root", parentId: null }
+                    : { id: "child", parentId: "parent" }) as ActorRecord,
+              },
+              sendToParent: (_parentId, body) => notices.push(body),
+              postToErrorChat: (body) => notices.push(body),
+              principals:
+                source === "operator"
+                  ? {
+                      getUser: (id) =>
+                        id === "operator"
+                          ? {
+                              kind: "user" as const,
+                              id,
+                              createdAt: "2026-01-01",
+                              email: "operator@example.invalid",
+                            }
+                          : undefined,
+                    }
+                  : undefined,
+              rootId: "root",
+              log: () => {},
+            },
+            source === "operator" ? "root" : "child",
+            event.terminal.result
+          );
+        },
+      },
+    ]);
+    const actor = createOpenRouterActor(root, provider, lifecycle, {
+      id: source === "operator" ? "root" : "child",
+    });
+
+    actor.requestRun({ priority: "responsive" });
+    await waitForPeerProgress(peerMarkerPath);
+    if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
+    else expect(actor.preemptForResponsive().preempted).toBe(true);
+    await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
+    actor.close();
+
+    expect(ended).toMatchObject({
+      success: false,
+      cancelled: true,
+      interrupted: true,
+      interruptSource: source,
+    });
+    expect(notices).toEqual([]);
+  },
+  15_000
+);
+
+it.each([
+  ["stall watchdog", 15 * 60 * 1000, "stall-watchdog"],
+  ["run ceiling", 1_000, "run-ceiling"],
+] as const)(
+  "attributes the %s after real peer progress goes quiet",
+  async (_label, timeoutMs, reason) => {
+    const { root, provider } = await fixture({ peerMode: "wait" });
+    vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+    let resolveProgress!: () => void;
+    const progress = new Promise<void>((resolve) => {
+      resolveProgress = resolve;
+    });
+    let chunks = 0;
+    let resolveEnd!: (result: Awaited<ReturnType<OpenRouterProvider["run"]>>) => void;
+    const terminal = new Promise<Awaited<ReturnType<OpenRouterProvider["run"]>>>((resolve) => {
+      resolveEnd = resolve;
+    });
+    const lifecycle = createActorLifecycle([
+      {
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") resolveEnd(event.terminal.result);
+        },
+      },
+    ]);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const actor = createOpenRouterActor(root, provider, lifecycle, {
+        timeoutMs: reason === "run-ceiling" ? timeoutMs : undefined,
+        log: () => {
+          if (++chunks === 6) resolveProgress();
+        },
+      });
+      actor.requestRun({ priority: "responsive" });
+      await vi.advanceTimersByTimeAsync(0);
+      await progress;
+      if (reason === "stall-watchdog") {
+        await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
+      } else {
+        await vi.advanceTimersByTimeAsync(timeoutMs);
+      }
+      await expect(terminal).resolves.toMatchObject({
+        success: false,
+        cancelled: true,
+        abortReason: reason,
+        output: expect.stringContaining(
+          reason === "stall-watchdog" ? "stall watchdog" : "run ceiling"
+        ),
+      });
+      actor.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+  15_000
+);
+
+it("reports an ordinary peer failure after protocol progress", async () => {
+  const { root, peerMarkerPath, provider } = await fixture({ peerMode: "failure" });
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const notices: string[] = [];
-  let actor: Actor;
-  let ended = false;
-  let terminalOutput = "";
+  let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
   const lifecycle = createActorLifecycle([
     {
-      onPrompt: () => {
-        if (!ended) actor.preemptForResponsive();
-      },
       onEnd: async (event) => {
         if (event.terminal.kind !== "result") return;
-        ended = true;
-        terminalOutput = event.terminal.result.output;
+        ended = event.terminal.result;
         await routeRunFailure(
           {
             actors: { get: () => ({ id: "child", parentId: "parent" }) as ActorRecord },
@@ -128,24 +335,15 @@ it("carries a real adapter preemption through the actor into the failure sink", 
       },
     },
   ]);
-  actor = new Actor({
-    id: "child",
-    cwd: root,
-    modelConfig: [{ provider: "openrouter", model: "vendor/fixed-model" }],
-    resolveProvider: () => provider,
-    mcpServers: [],
-    loadSessionId: () => undefined,
-    saveSessionId: () => {},
-    buildPrompt: () => ({ prompt: "synthetic preemption" }),
-    debounceMs: 0,
-    lifecycle,
-  });
-
+  const actor = createOpenRouterActor(root, provider, lifecycle);
   actor.requestRun({ priority: "responsive" });
-  await vi.waitFor(() => expect(ended).toBe(true), { timeout: 10_000 });
+  await waitForPeerProgress(peerMarkerPath);
+  await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
   actor.close();
-  expect(notices).toEqual([]);
-  expect(terminalOutput.match(/\[Task interrupted by responsive-notification\]/g)).toHaveLength(1);
+
+  expect(ended).toMatchObject({ success: false, exitCode: 1 });
+  expect(notices).toHaveLength(1);
+  expect(notices[0]).toContain("Pi reported a provider error or abort");
 }, 15_000);
 it("requires the independently managed Pi login", async () => {
   const { root, apiKeyPath, provider } = await fixture();
@@ -169,7 +367,7 @@ it("uses a static Pi login without changing the source profile", async () => {
   await expect(provider.run({ cwd: root, prompt: "ping" })).rejects.toThrow(/launch pi/);
 });
 it("settles through real pipes, reaps the peer and retains usage without a subscription token record", async () => {
-  const { root, provider } = await fixture();
+  const { root, peerMarkerPath, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const result = await provider.run({
     cwd: root,
@@ -181,6 +379,8 @@ it("settles through real pipes, reaps the peer and retains usage without a subsc
     output: "ping-unique",
     exitCode: 0,
   });
+  const peer = await waitForPeerProgress(peerMarkerPath);
+  expect(() => process.kill(peer.pid, 0)).toThrow();
   const artifacts = await readdir(join(root, "artifacts"));
   expect(artifacts).toHaveLength(1);
   const receipt = await readFile(join(root, "artifacts", artifacts[0] as string), "utf8");

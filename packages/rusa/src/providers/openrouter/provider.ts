@@ -10,11 +10,6 @@ import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
 
-/** The actor owns the deadline; this adapter only retains a standalone default. */
-export function openRouterTimeoutMs(opts: Pick<RunOptions, "timeoutMs">): number {
-  return opts.timeoutMs ?? 120_000;
-}
-
 /** Local end-to-end prototype. Fresh Pi process, portable context, built-in and MCP tools.
  * Worker launches use the shared actor bwrap boundary with isolated Pi state.
  * Usage stays in an artifact, outside subscription accounting and quota pacing.
@@ -163,7 +158,7 @@ export class OpenRouterProvider implements CodingProvider {
         // The actor owns invocation timing. Its deadline includes the shared
         // watchdog policy and a subprocess grace margin; an adapter-local cap
         // would turn a healthy run into an unrelated provider timeout.
-        timeoutMs: openRouterTimeoutMs(opts),
+        timeoutMs: opts.timeoutMs ?? 120_000,
         signal: opts.signal,
         onSpawn: () => opts.onPromptLaunched?.(opts.prompt),
         onDuplex: (value) => {
@@ -178,6 +173,7 @@ export class OpenRouterProvider implements CodingProvider {
         },
         onStdoutEnd: (_chunks, cause) => {
           if (cause === "eof") invocation?.endStdout();
+          else void invocation?.cancel();
         },
         handleStderrData: () => {},
         buildKilledResult: (termination) => ({ success: false, ...termination }),
