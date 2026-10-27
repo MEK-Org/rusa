@@ -1,9 +1,10 @@
 // @vitest-environment node
 
 import { execFileSync } from "node:child_process";
+import { watch } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
 import { Actor } from "../../actor/actor.js";
@@ -64,17 +65,38 @@ async function fixture(options: { peerMode?: "failure" | "wait" } = {}) {
   };
 }
 
-async function waitForPeerProgress(path: string): Promise<{ pid: number; stage: string }> {
-  let progress: { pid: number; stage: string } | undefined;
-  await vi.waitFor(
-    async () => {
-      progress = JSON.parse(await readFile(path, "utf8")) as { pid: number; stage: string };
-      expect(progress).toMatchObject({ stage: "prompt-progress" });
-    },
-    { timeout: 10_000 }
-  );
-  if (!progress) throw new Error("synthetic peer did not report prompt progress");
+async function readPeerProgress(path: string): Promise<{ pid: number; stage: string }> {
+  const progress = JSON.parse(await readFile(path, "utf8")) as { pid: number; stage: string };
+  expect(progress).toMatchObject({ stage: "prompt-progress" });
   return progress;
+}
+
+/** Wait on the peer's protocol marker, not a host-dependent stdout chunk count. */
+async function waitForPeerProgress(path: string): Promise<{ pid: number; stage: string }> {
+  try {
+    return await readPeerProgress(path);
+  } catch {
+    // The fixture has not reached prompt protocol progress yet.
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const watcher = watch(dirname(path), () => {
+      void readPeerProgress(path).then(settle, () => {});
+    });
+    const settle = (progress: { pid: number; stage: string }) => {
+      if (settled) return;
+      settled = true;
+      watcher.close();
+      resolve(progress);
+    };
+    watcher.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    // Cover the interval between the initial read and watcher registration.
+    void readPeerProgress(path).then(settle, () => {});
+  });
 }
 
 function createOpenRouterActor(
@@ -135,10 +157,6 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
   const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const controller = new AbortController();
-  let progressed!: () => void;
-  const progress = new Promise<void>((resolve) => {
-    progressed = resolve;
-  });
   let settled = false;
   let run: ReturnType<OpenRouterProvider["run"]> | undefined;
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -148,12 +166,6 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
       prompt: "wait for deadline",
       timeoutMs: 180_000,
       signal: controller.signal,
-      onChunk: () => {
-        void readFile(peerMarkerPath, "utf8").then(
-          () => progressed(),
-          () => {}
-        );
-      },
     });
     void run.then(
       () => {
@@ -163,8 +175,7 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
         settled = true;
       }
     );
-    await progress;
-    const peer = JSON.parse(await readFile(peerMarkerPath, "utf8")) as { pid: number };
+    const peer = await waitForPeerProgress(peerMarkerPath);
     await vi.advanceTimersByTimeAsync(120_001);
     expect(settled).toBe(false);
     expect(() => process.kill(peer.pid, 0)).not.toThrow();
@@ -259,13 +270,8 @@ it.each([
 ] as const)(
   "attributes the %s after real peer progress goes quiet",
   async (_label, timeoutMs, reason) => {
-    const { root, provider } = await fixture({ peerMode: "wait" });
+    const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
     vi.stubEnv("RUSA_OPENROUTER_POC", "1");
-    let resolveProgress!: () => void;
-    const progress = new Promise<void>((resolve) => {
-      resolveProgress = resolve;
-    });
-    let chunks = 0;
     let resolveEnd!: (result: Awaited<ReturnType<OpenRouterProvider["run"]>>) => void;
     const terminal = new Promise<Awaited<ReturnType<OpenRouterProvider["run"]>>>((resolve) => {
       resolveEnd = resolve;
@@ -281,13 +287,9 @@ it.each([
     try {
       const actor = createOpenRouterActor(root, provider, lifecycle, {
         timeoutMs: reason === "run-ceiling" ? timeoutMs : undefined,
-        log: () => {
-          if (++chunks === 6) resolveProgress();
-        },
       });
       actor.requestRun({ priority: "responsive" });
-      await vi.advanceTimersByTimeAsync(0);
-      await progress;
+      await waitForPeerProgress(peerMarkerPath);
       if (reason === "stall-watchdog") {
         await vi.advanceTimersByTimeAsync(timeoutMs - 1);
         await Promise.resolve();

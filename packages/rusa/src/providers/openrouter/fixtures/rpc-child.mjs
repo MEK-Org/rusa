@@ -6,7 +6,10 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
-const mode = process.env.RUSA_TEST_PEER_MODE;
+// Direct synthetic-pipe tests pass their mode as argv; provider tests use an
+// environment wrapper because the adapter owns argv. Keep both fixture entry
+// points so a provider-test extension cannot silently change pipe semantics.
+const mode = process.env.RUSA_TEST_PEER_MODE ?? process.argv[2];
 const progressPath = process.env.RUSA_TEST_PEER_MARKER;
 if (process.env.PI_CODING_AGENT_DIR) {
   const settings = JSON.parse(
