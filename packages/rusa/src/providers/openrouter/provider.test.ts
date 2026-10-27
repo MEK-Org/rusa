@@ -78,6 +78,16 @@ async function waitForPeerProgress(path: string): Promise<{ pid: number; stage: 
   return vi.waitFor(() => readPeerProgress(path), { timeout: 10_000 });
 }
 
+async function waitForParentProgress(
+  hasProgress: () => boolean,
+  terminal: Promise<void>
+): Promise<void> {
+  await Promise.race([
+    vi.waitFor(() => expect(hasProgress()).toBe(true), { timeout: 10_000 }),
+    terminal.then(() => Promise.reject(new Error("Actor settled before parent observed progress"))),
+  ]);
+}
+
 function createOpenRouterActor(
   root: string,
   provider: OpenRouterProvider,
@@ -203,54 +213,66 @@ it.each([
 ] as const)(
   "suppresses a %s after real peer progress",
   async (_label, source) => {
-    const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
+    const { root, provider } = await fixture({ peerMode: "wait" });
     vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     const notices: string[] = [];
     let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
+    let terminalSeen = false;
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => {
+      resolveTerminal = resolve;
+    });
     const lifecycle = createActorLifecycle([
       {
         onEnd: async (event) => {
-          if (event.terminal.kind !== "result") return;
-          ended = event.terminal.result;
-          await routeRunFailure(
-            {
-              actors: {
-                get: () =>
-                  (source === "operator"
-                    ? { id: "root", parentId: null }
-                    : { id: "child", parentId: "parent" }) as ActorRecord,
+          terminalSeen = true;
+          if (event.terminal.kind === "result") {
+            ended = event.terminal.result;
+            await routeRunFailure(
+              {
+                actors: {
+                  get: () =>
+                    (source === "operator"
+                      ? { id: "root", parentId: null }
+                      : { id: "child", parentId: "parent" }) as ActorRecord,
+                },
+                sendToParent: (_parentId, body) => notices.push(body),
+                postToErrorChat: (body) => notices.push(body),
+                principals:
+                  source === "operator"
+                    ? {
+                        getUser: (id) =>
+                          id === "operator"
+                            ? {
+                                kind: "user" as const,
+                                id,
+                                createdAt: "2026-01-01",
+                                email: "operator@example.invalid",
+                              }
+                            : undefined,
+                      }
+                    : undefined,
+                rootId: "root",
+                log: () => {},
               },
-              sendToParent: (_parentId, body) => notices.push(body),
-              postToErrorChat: (body) => notices.push(body),
-              principals:
-                source === "operator"
-                  ? {
-                      getUser: (id) =>
-                        id === "operator"
-                          ? {
-                              kind: "user" as const,
-                              id,
-                              createdAt: "2026-01-01",
-                              email: "operator@example.invalid",
-                            }
-                          : undefined,
-                    }
-                  : undefined,
-              rootId: "root",
-              log: () => {},
-            },
-            source === "operator" ? "root" : "child",
-            event.terminal.result
-          );
+              source === "operator" ? "root" : "child",
+              event.terminal.result
+            );
+          }
+          resolveTerminal();
         },
       },
     ]);
+    let parentProgress = false;
     const actor = createOpenRouterActor(root, provider, lifecycle, {
       id: source === "operator" ? "root" : "child",
+      log: () => {
+        parentProgress = true;
+      },
     });
     try {
       actor.requestRun({ priority: "responsive" });
-      await waitForPeerProgress(peerMarkerPath);
+      await waitForParentProgress(() => parentProgress, terminal);
       if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
       else expect(actor.preemptForResponsive().preempted).toBe(true);
       await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
@@ -263,6 +285,10 @@ it.each([
       });
       expect(notices).toEqual([]);
     } finally {
+      if (!terminalSeen) {
+        const interrupted = actor.interrupt("provider-test-cleanup");
+        if (interrupted.interrupted && !interrupted.wasQueued) await terminal;
+      }
       actor.close();
     }
   },
@@ -275,35 +301,40 @@ it.each([
 ] as const)(
   "attributes the %s after real peer progress goes quiet",
   async (_label, timeoutMs, reason) => {
-    const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
+    const { root, provider } = await fixture({ peerMode: "wait" });
     vi.stubEnv("RUSA_OPENROUTER_POC", "1");
-    let resolveEnd!: (result: Awaited<ReturnType<OpenRouterProvider["run"]>>) => void;
-    const terminal = new Promise<Awaited<ReturnType<OpenRouterProvider["run"]>>>((resolve) => {
-      resolveEnd = resolve;
+    let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
+    let terminalSeen = false;
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => {
+      resolveTerminal = resolve;
     });
     const lifecycle = createActorLifecycle([
       {
         onEnd: (event) => {
-          if (event.terminal.kind === "result") resolveEnd(event.terminal.result);
+          terminalSeen = true;
+          if (event.terminal.kind === "result") ended = event.terminal.result;
+          resolveTerminal();
         },
       },
     ]);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let actor: Actor | undefined;
+    let parentProgress = false;
     try {
       actor = createOpenRouterActor(root, provider, lifecycle, {
         timeoutMs: reason === "run-ceiling" ? timeoutMs : undefined,
+        log: () => {
+          parentProgress = true;
+        },
       });
       actor.requestRun({ priority: "responsive" });
-      await waitForPeerProgress(peerMarkerPath);
-      if (reason === "stall-watchdog") {
-        await vi.advanceTimersByTimeAsync(timeoutMs - 1);
-        await Promise.resolve();
-        await vi.advanceTimersByTimeAsync(1);
-      } else {
-        await vi.advanceTimersByTimeAsync(timeoutMs);
-      }
-      await expect(terminal).resolves.toMatchObject({
+      await waitForParentProgress(() => parentProgress, terminal);
+      await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+      expect(terminalSeen).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await terminal;
+      expect(ended).toMatchObject({
         success: false,
         cancelled: true,
         abortReason: reason,
@@ -312,6 +343,10 @@ it.each([
         ),
       });
     } finally {
+      if (actor && !terminalSeen) {
+        const interrupted = actor.interrupt("provider-test-cleanup");
+        if (interrupted.interrupted && !interrupted.wasQueued) await terminal;
+      }
       actor?.close();
       vi.useRealTimers();
     }

@@ -166,48 +166,51 @@ describe("subprocess provider lifecycle parity", () => {
       const { root, command } = await hangingCli();
       const notices: string[] = [];
       let ended: Awaited<ReturnType<CodingProvider["run"]>> | undefined;
-      let resolveTerminal!: (result: Awaited<ReturnType<CodingProvider["run"]>>) => void;
-      const terminal = new Promise<Awaited<ReturnType<CodingProvider["run"]>>>((resolve) => {
+      let terminalSeen = false;
+      let resolveTerminal!: () => void;
+      const terminal = new Promise<void>((resolve) => {
         resolveTerminal = resolve;
       });
       let ready = false;
       const lifecycle = createActorLifecycle([
         {
           onEnd: async (event) => {
-            if (event.terminal.kind !== "result") return;
-            ended = event.terminal.result;
-            resolveTerminal(event.terminal.result);
-            await routeRunFailure(
-              {
-                actors: {
-                  get: () =>
-                    ({
-                      id: actorId,
-                      parentId: actorId === "root" ? null : "parent",
-                    }) as ActorRecord,
+            terminalSeen = true;
+            if (event.terminal.kind === "result") {
+              ended = event.terminal.result;
+              await routeRunFailure(
+                {
+                  actors: {
+                    get: () =>
+                      ({
+                        id: actorId,
+                        parentId: actorId === "root" ? null : "parent",
+                      }) as ActorRecord,
+                  },
+                  sendToParent: (_parentId, body) => notices.push(body),
+                  postToErrorChat: (body) => notices.push(body),
+                  principals:
+                    source === "operator"
+                      ? {
+                          getUser: (id) =>
+                            id === "operator"
+                              ? {
+                                  kind: "user" as const,
+                                  id,
+                                  createdAt: "2026-01-01",
+                                  email: "operator@example.invalid",
+                                }
+                              : undefined,
+                        }
+                      : undefined,
+                  rootId: "root",
+                  log: () => {},
                 },
-                sendToParent: (_parentId, body) => notices.push(body),
-                postToErrorChat: (body) => notices.push(body),
-                principals:
-                  source === "operator"
-                    ? {
-                        getUser: (id) =>
-                          id === "operator"
-                            ? {
-                                kind: "user" as const,
-                                id,
-                                createdAt: "2026-01-01",
-                                email: "operator@example.invalid",
-                              }
-                            : undefined,
-                      }
-                    : undefined,
-                rootId: "root",
-                log: () => {},
-              },
-              actorId,
-              event.terminal.result
-            );
+                actorId,
+                event.terminal.result
+              );
+            }
+            resolveTerminal();
           },
         },
       ]);
@@ -229,7 +232,7 @@ describe("subprocess provider lifecycle parity", () => {
         ]);
         if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
         else expect(actor.preemptForResponsive().preempted).toBe(true);
-        await expect(terminal).resolves.toBeDefined();
+        await terminal;
         expect(ended).toMatchObject({
           success: false,
           cancelled: true,
@@ -238,9 +241,9 @@ describe("subprocess provider lifecycle parity", () => {
         });
         expect(notices).toEqual([]);
       } finally {
-        if (!ended) {
-          actor.interrupt("parity-test-cleanup");
-          await terminal;
+        if (!terminalSeen) {
+          const interrupted = actor.interrupt("parity-test-cleanup");
+          if (interrupted.interrupted && !interrupted.wasQueued) await terminal;
         }
         actor.close();
       }

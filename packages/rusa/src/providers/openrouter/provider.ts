@@ -177,7 +177,7 @@ export class OpenRouterProvider implements CodingProvider {
         },
         handleStderrData: () => {},
         buildKilledResult: (termination) => ({ success: false, ...termination }),
-        buildSignalResult: (termination) => ({ success: false, ...termination }),
+        buildSignalResult: () => failed("Pi prototype process signalled"),
         buildExitResult: () => failed("Pi prototype process exited before settlement"),
         buildSpawnErrorResult: () => failed("Pi prototype could not start"),
       });
