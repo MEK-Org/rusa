@@ -255,7 +255,11 @@ describe("Pi RPC portable invocation spike", () => {
     expect(f.invocation.cancel()).toBe(cancelled);
     await cancelled;
     wire(f.invocation, { type: "agent_settled" });
-    expect(await result).toMatchObject({ success: false, reason: "Pi invocation cancelled" });
+    expect(await result).toMatchObject({
+      success: false,
+      cancelled: true,
+      reason: "Pi invocation cancelled",
+    });
     expect(f.commands.some((c) => c.type === "clear_queue" || c.type === "abort")).toBe(false);
     expect(f.transport.close).toHaveBeenCalledOnce();
     await expect(f.invocation.run("again")).rejects.toThrow("already used");

@@ -81,6 +81,8 @@ export interface PiUsageObservation {
 
 export interface PiRpcOutcome {
   success: boolean;
+  /** True only when the host terminated this invocation before Pi settled it. */
+  cancelled?: true;
   reason?: string;
   output: string;
   requests: PiUsageObservation[];
@@ -350,12 +352,12 @@ export class PiRpcInvocation {
   cancel(): Promise<void> {
     if (!this.cancellation) {
       this.cancellation = Promise.resolve();
-      this.finish(false, "Pi invocation cancelled");
+      this.finish(false, "Pi invocation cancelled", true);
     }
     return this.cancellation;
   }
 
-  private finish(success: boolean, reason?: string): void {
+  private finish(success: boolean, reason?: string, cancelled = false): void {
     if (this.phase === "done") return;
     this.phase = "done";
     for (const request of this.pending.values())
@@ -367,6 +369,12 @@ export class PiRpcInvocation {
       success = false;
       reason = "Pi transport cleanup failed";
     }
-    this.finishRun?.({ success, reason, output: this.output, requests: this.requests });
+    this.finishRun?.({
+      success,
+      ...(cancelled ? { cancelled: true } : {}),
+      reason,
+      output: this.output,
+      requests: this.requests,
+    });
   }
 }

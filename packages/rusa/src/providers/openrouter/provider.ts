@@ -207,17 +207,23 @@ export class OpenRouterProvider implements CodingProvider {
       // A normally settled Pi invocation closes its deliberately long-lived
       // subprocess as cleanup, which also yields a cancelled process result.
       // That cleanup must not rewrite a real success or ordinary Pi failure.
-      // The host-triggered cancellation path explicitly settles Pi as cancelled;
-      // an already-aborted caller signal wins the same race if Pi settled first.
-      if (
-        processResult.cancelled &&
-        (result.reason === "Pi invocation cancelled" || opts.signal?.aborted)
-      ) {
+      // The host-triggered cancellation path explicitly settles Pi as cancelled.
+      // Keep that fact structured instead of coupling this adapter to its diagnosis
+      // text: the subprocess result is the canonical terminal attribution, while
+      // Pi's reason is useful context for the person reading it.
+      if (processResult.cancelled && result.cancelled) {
         return {
           ...processResult,
           success: false,
-          output: formatSigtermResult(output, opts.signal).output,
+          output: [result.reason, processResult.output].filter(Boolean).join("\n"),
         };
+      }
+      // A caller may abort after Pi has settled and its deliberately long-lived
+      // subprocess has been reaped. In that narrow window, construct every
+      // terminal field from the caller signal rather than combining its marker
+      // with the prior cleanup result's unattributed fields.
+      if (opts.signal?.aborted) {
+        return { success: false, ...formatSigtermResult(output, opts.signal) };
       }
       return {
         success: result.success,
