@@ -69,10 +69,12 @@ lines.on("line", (line) => {
         : undefined;
   emit({ type: "response", id: command.id, command: command.type, success: true, data });
   if (command.type !== "prompt") return;
-  emit({ type: "turn_start" });
   if (progressPath) {
-    writeFileSync(progressPath, JSON.stringify({ pid: process.pid, stage: "prompt-progress" }));
+    // The parent test waits for this acknowledgement before observing the
+    // following execution event, so admission traffic cannot satisfy it.
+    writeFileSync(progressPath, JSON.stringify({ pid: process.pid, stage: "prompt-accepted" }));
   }
+  emit({ type: "turn_start" });
   if (mode === "wait") {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta" } });
     return;

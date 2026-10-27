@@ -66,7 +66,7 @@ async function fixture(options: { peerMode?: "failure" | "wait" } = {}) {
 
 async function readPeerProgress(path: string): Promise<{ pid: number; stage: string }> {
   const progress = JSON.parse(await readFile(path, "utf8")) as { pid: number; stage: string };
-  expect(progress).toMatchObject({ stage: "prompt-progress" });
+  expect(progress).toMatchObject({ stage: "prompt-accepted" });
   return progress;
 }
 
@@ -213,7 +213,7 @@ it.each([
 ] as const)(
   "suppresses a %s after real peer progress",
   async (_label, source) => {
-    const { root, provider } = await fixture({ peerMode: "wait" });
+    const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
     vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     const notices: string[] = [];
     let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
@@ -263,16 +263,17 @@ it.each([
         },
       },
     ]);
-    let parentProgress = false;
+    let parentProgressAt: number | undefined;
     const actor = createOpenRouterActor(root, provider, lifecycle, {
       id: source === "operator" ? "root" : "child",
       log: () => {
-        parentProgress = true;
+        parentProgressAt = Date.now();
       },
     });
     try {
       actor.requestRun({ priority: "responsive" });
-      await waitForParentProgress(() => parentProgress, terminal);
+      await waitForPeerProgress(peerMarkerPath);
+      await waitForParentProgress(() => parentProgressAt !== undefined, terminal);
       if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
       else expect(actor.preemptForResponsive().preempted).toBe(true);
       await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
@@ -297,11 +298,11 @@ it.each([
 
 it.each([
   ["stall watchdog", 15 * 60 * 1000, "stall-watchdog"],
-  ["run ceiling", 1_000, "run-ceiling"],
+  ["run ceiling", 60_000, "run-ceiling"],
 ] as const)(
   "attributes the %s after real peer progress goes quiet",
   async (_label, timeoutMs, reason) => {
-    const { root, provider } = await fixture({ peerMode: "wait" });
+    const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
     vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
     let terminalSeen = false;
@@ -311,6 +312,9 @@ it.each([
     });
     const lifecycle = createActorLifecycle([
       {
+        onStart: () => {
+          runStartedAt = Date.now();
+        },
         onEnd: (event) => {
           terminalSeen = true;
           if (event.terminal.kind === "result") ended = event.terminal.result;
@@ -318,19 +322,25 @@ it.each([
         },
       },
     ]);
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     let actor: Actor | undefined;
-    let parentProgress = false;
+    let parentProgressAt: number | undefined;
+    let runStartedAt: number | undefined;
     try {
       actor = createOpenRouterActor(root, provider, lifecycle, {
         timeoutMs: reason === "run-ceiling" ? timeoutMs : undefined,
         log: () => {
-          parentProgress = true;
+          parentProgressAt = Date.now();
         },
       });
       actor.requestRun({ priority: "responsive" });
-      await waitForParentProgress(() => parentProgress, terminal);
-      await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+      await waitForPeerProgress(peerMarkerPath);
+      await waitForParentProgress(() => parentProgressAt !== undefined, terminal);
+      const timerAnchor = reason === "stall-watchdog" ? parentProgressAt : runStartedAt;
+      expect(timerAnchor).toBeDefined();
+      const remainingMs = timeoutMs - (Date.now() - (timerAnchor as number));
+      expect(remainingMs).toBeGreaterThan(1);
+      await vi.advanceTimersByTimeAsync(remainingMs - 1);
       expect(terminalSeen).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       await terminal;

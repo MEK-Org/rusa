@@ -163,13 +163,20 @@ export class OpenRouterProvider implements CodingProvider {
         onSpawn: () => opts.onPromptLaunched?.(opts.prompt),
         onDuplex: (value) => {
           transport = value;
-          invocation = new PiRpcInvocation(value, this.model as string);
+          invocation = new PiRpcInvocation(
+            value,
+            this.model as string,
+            undefined,
+            undefined,
+            undefined,
+            // Keep raw RPC/tool records private. Actor liveness starts only
+            // once Pi has admitted the prompt and emitted execution activity.
+            () => opts.onChunk?.(".")
+          );
           outcome = invocation.run(opts.prompt);
         },
         handleStdoutData: (chunk) => {
           invocation?.acceptStdout(chunk);
-          // Progress without publishing raw RPC/tool records or credentials.
-          opts.onChunk?.(".");
         },
         onStdoutEnd: (_chunks, cause) => {
           if (cause === "eof") invocation?.endStdout();
