@@ -33,6 +33,26 @@ async function hangingCli(): Promise<{ root: string; command: string }> {
   return { root, command };
 }
 
+function readinessLatch(): { ready: Promise<void>; markReady: () => void } {
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  return { ready, markReady };
+}
+
+async function waitForReady<T>(ready: Promise<void>, run: Promise<T>): Promise<void> {
+  await Promise.race([
+    ready,
+    run.then(
+      () => {
+        throw new Error("Synthetic subprocess settled before it emitted readiness");
+      },
+      (error) => Promise.reject(error)
+    ),
+  ]);
+}
+
 const adapters: { name: string; create: (config: ProviderConfig) => CodingProvider }[] = [
   { name: "Claude", create: (config) => new ClaudeProvider("claude", config) },
   { name: "Codex", create: (config) => new CodexProvider("codex", config) },
@@ -68,23 +88,33 @@ describe("subprocess provider lifecycle parity", () => {
     create,
   }) => {
     const { root, command } = await hangingCli();
-    const stdout: string[] = [];
-
-    const result = await create({ cliCommand: command }).run({
-      prompt: "synthetic lifecycle deadline",
-      cwd: root,
-      timeoutMs: 300,
-      onStdout: (chunk) => stdout.push(chunk),
-      onChunk: (chunk) => stdout.push(chunk),
-    });
-
-    expect(stdout.join("")).toContain("ready");
-    expect(result).toMatchObject({
-      success: false,
-      cancelled: true,
-      exitCode: 143,
-      abortReason: "unknown",
-    });
+    const controller = new AbortController();
+    const { ready, markReady } = readinessLatch();
+    let resultPromise: ReturnType<CodingProvider["run"]> | undefined;
+    try {
+      resultPromise = create({ cliCommand: command }).run({
+        prompt: "synthetic lifecycle deadline",
+        cwd: root,
+        timeoutMs: 300,
+        signal: controller.signal,
+        onStdout: (chunk) => {
+          if (chunk.includes("ready")) markReady();
+        },
+        onChunk: (chunk) => {
+          if (chunk.includes("ready")) markReady();
+        },
+      });
+      await waitForReady(ready, resultPromise);
+      await expect(resultPromise).resolves.toMatchObject({
+        success: false,
+        cancelled: true,
+        exitCode: 143,
+        abortReason: "unknown",
+      });
+    } finally {
+      if (!controller.signal.aborted) controller.abort("interrupt:parity-deadline-cleanup");
+      await resultPromise?.catch(() => {});
+    }
   });
 
   it.each(adapters)("preserves an in-flight $name interruption's shared attribution", async ({
@@ -92,35 +122,36 @@ describe("subprocess provider lifecycle parity", () => {
   }) => {
     const { root, command } = await hangingCli();
     const controller = new AbortController();
-    let markReady: (() => void) | undefined;
-    const ready = new Promise<void>((resolve) => {
-      markReady = resolve;
-    });
+    const { ready, markReady } = readinessLatch();
+    let resultPromise: ReturnType<CodingProvider["run"]> | undefined;
+    try {
+      resultPromise = create({ cliCommand: command }).run({
+        prompt: "synthetic lifecycle interruption",
+        cwd: root,
+        timeoutMs: 10_000,
+        signal: controller.signal,
+        onStdout: (chunk) => {
+          if (chunk.includes("ready")) markReady();
+        },
+        onChunk: (chunk) => {
+          if (chunk.includes("ready")) markReady();
+        },
+      });
+      await waitForReady(ready, resultPromise);
+      controller.abort("interrupt:parity-fixture");
 
-    const resultPromise = create({ cliCommand: command }).run({
-      prompt: "synthetic lifecycle interruption",
-      cwd: root,
-      timeoutMs: 10_000,
-      signal: controller.signal,
-      onStdout: (chunk) => {
-        if (chunk.includes("ready")) markReady?.();
-      },
-      onChunk: (chunk) => {
-        if (chunk.includes("ready")) markReady?.();
-      },
-    });
-
-    await ready;
-    controller.abort("interrupt:parity-fixture");
-
-    await expect(resultPromise).resolves.toMatchObject({
-      success: false,
-      cancelled: true,
-      interrupted: true,
-      interruptSource: "parity-fixture",
-      abortReason: "interrupt:parity-fixture",
-      exitCode: 143,
-    });
+      await expect(resultPromise).resolves.toMatchObject({
+        success: false,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "parity-fixture",
+        abortReason: "interrupt:parity-fixture",
+        exitCode: 143,
+      });
+    } finally {
+      if (!controller.signal.aborted) controller.abort("interrupt:parity-cleanup");
+      await resultPromise?.catch(() => {});
+    }
   });
 
   it.each(
@@ -135,12 +166,17 @@ describe("subprocess provider lifecycle parity", () => {
       const { root, command } = await hangingCli();
       const notices: string[] = [];
       let ended: Awaited<ReturnType<CodingProvider["run"]>> | undefined;
+      let resolveTerminal!: (result: Awaited<ReturnType<CodingProvider["run"]>>) => void;
+      const terminal = new Promise<Awaited<ReturnType<CodingProvider["run"]>>>((resolve) => {
+        resolveTerminal = resolve;
+      });
       let ready = false;
       const lifecycle = createActorLifecycle([
         {
           onEnd: async (event) => {
             if (event.terminal.kind !== "result") return;
             ended = event.terminal.result;
+            resolveTerminal(event.terminal.result);
             await routeRunFailure(
               {
                 actors: {
@@ -187,10 +223,13 @@ describe("subprocess provider lifecycle parity", () => {
 
       try {
         actor.requestRun({ priority: "responsive" });
-        await vi.waitFor(() => expect(ready).toBe(true), { timeout: 10_000 });
+        await Promise.race([
+          vi.waitFor(() => expect(ready).toBe(true), { timeout: 10_000 }),
+          terminal.then(() => Promise.reject(new Error("Actor settled before fixture readiness"))),
+        ]);
         if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
         else expect(actor.preemptForResponsive().preempted).toBe(true);
-        await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
+        await expect(terminal).resolves.toBeDefined();
         expect(ended).toMatchObject({
           success: false,
           cancelled: true,
@@ -199,6 +238,10 @@ describe("subprocess provider lifecycle parity", () => {
         });
         expect(notices).toEqual([]);
       } finally {
+        if (!ended) {
+          actor.interrupt("parity-test-cleanup");
+          await terminal;
+        }
         actor.close();
       }
     }
