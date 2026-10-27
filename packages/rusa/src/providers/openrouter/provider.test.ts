@@ -6,7 +6,11 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
-import { OpenRouterProvider } from "./provider.js";
+import { Actor } from "../../actor/actor.js";
+import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
+import type { ActorRecord } from "../../actor/actor-record.js";
+import { routeRunFailure } from "../../actor/failure-sink.js";
+import { OpenRouterProvider, openRouterTimeoutMs } from "./provider.js";
 
 vi.mock("../../config/loader.js", () => ({
   loadConfig: () => ({ github: { account: "test" }, providers: {}, gitBridge: false }),
@@ -70,6 +74,79 @@ it("requires opt-in and refuses native sessions before inference", async () => {
     })
   ).rejects.toThrow(/fresh runs/);
 });
+
+it("honors the actor-supplied subprocess backstop instead of imposing an adapter cap", () => {
+  expect(openRouterTimeoutMs({ timeoutMs: 3_630_000 })).toBe(3_630_000);
+  expect(openRouterTimeoutMs({})).toBe(120_000);
+});
+
+it("returns full shared interruption attribution when the synthetic peer is cancelled", async () => {
+  const { root, provider } = await fixture();
+  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+  const controller = new AbortController();
+  controller.abort("interrupt:responsive-notification");
+
+  await expect(
+    provider.run({ cwd: root, prompt: "cancelled", signal: controller.signal })
+  ).resolves.toMatchObject({
+    success: false,
+    exitCode: 143,
+    cancelled: true,
+    interrupted: true,
+    interruptSource: "responsive-notification",
+    abortReason: "interrupt:responsive-notification",
+  });
+});
+
+it("carries a real adapter preemption through the actor into the failure sink", async () => {
+  const { root, provider } = await fixture();
+  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+  const notices: string[] = [];
+  let actor: Actor;
+  let ended = false;
+  let terminalOutput = "";
+  const lifecycle = createActorLifecycle([
+    {
+      onPrompt: () => {
+        if (!ended) actor.preemptForResponsive();
+      },
+      onEnd: async (event) => {
+        if (event.terminal.kind !== "result") return;
+        ended = true;
+        terminalOutput = event.terminal.result.output;
+        await routeRunFailure(
+          {
+            actors: { get: () => ({ id: "child", parentId: "parent" }) as ActorRecord },
+            sendToParent: (_parentId, body) => notices.push(body),
+            postToErrorChat: null,
+            rootId: "root",
+            log: () => {},
+          },
+          "child",
+          event.terminal.result
+        );
+      },
+    },
+  ]);
+  actor = new Actor({
+    id: "child",
+    cwd: root,
+    modelConfig: [{ provider: "openrouter", model: "vendor/fixed-model" }],
+    resolveProvider: () => provider,
+    mcpServers: [],
+    loadSessionId: () => undefined,
+    saveSessionId: () => {},
+    buildPrompt: () => ({ prompt: "synthetic preemption" }),
+    debounceMs: 0,
+    lifecycle,
+  });
+
+  actor.requestRun({ priority: "responsive" });
+  await vi.waitFor(() => expect(ended).toBe(true), { timeout: 10_000 });
+  actor.close();
+  expect(notices).toEqual([]);
+  expect(terminalOutput.match(/\[Task interrupted by responsive-notification\]/g)).toHaveLength(1);
+}, 15_000);
 it("requires the independently managed Pi login", async () => {
   const { root, apiKeyPath, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");

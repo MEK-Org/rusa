@@ -2683,8 +2683,16 @@ describe("Actor", () => {
       const preemption = actor.preemptForResponsive();
       expect(preemption.preempted).toBe(true);
 
-      // Resolve the provider without any manual attribution (it didn't use subprocess-execution)
-      resolveRun({ success: false, output: "simulated output", exitCode: 1 });
+      // A provider can observe its own kill and return a partial cancellation.
+      // The shared runtime must still add the interruption source the failure
+      // sink needs to suppress this intentional preemption.
+      resolveRun({
+        success: false,
+        output: "simulated output",
+        exitCode: 1,
+        cancelled: true,
+        abortReason: "interrupt:responsive-notification",
+      });
       await flush();
 
       expect(seen).toHaveLength(1);

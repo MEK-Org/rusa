@@ -7,7 +7,6 @@ import {
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
-  extractAbortReason,
   formatSigtermResult,
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -1225,12 +1224,18 @@ function thrownRunResult(err: unknown): RunResult {
 
 /** Attribute an aborted signal's SIGTERM to the result it ended, in place. */
 function attributeAbort(result: RunResult, signal: AbortSignal): void {
-  if (!result.cancelled) {
-    result.success = false;
-    Object.assign(result, formatSigtermResult(result.output, signal));
-  } else if (!result.abortReason) {
-    result.abortReason = extractAbortReason(signal);
-  }
+  // Adapters may observe the process exit before the shared controller is
+  // inspected and report only `cancelled`. The runtime owns termination
+  // attribution, so complete the canonical result even when an adapter has
+  // already marked the attempt cancelled.
+  const attribution = formatSigtermResult(result.output, signal);
+  const marker = formatSigtermResult("", signal).output;
+  result.success = false;
+  Object.assign(result, attribution, {
+    // A conforming adapter may already have included the shared marker. Keep
+    // its captured output intact instead of duplicating the terminal line.
+    output: result.output.endsWith(marker) ? result.output : attribution.output,
+  });
 }
 
 /** A configured pool entry skipped during recovery without an attempt. */

@@ -5,9 +5,15 @@ import { join, resolve } from "node:path";
 import type { ProviderConfig } from "../../config/types.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "../sandbox.js";
 import { runSubprocess, type SubprocessDuplex } from "../subprocess-execution.js";
+import { formatSigtermResult } from "../termination-attribution.js";
 import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
+
+/** The actor owns the deadline; this adapter only retains a standalone default. */
+export function openRouterTimeoutMs(opts: Pick<RunOptions, "timeoutMs">): number {
+  return opts.timeoutMs ?? 120_000;
+}
 
 /** Local end-to-end prototype. Fresh Pi process, portable context, built-in and MCP tools.
  * Worker launches use the shared actor bwrap boundary with isolated Pi state.
@@ -154,7 +160,10 @@ export class OpenRouterProvider implements CodingProvider {
           PI_TELEMETRY: "0",
           PATH: process.env.PATH,
         },
-        timeoutMs: Math.min(opts.timeoutMs ?? 120_000, 120_000),
+        // The actor owns invocation timing. Its deadline includes the shared
+        // watchdog policy and a subprocess grace margin; an adapter-local cap
+        // would turn a healthy run into an unrelated provider timeout.
+        timeoutMs: openRouterTimeoutMs(opts),
         signal: opts.signal,
         onSpawn: () => opts.onPromptLaunched?.(opts.prompt),
         onDuplex: (value) => {
@@ -171,8 +180,8 @@ export class OpenRouterProvider implements CodingProvider {
           if (cause === "eof") invocation?.endStdout();
         },
         handleStderrData: () => {},
-        buildKilledResult: () => failed("Pi prototype deadline or cancellation"),
-        buildSignalResult: () => failed("Pi prototype process signalled"),
+        buildKilledResult: (termination) => ({ success: false, ...termination }),
+        buildSignalResult: (termination) => ({ success: false, ...termination }),
         buildExitResult: () => failed("Pi prototype process exited before settlement"),
         buildSpawnErrorResult: () => failed("Pi prototype could not start"),
       });
@@ -194,14 +203,13 @@ export class OpenRouterProvider implements CodingProvider {
           { mode: 0o600, flag: "wx" }
         );
       }
+      const terminated = opts.signal?.aborted ? formatSigtermResult("", opts.signal) : undefined;
       return {
         success: result.success,
         output: result.success ? result.output : (result.reason ?? "Pi failed"),
         exitCode: result.success ? 0 : 1,
         // Pi message.model is a configuration echo, not upstream read-back.
-        ...(opts.signal?.aborted
-          ? { cancelled: true, abortReason: processResult.abortReason }
-          : {}),
+        ...(terminated ?? {}),
       };
     } finally {
       await transport?.close();
