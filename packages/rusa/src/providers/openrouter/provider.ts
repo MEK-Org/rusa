@@ -199,13 +199,31 @@ export class OpenRouterProvider implements CodingProvider {
           { mode: 0o600, flag: "wx" }
         );
       }
-      const terminated = opts.signal?.aborted ? formatSigtermResult("", opts.signal) : undefined;
+      const output = result.success ? result.output : (result.reason ?? "Pi failed");
+      // A duplex invocation has its own semantic outcome, but subprocess-execution
+      // owns termination attribution. Preserve both when the host ended the process:
+      // the canonical cancelled result controls the terminal state, while Pi's reason
+      // remains useful failure diagnosis instead of being replaced by a bare marker.
+      // A normally settled Pi invocation closes its deliberately long-lived
+      // subprocess as cleanup, which also yields a cancelled process result.
+      // That cleanup must not rewrite a real success or ordinary Pi failure.
+      // The host-triggered cancellation path explicitly settles Pi as cancelled;
+      // an already-aborted caller signal wins the same race if Pi settled first.
+      if (
+        processResult.cancelled &&
+        (result.reason === "Pi invocation cancelled" || opts.signal?.aborted)
+      ) {
+        return {
+          ...processResult,
+          success: false,
+          output: formatSigtermResult(output, opts.signal).output,
+        };
+      }
       return {
         success: result.success,
-        output: result.success ? result.output : (result.reason ?? "Pi failed"),
+        output,
         exitCode: result.success ? 0 : 1,
         // Pi message.model is a configuration echo, not upstream read-back.
-        ...(terminated ?? {}),
       };
     } finally {
       await transport?.close();

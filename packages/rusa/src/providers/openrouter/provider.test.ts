@@ -214,12 +214,38 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
       cancelled: true,
       interrupted: true,
       interruptSource: "deadline-test",
+      output: expect.stringContaining("Pi invocation cancelled"),
     });
   } finally {
     progressAbort.abort();
     if (!controller.signal.aborted) controller.abort("interrupt:deadline-test-cleanup");
     await run?.catch(() => {});
     vi.useRealTimers();
+  }
+}, 15_000);
+
+it("keeps the Pi cancellation diagnosis on an adapter-local deadline", async () => {
+  const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
+  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+  const progressAbort = new AbortController();
+  let run: ReturnType<OpenRouterProvider["run"]> | undefined;
+  try {
+    run = provider.run({
+      cwd: root,
+      prompt: "wait for adapter deadline",
+      timeoutMs: 300,
+    });
+    await waitForPeerProgress(peerMarkerPath, progressAbort.signal);
+    await expect(run).resolves.toMatchObject({
+      success: false,
+      cancelled: true,
+      exitCode: 143,
+      abortReason: "unknown",
+      output: expect.stringContaining("Pi invocation cancelled"),
+    });
+  } finally {
+    progressAbort.abort();
+    await run?.catch(() => {});
   }
 }, 15_000);
 
