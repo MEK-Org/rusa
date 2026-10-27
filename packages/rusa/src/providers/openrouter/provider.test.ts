@@ -72,7 +72,10 @@ async function readPeerProgress(path: string): Promise<{ pid: number; stage: str
 }
 
 /** Wait on the peer's protocol marker, not a host-dependent stdout chunk count. */
-async function waitForPeerProgress(path: string): Promise<{ pid: number; stage: string }> {
+async function waitForPeerProgress(
+  path: string,
+  signal?: AbortSignal
+): Promise<{ pid: number; stage: string }> {
   try {
     return await readPeerProgress(path);
   } catch {
@@ -80,20 +83,33 @@ async function waitForPeerProgress(path: string): Promise<{ pid: number; stage: 
   }
   return new Promise((resolve, reject) => {
     let settled = false;
-    const watcher = watch(dirname(path), () => {
+    let watcher: ReturnType<typeof watch> | undefined;
+    const closeWatcher = () => {
+      watcher?.close();
+      signal?.removeEventListener("abort", abort);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      closeWatcher();
+      reject(error);
+    };
+    watcher = watch(dirname(path), () => {
       void readPeerProgress(path).then(settle, () => {});
     });
     const settle = (progress: { pid: number; stage: string }) => {
       if (settled) return;
       settled = true;
-      watcher.close();
+      closeWatcher();
       resolve(progress);
     };
-    watcher.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    });
+    const abort = () =>
+      fail(
+        signal?.reason instanceof Error ? signal.reason : new Error("Peer progress wait aborted")
+      );
+    watcher.once("error", fail);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     // Cover the interval between the initial read and watcher registration.
     void readPeerProgress(path).then(settle, () => {});
   });
@@ -120,6 +136,17 @@ function createOpenRouterActor(
     timeoutMs: options.timeoutMs,
   });
 }
+
+it("releases a pending peer-progress watcher when test cleanup aborts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openrouter-progress-abort-"));
+  roots.push(root);
+  const controller = new AbortController();
+  const waiting = waitForPeerProgress(join(root, "never-written.json"), controller.signal);
+
+  controller.abort(new Error("peer-progress test cleanup"));
+
+  await expect(waiting).rejects.toThrow("peer-progress test cleanup");
+});
 
 it("requires opt-in and refuses native sessions before inference", async () => {
   const { root, provider } = await fixture();
@@ -157,6 +184,7 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
   const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const controller = new AbortController();
+  const progressAbort = new AbortController();
   let settled = false;
   let run: ReturnType<OpenRouterProvider["run"]> | undefined;
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -175,7 +203,7 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
         settled = true;
       }
     );
-    const peer = await waitForPeerProgress(peerMarkerPath);
+    const peer = await waitForPeerProgress(peerMarkerPath, progressAbort.signal);
     await vi.advanceTimersByTimeAsync(120_001);
     expect(settled).toBe(false);
     expect(() => process.kill(peer.pid, 0)).not.toThrow();
@@ -188,6 +216,7 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
       interruptSource: "deadline-test",
     });
   } finally {
+    progressAbort.abort();
     if (!controller.signal.aborted) controller.abort("interrupt:deadline-test-cleanup");
     await run?.catch(() => {});
     vi.useRealTimers();
@@ -245,21 +274,25 @@ it.each([
     const actor = createOpenRouterActor(root, provider, lifecycle, {
       id: source === "operator" ? "root" : "child",
     });
+    const progressAbort = new AbortController();
+    try {
+      actor.requestRun({ priority: "responsive" });
+      await waitForPeerProgress(peerMarkerPath, progressAbort.signal);
+      if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
+      else expect(actor.preemptForResponsive().preempted).toBe(true);
+      await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
 
-    actor.requestRun({ priority: "responsive" });
-    await waitForPeerProgress(peerMarkerPath);
-    if (source === "operator") expect(actor.interrupt(source).interrupted).toBe(true);
-    else expect(actor.preemptForResponsive().preempted).toBe(true);
-    await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
-    actor.close();
-
-    expect(ended).toMatchObject({
-      success: false,
-      cancelled: true,
-      interrupted: true,
-      interruptSource: source,
-    });
-    expect(notices).toEqual([]);
+      expect(ended).toMatchObject({
+        success: false,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: source,
+      });
+      expect(notices).toEqual([]);
+    } finally {
+      progressAbort.abort();
+      actor.close();
+    }
   },
   15_000
 );
@@ -284,12 +317,14 @@ it.each([
       },
     ]);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const progressAbort = new AbortController();
+    let actor: Actor | undefined;
     try {
-      const actor = createOpenRouterActor(root, provider, lifecycle, {
+      actor = createOpenRouterActor(root, provider, lifecycle, {
         timeoutMs: reason === "run-ceiling" ? timeoutMs : undefined,
       });
       actor.requestRun({ priority: "responsive" });
-      await waitForPeerProgress(peerMarkerPath);
+      await waitForPeerProgress(peerMarkerPath, progressAbort.signal);
       if (reason === "stall-watchdog") {
         await vi.advanceTimersByTimeAsync(timeoutMs - 1);
         await Promise.resolve();
@@ -305,8 +340,9 @@ it.each([
           reason === "stall-watchdog" ? "stall watchdog" : "run ceiling"
         ),
       });
-      actor.close();
     } finally {
+      progressAbort.abort();
+      actor?.close();
       vi.useRealTimers();
     }
   },
@@ -338,14 +374,19 @@ it("reports an ordinary peer failure after protocol progress", async () => {
     },
   ]);
   const actor = createOpenRouterActor(root, provider, lifecycle);
-  actor.requestRun({ priority: "responsive" });
-  await waitForPeerProgress(peerMarkerPath);
-  await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
-  actor.close();
+  const progressAbort = new AbortController();
+  try {
+    actor.requestRun({ priority: "responsive" });
+    await waitForPeerProgress(peerMarkerPath, progressAbort.signal);
+    await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
 
-  expect(ended).toMatchObject({ success: false, exitCode: 1 });
-  expect(notices).toHaveLength(1);
-  expect(notices[0]).toContain("Pi reported a provider error or abort");
+    expect(ended).toMatchObject({ success: false, exitCode: 1 });
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("Pi reported a provider error or abort");
+  } finally {
+    progressAbort.abort();
+    actor.close();
+  }
 }, 15_000);
 it("requires the independently managed Pi login", async () => {
   const { root, apiKeyPath, provider } = await fixture();
