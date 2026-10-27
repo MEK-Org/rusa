@@ -6,7 +6,11 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
-const mode = process.argv[2];
+// Direct synthetic-pipe tests pass their mode as argv; provider tests use an
+// environment wrapper because the adapter owns argv. Keep both fixture entry
+// points so a provider-test extension cannot silently change pipe semantics.
+const mode = process.env.RUSA_TEST_PEER_MODE ?? process.argv[2];
+const progressPath = process.env.RUSA_TEST_PEER_MARKER;
 if (process.env.PI_CODING_AGENT_DIR) {
   const settings = JSON.parse(
     await readFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), "utf8")
@@ -65,6 +69,31 @@ lines.on("line", (line) => {
         : undefined;
   emit({ type: "response", id: command.id, command: command.type, success: true, data });
   if (command.type !== "prompt") return;
+  if (progressPath) {
+    // The parent test waits for this acknowledgement before observing the
+    // following execution event, so admission traffic cannot satisfy it.
+    writeFileSync(progressPath, JSON.stringify({ pid: process.pid, stage: "prompt-accepted" }));
+  }
+  emit({ type: "turn_start" });
+  if (mode === "wait") {
+    emit({ type: "message_update", assistantMessageEvent: { type: "text_delta" } });
+    return;
+  }
+  if (mode === "failure") {
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        provider: "openrouter",
+        model: "vendor/fixed-model",
+        stopReason: "error",
+        content: [{ type: "text", text: "synthetic provider failure" }],
+        usage: { input: 3, output: 2 },
+      },
+    });
+    emit({ type: "agent_settled" });
+    return;
+  }
   emit({
     type: "message_end",
     message: {

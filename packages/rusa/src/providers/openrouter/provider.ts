@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import type { ProviderConfig } from "../../config/types.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "../sandbox.js";
 import { runSubprocess, type SubprocessDuplex } from "../subprocess-execution.js";
+import { formatSigtermResult } from "../termination-attribution.js";
 import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
@@ -154,24 +155,35 @@ export class OpenRouterProvider implements CodingProvider {
           PI_TELEMETRY: "0",
           PATH: process.env.PATH,
         },
-        timeoutMs: Math.min(opts.timeoutMs ?? 120_000, 120_000),
+        // The actor owns invocation timing. Its deadline includes the shared
+        // watchdog policy and a subprocess grace margin; an adapter-local cap
+        // would turn a healthy run into an unrelated provider timeout.
+        timeoutMs: opts.timeoutMs ?? 120_000,
         signal: opts.signal,
         onSpawn: () => opts.onPromptLaunched?.(opts.prompt),
         onDuplex: (value) => {
           transport = value;
-          invocation = new PiRpcInvocation(value, this.model as string);
+          invocation = new PiRpcInvocation(
+            value,
+            this.model as string,
+            undefined,
+            undefined,
+            undefined,
+            // Keep raw RPC/tool records private. Actor liveness starts only
+            // once Pi has admitted the prompt and emitted execution activity.
+            () => opts.onChunk?.(".")
+          );
           outcome = invocation.run(opts.prompt);
         },
         handleStdoutData: (chunk) => {
           invocation?.acceptStdout(chunk);
-          // Progress without publishing raw RPC/tool records or credentials.
-          opts.onChunk?.(".");
         },
         onStdoutEnd: (_chunks, cause) => {
           if (cause === "eof") invocation?.endStdout();
+          else void invocation?.cancel();
         },
         handleStderrData: () => {},
-        buildKilledResult: () => failed("Pi prototype deadline or cancellation"),
+        buildKilledResult: (termination) => ({ success: false, ...termination }),
         buildSignalResult: () => failed("Pi prototype process signalled"),
         buildExitResult: () => failed("Pi prototype process exited before settlement"),
         buildSpawnErrorResult: () => failed("Pi prototype could not start"),
@@ -194,14 +206,37 @@ export class OpenRouterProvider implements CodingProvider {
           { mode: 0o600, flag: "wx" }
         );
       }
+      const output = result.success ? result.output : (result.reason ?? "Pi failed");
+      // A duplex invocation has its own semantic outcome, but subprocess-execution
+      // owns termination attribution. Preserve both when the host ended the process:
+      // the canonical cancelled result controls the terminal state, while Pi's reason
+      // remains useful failure diagnosis instead of being replaced by a bare marker.
+      // A normally settled Pi invocation closes its deliberately long-lived
+      // subprocess as cleanup, which also yields a cancelled process result.
+      // That cleanup must not rewrite a real success or ordinary Pi failure.
+      // The host-triggered cancellation path explicitly settles Pi as cancelled.
+      // Keep that fact structured instead of coupling this adapter to its diagnosis
+      // text: the subprocess result is the canonical terminal attribution, while
+      // Pi's reason is useful context for the person reading it.
+      if (processResult.cancelled && result.cancelled) {
+        return {
+          ...processResult,
+          success: false,
+          output: [result.reason, processResult.output].filter(Boolean).join("\n"),
+        };
+      }
+      // A caller may abort after Pi has settled and its deliberately long-lived
+      // subprocess has been reaped. In that narrow window, construct every
+      // terminal field from the caller signal rather than combining its marker
+      // with the prior cleanup result's unattributed fields.
+      if (opts.signal?.aborted) {
+        return { success: false, ...formatSigtermResult(output, opts.signal) };
+      }
       return {
         success: result.success,
-        output: result.success ? result.output : (result.reason ?? "Pi failed"),
+        output,
         exitCode: result.success ? 0 : 1,
         // Pi message.model is a configuration echo, not upstream read-back.
-        ...(opts.signal?.aborted
-          ? { cancelled: true, abortReason: processResult.abortReason }
-          : {}),
       };
     } finally {
       await transport?.close();
