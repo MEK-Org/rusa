@@ -115,6 +115,77 @@ describe("Gemini usage logger and on-demand report", () => {
     );
   });
 
+  it("retains actor/run attribution, accepts legacy rows, and keeps actor sums equal to group totals", async () => {
+    const { lines } = capture();
+    for (const [runId, input] of [
+      ["run-1", 50],
+      ["run-2", 100],
+    ] as const)
+      await observeGeminiRequest(
+        "portable_compaction",
+        "model",
+        async () => ({
+          usageMetadata: { ...metadata, promptTokenCount: input, totalTokenCount: input + 27 },
+        }),
+        { actorId: "actor-a", runId }
+      );
+    await observeGeminiRequest("portable_compaction", "model", async () => ({
+      usageMetadata: metadata,
+    }));
+    const partial = beginGeminiAttempt("portable_compaction", "model", {
+      actorId: "actor-a",
+      runId: "run-3",
+    });
+    partial.observe({ usageMetadata: metadata });
+    partial.finish("cancelled", true);
+    await observeGeminiRequest(
+      "portable_compaction",
+      "model",
+      async () => ({ usageMetadata: metadata }),
+      { actorId: "x".repeat(201), runId: "must-not-survive" }
+    );
+
+    const rows = lines.map((line) => JSON.parse(line));
+    expect(rows[0].usage).toMatchObject({ actorId: "actor-a", runId: "run-1" });
+    expect(rows[2].usage).toMatchObject({ actorId: null, runId: null });
+    expect(rows[4].usage).toMatchObject({ actorId: null, runId: null });
+
+    // Pre-attribution v1 exports have neither field. They remain valid v1
+    // records and belong in the explicit unattributed bucket.
+    delete rows[2].usage.actorId;
+    delete rows[2].usage.runId;
+    rows[2].usage.counts.input = 200;
+    rows[2].usage.counts.total = 227;
+    const report = await buildGeminiUsageReport(
+      [source("attribution", `${lines[0]}${lines[1]}${JSON.stringify(rows[2])}\n${lines[3]}`)],
+      window
+    );
+    const group = report.groups[0];
+    const actor = group.actors.find((entry) => entry.actorId === "actor-a");
+    const unattributed = group.actors.find((entry) => entry.actorId === null);
+    if (!actor || !unattributed) throw new Error("expected attributed and unattributed buckets");
+    expect(actor).toMatchObject({
+      calls: 3,
+      partialCalls: 1,
+      runIds: ["run-1", "run-2", "run-3"],
+      input: { sum: 150, measured: 2, missing: 0 },
+      output: { sum: 50, measured: 2, missing: 0 },
+      inputPerCall: { max: 100, p50: 50, p90: 100 },
+    });
+    expect(unattributed).toMatchObject({
+      calls: 1,
+      partialCalls: 0,
+      runIds: [],
+      input: { sum: 200, measured: 1, missing: 0 },
+      output: { sum: 25, measured: 1, missing: 0 },
+    });
+    expect((actor.input.sum ?? 0) + (unattributed.input.sum ?? 0)).toBe(group.totals.input.sum);
+    expect((actor.output.sum ?? 0) + (unattributed.output.sum ?? 0)).toBe(group.totals.output.sum);
+    expect(group.actors.map((entry) => entry.actorId)).toEqual([null, "actor-a"]);
+    expect(formatGeminiUsageReport(report)).toContain("actor unattributed: 1 calls; interrupted=0");
+    expect(formatGeminiUsageReport(report)).toContain("actor actor-a: 3 calls; interrupted=1");
+  });
+
   it("counts outer retries, stronger-model fallback and a response rejected by application validation", async () => {
     const { lines } = capture();
     const call = vi
@@ -245,16 +316,19 @@ describe("Gemini usage logger and on-demand report", () => {
       buildGeminiUsageReport([source("conflict", lines[0] + JSON.stringify(changed))], window)
     ).rejects.toThrow("Conflicting copies");
     changed.usage.version = 2;
+    const orphanRun = JSON.parse(lines[0]);
+    orphanRun.usage.actorId = null;
+    orphanRun.usage.runId = "orphan-run";
     const report = await buildGeminiUsageReport(
       [
         source(
           "damaged",
-          `PRIVATE BROKEN JSON\n${"x".repeat(MAX_USAGE_LINE_BYTES + 1)}\n${JSON.stringify(changed)}\n${lines[0]}`
+          `PRIVATE BROKEN JSON\n${"x".repeat(MAX_USAGE_LINE_BYTES + 1)}\n${JSON.stringify(changed)}\n${JSON.stringify(orphanRun)}\n${lines[0]}`
         ),
       ],
       window
     );
-    expect(report.sources[0]).toMatchObject({ malformed: 1, oversized: 1, invalidUsage: 1 });
+    expect(report.sources[0]).toMatchObject({ malformed: 1, oversized: 1, invalidUsage: 2 });
     expect(report.groups[0].calls).toBe(1);
     expect(JSON.stringify(report)).not.toContain("PRIVATE BROKEN JSON");
   });

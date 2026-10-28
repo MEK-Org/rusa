@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { compactPortableContext } from "../commands/start.js";
 import * as dbIdx from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -9,6 +9,8 @@ import {
   type PortableLedgerSource,
 } from "../db/repositories/actor-run-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import { configureGeminiUsage } from "../observability/gemini-usage.js";
+import { createLogger, nullLogger } from "../observability/logger.js";
 import * as geminiUtils from "../understanding/gemini-utils.js";
 import { seedPortableBriefState } from "./portable-context-brief.js";
 import {
@@ -1534,14 +1536,29 @@ describe("compactPortableContext integration (spec 6b)", () => {
     vi.mocked(dbIdx.getRepositories).mockReturnValue({ actorRuns } as any);
   });
 
+  afterEach(() => {
+    configureGeminiUsage(nullLogger, "/synthetic/test");
+  });
+
   it("folds message and advances watermark even when quarantined, preventing re-fetch", async () => {
     recordInbound("bad body");
     const events = actorRuns.listLedgerSourcesAfter("actor-a", null).sources;
+    const lines: string[] = [];
+    configureGeminiUsage(
+      createLogger({ format: "json", destination: { write: (line) => lines.push(line) } }),
+      "/synthetic/portable-compaction"
+    );
 
     // Mock the Gemini API to always return an operation with a bad quote
     const mockClient = {
       models: {
         generateContent: vi.fn().mockResolvedValue({
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            thoughtsTokenCount: 5,
+            totalTokenCount: 125,
+          },
           text: () =>
             JSON.stringify({
               operations: [
@@ -1565,10 +1582,20 @@ describe("compactPortableContext integration (spec 6b)", () => {
     const store = new InMemoryPortableContextStore();
     const compactor = new GeminiPortableContextCompactor("fake-key");
 
-    const result1 = await compactPortableContext({ actorId: "actor-a", store, compactor });
+    const result1 = await compactPortableContext({
+      actorId: "actor-a",
+      runId: "run-42",
+      store,
+      compactor,
+    });
     expect(result1?.folded).toBe(1);
     expect(result1?.quarantined).toBe(1);
     expect(result1?.items).toBe(0); // nothing added
+    expect(JSON.parse(lines[0] ?? "{}").usage).toMatchObject({
+      purpose: "portable_compaction",
+      actorId: "actor-a",
+      runId: "run-42",
+    });
 
     const state1 = store.load("actor-a");
     expect(state1.lastFoldedSourceId).toBe(events[0].id);

@@ -37,6 +37,31 @@ interface Measurement {
   missing: number;
 }
 type Totals = { [K in keyof GeminiCounts | "output"]: Measurement };
+interface InputPerCall {
+  max: number | null;
+  p50: number | null;
+  p90: number | null;
+}
+interface UsageActor {
+  actorId: string | null;
+  /** Distinct attributed run ids; omitted from text output but retained in JSON. */
+  runIds: string[];
+  calls: number;
+  /** Interrupted calls are excluded from completed usage summaries. */
+  partialCalls: number;
+  input: Measurement;
+  output: Measurement;
+  inputPerCall: InputPerCall;
+}
+interface UsageActorAccumulator {
+  actorId: string | null;
+  runIds: Set<string>;
+  calls: number;
+  partialCalls: number;
+  input: Measurement;
+  output: Measurement;
+  inputSamples: number[];
+}
 interface UsageGroup {
   purpose: GeminiUsageRecord["purpose"];
   model: string;
@@ -45,6 +70,7 @@ interface UsageGroup {
   coverage: Record<GeminiUsageRecord["usage"], number>;
   totals: Totals;
   partialObservations: Totals;
+  actors: UsageActor[];
 }
 export interface GeminiUsageReport {
   version: 1;
@@ -75,9 +101,14 @@ function parseUsage(value: unknown): GeminiUsageRecord | null {
   if (value === null || typeof value !== "object") return null;
   const r = value as GeminiUsageRecord;
   const occurredAt = usageUtc(r.occurredAt);
+  const actorId = nullableUsageIdentifier(r.actorId);
+  const runId = nullableUsageIdentifier(r.runId);
   if (
     r.version !== 1 ||
     !occurredAt ||
+    actorId === undefined ||
+    runId === undefined ||
+    (actorId === null && runId !== null) ||
     !GEMINI_USAGE_PURPOSES.includes(r.purpose) ||
     !["response", "error", "cancelled"].includes(r.outcome) ||
     !["complete", "partial", "missing"].includes(r.usage) ||
@@ -118,6 +149,8 @@ function parseUsage(value: unknown): GeminiUsageRecord | null {
     pid: r.pid,
     attemptId: r.attemptId,
     purpose: r.purpose,
+    actorId,
+    runId,
     requestedModel: r.requestedModel,
     model: r.model,
     outcome: r.outcome,
@@ -125,6 +158,12 @@ function parseUsage(value: unknown): GeminiUsageRecord | null {
     partial: r.partial,
     counts,
   };
+}
+
+/** Missing fields are pre-attribution v1 records; malformed values are refused. */
+function nullableUsageIdentifier(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" && value.length > 0 && value.length <= 200 ? value : undefined;
 }
 
 async function* boundedLines(stream: AsyncIterable<Uint8Array>): AsyncGenerator<string | null> {
@@ -166,22 +205,57 @@ function totals(): Totals {
 function addCounts(target: Totals, counts: GeminiCounts): void {
   const values = {
     ...counts,
-    output:
-      counts.response !== null && counts.thinking !== null
-        ? counts.response + counts.thinking
-        : null,
+    output: outputCount(counts),
   };
-  for (const key of Object.keys(values) as (keyof Totals)[]) {
-    const value = values[key];
-    if (value === null) {
-      target[key].missing++;
-      continue;
-    }
-    const sum = (target[key].sum ?? 0) + value;
-    if (!Number.isSafeInteger(sum)) throw new Error("Usage aggregate exceeds safe integer range");
-    target[key].sum = sum;
-    target[key].measured++;
+  for (const key of Object.keys(values) as (keyof Totals)[])
+    addMeasurement(target[key], values[key]);
+}
+function addMeasurement(target: Measurement, value: number | null): void {
+  if (value === null) {
+    target.missing++;
+    return;
   }
+  const sum = (target.sum ?? 0) + value;
+  if (!Number.isSafeInteger(sum)) throw new Error("Usage aggregate exceeds safe integer range");
+  target.sum = sum;
+  target.measured++;
+}
+function outputCount(counts: GeminiCounts): number | null {
+  return counts.response !== null && counts.thinking !== null
+    ? counts.response + counts.thinking
+    : null;
+}
+function inputPerCall(samples: number[]): InputPerCall {
+  if (samples.length === 0) return { max: null, p50: null, p90: null };
+  // The accumulator is private to this actor and is no longer needed after
+  // finalization. Sort once without spreading it into a call: one actor can
+  // legitimately own every sample in the report's one-million-attempt limit.
+  samples.sort((a, b) => a - b);
+  const nearestRank = (fraction: number) =>
+    samples[Math.ceil(samples.length * fraction) - 1] ?? null;
+  return {
+    max: samples.at(-1) ?? null,
+    p50: nearestRank(0.5),
+    p90: nearestRank(0.9),
+  };
+}
+function compareActors(a: UsageActor, b: UsageActor): number {
+  const byInput = (b.input.sum ?? -1) - (a.input.sum ?? -1);
+  if (byInput) return byInput;
+  if (a.actorId === null) return b.actorId === null ? 0 : 1;
+  if (b.actorId === null) return -1;
+  return a.actorId.localeCompare(b.actorId);
+}
+function finalizeActor(actor: UsageActorAccumulator): UsageActor {
+  return {
+    actorId: actor.actorId,
+    runIds: [...actor.runIds].sort(),
+    calls: actor.calls,
+    partialCalls: actor.partialCalls,
+    input: actor.input,
+    output: actor.output,
+    inputPerCall: inputPerCall(actor.inputSamples),
+  };
 }
 function bounds(coverage: SourceCoverage, kind: "log" | "usage", time: string): void {
   const from = `${kind}From` as const;
@@ -216,6 +290,7 @@ export async function buildGeminiUsageReport(
   };
   const seen = new Map<string, string>();
   const groups = new Map<string, UsageGroup>();
+  const actors = new Map<string, Map<string | null, UsageActorAccumulator>>();
   const instances = new Set<string>();
   const processes = new Set<string>();
   for (const source of sources) {
@@ -283,6 +358,7 @@ export async function buildGeminiUsageReport(
           coverage: { complete: 0, partial: 0, missing: 0 },
           totals: totals(),
           partialObservations: totals(),
+          actors: [],
         };
         groups.set(key, group);
       }
@@ -290,6 +366,34 @@ export async function buildGeminiUsageReport(
       group.outcomes[record.outcome]++;
       group.coverage[record.usage]++;
       addCounts(record.partial ? group.partialObservations : group.totals, record.counts);
+      let actorGroups = actors.get(key);
+      if (!actorGroups) {
+        actorGroups = new Map();
+        actors.set(key, actorGroups);
+      }
+      let actor = actorGroups.get(record.actorId);
+      if (!actor) {
+        actor = {
+          actorId: record.actorId,
+          runIds: new Set(),
+          calls: 0,
+          partialCalls: 0,
+          input: { sum: null, measured: 0, missing: 0 },
+          output: { sum: null, measured: 0, missing: 0 },
+          inputSamples: [],
+        };
+        actorGroups.set(record.actorId, actor);
+      }
+      actor.calls++;
+      if (record.partial) actor.partialCalls++;
+      if (record.runId !== null) actor.runIds.add(record.runId);
+      // Keep per-actor measured sums and percentiles on the same completed-only
+      // basis as the group totals. Interrupted snapshots remain separate above.
+      if (!record.partial) {
+        addMeasurement(actor.input, record.counts.input);
+        addMeasurement(actor.output, outputCount(record.counts));
+        if (record.counts.input !== null) actor.inputSamples.push(record.counts.input);
+      }
     }
     if (coverage.malformed || coverage.oversized || coverage.invalidUsage) {
       report.warnings.push(
@@ -299,13 +403,18 @@ export async function buildGeminiUsageReport(
   }
   report.instances = [...instances].sort();
   report.processes = [...processes].sort();
-  report.groups = [...groups.values()].sort(
-    (a, b) =>
-      (b.totals.total.sum ?? b.totals.input.sum ?? 0) -
-        (a.totals.total.sum ?? a.totals.input.sum ?? 0) ||
-      a.purpose.localeCompare(b.purpose) ||
-      a.model.localeCompare(b.model)
-  );
+  report.groups = [...groups.entries()]
+    .map(([key, group]) => ({
+      ...group,
+      actors: [...(actors.get(key)?.values() ?? [])].map(finalizeActor).sort(compareActors),
+    }))
+    .sort(
+      (a, b) =>
+        (b.totals.total.sum ?? b.totals.input.sum ?? 0) -
+          (a.totals.total.sum ?? a.totals.input.sum ?? 0) ||
+        a.purpose.localeCompare(b.purpose) ||
+        a.model.localeCompare(b.model)
+    );
   report.unobservedPurposes = GEMINI_USAGE_PURPOSES.filter(
     (purpose) => !report.groups.some((group) => group.purpose === purpose)
   );
@@ -330,6 +439,10 @@ export function formatGeminiUsageReport(report: GeminiUsageReport): string {
     for (const key of Object.keys(group.totals) as (keyof Totals)[])
       lines.push(
         `  ${key}: ${measured(group.totals[key])}; interrupted observations: ${measured(group.partialObservations[key])}`
+      );
+    for (const actor of group.actors)
+      lines.push(
+        `  actor ${actor.actorId ?? "unattributed"}: ${actor.calls} calls; interrupted=${actor.partialCalls}; input: ${measured(actor.input)}; output: ${measured(actor.output)}; input/call max=${actor.inputPerCall.max ?? "unknown"}, p50=${actor.inputPerCall.p50 ?? "unknown"}, p90=${actor.inputPerCall.p90 ?? "unknown"}`
       );
   }
   lines.push(
