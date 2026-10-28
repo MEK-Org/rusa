@@ -19,30 +19,59 @@ import 'fakes.dart';
 
 void main() {
   group('resolveRootActorId', () {
-    test('is the one active parentless actor, whatever its id', () {
+    ThreadsSnapshot snapshot(String? rootActorId, List<ThreadDto> threads) =>
+        ThreadsSnapshot(
+          halted: false,
+          threads: threads,
+          rootActorId: rootActorId,
+        );
+
+    test('is the actor the server names, whatever its id', () {
       expect(
-        resolveRootActorId([
-          makeThread('root', status: 'retired'),
-          makeThread('child', parent: 'top'),
-          makeThread('top'),
-        ]),
-        'top',
+        resolveRootActorId(
+          snapshot('imported-id', [
+            makeThread('detached'),
+            makeThread('imported-id'),
+            makeThread('child', parent: 'imported-id'),
+          ]),
+        ),
+        'imported-id',
       );
     });
 
-    test('is null with several active parentless actors', () {
+    test('is null when the named root is retired, even with another top', () {
       expect(
-        resolveRootActorId([
-          makeThread('root'),
-          makeThread('detached'),
-          makeThread('child', parent: 'root'),
-        ]),
+        resolveRootActorId(
+          snapshot('imported-id', [
+            makeThread('imported-id', status: 'retired'),
+            makeThread('detached'),
+          ]),
+        ),
         isNull,
       );
     });
 
-    test('is null without an active root', () {
-      expect(resolveRootActorId([makeThread('child', parent: 'gone')]), isNull);
+    test('is null when the named root is missing, even with another top', () {
+      expect(
+        resolveRootActorId(snapshot('imported-id', [makeThread('detached')])),
+        isNull,
+      );
+    });
+
+    test('is null when the server names no root, even with a `root` id', () {
+      expect(resolveRootActorId(snapshot(null, [makeThread('root')])), isNull);
+    });
+
+    test('reads the root id from the threads response', () {
+      final parsed = ThreadsSnapshot.fromJson({
+        'threads': <Object>[],
+        'rootActorId': 'imported-id',
+      });
+      expect(parsed.rootActorId, 'imported-id');
+      expect(
+        ThreadsSnapshot.fromJson({'threads': <Object>[]}).rootActorId,
+        isNull,
+      );
     });
   });
 
@@ -142,7 +171,7 @@ void main() {
       await pumpPage(tester);
 
       expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
-      expect(find.text('No single active root actor'), findsOneWidget);
+      expect(find.text('No active root actor'), findsOneWidget);
       expect(walkie.recorder.startCalls, 0);
 
       api.threadsResult = [makeThread('root')];
@@ -150,6 +179,26 @@ void main() {
       await tester.pump();
       await tester.pump();
       expect(walkie.recorder.startCalls, 1);
+      await unmount(tester);
+    });
+
+    testWidgets('never sends to another top-level actor in root\'s place', (
+      tester,
+    ) async {
+      api
+        ..rootActorId = 'imported-id'
+        ..threadsResult = [
+          makeThread('imported-id', status: 'retired'),
+          makeThread('detached'),
+        ];
+      await pumpPage(tester);
+
+      expect(find.text('No active root actor'), findsOneWidget);
+      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.streams, isEmpty);
+      assistant.triggerCtrl.add(null);
+      await tester.pump();
+      expect(api.memoSends, isEmpty);
       await unmount(tester);
     });
 
@@ -189,7 +238,13 @@ void main() {
       await pumpPage(tester);
       await unmount(tester);
 
-      gate.complete(ThreadsSnapshot(halted: false, threads: api.threadsResult));
+      gate.complete(
+        ThreadsSnapshot(
+          halted: false,
+          threads: api.threadsResult,
+          rootActorId: 'root',
+        ),
+      );
       await tester.pump();
       await tester.pump();
 
@@ -201,7 +256,7 @@ void main() {
     testWidgets('closing during a Retry start starts nothing', (tester) async {
       api.threadsResult = [makeThread('child', parent: 'gone')];
       await pumpPage(tester);
-      expect(find.text('No single active root actor'), findsOneWidget);
+      expect(find.text('No active root actor'), findsOneWidget);
 
       api.threadsResult = [makeThread('root')];
       final gate = Completer<ThreadsSnapshot>();
@@ -210,7 +265,13 @@ void main() {
       await tester.pump();
       await unmount(tester);
 
-      gate.complete(ThreadsSnapshot(halted: false, threads: api.threadsResult));
+      gate.complete(
+        ThreadsSnapshot(
+          halted: false,
+          threads: api.threadsResult,
+          rootActorId: 'root',
+        ),
+      );
       await tester.pump();
       await tester.pump();
 

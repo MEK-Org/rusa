@@ -227,6 +227,7 @@ class FakeApi extends DashboardApi {
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
   Object? threadsError;
+  String? rootActorId = 'root';
   final timingInteractions =
       <({DashboardInteraction interaction, String outcome})>[];
   List<EventPage> eventPages = [];
@@ -296,6 +297,7 @@ class FakeApi extends DashboardApi {
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
       supportedVoices: supportedVoices,
+      rootActorId: rootActorId,
     );
   }
 

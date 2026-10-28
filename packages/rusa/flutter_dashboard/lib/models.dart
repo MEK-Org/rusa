@@ -711,10 +711,16 @@ class ThreadsSnapshot {
     this.halt,
     this.haltBrake,
     this.availabilityHolds,
+    this.rootActorId,
   });
 
   final bool halted;
   final List<ThreadDto> threads;
+
+  /// Root's actor id, as the server's mesh resolves it. Every parentless
+  /// thread carries the root handle, so this is what identifies root. Null
+  /// against an older server, or one with no live mesh: root unknown.
+  final String? rootActorId;
   final RuntimeCursor? runtimeCursor;
 
   /// The supported voices across providers, as reported by the server — the
@@ -765,6 +771,7 @@ class ThreadsSnapshot {
     availabilityHolds: (j['availabilityHolds'] as List<dynamic>?)
         ?.map((e) => AvailabilityHoldDto.fromJson(e as Map<String, dynamic>))
         .toList(),
+    rootActorId: j['rootActorId'] as String?,
   );
 }
 

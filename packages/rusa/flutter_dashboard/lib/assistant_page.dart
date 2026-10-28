@@ -70,8 +70,8 @@ class _AssistantPageState extends State<AssistantPage> {
     await _enabledSub?.cancel();
     _enabledSub = null;
     if (stale()) throw StateError('Assist screen closed');
-    final root = resolveRootActorId(snapshot.threads);
-    if (root == null) throw StateError('No single active root actor');
+    final root = resolveRootActorId(snapshot);
+    if (root == null) throw StateError('No active root actor');
     unawaited(_controller?.dispose());
     final controller = WalkieController(
       actorId: root,
