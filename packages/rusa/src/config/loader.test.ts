@@ -57,6 +57,52 @@ describe("loadConfig deployBranch", () => {
   });
 });
 
+describe("loadConfig customMcpServers", () => {
+  const customMcpServers = {
+    glass_goals: {
+      command: "goals-mcp",
+      args: ["serve"],
+      userId: "configured-user",
+      readTools: ["read_goal"],
+      writeTools: ["write_goal"],
+    },
+  };
+
+  it("accepts a fixed-user custom stdio server without granting it to an actor", () => {
+    expect(loadConfig(writeConfig({ customMcpServers })).customMcpServers).toEqual(
+      customMcpServers
+    );
+  });
+
+  it("accepts a read-only server", () => {
+    const readOnly = { glass_goals: { ...customMcpServers.glass_goals, writeTools: [] } };
+    expect(loadConfig(writeConfig({ customMcpServers: readOnly })).customMcpServers).toEqual(
+      readOnly
+    );
+  });
+
+  it.each([
+    [{ glass_goals: { ...customMcpServers.glass_goals, userId: "caller:chosen" } }, /colon-free/],
+    [
+      {
+        glass_goals: { ...customMcpServers.glass_goals, readTools: ["same"], writeTools: ["same"] },
+      },
+      /not both/,
+    ],
+    [
+      { glass_goals: { ...customMcpServers.glass_goals, env: { TOKEN: "do-not-inline" } } },
+      /not supported/,
+    ],
+    [{ GlassGoals: customMcpServers.glass_goals }, /capability name/],
+    [
+      { glass_goals: { ...customMcpServers.glass_goals, readTools: [], writeTools: [] } },
+      /at least one tool/,
+    ],
+  ])("rejects unsafe or ambiguous custom MCP configuration", (customMcpServers, message) => {
+    expect(() => loadConfig(writeConfig({ customMcpServers }))).toThrow(message);
+  });
+});
+
 describe("loadConfig Slack", () => {
   it("accepts host token paths", () => {
     const config = loadConfig(

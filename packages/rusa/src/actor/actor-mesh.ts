@@ -817,6 +817,11 @@ export interface ActorMeshOptions {
    * rejected, bounding what the primitive can ever hand out. Defaults to empty.
    */
   grantableCapabilities?: ReadonlySet<string>;
+  /**
+   * Configured custom MCP capabilities mapped to their fixed upstream user. A
+   * grant of one is accepted only as `<capability>:<user>:read|write`.
+   */
+  customMcpUserIds?: ReadonlyMap<string, string>;
   /** Host-owned one-shot messages. Production supplies the `at`-backed OS scheduler. */
   scheduledMessages?: ScheduledMessageScheduler;
   /** Atomic boundary for recording a scheduled message's chat/audit rows. */
@@ -995,6 +1000,7 @@ export class ActorMesh {
   private readonly activeSuppressions = new Map<string, ActiveInterruptionSuppression>();
   private readonly reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
   private readonly grantable: ReadonlySet<string>;
+  private readonly customMcpUserIds: ReadonlyMap<string, string>;
   private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
   private readonly voiceTransferLog: Logger;
@@ -1109,6 +1115,7 @@ export class ActorMesh {
     this.grantable = new Set(
       [...(opts.grantableCapabilities ?? [])].filter((cap) => !HOST_GLOBAL_CAPABILITIES.has(cap))
     );
+    this.customMcpUserIds = opts.customMcpUserIds ?? new Map();
     this.secretsDir = opts.secretsDir ?? secretsDirPath();
     if (!opts.inboxStore) {
       this.log(
@@ -3556,6 +3563,17 @@ export class ActorMesh {
       baseCapability = "drive-read";
     } else if (capability.startsWith("secret:")) {
       baseCapability = "secret";
+    }
+    const customBase = capability.split(":", 1)[0] as string;
+    const customUserId = this.customMcpUserIds.get(customBase);
+    if (customUserId !== undefined) {
+      const prefix = `${customBase}:${customUserId}:`;
+      if (capability !== `${prefix}read` && capability !== `${prefix}write`) {
+        throw new Error(
+          `${customBase} grant must be exactly ${prefix}read or ${prefix}write; got ${capability}`
+        );
+      }
+      baseCapability = customBase;
     }
     if (capability === "chat-write" || capability === "chat-write:") {
       throw new Error(

@@ -333,6 +333,10 @@ live edge, `dev` for a watch loop, `status`, `logs`, `dashboard`,
 `install-service` to run under systemd, `forward-webhooks` for local GitHub
 delivery, and the `quota-coordinator` family.
 
+Operator-configured external stdio integrations use the same per-actor MCP
+boundary; see [host-owned custom MCP servers](docs/custom-mcp.md) for the
+grant and lifecycle contract.
+
 ## Contributing
 
 This repo is built largely by Rusa's own actors, so the working conventions

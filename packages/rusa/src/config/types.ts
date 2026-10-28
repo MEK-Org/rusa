@@ -285,6 +285,31 @@ export interface GlassGoalsConfig {
   rootNodeId?: string;
 }
 
+/**
+ * An operator-owned stdio MCP server exposed only through a grantable,
+ * per-actor loopback endpoint. The configured user is an upstream launch
+ * binding, never a tool argument supplied by an actor.
+ */
+export interface CustomMcpServerConfig {
+  /** Executable launched on the host for one proxied MCP session. */
+  command: string;
+  /** Fixed arguments for the host-owned process. */
+  args?: string[];
+  /** Optional host working directory for the process. */
+  cwd?: string;
+  /**
+   * Fixed external graph identity accepted by this configured server. This is
+   * the upstream process's launch binding and is independent of
+   * `understanding.glassGoals.username`, which configures Rusa's own
+   * Integrated Understanding store.
+   */
+  userId: string;
+  /** Tool names a read or write grant may call. */
+  readTools: string[];
+  /** Tool names only a write grant may call. */
+  writeTools: string[];
+}
+
 export interface UnderstandingMountConfig {
   /**
    * Whether to mount the Integrated Understanding as a read-only filesystem
@@ -523,6 +548,11 @@ export interface RusaConfig {
   observability?: ObservabilityConfig;
   /** Provider-neutral Integrated Understanding settings. */
   understanding?: UnderstandingConfig;
+  /**
+   * Optional host-owned stdio MCP integrations, keyed by their grant capability
+   * (for example `glass_goals`). No entry grants any actor access by itself.
+   */
+  customMcpServers?: Record<string, CustomMcpServerConfig>;
   /**
    * @deprecated Legacy top-level Glass Goals configuration.
    * Prefer nesting under `understanding.glassGoals` . Retained as a compatibility fallback.
