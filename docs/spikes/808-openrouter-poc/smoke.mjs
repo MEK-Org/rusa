@@ -36,7 +36,6 @@ await writeFile(
         cliCommand: "openrouter",
         openrouterPoc: {
           piCommand,
-          artifactDir: join(root, "artifacts"),
         },
       },
     },

@@ -63,9 +63,12 @@ the existing saved login plus temporary runtime settings.
 Pi starts in the resolved actor workspace, while its HOME, agent configuration,
 cache and MCP configuration remain per-invocation private state. This restores
 repository discovery and durable workspace changes across fresh invocations.
-The pinned Pi release's project-startup migration behavior is therefore part of
-the actor-workspace boundary; the synthetic runtime proof starts from a nonempty
-repository before exercising the two fresh invocations.
+Pi 0.99.2 with `--no-approve` treats the workspace as untrusted, so project
+`.pi/settings.json`, `.pi/mcp.json`, extensions, skills, prompts and themes are
+ignored. Its one project-side effect is the startup migration that renames
+`<cwd>/.pi/commands` to `<cwd>/.pi/prompts` when only the former exists; that
+rename is part of the actor-workspace boundary. The synthetic runtime proof
+starts from a nonempty repository before exercising the two fresh invocations.
 Pi's built-in filesystem and shell tools remain enabled alongside granted MCP
 tools. Worker launches use the shared actor Bubblewrap boundary. Only the native
 MCP extension and generated admission extension are loaded.
@@ -74,16 +77,18 @@ Deadline/cancellation and settlement use the existing process-group supervisor;
 the provider awaits direct-child close and removes the temporary launch tree.
 Private, exclusive-create `usage-<UUID>.json` observations go to
 `$RUSA_HOME/artifacts/openrouter`, never the actor cwd. They are not OpenRouter
-billing receipts or subscription token rows.
+billing receipts or subscription token rows. A failed receipt write is logged
+and does not change the run result. Receipts are retained without rotation for
+this opt-in prototype's review; remove them with the disposable home.
 There are no schema changes and no entries in reset-window quota pacing.
 
 Production checkpoints should be decided against this working implementation.
 Remaining work includes model/runtime provisioning, richer MCP admission and
 authorization failure handling, admission
 budget controls, durable cost accounting, portable-context behavior across real tasks
-and broader tool/process containment. Portable context is required and reasoning
-effort must be omitted: this adapter uses Pi's default because it exposes no
-configured effort selector. The Actor-supplied deadline owns a normal run; a
+and broader tool/process containment. Portable context is required. The provider
+declares no reasoning-effort capability, so selection rejects an effort and Pi
+uses its default. The Actor-supplied deadline owns a normal run; a
 standalone adapter call retains its 120-second fallback. The adapter disables
 automatic retries, compaction and cache warming (`cacheWarming: "off"`); account-side
 limits remain external to this prototype. Provider invocation permissions and cross-provider

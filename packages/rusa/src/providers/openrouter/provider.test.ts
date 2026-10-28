@@ -439,10 +439,15 @@ it("keeps a nonempty actor repository and its marker across two fresh Actor runs
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const ended: Array<Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined> = [];
   let prompt = "repository-write";
+  let settle = () => {};
+  let terminal = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
   const lifecycle = createActorLifecycle([
     {
       onEnd: (event) => {
         if (event.terminal.kind === "result") ended.push(event.terminal.result);
+        settle();
       },
     },
   ]);
@@ -454,6 +459,9 @@ it("keeps a nonempty actor repository and its marker across two fresh Actor runs
     actor.requestRun({ priority: "responsive" });
     await vi.waitFor(() => expect(ended).toHaveLength(1), { timeout: 10_000 });
     prompt = "repository-read";
+    terminal = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
     actor.requestRun({ priority: "responsive" });
     await vi.waitFor(() => expect(ended).toHaveLength(2), { timeout: 10_000 });
 
@@ -463,6 +471,8 @@ it("keeps a nonempty actor repository and its marker across two fresh Actor runs
     ]);
     expect(await readFile(join(root, "repository-marker"), "utf8")).toBe("first invocation\n");
   } finally {
+    const interrupted = actor.interrupt("provider-test-cleanup");
+    if (interrupted.interrupted && !interrupted.wasQueued) await terminal;
     actor.close();
   }
 }, 15_000);
@@ -472,10 +482,15 @@ it("renders Pi text and tool events through Actor while liveness remains invisib
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const live: string[] = [];
   let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
+  let settle = () => {};
+  const terminal = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
   const lifecycle = createActorLifecycle([
     {
       onEnd: (event) => {
         if (event.terminal.kind === "result") ended = event.terminal.result;
+        settle();
       },
     },
   ]);
@@ -499,6 +514,8 @@ it("renders Pi text and tool events through Actor while liveness remains invisib
     expect(live).not.toContain(".");
     expect(live.join("")).not.toContain("not rendered");
   } finally {
+    const interrupted = actor.interrupt("provider-test-cleanup");
+    if (interrupted.interrupted && !interrupted.wasQueued) await terminal;
     actor.close();
   }
 }, 15_000);
@@ -525,11 +542,19 @@ it("settles through real pipes, reaps the peer and retains usage in its internal
   expect(receipt).not.toContain("synthetic-not-a-real-key");
 }, 10000);
 
-it("rejects a direct unsupported reasoning-effort selection before launching Pi", async () => {
-  const { root, config } = await fixture();
+it("keeps the run result when its diagnostic receipt cannot be written", async () => {
+  const { root, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
-  const provider = new OpenRouterProvider("test", config, "vendor/fixed-model", "high");
-  await expect(provider.run({ cwd: root, prompt: "ping" })).rejects.toThrow(/reasoning-effort/);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  // A file where the artifacts directory belongs makes the receipt write fail.
+  await mkdir(join(root, "rusa-home"), { recursive: true });
+  await writeFile(join(root, "rusa-home", "artifacts"), "not a directory");
+  expect(await provider.run({ cwd: root, prompt: "ping" })).toEqual({
+    success: true,
+    output: "ping",
+    exitCode: 0,
+  });
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("usage receipt not written"));
 });
 
 it("retains distinct artifacts for concurrent invocations", async () => {

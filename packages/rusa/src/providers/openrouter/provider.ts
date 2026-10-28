@@ -26,9 +26,7 @@ export class OpenRouterProvider implements CodingProvider {
   constructor(
     public readonly name: string,
     private readonly config: ProviderConfig,
-    public readonly model?: string,
-    /** Pi has no configured reasoning-effort control in this bounded lane. */
-    public readonly effort?: string
+    public readonly model?: string
   ) {}
 
   async run(opts: RunOptions): Promise<RunResult> {
@@ -47,11 +45,6 @@ export class OpenRouterProvider implements CodingProvider {
       if (process.env.RUSA_OPENROUTER_POC !== "1" || !config || !this.model) {
         throw new Error(
           "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, openrouterPoc and model"
-        );
-      }
-      if (this.effort !== undefined) {
-        throw new Error(
-          "OpenRouter prototype does not expose a reasoning-effort control; omit effort to use Pi's default"
         );
       }
       if (opts.session?.id || opts.computerUse) {
@@ -157,11 +150,14 @@ export class OpenRouterProvider implements CodingProvider {
           NODE_COMPILE_CACHE: join(root, "cache"),
           PI_SKIP_VERSION_CHECK: "1",
           PI_TELEMETRY: "0",
-          // Match the shared execution profile: installed node/pnpm plus ordinary
-          // utilities (git, gh and shell tools) remain discoverable without
-          // inheriting an unrestricted host environment.
+          // Same toolchain PATH the shared profile builds. Under bwrap the
+          // launcher's own --setenv PATH takes precedence.
           PATH: buildToolchainPath(),
-          GIT_DISCOVERY_ACROSS_FILESYSTEM: "1",
+          // HOME stays private to this invocation, which would hide the git and
+          // gh configuration the shared profile binds at the real home. Name
+          // those paths directly so pushes keep the gh credential helper.
+          GIT_CONFIG_GLOBAL: join(homedir(), ".gitconfig"),
+          GH_CONFIG_DIR: join(homedir(), ".config", "gh"),
         },
         // The actor owns invocation timing. Its deadline includes the shared
         // watchdog policy and a subprocess grace margin; an adapter-local cap
@@ -174,7 +170,6 @@ export class OpenRouterProvider implements CodingProvider {
           invocation = new PiRpcInvocation(
             value,
             this.model as string,
-            undefined,
             undefined,
             undefined,
             // Liveness is a separate empty chunk. Pi protocol records are parsed
@@ -202,17 +197,24 @@ export class OpenRouterProvider implements CodingProvider {
       const result = await outcome;
       // Harness observations only. Do not mislabel these as subscription tokens
       // or OpenRouter billed cost. Retain across process cleanup for review.
-      const artifactDir = join(resolveHome(), "artifacts", "openrouter");
-      await mkdir(artifactDir, { recursive: true, mode: 0o700 });
-      await writeFile(
-        join(artifactDir, `usage-${randomUUID()}.json`),
-        JSON.stringify(
-          { success: result.success, reason: result.reason, requests: result.requests },
-          null,
-          2
-        ),
-        { mode: 0o600, flag: "wx" }
-      );
+      // The receipt is diagnostic: failing to write it must not change the run.
+      try {
+        const artifactDir = join(resolveHome(), "artifacts", "openrouter");
+        await mkdir(artifactDir, { recursive: true, mode: 0o700 });
+        await writeFile(
+          join(artifactDir, `usage-${randomUUID()}.json`),
+          JSON.stringify(
+            { success: result.success, reason: result.reason, requests: result.requests },
+            null,
+            2
+          ),
+          { mode: 0o600, flag: "wx" }
+        );
+      } catch (error) {
+        console.warn(
+          `[openrouter] usage receipt not written: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
       const output = result.success ? result.output : (result.reason ?? "Pi failed");
       // A duplex invocation has its own semantic outcome, but subprocess-execution
       // owns termination attribution. Preserve both when the host ended the process:
