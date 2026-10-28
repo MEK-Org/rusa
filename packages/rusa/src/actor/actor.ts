@@ -1125,18 +1125,11 @@ export class Actor {
       lastResult = recoveryResult;
     }
 
-    // The notice's lead line names the run's selected entry, so the exhausted
-    // chain stays typed only when that entry made the sole attempt (every
-    // other entry skipped). Otherwise each attempt's typed fact stays on its
-    // own line: typing the aggregate would pin a later entry's capacity
-    // rejection on the selected one.
-    const sole = failures.length === 1 ? failures[0]?.result.failure : undefined;
     return {
       success: false,
       output: formatRecoveryChainFailure({ failures, skipped }),
       exitCode: lastResult.exitCode || 1,
       sessionId: lastResult.sessionId,
-      ...(sole?.kind === "provider-capacity" ? { failure: sole } : {}),
     };
   }
 
@@ -1266,9 +1259,7 @@ function formatFailedAttempt(
   const facts =
     result.failure?.stage === "provider-selection"
       ? "could not prepare this entry; provider was not invoked. "
-      : result.failure?.kind === "provider-capacity"
-        ? "provider reported a temporary capacity rejection. "
-        : "";
+      : "";
   const diagnostic = failureDiagnostic(result, budget) || "(no diagnostic output)";
   return `- attempt ${index + 1} on ${describeModelConfigEntry(entry)} (${exit}): ${facts}${diagnostic}`;
 }

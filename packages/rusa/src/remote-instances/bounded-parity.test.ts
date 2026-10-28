@@ -99,7 +99,6 @@ describe("bounded completion leader parity", () => {
         output,
         abortReason: "interrupt:watchdog",
         interruptSource: "watchdog",
-        failure: { kind: "provider-capacity", message: "capacity" },
       },
       {
         success: false,

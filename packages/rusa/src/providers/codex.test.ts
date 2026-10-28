@@ -1216,7 +1216,7 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(result.output).toContain("usage limit reached");
   });
 
-  it("preserves a terminal Codex capacity rejection after assistant progress", async () => {
+  it("appends the terminal error after assistant progress with the provider's wording", async () => {
     const { result, live } = await runWithStream({
       exitCode: 1,
       stdout:
@@ -1240,34 +1240,10 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(result).toMatchObject({
       success: false,
       output:
-        "I inspected the current implementation.\n\n[terminal provider capacity: Selected model is at capacity. Please try a different model.]",
-      failure: {
-        kind: "provider-capacity",
-        message: "Selected model is at capacity. Please try a different model.",
-      },
+        "I inspected the current implementation.\n\n[terminal error: Selected model is at capacity. Please try a different model.]",
     });
+    expect(result.failure).toBeUndefined();
     expect(live.join("")).toContain("Selected model is at capacity");
-  });
-
-  it("preserves a pre-progress terminal Codex capacity rejection without raw JSONL", async () => {
-    const { result } = await runWithStream({
-      exitCode: 1,
-      stdout: line({
-        type: "error",
-        message: "Selected model is at capacity. Please try a different model.",
-      }),
-    });
-
-    expect(result).toMatchObject({
-      success: false,
-      output:
-        "[terminal provider capacity: Selected model is at capacity. Please try a different model.]",
-      failure: {
-        kind: "provider-capacity",
-        message: "Selected model is at capacity. Please try a different model.",
-      },
-    });
-    expect(result.output).not.toContain('"type":"error"');
   });
 
   it("keeps ordinary successful assistant output free of a terminal failure", async () => {
@@ -1305,7 +1281,7 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(result.output).toBe("built");
   });
 
-  it("clears a transient capacity error when a subsequent turn completes successfully", async () => {
+  it("clears a transient error when a subsequent turn completes successfully", async () => {
     const { result } = await runWithStream({
       exitCode: 0,
       stdout:
@@ -1337,7 +1313,7 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(result.failure).toBeUndefined();
   });
 
-  it("surfaces a terminal authentication failure even if an earlier transient capacity error occurred", async () => {
+  it("surfaces a terminal authentication failure even if an earlier transient error occurred", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const { result } = await runWithStream({
       exitCode: 1,
@@ -1371,94 +1347,5 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(isCodexAuthFailure(result.output)).toBe(true);
     expect(errSpy.mock.calls.flat().join("\n")).toContain("AUTHENTICATION ALARM");
     errSpy.mockRestore();
-  });
-
-  it("keeps a stderr authentication cause over a terminal capacity event after progress", async () => {
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const { result } = await runWithStream({
-      exitCode: 1,
-      stdout:
-        line({
-          type: "item.completed",
-          item: {
-            id: "item_1",
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "Progress before the failure." }],
-          },
-        }) +
-        line({
-          type: "turn.failed",
-          error: { message: "Selected model is at capacity. Please try a different model." },
-        }),
-      stderr: "Reading config...\nAuthentication failed: token expired\n",
-    });
-
-    expect(result.failure).toBeUndefined();
-    expect(result.output).toBe(
-      "Progress before the failure.\n\n[terminal error: Authentication failed: token expired]"
-    );
-    expect(isCodexAuthFailure(result.output)).toBe(true);
-    expect(errSpy.mock.calls.flat().join("\n")).toContain("AUTHENTICATION ALARM");
-    errSpy.mockRestore();
-  });
-
-  it("keeps a terminal capacity event when only tool output mentions authorization", async () => {
-    const { result } = await runWithStream({
-      exitCode: 1,
-      stdout:
-        line({
-          type: "item.completed",
-          item: {
-            id: "item_1",
-            type: "function_call_output",
-            exit_code: 1,
-            output: "HTTP 401 Unauthorized",
-          },
-        }) +
-        line({
-          type: "turn.failed",
-          error: { message: "Selected model is at capacity. Please try a different model." },
-        }),
-    });
-
-    expect(result.failure).toEqual({
-      kind: "provider-capacity",
-      message: "Selected model is at capacity. Please try a different model.",
-    });
-  });
-
-  it("preserves an unrelated terminal failure without misclassifying as capacity when a transient capacity error was retried", async () => {
-    const { result } = await runWithStream({
-      exitCode: 1,
-      stdout:
-        line({
-          type: "item.completed",
-          item: {
-            id: "item_1",
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "Progress before the failure." }],
-          },
-        }) +
-        line({
-          type: "error",
-          message: "Selected model is at capacity. Please try a different model.",
-        }) +
-        line({
-          type: "turn.failed",
-          error: {
-            message: "tool failed: process crashed with SIGSEGV",
-          },
-        }),
-    });
-
-    expect(result).toMatchObject({
-      success: false,
-    });
-    expect(result.failure).toBeUndefined();
-    expect(result.output).toBe(
-      "Progress before the failure.\n\n[terminal error: tool failed: process crashed with SIGSEGV]"
-    );
   });
 });

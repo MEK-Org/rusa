@@ -51,33 +51,16 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** Capability lifetime past a run's worst case (a resume attempt, then a fresh one). */
 const AUTH_LEASE_GRACE_MS = 5 * 60 * 1000;
 const CODEX_TERMINAL_REASON_BUDGET = 300;
-/**
- * Codex's `ServerOverloaded` error text. `codex exec --json` serializes `error`
- * and `turn.failed` as `{ message }` only (exec_events.rs `ThreadErrorEvent`,
- * codex-cli 0.163.0), so this upstream-fixed message is the sole capacity
- * evidence on the interface the adapter reads.
- */
-const CODEX_SERVER_OVERLOADED_MESSAGE = "Selected model is at capacity.";
 
 /** A session/conversation UUID as it appears in codex rollout filenames + `session_meta.payload.id`. */
 const SESSION_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-/** The bounded, sanitized message of the latest `error`/`turn.failed` event. */
-interface CodexTerminalError {
-  message: string;
-  /** Upstream's `ServerOverloaded` text: eligible for declared-pool recovery, not a quota reading. */
-  capacity: boolean;
+function codexTerminalError(message: string): string {
+  return clipFailureDiagnostic(sanitizeFailureText(message), CODEX_TERMINAL_REASON_BUDGET);
 }
 
-function codexTerminalError(message: string): CodexTerminalError {
-  return {
-    message: clipFailureDiagnostic(sanitizeFailureText(message), CODEX_TERMINAL_REASON_BUDGET),
-    capacity: message.trimStart().startsWith(CODEX_SERVER_OVERLOADED_MESSAGE),
-  };
-}
-
-function appendTerminalError(output: string, error: CodexTerminalError): string {
-  const reason = `[${error.capacity ? "terminal provider capacity" : "terminal error"}: ${error.message}]`;
+function appendTerminalError(output: string, error: string): string {
+  const reason = `[terminal error: ${error}]`;
   return output ? `${output}\n\n${reason}` : reason;
 }
 
@@ -528,8 +511,7 @@ export class CodexProvider implements CodingProvider {
       // firing while tool results are suppressed.
       let lineBuffer = "";
       const assistantTexts: string[] = [];
-      let lastTerminalError: CodexTerminalError | undefined;
-      const stderrChunks: string[] = [];
+      let lastTerminalError: string | undefined;
       const tick = () => opts.onChunk?.("");
       const itemText = (item: { content?: unknown; text?: unknown }): string => {
         if (typeof item.text === "string") return item.text;
@@ -745,7 +727,6 @@ export class CodexProvider implements CodingProvider {
           // The rendered transcript stays in the durable record but never
           // reaches the live-output callback (issue #210).
           chunks.push(text);
-          stderrChunks.push(text);
         },
         // Temp cleanup is owned by run() below, not per-spawn.
         buildKilledResult: (sigtermResult) =>
@@ -763,26 +744,13 @@ export class CodexProvider implements CodingProvider {
             processLine(lineBuffer);
             lineBuffer = "";
           }
-          const lastError = exitCode !== 0 ? lastTerminalError : undefined;
-          // Auth reaching only stderr must not be masked as capacity; its
-          // bounded line becomes the cause. Stdout is not searched, since tool
-          // output there can mention authorization without being the failure.
-          const stderrAuthLine = lastError?.capacity
-            ? stderrChunks
-                .join("")
-                .split("\n")
-                .find((l) => isCodexAuthFailure(l))
-            : undefined;
-          const terminalError =
-            stderrAuthLine !== undefined ? codexTerminalError(stderrAuthLine) : lastError;
-          const capacity = terminalError?.capacity === true;
+          const terminalError = exitCode !== 0 ? lastTerminalError : undefined;
           const progress = assistantTexts.join("\n");
           // Assistant progress alone would hide why the run failed, so the
-          // bounded terminal cause follows it. A capacity cause replaces the raw
-          // JSONL even without progress; any other cause keeps the raw stream,
-          // which already carries it.
+          // bounded terminal cause follows it. Without progress the raw stream
+          // already carries the cause.
           const outputText =
-            terminalError && (capacity || progress)
+            terminalError && progress
               ? appendTerminalError(progress, terminalError)
               : effectiveOutput(output);
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
@@ -800,9 +768,6 @@ export class CodexProvider implements CodingProvider {
             success: exitCode === 0,
             output: outputText,
             exitCode,
-            ...(terminalError && capacity
-              ? { failure: { kind: "provider-capacity" as const, message: terminalError.message } }
-              : {}),
           });
         },
         buildSpawnErrorResult: (err) =>
