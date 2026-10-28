@@ -5,9 +5,12 @@ import {
   request as proxyRequest,
   type ServerResponse,
 } from "node:http";
+import type { ActorRecord } from "../actor/actor-record.js";
+import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import { MCP_HEADERS_TIMEOUT_MS, MCP_KEEP_ALIVE_TIMEOUT_MS } from "../mcp/http-server.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { McpServerSpec } from "../providers/types.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
 import type { ActorChannel } from "./actor-channel.js";
 import { EventTransferReceiver, type EventTransferStep } from "./follower-event-transfer.js";
 import {
@@ -24,11 +27,14 @@ import type {
   FollowerUpdateCommand,
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
+  InstanceEntityRef,
   LeaderCommand,
+  QuotaObservation,
 } from "./protocol.js";
 import {
   BOUNDED_EXECUTION_CAPABILITY,
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
+  INSTANCE_EXECUTION_CAPABILITY,
   INSTANCE_PROTOCOL_VERSION,
   OLDEST_FOLLOWER_PROTOCOL_VERSION,
 } from "./protocol.js";
@@ -77,6 +83,13 @@ export interface FollowerEvent {
 }
 
 export interface FollowerHubOptions {
+  instanceExecution?: {
+    instanceId: string;
+    actor: (id: string) => ActorRecord | undefined;
+    inbox: InboxRepository;
+    message: (id: string) => MeshChat | null;
+    quota: (followerId: string) => QuotaObservation[];
+  };
   logger?: Logger;
   triggerStore?: FollowerUpdateTriggerStore;
   /** Replaces the default event-transfer receiver and its limits; for tests. */
@@ -211,7 +224,7 @@ export class FollowerHub {
   private readonly allowedFollowerIds?: ReadonlySet<string>;
   constructor(
     private readonly token: string,
-    opts?: FollowerHubOptions
+    private readonly opts?: FollowerHubOptions
   ) {
     if (token.length < 32) throw new Error("Follower token must be at least 32 characters");
     // Keep follower-hub connections alive matching MCP HTTP timeouts (MEK-Org/rusa#1194, #294).
@@ -227,6 +240,28 @@ export class FollowerHub {
         logger: this.log,
       });
     }
+  }
+
+  ownsExecution(followerId: string): boolean {
+    return this.followers.get(followerId)?.ownsExecution === true;
+  }
+
+  async readMessage(requesterId: string, ref: InstanceEntityRef): Promise<MeshChat> {
+    const local = this.opts?.instanceExecution;
+    if (!local || ref.kind !== "message") throw new Error("Message entity reads unsupported");
+    const message =
+      ref.instance === local.instanceId
+        ? local.message(ref.id)
+        : ((await this.followers.get(ref.instance)?.entityRead(requesterId, ref)) as
+            | MeshChat
+            | undefined);
+    if (
+      !message ||
+      message.id !== ref.id ||
+      (message.senderId !== requesterId && message.recipientId !== requesterId)
+    )
+      throw new Error("Message absent, unavailable or not visible");
+    return message;
   }
 
   onRegister(callback: (follower: RemoteInstance) => void): () => void {
@@ -629,6 +664,9 @@ export class FollowerHub {
       }
       if (existing) {
         if (existing.generation === body.generation) {
+          existing.ownsExecution =
+            !!this.opts?.instanceExecution &&
+            (body.instanceExecution as { version?: unknown } | undefined)?.version === 1;
           existing.renewSession();
           this.staleFollowerIds.delete(existing.id);
           this.log.info("follower_reconnected", {
@@ -649,6 +687,7 @@ export class FollowerHub {
             protocolVersion: existing.protocolVersion,
             leaderToken: this.leaderToken,
             eventTransfer: this.eventTransfers.capability,
+            ...(existing.ownsExecution ? { instanceExecution: INSTANCE_EXECUTION_CAPABILITY } : {}),
             ...(existing.boundedExecution
               ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY }
               : {}),
@@ -676,6 +715,9 @@ export class FollowerHub {
         FollowerHub.STALE_AFTER_MS
       );
       follower.boundedExecution = offersBoundedExecution(body);
+      follower.ownsExecution =
+        !!this.opts?.instanceExecution &&
+        (body.instanceExecution as { version?: unknown } | undefined)?.version === 1;
       this.followers.set(follower.id, follower);
       this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
@@ -697,6 +739,7 @@ export class FollowerHub {
         protocolVersion,
         leaderToken: this.leaderToken,
         eventTransfer: this.eventTransfers.capability,
+        ...(follower.ownsExecution ? { instanceExecution: INSTANCE_EXECUTION_CAPABILITY } : {}),
         ...(follower.boundedExecution ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY } : {}),
       });
       return;
@@ -713,7 +756,30 @@ export class FollowerHub {
       reply(res, 200, {});
       return;
     }
+    if (path === "/entities/read") {
+      const local = this.opts?.instanceExecution;
+      const requesterId = String(body.actorId ?? "");
+      if (
+        !follower.ownsExecution ||
+        local?.actor(requesterId)?.executionConfig?.executionTarget !== follower.id
+      ) {
+        reply(res, 403, { error: "Requester is not installed on this instance" });
+        return;
+      }
+      reply(res, 200, await this.readMessage(requesterId, body.ref as InstanceEntityRef));
+      return;
+    }
     if (path === "/poll") {
+      if (follower.ownsExecution && Date.now() - follower.lastQuotaSentAt >= 20_000) {
+        follower.lastQuotaSentAt = Date.now();
+        follower.enqueueCommand({
+          actorId: "$instance",
+          message: {
+            type: "quota",
+            observations: this.opts?.instanceExecution?.quota(follower.id) ?? [],
+          },
+        });
+      }
       // Like contact age, each authenticated poll refreshes the report, even one
       // refused below as a duplicate. A follower that omits it is left unreported.
       if ("parkedEvent" in body) follower.parkedEvent = parseParkedEvent(body.parkedEvent);
@@ -817,7 +883,45 @@ export class FollowerHub {
     // have performed a side effect before a later listener throws.
     follower.recordEvent(event.eventId, "failed");
     try {
-      follower.receive(event);
+      if (event.message.type === "inboxEvent") {
+        const local = this.opts?.instanceExecution;
+        const { fromId, entry } = event.message;
+        const sender = local?.actor(fromId);
+        const entity = entry.payload.entity as InstanceEntityRef | undefined;
+        if (
+          !local ||
+          !follower.ownsExecution ||
+          fromId !== event.actorId ||
+          sender?.executionConfig?.executionTarget !== follower.id ||
+          sender.status !== "active" ||
+          (sender.parentId !== entry.actorId &&
+            !sender.handles?.some((h) => h.id === entry.actorId)) ||
+          local.actor(entry.actorId)?.status !== "active" ||
+          entry.payload.type !== "mesh.message" ||
+          entry.payload.fromId !== fromId ||
+          entity?.instance !== follower.id ||
+          entity.kind !== "message"
+        ) {
+          throw new Error("Unauthorized instance event");
+        }
+        // Reconstruct the small envelope; never accept an injected body/prompt.
+        local.inbox.append([
+          {
+            id: `${follower.id}:${entry.id}`,
+            actorId: entry.actorId,
+            source: `mesh:${fromId}`,
+            deliveredAt: new Date(entry.deliveredAt),
+            payload: {
+              type: "mesh.message",
+              fromId,
+              messageId: entity.id,
+              entity,
+              deliveryRole: "owner",
+              ...(entry.payload.priority === "responsive" ? { priority: "responsive" } : {}),
+            },
+          },
+        ]);
+      } else follower.receive(event);
     } catch {
       this.log.warn("follower_event_acceptance_failed", {
         followerId: follower.id,

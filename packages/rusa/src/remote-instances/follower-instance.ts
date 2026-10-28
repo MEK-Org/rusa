@@ -5,6 +5,7 @@ import { ComputerUseLock } from "../actor/computer-use-lock.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
 import { createActorRuntime, type RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
+import type { ExecutionInstance } from "./execution-instance.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
 import type {
   FollowerFileOperation,
@@ -21,6 +22,8 @@ export type FollowerFileOps = (
 ) => Promise<FollowerFileOperationResult>;
 
 export interface FollowerInstanceOptions {
+  execution?: ExecutionInstance;
+  executionEnabled?: () => boolean;
   requireReconciliation?: boolean;
   repositories?: FollowerRepositories;
   /** Provider executable/settings belong to this host, never the leader Bootstrap. */
@@ -42,6 +45,8 @@ export class FollowerInstance {
   private readonly computerUseLock = new ComputerUseLock();
   private readonly fileOps?: FollowerFileOps;
   private readonly material?: RunMaterialOptions;
+  private readonly execution?: ExecutionInstance;
+  private readonly executionEnabled: () => boolean;
 
   constructor(
     private readonly home: string,
@@ -56,6 +61,8 @@ export class FollowerInstance {
     this.providerOptions = options?.providerOptions;
     this.fileOps = options?.fileOps;
     this.material = options?.material;
+    this.execution = options?.execution;
+    this.executionEnabled = options?.executionEnabled ?? (() => true);
   }
 
   get isReconciled(): boolean {
@@ -67,7 +74,7 @@ export class FollowerInstance {
   }
 
   get actorIds(): string[] {
-    return [...this.actors.keys()];
+    return [...this.actors.keys(), ...(this.execution?.activeActorIds ?? [])];
   }
 
   dispatch({ actorId, message }: FollowerActorCommand): void {
@@ -77,7 +84,77 @@ export class FollowerInstance {
     if (!this.reconciled) {
       throw new Error("Follower instance is not reconciled with leader; dispatch refused");
     }
-    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(actorId)) throw new Error("Invalid actor ID");
+    if (actorId !== "$instance" && !/^[a-zA-Z0-9_-]{1,128}$/.test(actorId))
+      throw new Error("Invalid actor ID");
+    if (actorId === "$instance" && message.type !== "quota")
+      throw new Error("Invalid instance command");
+    if (this.execution && this.executionEnabled()) {
+      switch (message.type) {
+        case "install":
+          this.execution.install(message.record);
+          return;
+        case "inbox":
+          for (const entry of message.entries) this.execution.receive(entry);
+          return;
+        case "quota":
+          for (const observation of message.observations) this.execution.observeQuota(observation);
+          return;
+        case "executionRead":
+          this.emit({
+            eventId: randomUUID(),
+            actorId,
+            message: { type: "executionSnapshot", ...this.execution.snapshot(actorId) },
+          });
+          return;
+        case "entityRead": {
+          let value: unknown;
+          let error: string | undefined;
+          try {
+            value = this.execution.serveMessage(message.requesterId, message.ref);
+          } catch (err) {
+            error = err instanceof Error ? err.message : String(err);
+          }
+          this.emit({
+            eventId: randomUUID(),
+            actorId,
+            message: { type: "entityReadResult", requestId: message.requestId, value, error },
+          });
+          return;
+        }
+      }
+      const actor = this.execution.mesh.get(actorId);
+      if (actor) {
+        switch (message.type) {
+          case "wake":
+            this.execution.mesh.dispatch(actorId);
+            return;
+          case "modelConfig":
+            actor.setModelConfig?.(
+              message.modelConfig as import("../providers/model-config.js").ProviderModelConfig[]
+            );
+            return;
+          case "interrupt":
+            actor.interrupt?.(message.by);
+            return;
+          case "cancelQueued":
+            actor.cancelQueuedRun?.({ retain: message.retain });
+            return;
+          case "resumeCancelled":
+            actor.resumeCancelledRun?.();
+            return;
+          case "stop":
+            this.execution.repositories.actors.patch(actorId, { status: "retired" });
+            actor.close();
+            return;
+          case "unkillable":
+            actor.markUnkillable();
+            return;
+          // Preemption is decided by the local durable inbox, not a remote guess.
+          case "preempt":
+            return;
+        }
+      }
+    }
     if (message.type === "fileOp") {
       void this.runFileOp(actorId, message.requestId, message.operation);
       return;
@@ -141,7 +218,7 @@ export class FollowerInstance {
     let outcome: { result: FollowerFileOperationResult } | { error: string };
     try {
       // Only an actor this process hosts has a working directory here to write into.
-      if (!this.actors.has(actorId)) {
+      if (!this.actors.has(actorId) && !this.execution?.mesh.get(actorId)) {
         throw new Error(`this follower does not host actor ${actorId}`);
       }
       if (!this.fileOps) throw new Error("this follower cannot run file operations");
@@ -192,6 +269,7 @@ export class FollowerInstance {
 
   beginDrain(): void {
     this.draining = true;
+    this.execution?.beginDrain();
   }
 
   async waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }> {
@@ -206,6 +284,7 @@ export class FollowerInstance {
     if (this.stopped) return;
     this.stopped = true;
     this.computerUseLock.close();
+    this.execution?.close();
     for (const actor of [...this.actors.values()]) actor.close();
   }
 }

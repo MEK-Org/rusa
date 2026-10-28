@@ -2,13 +2,21 @@ import { Actor } from "../actor/actor.js";
 import type { RunStartE2EHooks } from "../commands/start.js";
 import type { RusaConfig } from "../config/types.js";
 import type { Logger } from "../observability/logger.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
 import { ActorHandle } from "./actor-handle.js";
+import { ActorProjection } from "./actor-projection.js";
 import type { FollowerHub } from "./follower-hub.js";
+import type { QuotaObservation } from "./protocol.js";
 
 export function instanceWorkerFactory(
   config: RusaConfig,
   hub: FollowerHub,
-  opts?: { logger?: Logger }
+  opts?: {
+    logger?: Logger;
+    inbox?: InboxRepository;
+    leaderInstanceId?: string;
+    quota?: (record: import("../actor/actor-record.js").ActorRecord) => QuotaObservation[];
+  }
 ): NonNullable<RunStartE2EHooks["createWorkerActor"]> {
   return (context, options) => {
     const record = context.record;
@@ -23,6 +31,18 @@ export function instanceWorkerFactory(
     // leak into every other candidate's provider.
     const name = options.modelConfig[0]?.provider ?? config.rootActor?.provider ?? "antigravity";
     const host = hub.createHost(target, record.id);
+    if (hub.ownsExecution(target)) {
+      if (!opts?.inbox || !opts.leaderInstanceId || !opts.quota)
+        throw new Error("Instance execution handoff is not composed");
+      return new ActorProjection({
+        host,
+        record: () => context.getRecord() ?? record,
+        inbox: opts.inbox,
+        quota: opts.quota,
+        leaderInstanceId: opts.leaderInstanceId,
+        onState: context.onRuntimeStateChanged,
+      });
+    }
     const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
     const runtime = new ActorHandle({
       host,
