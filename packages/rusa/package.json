@@ -19,6 +19,7 @@
     "build:maintenance": "tsup --config tsup.maintenance.config.ts",
     "build": "tsup && node scripts/copy-assets.mjs && pnpm run build:dashboard-ui",
     "build:dashboard-ui": "node scripts/build-dashboard-ui.mjs",
+    "build:android": "pnpm --reporter=silent run build:maintenance --silent && node scripts/build-android.mjs",
     "analyze:dashboard-ui": "node scripts/flutter-run.mjs analyze",
     "backfill:codex-quota": "pnpm --reporter=silent run build:maintenance --silent && node scripts/backfill-codex-quota-parses.mjs",
     "backfill:token-records": "pnpm --reporter=silent run build:maintenance --silent && node scripts/backfill-run-token-records.mjs",
