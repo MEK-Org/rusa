@@ -59,9 +59,8 @@ function codexTerminalError(message: string): string {
   return clipFailureDiagnostic(sanitizeFailureText(message), CODEX_TERMINAL_REASON_BUDGET);
 }
 
-function appendTerminalError(output: string, error: string): string {
-  const reason = `[terminal error: ${error}]`;
-  return output ? `${output}\n\n${reason}` : reason;
+function appendTerminalError(progress: string, error: string): string {
+  return `${progress}\n\n[terminal error: ${error}]`;
 }
 
 export interface CodexArgsOptions {
