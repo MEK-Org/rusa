@@ -5,13 +5,14 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { routeRunFailure } from "../../actor/failure-sink.js";
+import type { Logger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../types.js";
-import { OpenRouterProvider } from "./provider.js";
+import { OpenRouterProvider, setOpenRouterLogger } from "./provider.js";
 
 vi.mock("../../config/loader.js", () => ({
   loadConfig: () => ({ github: { account: "test" }, providers: {}, gitBridge: false }),
@@ -545,7 +546,9 @@ it("settles through real pipes, reaps the peer and retains usage in its internal
 it("keeps the run result when its diagnostic receipt cannot be written", async () => {
   const { root, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const warnings: string[] = [];
+  setOpenRouterLogger({ warn: (event: string) => warnings.push(event) } as unknown as Logger);
+  onTestFinished(() => setOpenRouterLogger(undefined));
   // A file where the artifacts directory belongs makes the receipt write fail.
   await mkdir(join(root, "rusa-home"), { recursive: true });
   await writeFile(join(root, "rusa-home", "artifacts"), "not a directory");
@@ -554,7 +557,7 @@ it("keeps the run result when its diagnostic receipt cannot be written", async (
     output: "ping",
     exitCode: 0,
   });
-  expect(warn).toHaveBeenCalledWith(expect.stringContaining("usage receipt not written"));
+  expect(warnings).toEqual(["openrouter_usage_receipt_not_written"]);
 });
 
 it("retains distinct artifacts for concurrent invocations", async () => {

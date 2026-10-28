@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { resolveHome } from "../../config/secrets.js";
 import type { ProviderConfig } from "../../config/types.js";
+import { createLogger, type Logger } from "../../observability/logger.js";
 import {
   buildActorBwrapArgs,
   buildActorBwrapCommand,
@@ -15,6 +16,15 @@ import { formatSigtermResult } from "../termination-attribution.js";
 import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
+
+let _openrouterLogger: Logger | undefined;
+export function setOpenRouterLogger(logger: Logger | undefined): void {
+  _openrouterLogger = logger;
+}
+function openrouterLog(): Logger {
+  _openrouterLogger ??= createLogger({ context: { component: "openrouter" } });
+  return _openrouterLogger;
+}
 
 /** Local end-to-end prototype. Fresh Pi process, portable context, built-in and MCP tools.
  * Worker launches use the shared actor bwrap boundary with isolated Pi state.
@@ -211,9 +221,7 @@ export class OpenRouterProvider implements CodingProvider {
           { mode: 0o600, flag: "wx" }
         );
       } catch (error) {
-        console.warn(
-          `[openrouter] usage receipt not written: ${error instanceof Error ? error.message : String(error)}`
-        );
+        openrouterLog().warn("openrouter_usage_receipt_not_written", { err: error });
       }
       const output = result.success ? result.output : (result.reason ?? "Pi failed");
       // A duplex invocation has its own semantic outcome, but subprocess-execution
