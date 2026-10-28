@@ -194,7 +194,7 @@ describe("configured stdio MCP through the mesh grant boundary", () => {
     const grantStore = new InMemoryCapabilityGrantStore();
     const servers = buildGrantableServers({
       customMcpServers: { glass_goals: config },
-      activeCapabilitiesForActor: (actorId) => mesh.activeCapabilitiesFor(actorId),
+      activeCapabilitiesForActor: (actorId: string) => mesh.activeCapabilitiesFor(actorId),
       // Only the custom factory is exercised; the built-ins are never built.
     } as unknown as GrantableServerDeps);
     const mcpHttp = new McpHttpServer({ servers: {} });
