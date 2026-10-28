@@ -4,6 +4,7 @@ import 'package:goals_core/sync.dart' show GoalStatus, SyncClient;
 import 'package:goals_ui_core/core.dart'
     show GoalWidgetsContext, selectedGoalsProvider;
 import 'package:goals_widgets/goals_widgets.dart' show FlattenedGoalTree;
+import 'package:http/http.dart' as http;
 
 import 'iu_node_detail_panel.dart';
 import 'iu_tree_actions.dart';
@@ -65,12 +66,22 @@ List<GoalPath> iuTopLevelPaths(Map<String, Goal>? goalMap, String? rootNodeId) {
 }
 
 class IuTreeBody extends StatefulWidget {
-  const IuTreeBody({super.key, this.session});
+  const IuTreeBody({super.key, this.session, this.baseUrl, this.client});
 
   /// The dashboard session is injected into the persistence HTTP client so a
   /// 401 from the read-only IU endpoints follows the same expiry path as every
   /// other dashboard API request.
   final SessionRequestState? session;
+
+  /// Server origin the read-only IU endpoints resolve against. Null keeps the
+  /// web default of same-origin (the dashboard serves both); non-web hosts
+  /// pass their configured server (on Android `Uri.base` is a file: URI and
+  /// relative resolution would throw).
+  final Uri? baseUrl;
+
+  /// Transport for the read-only fetches. Non-web hosts pass their session
+  /// client so the cookie jar and Origin header travel with the request.
+  final http.Client? client;
 
   @override
   State<IuTreeBody> createState() => _IuTreeBodyState();
@@ -84,8 +95,14 @@ class _IuTreeBodyState extends State<IuTreeBody> {
   @override
   void initState() {
     super.initState();
-    // Same-origin: the dashboard serves both the UI and /api/understanding/ops.
-    _persistence = OpGetterPersistenceService(session: widget.session);
+    final base = widget.baseUrl;
+    _persistence = OpGetterPersistenceService(
+      baseUrl: base == null
+          ? ''
+          : '${base.scheme}://${base.host}${base.hasPort ? ':${base.port}' : ''}',
+      client: widget.client,
+      session: widget.session,
+    );
     _syncClient = SyncClient(persistenceService: _persistence);
     _ready = _syncClient.init();
     // Selection is shared (glass-goals) UI state; start clean so a prior mount's

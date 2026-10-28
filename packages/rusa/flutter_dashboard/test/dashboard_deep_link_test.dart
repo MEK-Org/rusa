@@ -114,11 +114,11 @@ void main() {
       );
       expect(parseDashboardView(Uri.parse('/reports')), DashboardView.reports);
       expect(parseDashboardView(Uri.parse('/work')), DashboardView.work);
+      expect(parseDashboardView(Uri.parse('/work/ob-123')), DashboardView.work);
       expect(
-        parseDashboardView(Uri.parse('/work/ob-123')),
-        DashboardView.work,
+        parseDashboardView(Uri.parse('/overview')),
+        DashboardView.overview,
       );
-      expect(parseDashboardView(Uri.parse('/overview')), DashboardView.overview);
       expect(parseDashboardView(Uri.parse('/')), isNull);
     });
 
@@ -131,16 +131,10 @@ void main() {
         parseFocusedObligationId(Uri.parse('/?obligation=ob%2Dlegacy')),
         'ob-legacy',
       );
-      expect(
-        parseFocusedObligationId(Uri.parse('/?obligation=50%25')),
-        '50%',
-      );
+      expect(parseFocusedObligationId(Uri.parse('/?obligation=50%25')), '50%');
       expect(parseFocusedObligationId(Uri.parse('/overview')), isNull);
 
-      expect(
-        parseFocusedActorId(Uri.parse('/actors/actor%2D99')),
-        'actor-99',
-      );
+      expect(parseFocusedActorId(Uri.parse('/actors/actor%2D99')), 'actor-99');
       expect(parseFocusedActorId(Uri.parse('/work/ob-1')), isNull);
     });
 
@@ -197,49 +191,46 @@ void main() {
       ('/work/ob-focused', 'ob-focused', true),
       ('/actors/actor-99', 'actor-99', false),
     ]) {
-      testWidgets(
-        'preserves $path deep link through cold authenticated load',
-        (tester) async {
-          await tester.runAsync(() async {
-            addTearDown(() {
-              tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            });
-
-            tester.platformDispatcher.defaultRouteNameTestValue = path;
-            debugDashboardUrl = path;
-
-            final api = FakeApi();
-            if (!isWork) {
-              api.threadsResult = [makeThread(expectedId)];
-            }
-            final store = DashboardStore(api: api, stream: FakeStream());
-            await store.init();
-
-            final session = _TestSession(
-              status: DashboardSessionStatus.signedIn,
-            );
-
-            await tester.pumpWidget(
-              RusaDashboardApp(
-                bootstrapSession: () => Future.value(session),
-                pageBuilder: (_, _) => _testDashboardBody(store),
-              ),
-            );
-            await tester.pump();
-            await tester.pump(const Duration(milliseconds: 50));
-
-            expect(find.byType(DashboardBody), findsOneWidget);
-            if (isWork) {
-              expect(store.focusedObligationId.value, expectedId);
-            } else {
-              expect(store.primary.value, expectedId);
-            }
-            expect(debugDashboardUrl, path);
-
-            await store.dispose();
+      testWidgets('preserves $path deep link through cold authenticated load', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          addTearDown(() {
+            tester.platformDispatcher.clearDefaultRouteNameTestValue();
           });
-        },
-      );
+
+          tester.platformDispatcher.defaultRouteNameTestValue = path;
+          debugDashboardUrl = path;
+
+          final api = FakeApi();
+          if (!isWork) {
+            api.threadsResult = [makeThread(expectedId)];
+          }
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+
+          final session = _TestSession(status: DashboardSessionStatus.signedIn);
+
+          await tester.pumpWidget(
+            RusaDashboardApp(
+              bootstrapSession: () => Future.value(session),
+              pageBuilder: (_, _) => _testDashboardBody(store),
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+
+          expect(find.byType(DashboardBody), findsOneWidget);
+          if (isWork) {
+            expect(store.focusedObligationId.value, expectedId);
+          } else {
+            expect(store.primary.value, expectedId);
+          }
+          expect(debugDashboardUrl, path);
+
+          await store.dispose();
+        });
+      });
     }
 
     for (final (path, expectedId, isWork) in [
@@ -354,5 +345,25 @@ void main() {
         );
       },
     );
+
+    testWidgets('renders only the safe missing-define configuration error', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        RusaDashboardApp(
+          bootstrapSession: () => Future.error(
+            const DashboardConfigurationError('RUSA_FIREBASE_ANDROID_APP_ID'),
+          ),
+          pageBuilder: (_, _) => const SizedBox(),
+        ),
+      );
+      await tester.pump();
+
+      expect(
+        find.textContaining('RUSA_FIREBASE_ANDROID_APP_ID'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Firebase'), findsNothing);
+    });
   });
 }

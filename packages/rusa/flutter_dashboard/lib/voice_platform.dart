@@ -6,8 +6,9 @@ import 'models.dart';
 /// Thin injectable seams over the browser voice APIs (MediaRecorder,
 /// HTMLAudioElement, Wake Lock, the `voice` EventSource) so the walkie-talkie
 /// controller (`walkie_controller.dart`) and its tests never import
-/// `package:web`. The real implementations live in `voice_web.dart`; tests use
-/// the fakes in `test/fakes.dart`. Mirrors the `MeshStreamSource` pattern.
+/// `package:web`. The real implementations live in `voice_web.dart` (browser)
+/// and `voice_io.dart` (Android); tests use the fakes in `test/fakes.dart`.
+/// Mirrors the `MeshStreamSource` pattern.
 
 /// The captured clip handed back by [VoiceRecorder.stop].
 class RecordedAudio {

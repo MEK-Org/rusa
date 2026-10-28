@@ -49,18 +49,22 @@ class ActorAvatar extends StatelessWidget {
       stream: store?.avatarEpoch,
       initialData: 0,
       builder: (context, _) {
-        // Relative to the page origin (Uri.base) so the same build works on
-        // localhost and behind `tailscale serve`, matching DashboardApi.
+        // Relative to the dashboard's API origin (store.apiBase — Uri.base on
+        // web, the configured server on Android) so the same build works on
+        // localhost, behind `tailscale serve`, and on non-web hosts, matching
+        // DashboardApi.
         final version = store?.avatarVersion(id) ?? 0;
         final generating = store?.isAvatarGenerating(id) ?? false;
-        final url = Uri.base
+        final url = (store?.apiBase ?? Uri.base)
             .resolve(
               '/api/mesh/avatar/$id.png${version > 0 ? '?v=$version' : ''}',
             )
             .toString();
+        final imageHeaders = store?.avatarHeaders(Uri.parse(url));
 
         final image = Image.network(
           url,
+          headers: imageHeaders,
           // A new version (upload, manual generate, or lazy `ready`) must start
           // from a clean image state rather than inherit the previous URL's
           // error, so the replacement image fades in instead of snapping.
@@ -287,13 +291,17 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                           builder: (context, _) {
                             final version =
                                 widget.store?.avatarVersion(widget.id) ?? 0;
-                            final url = Uri.base
+                            final url = (widget.store?.apiBase ?? Uri.base)
                                 .resolve(
                                   '/api/mesh/avatar/${widget.id}.png${version > 0 ? '?v=$version' : ''}',
                                 )
                                 .toString();
+                            final imageHeaders = widget.store?.avatarHeaders(
+                              Uri.parse(url),
+                            );
                             return Image.network(
                               url,
+                              headers: imageHeaders,
                               fit: BoxFit.contain,
                               gaplessPlayback: true,
                               loadingBuilder: (_, child, progress) =>

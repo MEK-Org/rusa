@@ -64,19 +64,32 @@ class PartialReferenceFetchException implements Exception {
 /// the page origin (`Uri.base`), so the same build works on localhost and
 /// behind `tailscale serve` (relative paths, no hard-coded host).
 class DashboardApi {
-  DashboardApi({http.Client? client, Uri? base, SessionRequestState? session})
-    : _base = base ?? Uri.base {
+  DashboardApi({
+    http.Client? client,
+    Uri? base,
+    SessionRequestState? session,
+    Map<String, String> Function(Uri url)? imageHeaders,
+  }) : _base = base ?? Uri.base,
+       _imageHeaders = imageHeaders ?? _noImageHeaders {
     _client = DashboardTimingClient(SessionClient(client, session));
     _timings = DashboardTimingReporter(client: _client, base: _base);
   }
 
   late final http.Client _client;
   final Uri _base;
+  final Map<String, String> Function(Uri url) _imageHeaders;
   late final DashboardTimingReporter _timings;
+
+  static Map<String, String> _noImageHeaders(Uri _) => const {};
 
   /// The origin every request is resolved against. Exposed so the store can
   /// scope persisted state to the server it actually came from.
   Uri get base => _base;
+
+  /// Credentials for an image that Flutter loads outside this API's client.
+  /// Browser builds return no headers and let the browser manage its cookie;
+  /// IO builds supply same-origin headers from their session transport.
+  Map<String, String> imageHeaders(Uri url) => _imageHeaders(url);
 
   Uri _u(String path, [Map<String, String>? query]) => _base
       .resolve(path)
@@ -200,10 +213,7 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({
-        'provider': provider,
-        'models': ?models,
-      }),
+      body: jsonEncode({'provider': provider, 'models': ?models}),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
