@@ -28,6 +28,7 @@ import {
   type InstanceRole,
   type PeerConfig,
   type QuotaThrottleConfig,
+  RESERVED_MCP_SERVER_NAMES,
   type RusaConfig,
 } from "./types.js";
 
@@ -665,6 +666,74 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         throw new Error(`config.yaml: ${source}.rootNodeId must be a non-empty string when set`);
       }
       gg.rootNodeId = gg.rootNodeId.trim();
+    }
+  }
+
+  if (parsed.customMcpServers !== undefined) {
+    if (
+      typeof parsed.customMcpServers !== "object" ||
+      parsed.customMcpServers === null ||
+      Array.isArray(parsed.customMcpServers)
+    ) {
+      throw new Error("config.yaml: customMcpServers must be a mapping when set");
+    }
+    for (const [capability, server] of Object.entries(parsed.customMcpServers)) {
+      const source = `config.yaml: customMcpServers.${capability}`;
+      if (!/^[a-z][a-z0-9_]{0,63}$/.test(capability)) {
+        throw new Error(
+          `${source} capability name must use lowercase letters, digits, or underscores`
+        );
+      }
+      if (RESERVED_MCP_SERVER_NAMES.has(capability)) {
+        throw new Error(`${source} must not shadow a built-in MCP server name`);
+      }
+      if (typeof server !== "object" || server === null || Array.isArray(server)) {
+        throw new Error(`${source} must be a mapping`);
+      }
+      if (typeof server.command !== "string" || !server.command.trim()) {
+        throw new Error(`${source}.command must be a non-empty string`);
+      }
+      server.command = server.command.trim();
+      if (server.args !== undefined) {
+        if (!Array.isArray(server.args) || server.args.some((arg) => typeof arg !== "string")) {
+          throw new Error(`${source}.args must be an array of strings when set`);
+        }
+      }
+      if (server.cwd !== undefined) {
+        if (typeof server.cwd !== "string" || !server.cwd.trim()) {
+          throw new Error(`${source}.cwd must be a non-empty string when set`);
+        }
+        server.cwd = server.cwd.trim();
+      }
+      if ("env" in (server as object)) {
+        throw new Error(
+          `${source}.env is not supported; the host-owned executable must resolve its own credentials`
+        );
+      }
+      if (
+        typeof server.userId !== "string" ||
+        !server.userId.trim() ||
+        server.userId.includes(":")
+      ) {
+        throw new Error(`${source}.userId must be a non-empty colon-free string`);
+      }
+      server.userId = server.userId.trim();
+      for (const key of ["readTools", "writeTools"] as const) {
+        const tools = server[key];
+        if (
+          !Array.isArray(tools) ||
+          tools.length === 0 ||
+          tools.some((tool) => typeof tool !== "string" || !/^[A-Za-z0-9_.-]+$/.test(tool))
+        ) {
+          throw new Error(`${source}.${key} must be a non-empty array of MCP tool names`);
+        }
+        if (new Set(tools).size !== tools.length) {
+          throw new Error(`${source}.${key} must not contain duplicate tool names`);
+        }
+      }
+      if (server.readTools.some((tool) => server.writeTools.includes(tool))) {
+        throw new Error(`${source} must classify each tool as read or write, not both`);
+      }
     }
   }
   // geminiApiKey and mistralApiKey are optional at config-validation time;

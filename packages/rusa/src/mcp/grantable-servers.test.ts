@@ -154,6 +154,37 @@ describe("grantable capabilities allow-list ", () => {
     expect(() => servers.get("pnpm-hardlinks")?.("0b2c3d4e-steward", [])).not.toThrow();
   });
 
+  it("mounts an operator-configured custom server only through its parameterized grant", () => {
+    const servers = buildGrantableServers({
+      ...STUB_DEPS,
+      customMcpServers: {
+        glass_goals: {
+          command: "synthetic-goals-mcp",
+          userId: "configured-user",
+          readTools: ["read_goal"],
+          writeTools: ["write_goal"],
+        },
+      },
+      activeCapabilitiesForActor: () => [],
+    });
+    const mountedFactories = new Map<string, () => McpServer>();
+    const mcpHttp = {
+      addServer: (name: string, factory: () => McpServer) => {
+        mountedFactories.set(name, factory);
+        return `http://mcp/${name}`;
+      },
+      removeServer: async (name: string) => {
+        mountedFactories.delete(name);
+      },
+    };
+
+    expect(mountGrantedServers("reader", [], servers, mcpHttp)).toEqual([]);
+    expect(
+      mountGrantedServers("reader", ["glass_goals:configured-user:read"], servers, mcpHttp)
+    ).toEqual([{ name: "glass_goals", url: "http://mcp/reader:glass_goals" }]);
+    expect(mountedFactories.has("reader:glass_goals")).toBe(true);
+  });
+
   it("serves the bounded mesh_events read only behind a `distiller` grant (#537)", async () => {
     // The read has no principal of its own: it exists on an actor's endpoint set
     // exactly when a `distiller` grant row does, and leaves with it. The

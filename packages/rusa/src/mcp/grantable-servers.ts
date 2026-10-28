@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { CalendarClientProvider } from "../calendar/calendar-client.js";
 import type { ChatClient } from "../chat/types.js";
+import type { CustomMcpServerConfig } from "../config/types.js";
 import type { DriveClient } from "../drive/drive-client.js";
 import type { GmailClient } from "../email/gmail-client.js";
 import type { Logger } from "../observability/logger.js";
@@ -22,6 +23,7 @@ import {
   createCalendarWriteMcpServer,
 } from "./calendar-mcp.js";
 import { CHAT_WRITE_MCP_NAME, createChatWriteMcpServer } from "./chat-mcp.js";
+import { createCustomStdioMcpServer } from "./custom-stdio-mcp.js";
 import {
   createDistillerServer,
   DISTILLER_MCP_NAME,
@@ -106,6 +108,10 @@ export interface GrantableServerDeps {
    * stays registered and its tool reports that instead.
    */
   quotaManual?: QuotaManualMcpDeps;
+  /** Current grants, read at every proxied custom-MCP invocation. */
+  activeCapabilitiesForActor?: (actorId: string) => readonly string[];
+  /** Operator-configured, host-owned stdio integrations keyed by capability. */
+  customMcpServers?: Record<string, CustomMcpServerConfig>;
   /**
    * Host-maintenance servers (#549). Formerly mounted on the configured root's
    * tool set by id; now capabilities named after their servers (`update`,
@@ -260,6 +266,16 @@ export function buildGrantableServers(
       });
     });
   }
+  for (const [capability, config] of Object.entries(deps.customMcpServers ?? {})) {
+    map.set(capability, (selfId) =>
+      createCustomStdioMcpServer({
+        actorId: selfId,
+        server: { capability, config },
+        // Absent wiring fails closed, including for the configured default actor.
+        activeCapabilities: deps.activeCapabilitiesForActor ?? (() => []),
+      })
+    );
+  }
   const updateToolDepsFor = deps.hostMaintenance?.updateToolDepsFor;
   if (updateToolDepsFor) {
     map.set(UPDATE_MCP_NAME, (selfId) => createUpdateMcpServer(updateToolDepsFor(selfId), selfId));
@@ -338,31 +354,13 @@ export async function handleCapabilityRevoked(
       // on the actor's next sandboxed spawn via the secrets tmpfs mask.
       return;
     }
-    let baseCapability = capability;
-    if (capability.startsWith("chat-write:")) {
-      baseCapability = "chat-write";
-    } else if (capability.startsWith("slack-write:")) {
-      baseCapability = "slack-write";
-    } else if (capability.startsWith("calendar-read:")) {
-      baseCapability = "calendar-read";
-    } else if (capability.startsWith("calendar-write:")) {
-      baseCapability = "calendar-write";
-    } else if (capability.startsWith("email-send:")) {
-      baseCapability = "email-send";
-    } else if (capability.startsWith("drive-read:")) {
-      baseCapability = "drive-read";
-    }
+    const baseCapability = capability.split(":", 1)[0] as string;
 
-    if (
-      baseCapability === "chat-write" ||
-      baseCapability === "slack-write" ||
-      baseCapability === "calendar-read" ||
-      baseCapability === "calendar-write" ||
-      baseCapability === "email-send" ||
-      baseCapability === "drive-read"
-    ) {
+    if (grantableServers.has(baseCapability)) {
       const prefix = `${baseCapability}:`;
-      const activeGrants = getActiveCapabilities().filter((c) => c.startsWith(prefix));
+      const activeGrants = getActiveCapabilities().filter(
+        (candidate) => candidate === baseCapability || candidate.startsWith(prefix)
+      );
       if (activeGrants.length === 0) {
         await mcpHttp.removeServer(`${actorId}:${baseCapability}`);
       } else {

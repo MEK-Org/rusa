@@ -2958,6 +2958,10 @@ async function composeStart(
         }),
       }),
     quotaManual: { client: quotaCoordinatorClient },
+    customMcpServers: config.customMcpServers,
+    // `mesh` is assigned below. The callback runs only from a mounted server,
+    // after actor creation, and is intentionally read fresh at every tool call.
+    activeCapabilitiesForActor: (actorId) => mesh.activeCapabilitiesFor(actorId),
   });
   // Actor keeps this array by reference and hands its current contents to the
   // provider at run start. A live grant updates it synchronously, which is the
