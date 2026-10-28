@@ -41,6 +41,8 @@ class _AssistantPageState extends State<AssistantPage> {
   late Future<WalkieController> _ready;
   final _subs = <StreamSubscription<Object?>>[];
   StreamSubscription<bool>? _enabledSub;
+  int _attempt = 0;
+  bool _disposed = false;
 
   @override
   void initState() {
@@ -56,22 +58,40 @@ class _AssistantPageState extends State<AssistantPage> {
   }
 
   Future<WalkieController> _start() async {
+    // Each start owns its controller until the page is disposed or a Retry
+    // supersedes it; a stale start discards what it built instead of recording.
+    final attempt = ++_attempt;
+    bool stale() => _disposed || attempt != _attempt;
     final deps = _deps;
     if (deps == null) {
       throw StateError('Voice is not available on this device');
     }
     final snapshot = await _api.fetchThreads();
+    await _enabledSub?.cancel();
+    _enabledSub = null;
+    if (stale()) throw StateError('Assist screen closed');
     final root = resolveRootActorId(snapshot.threads);
     if (root == null) throw StateError('No active root actor');
-    await _enabledSub?.cancel();
     unawaited(_controller?.dispose());
-    final controller = WalkieController(actorId: root, deps: deps);
+    final controller = WalkieController(
+      actorId: root,
+      deps: deps,
+      sessionRepliesOnly: true,
+    );
     _controller = controller;
+    Future<Never> discard() async {
+      if (_controller == controller) _controller = null;
+      await controller.dispose();
+      throw StateError('Assist screen closed');
+    }
+
     await controller.init();
+    if (stale()) return discard();
     if (controller.available.valueOrNull == false) {
       throw StateError('Voice is not configured on this instance');
     }
     await controller.enable();
+    if (stale()) return discard();
     // Walkie off (the panel's power button) ends the assist session.
     _enabledSub = controller.enabled.skip(1).listen((enabled) {
       if (!enabled) _close();
@@ -105,6 +125,7 @@ class _AssistantPageState extends State<AssistantPage> {
 
   @override
   void dispose() {
+    _disposed = true;
     for (final sub in _subs) {
       unawaited(sub.cancel());
     }

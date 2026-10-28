@@ -1543,8 +1543,10 @@ VoiceAnnouncement makeAnnouncement(
   String actor = 'a',
   String? text,
   String createdAt = '2026-07-17T00:00:00Z',
+  String? sessionId,
 }) => VoiceAnnouncement(
   id: id,
+  sessionId: sessionId,
   actorId: actor,
   text: text ?? 'reply $id',
   audioUrl: '/api/mesh/voice/audio/$id',

@@ -17,7 +17,11 @@ class AssistActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        val channel = AssistantChannel(this, flutterEngine.dartExecutor.binaryMessenger)
+        val channel = AssistantChannel(
+            this,
+            flutterEngine.dartExecutor.binaryMessenger,
+            withHeadset = true,
+        )
         assistant = channel
         answerHeadset(intent, channel)
     }
@@ -37,7 +41,7 @@ class AssistActivity : FlutterActivity() {
      */
     private fun answerHeadset(intent: Intent?, channel: AssistantChannel) {
         if (intent?.action == Intent.ACTION_VOICE_COMMAND) {
-            channel.headset.startVoiceRecognition()
+            channel.headset?.startVoiceRecognition()
         }
     }
 

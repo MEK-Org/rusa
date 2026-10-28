@@ -1902,9 +1902,13 @@ class VoiceAnnouncement {
     required this.audioUrl,
     required this.mime,
     required this.createdAt,
+    this.sessionId,
   });
 
   final String id;
+
+  /// The walkie session the reply answered, or null for one outside any.
+  final String? sessionId;
 
   /// The actor whose message is being spoken.
   final String actorId;
@@ -1927,6 +1931,7 @@ class VoiceAnnouncement {
         audioUrl: j['audioUrl'] as String? ?? '',
         mime: j['mime'] as String? ?? 'audio/wav',
         createdAt: j['createdAt'] as String? ?? '',
+        sessionId: j['sessionId'] as String?,
       );
 }
 

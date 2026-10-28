@@ -164,12 +164,13 @@ class HeadsetRoute(private val context: Context, private val onLost: () -> Unit)
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
     private fun routeSco() {
-        val connected = try {
-            proxy?.connectedDevices?.isNotEmpty() == true
+        val headset = proxy
+        val device = try {
+            headset?.connectedDevices?.firstOrNull()
         } catch (_: SecurityException) {
-            false
+            null
         }
-        if (!connected || !audio.isBluetoothScoAvailableOffCall) {
+        if (headset == null || device == null || !audio.isBluetoothScoAvailableOffCall) {
             settle(false)
             return
         }
@@ -188,6 +189,15 @@ class HeadsetRoute(private val context: Context, private val onLost: () -> Unit)
         audio.startBluetoothSco()
         audio.isBluetoothScoOn = true
         scoStarted = true
+        // A link already up, as when the headset's own voice recognition opened
+        // it, gets no new state broadcast. Read the live link, not the sticky
+        // broadcast that may be a previous session's.
+        val audioConnected = try {
+            headset.isAudioConnected(device)
+        } catch (_: SecurityException) {
+            false
+        }
+        if (audioConnected) settle(true)
     }
 
     private fun settle(ok: Boolean) {

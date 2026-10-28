@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -5,6 +7,7 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/assistant_io.dart';
 import 'package:rusa_dashboard/assistant_page.dart';
 import 'package:rusa_dashboard/assistant_platform.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
@@ -160,6 +163,86 @@ void main() {
 
       expect(find.text('Voice is not configured on this instance'), findsOne);
       expect(walkie.recorder.startCalls, 0);
+      await unmount(tester);
+    });
+
+    testWidgets('closing during the root lookup starts nothing', (
+      tester,
+    ) async {
+      final gate = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(gate);
+      await pumpPage(tester);
+      await unmount(tester);
+
+      gate.complete(ThreadsSnapshot(halted: false, threads: api.threadsResult));
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.streams, isEmpty);
+      expect(walkie.wakeLock.acquireCalls, 0);
+      expect(walkie.recorder.startCalls, 0);
+    });
+
+    testWidgets('closing during a Retry start starts nothing', (tester) async {
+      api.threadsResult = [makeThread('child', parent: 'gone')];
+      await pumpPage(tester);
+      expect(find.text('No active root actor'), findsOneWidget);
+
+      api.threadsResult = [makeThread('root')];
+      final gate = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(gate);
+      await tester.tap(find.text('Retry'));
+      await tester.pump();
+      await unmount(tester);
+
+      gate.complete(ThreadsSnapshot(halted: false, threads: api.threadsResult));
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.streams, isEmpty);
+      expect(walkie.recorder.startCalls, 0);
+    });
+
+    testWidgets('closing while voice starts releases it unrecorded', (
+      tester,
+    ) async {
+      final probe = Completer<List<VoiceAnnouncement>>();
+      api.backlogGates.add(probe);
+      await pumpPage(tester);
+      await unmount(tester);
+
+      probe.complete(const []);
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.streams, isEmpty);
+      expect(walkie.wakeLock.acquireCalls, 0);
+      expect(walkie.recorder.startCalls, 0);
+    });
+
+    testWidgets('plays only replies to this assist session', (tester) async {
+      final probe = Completer<List<VoiceAnnouncement>>();
+      final backlog = Completer<List<VoiceAnnouncement>>();
+      api.backlogGates.addAll([probe, backlog]);
+      await pumpPage(tester);
+      probe.complete(const []);
+      await tester.pump();
+      await tester.pump();
+
+      // The backlog holds a root reply left unplayed before this trigger, and
+      // one answering this session.
+      final sessionId = walkie.stream.connectCalls.single.sessionId;
+      backlog.complete([
+        makeAnnouncement('earlier', actor: 'root'),
+        makeAnnouncement('elsewhere', actor: 'root', sessionId: 'other'),
+        makeAnnouncement('answer', actor: 'root', sessionId: sessionId),
+      ]);
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/answer']);
+      expect(find.text('reply earlier'), findsNothing);
+      expect(api.ackedIds, isNot(contains('earlier')));
       await unmount(tester);
     });
 

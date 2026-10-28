@@ -14,14 +14,20 @@ import io.flutter.plugin.common.MethodChannel
 
 /**
  * The `org.mek.rusa.dashboard/assistant` channel (`assistant_io.dart`): the
- * assistant role's status and settings page, and the headset microphone route.
+ * assistant role's status and settings page, and, [withHeadset], the headset
+ * microphone route. Only the assist activity records through a headset.
  */
 class AssistantChannel(
     private val activity: Activity,
     messenger: BinaryMessenger,
+    withHeadset: Boolean = false,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, NAME)
-    val headset = HeadsetRoute(activity) { channel.invokeMethod("routeLost", null) }
+    val headset = if (withHeadset) {
+        HeadsetRoute(activity) { channel.invokeMethod("routeLost", null) }
+    } else {
+        null
+    }
     private var pendingSettings: MethodChannel.Result? = null
 
     init {
@@ -32,9 +38,10 @@ class AssistantChannel(
         when (call.method) {
             "roleStatus" -> result.success(roleStatus())
             "openAssistantSettings" -> openAssistantSettings(result)
-            "acquireHeadset" -> headset.acquire { routed -> result.success(routed) }
+            "acquireHeadset" -> headset?.acquire { routed -> result.success(routed) }
+                ?: result.success(false)
             "releaseHeadset" -> {
-                headset.release()
+                headset?.release()
                 result.success(null)
             }
             else -> result.notImplemented()
@@ -106,7 +113,7 @@ class AssistantChannel(
         channel.setMethodCallHandler(null)
         pendingSettings?.success(null)
         pendingSettings = null
-        headset.close()
+        headset?.close()
     }
 
     companion object {
