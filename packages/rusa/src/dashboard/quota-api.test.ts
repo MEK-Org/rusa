@@ -2143,15 +2143,14 @@ describe("dead-reckoned lane estimates (#759)", () => {
   });
 
   it("writes no estimate to the quota database", async () => {
+    // SharedQuotaStore prunes against Date.now() on every raw write; pin the
+    // clock to this fixture's timeline so retention cannot drop its first
+    // pacing point as the real date advances (#1184).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at("13:30"));
     const root = mkdtempSync(join(tmpdir(), "rusa-quota-estimate-"));
     const store = new SharedQuotaStore(join(root, "quota.db"));
     try {
-      // SharedQuotaStore prunes against its real clock on every raw write.
-      // Keep this synthetic timeline recent so retention cannot remove the
-      // first pacing point before the API gets to estimate it.
-      const nowMs = Date.now();
-      const stamp = (minutesFromNow: number) =>
-        new Date(nowMs + minutesFromNow * 60 * 1000).toISOString();
       const record = (scrapedAt: string, limits: ProviderQuotaSnapshot["limits"]) => {
         const state: ProviderQuotaSnapshot = {
           provider: "claude",
@@ -2169,18 +2168,18 @@ describe("dead-reckoned lane estimates (#759)", () => {
         label: "Current session",
         kind: "session" as const,
         percentLeft: 90,
-        resetAtIso: stamp(90),
+        resetAtIso: at("15:00"),
       };
       const weekly = (percentLeft: number) => ({
         label: "Weekly",
         kind: "weekly" as const,
         percentLeft,
-        resetAtIso: stamp(4 * 24 * 60),
+        resetAtIso: RESET,
       });
-      record(stamp(-210), [session, weekly(80)]);
-      record(stamp(-90), [session, weekly(70)]);
+      record(at("10:00"), [session, weekly(80)]);
+      record(at("12:00"), [session, weekly(70)]);
       // The newest scrape missed the weekly panel.
-      record(stamp(-30), [session]);
+      record(at("13:00"), [session]);
       const counts = () =>
         store.db
           .prepare(
@@ -2190,14 +2189,14 @@ describe("dead-reckoned lane estimates (#759)", () => {
           .get();
       const before = counts();
       expect(
-        store.listHistorySince("claude", stamp(-240)).filter((row) => row.kind === "weekly")
+        store.listHistorySince("claude", at("09:00")).filter((row) => row.kind === "weekly")
       ).toHaveLength(2);
 
       const snapshot = await buildQuotaSnapshot({
         getQuota: async () =>
           store.getLatestSnapshot("claude") ?? { provider: "claude", status: "unknown" },
         providers: ["claude"],
-        now: () => nowMs,
+        now: () => Date.parse(at("13:30")),
         listHistory: (provider, sinceIso) => store.listHistorySince(provider, sinceIso),
       });
 
@@ -2216,6 +2215,7 @@ describe("dead-reckoned lane estimates (#759)", () => {
     } finally {
       store.close();
       rmSync(root, { recursive: true, force: true });
+      vi.useRealTimers();
     }
   });
 });
