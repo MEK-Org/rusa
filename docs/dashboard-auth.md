@@ -178,7 +178,8 @@ from the dashboard, else `rootActor.avatar`) becomes the launcher icon. Each
 falls back on its own to the built-in "Rusa" name and dashboard icon. The
 application id is derived only: `com.<handle>.dashboard` with every character
 outside `[A-Za-z0-9_]` stripped, or `org.mek.rusa.dashboard` when no handle is
-configured. There is no config override; a handle that leaves a segment not
+configured. A configured `root-actor`, the default handle, keeps the "Rusa"
+name but still derives `com.rootactor.dashboard`. There is no config override; a handle that leaves a segment not
 starting with a letter (empty, or digit- or underscore-leading) fails the
 build, and so does a configured `rootActor.avatar` the build cannot find (it
 resolves a relative path against its own working directory, so prefer an

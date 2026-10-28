@@ -73,11 +73,13 @@ export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): 
   const labelSource =
     name === null ? `built-in ${instance} name` : `rootActor.handle "${configuredHandle}"`;
 
-  const derived = name !== null && configuredHandle;
-  const applicationId = derived
+  // The id follows the configured handle alone. The label's fallback also treats
+  // a handle of `root-actor` as unbranded, but that is a display rule; a
+  // configured `root-actor` still derives `com.rootactor.dashboard`.
+  const applicationId = configuredHandle
     ? deriveAndroidApplicationId(configuredHandle)
     : LEGACY_ANDROID_APPLICATION_ID;
-  const applicationIdSource = derived
+  const applicationIdSource = configuredHandle
     ? "derived from rootActor.handle"
     : "built-in default (no rootActor.handle)";
 

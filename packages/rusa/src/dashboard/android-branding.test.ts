@@ -88,6 +88,16 @@ describe("resolveAndroidBranding", () => {
     );
   });
 
+  it("derives the id from a configured root-actor handle the label treats as unbranded", () => {
+    writeConfig({ rootActor: { handle: "root-actor" } });
+
+    const branding = resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR });
+    expect(branding.label).toBe("Rusa");
+    expect(branding.labelSource).toBe("built-in prod name");
+    expect(branding.applicationId).toBe("com.rootactor.dashboard");
+    expect(branding.applicationIdSource).toBe("derived from rootActor.handle");
+  });
+
   it("uses the uploaded root image, typed by its signature", () => {
     writeConfig({ rootActor: { handle: "silicon-familiar" } });
     mkdirSync(join(home, "avatars"));
