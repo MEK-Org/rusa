@@ -2143,6 +2143,11 @@ describe("dead-reckoned lane estimates (#759)", () => {
   });
 
   it("writes no estimate to the quota database", async () => {
+    // SharedQuotaStore prunes against Date.now() on every raw write; pin the
+    // clock to this fixture's timeline so retention cannot drop its first
+    // pacing point as the real date advances (#1184).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at("13:30"));
     const root = mkdtempSync(join(tmpdir(), "rusa-quota-estimate-"));
     const store = new SharedQuotaStore(join(root, "quota.db"));
     try {
@@ -2183,6 +2188,9 @@ describe("dead-reckoned lane estimates (#759)", () => {
           )
           .get();
       const before = counts();
+      expect(
+        store.listHistorySince("claude", at("09:00")).filter((row) => row.kind === "weekly")
+      ).toHaveLength(2);
 
       const snapshot = await buildQuotaSnapshot({
         getQuota: async () =>
@@ -2195,6 +2203,7 @@ describe("dead-reckoned lane estimates (#759)", () => {
       expect(snapshot.providers[0].windows).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ id: "weekly", usedPercent: 37.5, estimated: true }),
+          expect.objectContaining({ id: "session", usedPercent: 10, estimated: false }),
         ])
       );
       expect(counts()).toEqual(before);
@@ -2206,6 +2215,7 @@ describe("dead-reckoned lane estimates (#759)", () => {
     } finally {
       store.close();
       rmSync(root, { recursive: true, force: true });
+      vi.useRealTimers();
     }
   });
 });
