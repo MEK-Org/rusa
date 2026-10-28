@@ -5,6 +5,7 @@ import {
   request as proxyRequest,
   type ServerResponse,
 } from "node:http";
+import { MCP_HEADERS_TIMEOUT_MS, MCP_KEEP_ALIVE_TIMEOUT_MS } from "../mcp/http-server.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { McpServerSpec } from "../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
@@ -213,6 +214,9 @@ export class FollowerHub {
     opts?: FollowerHubOptions
   ) {
     if (token.length < 32) throw new Error("Follower token must be at least 32 characters");
+    // Keep follower-hub connections alive matching MCP HTTP timeouts (MEK-Org/rusa#1194, #294).
+    this.server.keepAliveTimeout = MCP_KEEP_ALIVE_TIMEOUT_MS;
+    this.server.headersTimeout = MCP_HEADERS_TIMEOUT_MS;
     this.log = (opts?.logger ?? nullLogger).child({ component: "follower-gateway" });
     this.sweep.unref();
     this.eventTransfers = opts?.eventTransfers ?? new EventTransferReceiver();
