@@ -7,11 +7,12 @@ comes back through the chat-write MCP tool. The runner also requires a successfu
 run settlement before shutting down the instance.
 
 This is an explicit host-execution prototype, not production activation. Set
-`RUSA_OPENROUTER_POC=1` and configure `providers.openrouter.openrouterPoc` with
-optional `piCommand` (default `pi`), absolute `authDir` (default Pi's normal
-`PI_CODING_AGENT_DIR` or `~/.pi/agent`) and optional absolute `artifactDir`.
-Launch the globally installed Pi, then run `/login openrouter`. The adapter validates the
-OpenRouter entry and exposes the existing
+`RUSA_OPENROUTER_POC=1` and configure `providers.openrouter.openrouterPoc: {}`.
+Launch the installed `pi` on the service PATH, then run `/login openrouter`.
+The saved login comes from the selected `PI_CODING_AGENT_DIR` or Pi's normal
+`~/.pi/agent` location. `openrouterPoc.piCommand` is the deliberate override
+when the service must select a separately installed executable. The adapter validates the
+OpenRouter entry and exposes the selected existing
 `auth.json` through a read-only bind for workers or a symlink for unsandboxed
 launches. The whole saved profile is visible to Pi, including other provider
 entries. Run settings, MCP configuration and cwd remain isolated. Missing or
@@ -59,26 +60,38 @@ The provider registry and normal model-selection path resolve `openrouter`.
 Each invocation starts a fresh supervised Pi RPC process, validates its exact
 model/session state using the existing protocol implementation and passes only
 the existing saved login plus temporary runtime settings.
-Pi starts in an empty temporary cwd to avoid migrating actor project files.
+Pi starts in the resolved actor workspace, while its HOME, agent configuration,
+cache and MCP configuration remain per-invocation private state. This restores
+repository discovery and durable workspace changes across fresh invocations.
+Pi 0.99.2 with `--no-approve` treats the workspace as untrusted, so project
+`.pi/settings.json`, `.pi/mcp.json`, extensions, skills, prompts and themes are
+ignored. Its one project-side effect is the startup migration that renames
+`<cwd>/.pi/commands` to `<cwd>/.pi/prompts` when only the former exists; that
+rename is part of the actor-workspace boundary. The synthetic runtime proof
+starts from a nonempty repository before exercising the two fresh invocations.
 Pi's built-in filesystem and shell tools remain enabled alongside granted MCP
 tools. Worker launches use the shared actor Bubblewrap boundary. Only the native
 MCP extension and generated admission extension are loaded.
 
 Deadline/cancellation and settlement use the existing process-group supervisor;
 the provider awaits direct-child close and removes the temporary launch tree.
-An optional absolute `openrouterPoc.artifactDir` retains private, exclusive-create
-`usage-<UUID>.json` files. The smoke points this at its disposable root. Without
-that setting no usage files are written, and the actor cwd is never used for artifacts. It is not an OpenRouter billing receipt or subscription token row.
+Private, exclusive-create `usage-<UUID>.json` observations go to
+`$RUSA_HOME/artifacts/openrouter`, never the actor cwd. They are not OpenRouter
+billing receipts or subscription token rows. A failed receipt write is logged
+and does not change the run result. Receipts are retained without rotation for
+this opt-in prototype's review; remove them with the disposable home.
 There are no schema changes and no entries in reset-window quota pacing.
 
 Production checkpoints should be decided against this working implementation.
 Remaining work includes model/runtime provisioning, richer MCP admission and
 authorization failure handling, admission
-budget controls, durable cost accounting, improved error diagnostics, portable
-context behavior across real tasks and broader tool/process containment. The
-prototype has a 120-second invocation ceiling and disables automatic retries,
-compaction and cache warming (`cacheWarming: "off"`); account-side limits remain
-external to this prototype. Provider invocation permissions and cross-provider
+budget controls, durable cost accounting, portable-context behavior across real tasks
+and broader tool/process containment. Portable context is required. The provider
+declares no reasoning-effort capability, so selection rejects an effort and Pi
+uses its default. The Actor-supplied deadline owns a normal run; a
+standalone adapter call retains its 120-second fallback. The adapter disables
+automatic retries, compaction and cache warming (`cacheWarming: "off"`); account-side
+limits remain external to this prototype. Provider invocation permissions and cross-provider
 credential isolation are
 deferred to a broader design discussion. Per the
 [operator ruling](https://github.com/MEK-Org/rusa/pull/1112#issuecomment-6266285746),

@@ -59,8 +59,12 @@ export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
   dailyCap?: string;
-  /** Explicit opt-in for the Pi/OpenRouter proof of concept. */
-  openrouterPoc?: { piCommand?: string; authDir?: string; artifactDir?: string };
+  /**
+   * Explicit opt-in for the Pi/OpenRouter proof of concept. Pi comes from the
+   * service PATH and its saved login from PI_CODING_AGENT_DIR (or Pi's default).
+   * piCommand is the deliberate escape hatch for a separately installed binary.
+   */
+  openrouterPoc?: { piCommand?: string };
   /**
    * Codex only: route every Codex refresh through the daemon's host-owned
    * broker so launched processes never hold or write the canonical login

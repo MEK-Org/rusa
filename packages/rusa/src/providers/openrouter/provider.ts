@@ -2,17 +2,33 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { resolveHome } from "../../config/secrets.js";
 import type { ProviderConfig } from "../../config/types.js";
-import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "../sandbox.js";
+import { createLogger, type Logger } from "../../observability/logger.js";
+import {
+  buildActorBwrapArgs,
+  buildActorBwrapCommand,
+  buildToolchainPath,
+  teardownFlutterOverlay,
+} from "../sandbox.js";
 import { runSubprocess, type SubprocessDuplex } from "../subprocess-execution.js";
 import { formatSigtermResult } from "../termination-attribution.js";
 import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
 
+let _openrouterLogger: Logger | undefined;
+export function setOpenRouterLogger(logger: Logger | undefined): void {
+  _openrouterLogger = logger;
+}
+function openrouterLog(): Logger {
+  _openrouterLogger ??= createLogger({ context: { component: "openrouter" } });
+  return _openrouterLogger;
+}
+
 /** Local end-to-end prototype. Fresh Pi process, portable context, built-in and MCP tools.
  * Worker launches use the shared actor bwrap boundary with isolated Pi state.
- * Usage stays in an artifact, outside subscription accounting and quota pacing.
+ * Usage stays in an internal artifact, outside subscription accounting and quota pacing.
  */
 export class OpenRouterProvider implements CodingProvider {
   readonly providerName = "openrouter";
@@ -38,14 +54,14 @@ export class OpenRouterProvider implements CodingProvider {
       const config = this.config.openrouterPoc;
       if (process.env.RUSA_OPENROUTER_POC !== "1" || !config || !this.model) {
         throw new Error(
-          "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, explicit paths and model"
+          "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, openrouterPoc and model"
         );
       }
       if (opts.session?.id || opts.computerUse) {
         throw new Error("OpenRouter prototype supports fresh runs without computer use only");
       }
-      const authDir =
-        config.authDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+      const actorCwd = resolve(opts.cwd);
+      const authDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
       const authPath = resolve(authDir, "auth.json");
       try {
         const auth = JSON.parse(await readFile(authPath, "utf8"));
@@ -63,9 +79,7 @@ export class OpenRouterProvider implements CodingProvider {
       const root = await mkdtemp(join(tmpdir(), "rusa-openrouter-"));
       tempPaths.push(root);
       const agent = join(root, "agent");
-      const work = join(root, "work");
       await mkdir(agent, { mode: 0o700 });
-      await mkdir(work, { mode: 0o700 });
       // Unsandboxed Pi uses the operator-managed profile directly. Workers receive
       // a read-only bind below, never a copied credential or secret-file grant.
       if (!opts.sandbox) await symlink(authPath, join(agent, "auth.json"));
@@ -127,33 +141,33 @@ export class OpenRouterProvider implements CodingProvider {
         );
         tempPaths.push(...sandbox.tempPaths);
         // The shared launcher shadows host /tmp. Rebind only this invocation's
-        // private state, then override its actor cwd to avoid Pi migrations.
-        sandbox.args.push(
-          "--bind",
-          root,
-          root,
-          "--ro-bind",
-          authPath,
-          join(agent, "auth.json"),
-          "--chdir",
-          work
-        );
+        // private Pi state. Its established actor cwd stays intact so repository
+        // discovery and durable workspace changes belong to the actor, not /tmp.
+        sandbox.args.push("--bind", root, root, "--ro-bind", authPath, join(agent, "auth.json"));
         spawnArgs = buildActorBwrapCommand(sandbox, command, args);
         command = "bwrap";
       }
       const processResult = await runSubprocess({
         command,
         args: spawnArgs,
-        cwd: work,
-        // Pi receives the operator-managed login and actor-bound MCP URLs.
-        // Empty cwd avoids Pi startup migration of the actor workspace.
+        // bwrap's own --chdir selects the same actor directory after mounts are
+        // established. Outside bwrap, launch Pi directly from that resolved cwd.
+        cwd: opts.sandbox ? "/" : actorCwd,
+        // Pi receives only its selected saved login and actor-bound MCP URLs.
         env: {
           HOME: root,
           PI_CODING_AGENT_DIR: agent,
           NODE_COMPILE_CACHE: join(root, "cache"),
           PI_SKIP_VERSION_CHECK: "1",
           PI_TELEMETRY: "0",
-          PATH: process.env.PATH,
+          // Same toolchain PATH the shared profile builds. Under bwrap the
+          // launcher's own --setenv PATH takes precedence.
+          PATH: buildToolchainPath(),
+          // HOME stays private to this invocation, which would hide the git and
+          // gh configuration the shared profile binds at the real home. Name
+          // those paths directly so pushes keep the gh credential helper.
+          GIT_CONFIG_GLOBAL: join(homedir(), ".gitconfig"),
+          GH_CONFIG_DIR: join(homedir(), ".config", "gh"),
         },
         // The actor owns invocation timing. Its deadline includes the shared
         // watchdog policy and a subprocess grace margin; an adapter-local cap
@@ -168,10 +182,10 @@ export class OpenRouterProvider implements CodingProvider {
             this.model as string,
             undefined,
             undefined,
-            undefined,
-            // Keep raw RPC/tool records private. Actor liveness starts only
-            // once Pi has admitted the prompt and emitted execution activity.
-            () => opts.onChunk?.(".")
+            // Liveness is a separate empty chunk. Pi protocol records are parsed
+            // into safe, readable output instead of showing a stream of dots.
+            () => opts.onChunk?.(""),
+            (chunk) => opts.onChunk?.(chunk)
           );
           outcome = invocation.run(opts.prompt);
         },
@@ -193,8 +207,9 @@ export class OpenRouterProvider implements CodingProvider {
       const result = await outcome;
       // Harness observations only. Do not mislabel these as subscription tokens
       // or OpenRouter billed cost. Retain across process cleanup for review.
-      const artifactDir = config.artifactDir;
-      if (artifactDir) {
+      // The receipt is diagnostic: failing to write it must not change the run.
+      try {
+        const artifactDir = join(resolveHome(), "artifacts", "openrouter");
         await mkdir(artifactDir, { recursive: true, mode: 0o700 });
         await writeFile(
           join(artifactDir, `usage-${randomUUID()}.json`),
@@ -205,6 +220,8 @@ export class OpenRouterProvider implements CodingProvider {
           ),
           { mode: 0o600, flag: "wx" }
         );
+      } catch (error) {
+        openrouterLog().warn("openrouter_usage_receipt_not_written", { err: error });
       }
       const output = result.success ? result.output : (result.reason ?? "Pi failed");
       // A duplex invocation has its own semantic outcome, but subprocess-execution
