@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -8,8 +8,9 @@ const [mode, pidFile] = process.argv.slice(2);
 
 if (mode === "--never-initialize") {
   // A synthetic upstream stuck in startup: it never answers initialize and,
-  // like any stdio server, exits once its stdin closes.
-  writeFileSync(pidFile, String(process.pid));
+  // like any stdio server, exits once its stdin closes. Each launch appends
+  // its pid, so a test can count how many children started.
+  appendFileSync(pidFile, `${process.pid}\n`);
   process.stdin.on("end", () => process.exit(0));
   process.stdin.resume();
   await new Promise(() => {});

@@ -120,6 +120,8 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
   };
 
   const launch = async (scope: Access): Promise<UpstreamSession> => {
+    // A launch queued behind one the close already ended must not replace it.
+    if (closed) throw new Error("custom MCP proxy session closed before upstream launch");
     const transport = new StdioClientTransport({
       command: configured.config.command,
       ...(configured.config.args ? { args: configured.config.args } : {}),

@@ -172,17 +172,32 @@ describe("configured host-side stdio MCP proxy", () => {
     grants.set("reader", ["glass_goals:configured-user:read"]);
     const dir = mkdtempSync(join(tmpdir(), "rusa-custom-mcp-"));
     const pidFile = join(dir, "pid");
+    const launched = () => readFileSync(pidFile, "utf8").trim().split("\n").map(Number);
+    const warn = vi.fn();
+    const logger = { warn } as unknown as Logger;
     try {
-      const client = await connect("reader", { args: [fixture, "--never-initialize", pidFile] });
-      const discovery = client.listTools().catch(() => undefined);
+      const client = await connect(
+        "reader",
+        { args: [fixture, "--never-initialize", pidFile] },
+        logger
+      );
+      // Two cold requests: the second waits behind the first child's startup.
+      const requests = [
+        client.listTools().catch(() => undefined),
+        client.callTool({ name: "read_goal" }).catch(() => undefined),
+      ];
       await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
-      const pid = Number(readFileSync(pidFile, "utf8"));
+      const [pid] = launched() as [number];
       expect(alive(pid)).toBe(true);
 
       await client.close();
       // Well inside the 30-second initialization timeout.
       await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 2_000 });
-      await discovery;
+      await Promise.all(requests);
+      // Both requests settle on the proxy side, and the queued one never
+      // starts a replacement child for the closed session.
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+      expect(launched()).toEqual([pid]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
