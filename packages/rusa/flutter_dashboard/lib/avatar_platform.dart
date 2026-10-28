@@ -1,8 +1,9 @@
 import 'dart:typed_data';
 
 /// Seam for picking a local image file to upload as an avatar . The
-/// real implementation is `WebAvatarFilePicker` (browser `<input type=file>`,
-/// in `avatar_upload_web.dart`); `DashboardStore` depends only on this
+/// real implementations are `WebAvatarFilePicker` (browser `<input type=file>`,
+/// in `avatar_upload_web.dart`) and `IoAvatarFilePicker` (the Android document
+/// picker, in `avatar_upload_io.dart`); `DashboardStore` depends only on this
 /// interface so it — and its headless tests — never import the web-only
 /// `package:web`, mirroring the `QuotaCache`/`WalkieDeps` platform splits.
 abstract interface class AvatarFilePicker {

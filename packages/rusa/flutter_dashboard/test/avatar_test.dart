@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/testing.dart';
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -103,6 +104,47 @@ DashboardStore _storeWith(FakeStream stream) {
 }
 
 void main() {
+  testWidgets('passes authenticated image headers to thumbnail and lightbox', (
+    tester,
+  ) async {
+    const id = '11111111-0000-4000-8000-000000000001';
+    final store = DashboardStore(
+      api: DashboardApi(
+        base: Uri.parse('https://dashboard.example.test'),
+        client: MockClient((_) async => throw UnimplementedError()),
+        imageHeaders: (_) => const {
+          'Origin': 'https://dashboard.example.test',
+          'Cookie': '__Host-rusa_session=session-1',
+        },
+      ),
+      stream: FakeStream(),
+    );
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(_wrap(ActorAvatar(id: id, store: store)));
+    await tester.pump();
+    NetworkImage thumbnail() =>
+        tester.widget<Image>(find.byType(Image).first).image as NetworkImage;
+    expect(thumbnail().headers, {
+      'Origin': 'https://dashboard.example.test',
+      'Cookie': '__Host-rusa_session=session-1',
+    });
+
+    await tester.tap(find.byType(ActorAvatar));
+    await tester.pump();
+    expect(find.byType(AvatarLightbox), findsOneWidget);
+    final lightboxImage = tester.widget<Image>(
+      find.descendant(
+        of: find.byType(AvatarLightbox),
+        matching: find.byType(Image),
+      ),
+    );
+    expect((lightboxImage.image as NetworkImage).headers, {
+      'Origin': 'https://dashboard.example.test',
+      'Cookie': '__Host-rusa_session=session-1',
+    });
+  });
+
   testWidgets(
     'renders a circular avatar and falls back to the silhouette placeholder',
     (tester) async {

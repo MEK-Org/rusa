@@ -148,7 +148,12 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
       }
       final session = snapshot.data;
       if (snapshot.hasError || session == null) {
-        return const _AuthStartupError();
+        final error = snapshot.error;
+        return _AuthStartupError(
+          missingDefine: error is DashboardConfigurationError
+              ? error.missingDefine
+              : null,
+        );
       }
       return _DashboardSessionHost(
         session: session,
@@ -227,7 +232,9 @@ class _DarkFrame extends StatelessWidget {
 }
 
 class _AuthStartupError extends StatelessWidget {
-  const _AuthStartupError();
+  const _AuthStartupError({this.missingDefine});
+
+  final String? missingDefine;
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -236,7 +243,10 @@ class _AuthStartupError extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.all(24),
         child: Text(
-          'Unable to connect to Rusa. Please reload and try again.',
+          missingDefine == null
+              ? 'Unable to connect to Rusa. Please reload and try again.'
+              : 'This dashboard build is missing $missingDefine. Rebuild with '
+                    '--dart-define=$missingDefine=<value>.',
           textAlign: TextAlign.center,
           style: Theme.of(context).textTheme.bodyLarge,
         ),

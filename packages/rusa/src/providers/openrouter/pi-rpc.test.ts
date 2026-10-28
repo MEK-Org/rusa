@@ -22,6 +22,7 @@ function fixture(
     disposition?: string;
     reject?: string;
     beforePromptResponse?: (invocation: PiRpcInvocation) => void;
+    onProgress?: () => void;
     maxOutputBytes?: number;
     maxRequests?: number;
   } = {}
@@ -58,7 +59,8 @@ function fixture(
     model,
     options.effort === null ? undefined : (options.effort ?? "high"),
     options.maxOutputBytes,
-    options.maxRequests
+    options.maxRequests,
+    options.onProgress
   );
   return { invocation, transport, commands };
 }
@@ -118,6 +120,22 @@ describe("Pi RPC portable invocation spike", () => {
       },
     });
     expect(await f.invocation.run("task")).toMatchObject({ success: true });
+  });
+
+  it("reports execution progress, not admission responses", async () => {
+    const onProgress = vi.fn();
+    const f = fixture({
+      onProgress,
+      beforePromptResponse(invocation) {
+        wire(invocation, { type: "turn_start" });
+      },
+    });
+
+    const { result } = await start(f);
+    await vi.waitFor(() => expect(onProgress).toHaveBeenCalledTimes(1));
+    assistant(f.invocation);
+    wire(f.invocation, { type: "agent_settled" });
+    await result;
   });
 
   it.each([
@@ -255,7 +273,11 @@ describe("Pi RPC portable invocation spike", () => {
     expect(f.invocation.cancel()).toBe(cancelled);
     await cancelled;
     wire(f.invocation, { type: "agent_settled" });
-    expect(await result).toMatchObject({ success: false, reason: "Pi invocation cancelled" });
+    expect(await result).toMatchObject({
+      success: false,
+      cancelled: true,
+      reason: "Pi invocation cancelled",
+    });
     expect(f.commands.some((c) => c.type === "clear_queue" || c.type === "abort")).toBe(false);
     expect(f.transport.close).toHaveBeenCalledOnce();
     await expect(f.invocation.run("again")).rejects.toThrow("already used");

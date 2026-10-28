@@ -18,6 +18,14 @@ class DashboardAccountSetupError implements Exception {
       'This Google account is not linked to this dashboard. Ask the dashboard administrator to check the account setup.';
 }
 
+/// A startup failure whose safe, operator-actionable detail may be rendered.
+/// Arbitrary platform and Firebase errors remain opaque to the dashboard.
+class DashboardConfigurationError implements Exception {
+  const DashboardConfigurationError(this.missingDefine);
+
+  final String missingDefine;
+}
+
 enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {
@@ -108,10 +116,12 @@ class FirebaseDashboardSession extends DashboardSession {
     this._auth, {
     http.Client? client,
     String? Function()? csrfToken,
-    void Function()? clearDashboardCaches,
+    FutureOr<void> Function()? clearDashboardCaches,
     Future<String?> Function()? applyBranding,
     Duration idleDuration = sessionIdleDuration,
-  }) : _csrfToken = csrfToken ?? (() => null),
+    Uri? baseUrl,
+  }) : _baseUrl = baseUrl,
+       _csrfToken = csrfToken ?? (() => null),
        _clearDashboardCaches = clearDashboardCaches ?? (() {}),
        _applyBranding = applyBranding ?? (() async => null),
        _idleDuration = idleDuration {
@@ -120,8 +130,12 @@ class FirebaseDashboardSession extends DashboardSession {
 
   final SessionAuth _auth;
   late final http.Client _client;
+
+  /// The server origin auth routes resolve against. Browser builds leave it
+  /// null and use the page origin; device builds pass the configured server.
+  final Uri? _baseUrl;
   final String? Function() _csrfToken;
-  final void Function() _clearDashboardCaches;
+  final FutureOr<void> Function() _clearDashboardCaches;
   final Future<String?> Function() _applyBranding;
   final Duration _idleDuration;
   StreamSubscription<SessionUser?>? _authSubscription;
@@ -235,8 +249,10 @@ class FirebaseDashboardSession extends DashboardSession {
     notifyListeners();
   }
 
+  Uri _resolve(String path) => (_baseUrl ?? Uri.base).resolve(path);
+
   Future<http.Response> _post(String path, {String? idToken}) => _client.post(
-    Uri.base.resolve('/api/auth/$path'),
+    _resolve('/api/auth/$path'),
     headers: const {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
@@ -249,7 +265,7 @@ class FirebaseDashboardSession extends DashboardSession {
   @override
   Future<void> checkSession() async {
     try {
-      final response = await _client.get(Uri.base.resolve('/api/auth/session'));
+      final response = await _client.get(_resolve('/api/auth/session'));
       if (response.statusCode == 401) await _expire();
     } catch (_) {
       // A transient check failure does not invalidate a locally restored user.
@@ -268,7 +284,9 @@ class FirebaseDashboardSession extends DashboardSession {
       );
       if (response.statusCode != 200) {
         await _auth.signOut();
-        if (response.statusCode == 409) throw const DashboardAccountSetupError();
+        if (response.statusCode == 409) {
+          throw const DashboardAccountSetupError();
+        }
         throw StateError('Sign in denied');
       }
       // A successful response only proves the server attempted to set the
@@ -276,7 +294,7 @@ class FirebaseDashboardSession extends DashboardSession {
       // the authenticated UI, otherwise HTTPS/cookie-policy failures loop on
       // the next dashboard request.
       try {
-        final check = await _client.get(Uri.base.resolve('/api/auth/session'));
+        final check = await _client.get(_resolve('/api/auth/session'));
         if (check.statusCode != 200) {
           throw StateError('Sign in session was not retained');
         }
@@ -349,7 +367,7 @@ class FirebaseDashboardSession extends DashboardSession {
     _expiring = true;
     try {
       _setError(null);
-      _clearDashboardCaches();
+      await _clearDashboardCaches();
       _idleTimer?.cancel();
       _setIdle(true);
       await _auth.signOut();

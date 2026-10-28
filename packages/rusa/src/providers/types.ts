@@ -156,11 +156,6 @@ export interface RunFailure {
    * provider was invoked.
    */
   stage?: "provider-selection";
-  /**
-   * A provider's terminal error event established temporary model capacity
-   * unavailability. This is not a quota reading or reset signal.
-   */
-  kind?: "provider-capacity";
   /** The exception's own message, without its stack. May be blank. */
   message: string;
 }

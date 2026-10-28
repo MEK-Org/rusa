@@ -81,6 +81,8 @@ export interface PiUsageObservation {
 
 export interface PiRpcOutcome {
   success: boolean;
+  /** True only when the host terminated this invocation before Pi settled it. */
+  cancelled?: true;
   reason?: string;
   output: string;
   requests: PiUsageObservation[];
@@ -107,13 +109,15 @@ export class PiRpcInvocation {
   private writeTail: Promise<void> = Promise.resolve();
   private cancellation?: Promise<void>;
   private finalStopReason?: unknown;
+  private progressBeforeAcceptance = false;
 
   constructor(
     private readonly transport: PiRpcTransport,
     private readonly model: string,
     private readonly effort?: string,
     private readonly maxOutputBytes = 1024 * 1024,
-    private readonly maxRequests = 1000
+    private readonly maxRequests = 1000,
+    private readonly onProgress?: () => void
   ) {
     if (
       !Number.isSafeInteger(maxOutputBytes) ||
@@ -195,6 +199,10 @@ export class PiRpcInvocation {
         throw new PiAdmissionError("Pi did not start submitted prompt");
       }
       this.accepted = true;
+      if (this.progressBeforeAcceptance) {
+        this.progressBeforeAcceptance = false;
+        this.onProgress?.();
+      }
       this.maybeFinish();
     } catch (error) {
       // Command failure text is untrusted and may contain credentials or prompt data.
@@ -255,6 +263,7 @@ export class PiRpcInvocation {
       this.finish(false, "Pi emitted work before prompt admission");
       return;
     }
+    this.reportExecutionProgress();
     if (
       record.type === "extension_error" ||
       (record.type === "message_update" &&
@@ -339,6 +348,12 @@ export class PiRpcInvocation {
     );
   }
 
+  /** Emits only execution activity after Pi has accepted the submitted prompt. */
+  private reportExecutionProgress(): void {
+    if (this.accepted) this.onProgress?.();
+    else this.progressBeforeAcceptance = true;
+  }
+
   /** Called by the host for malformed output, startup/exit failure or deadline. */
   fail(reason = "Pi subprocess ended before settlement"): void {
     this.finish(false, reason);
@@ -350,12 +365,12 @@ export class PiRpcInvocation {
   cancel(): Promise<void> {
     if (!this.cancellation) {
       this.cancellation = Promise.resolve();
-      this.finish(false, "Pi invocation cancelled");
+      this.finish(false, "Pi invocation cancelled", true);
     }
     return this.cancellation;
   }
 
-  private finish(success: boolean, reason?: string): void {
+  private finish(success: boolean, reason?: string, cancelled = false): void {
     if (this.phase === "done") return;
     this.phase = "done";
     for (const request of this.pending.values())
@@ -367,6 +382,12 @@ export class PiRpcInvocation {
       success = false;
       reason = "Pi transport cleanup failed";
     }
-    this.finishRun?.({ success, reason, output: this.output, requests: this.requests });
+    this.finishRun?.({
+      success,
+      ...(cancelled ? { cancelled: true } : {}),
+      reason,
+      output: this.output,
+      requests: this.requests,
+    });
   }
 }

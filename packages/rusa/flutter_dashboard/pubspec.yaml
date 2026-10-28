@@ -46,6 +46,8 @@ dependencies:
   # Renders the operator-supplied antler/tree SVG brand mark (issue #412) in
   # the dashboard header; Flutter's built-in Image has no SVG support.
   flutter_svg: ^2.2.0
+  # The Android avatar upload picker (#1171); the browser uses <input type=file>.
+  file_selector: ^1.1.0
   # Resizable sidebars (#897). The fork glass goals uses; declared exactly as
   # goals_widgets declares it, since pub needs one description per package.
   multi_split_view:
@@ -64,6 +66,16 @@ dependencies:
     path: ../../../third_party/glass_goals_devkit/packages/goals_ui_core
   goals_widgets:
     path: ../../../third_party/glass_goals_devkit/packages/goals_widgets
+  google_sign_in: ^7.2.0
+  # Android walkie mode (voice_io.dart): microphone capture, announcement
+  # playback, the screen wake lock, and the recorder's scratch directory.
+  record: ^6.2.1
+  audioplayers: ^6.7.1
+  wakelock_plus: ^1.7.0
+  path_provider: ^2.1.6
+  # Retains the server session and CSRF cookies across Android process restart
+  # using Android Keystore-backed encryption; never use regular preferences.
+  flutter_secure_storage: ^11.2.0
 
 # goals_widgets declares these overrides, but pub IGNORES a non-root package's
 # dependency_overrides — so the root (this app) must replicate them or resolution
@@ -84,6 +96,8 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   fake_async: ^1.3.3
+  # voice_io_test.dart answers the wake lock's pigeon channel with its codec.
+  wakelock_plus_platform_interface: ^1.6.0
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -91,6 +105,11 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  google_sign_in_android: ^7.2.11
+  firebase_core_platform_interface: ^8.1.1
+  firebase_auth_platform_interface: ^9.1.0
+  # The avatar picker test answers this plugin's platform channel directly.
+  file_selector_android: ^0.5.2+6
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

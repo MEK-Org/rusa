@@ -521,8 +521,7 @@ while every branch outside the refspec silently stops advancing, so reads off
 When you change code: work on a branch namespaced to you (e.g.
 \`rusa/${shortId}/<short-topic>\`) so you never collide, commit, push, and open a PR
 with your tools. Your charter defines the scope — it may span several repos or
-several PRs. Don't touch the user's live working trees or anything outside your
-directory.${mountNotice}`;
+several PRs.${mountNotice}`;
   return `${trackerWritingGuidance(generateHandle(ctx.threadId))}
 
 ${buildWorkerScaffold(ctx)}
