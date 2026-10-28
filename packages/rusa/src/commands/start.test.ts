@@ -54,6 +54,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
@@ -3267,6 +3268,768 @@ describe("runStart webhook event routing (Phase 4)", () => {
           priority: "responsive",
         }),
       ]);
+    });
+  });
+
+  describe("execution boundary characterization (#1176)", () => {
+    // Characterizes the current local and follower execution boundaries as
+    // composed by `runStart`: real Actor or ActorHandle claimant, production
+    // lifecycle listeners, the inbox MCP `select`, and the SQLite retry
+    // budget. Only the provider (local) or follower wire (remote) is faked.
+    // See docs/execution-boundaries.md.
+    const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const ok: RunResult = { success: true, exitCode: 0, output: "returned" };
+
+    type RunRow = {
+      id: string;
+      outcome: string | null;
+      success: number | null;
+      abandonReason: string | null;
+      focus: string[] | null;
+    };
+    const runRows = (actorId: string): RunRow[] =>
+      (
+        getDb()
+          .prepare(
+            `SELECT id, outcome, success, abandon_reason, focus_entry_ids_json
+             FROM actor_runs WHERE actor_id = ? ORDER BY started_at, rowid`
+          )
+          .all(actorId) as Array<{
+          id: string;
+          outcome: string | null;
+          success: number | null;
+          abandon_reason: string | null;
+          focus_entry_ids_json: string | null;
+        }>
+      ).map((row) => ({
+        id: row.id,
+        outcome: row.outcome,
+        success: row.success,
+        abandonReason: row.abandon_reason,
+        focus: row.focus_entry_ids_json ? (JSON.parse(row.focus_entry_ids_json) as string[]) : null,
+      }));
+    const budget = (actorId: string): Record<string, number> =>
+      Object.fromEntries(getRepositories().actorRuns.completedFocusEntryCounts(actorId));
+    const unhandled = (actorId: string): string[] =>
+      getRepositories()
+        .inbox.list(actorId, { status: "unhandled" })
+        .entries.map((entry) => entry.id);
+    const exhaustionNotes = (parentId: string, childId: string): string[] =>
+      getRepositories()
+        .inbox.list(parentId, { status: "all" })
+        .entries.map((entry) => entry.payload?.note)
+        .filter(
+          (note): note is string =>
+            typeof note === "string" &&
+            note.startsWith(`[inbox recovery exhausted] Child ${childId} `)
+        );
+    const runEvents = (actorId: string) =>
+      getRepositories()
+        .meshEvents.listEventsByActors([actorId], {
+          limit: 100,
+          kinds: ["run_start", "run_end", "run_abandoned"],
+        })
+        .events.map((event) => ({ kind: event.kind, detail: event.detail, success: event.success }))
+        .reverse();
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 300));
+
+    const callInbox = async (
+      url: string,
+      name: string,
+      args: Record<string, unknown>
+    ): Promise<CallToolResult> => {
+      const client = new Client({ name: "execution-boundary-test", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        return (await client.callTool({ name, arguments: args })) as CallToolResult;
+      } finally {
+        await client.close();
+      }
+    };
+
+    /** The production inbox endpoint every worker factory receives. */
+    const inboxUrls = new Map<string, string>();
+    const select = (actorId: string, entryIds: string[]) => {
+      const url = inboxUrls.get(actorId);
+      if (!url) throw new Error(`no inbox endpoint for ${actorId}`);
+      return callInbox(url, "select", { entry_ids: entryIds });
+    };
+    const recordInbox = (context: ActorFactoryContext, options: ActorOptions): void => {
+      const url = options.mcpServers.find((server) => server.name === "inbox")?.url;
+      if (!url) throw new Error("worker factory received no inbox endpoint");
+      inboxUrls.set(context.record.id, url);
+    };
+
+    const boot = async (
+      createWorkerActor: (
+        context: ActorFactoryContext,
+        options: ActorOptions
+      ) => Actor | ActorHandle
+    ): Promise<ActorMesh> => {
+      let mesh: ActorMesh | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            createWorkerActor,
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("execution boundary mesh did not start");
+      return mesh;
+    };
+    /** Stop the service and reopen the same RUSA_HOME, as a process restart does. */
+    const restart = async (
+      createWorkerActor: (
+        context: ActorFactoryContext,
+        options: ActorOptions
+      ) => Actor | ActorHandle
+    ): Promise<ActorMesh> => {
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      closeDb();
+      return boot(createWorkerActor);
+    };
+    const spawnWorker = (mesh: ActorMesh, executionTarget?: string): string =>
+      mesh.spawn({
+        charter: "execution boundary worker",
+        parentId: rootId,
+        modelConfig: selected,
+        ...(executionTarget ? { executionTarget } : {}),
+      });
+    const deliver = (mesh: ActorMesh, workerId: string, body: string): string => {
+      const before = new Set(unhandled(workerId));
+      mesh.sendMessage(workerId, body, rootId);
+      const [entryId] = unhandled(workerId).filter((id) => !before.has(id));
+      if (!entryId) throw new Error("work was not delivered");
+      return entryId;
+    };
+    /** Fail exactly the next terminal write through the production repository. */
+    const failNextTerminalWrite = (): void => {
+      const realComplete = ActorRunRepository.prototype.complete;
+      let failed = false;
+      const spy = vi.spyOn(ActorRunRepository.prototype, "complete");
+      onTestFinished(() => spy.mockRestore());
+      spy.mockImplementation(function (this: ActorRunRepository, ...args) {
+        if (!failed) {
+          failed = true;
+          throw new Error("injected terminal accounting write failure");
+        }
+        return realComplete.apply(this, args);
+      });
+    };
+
+    describe("local Actor", () => {
+      type Turn = (runIndex: number) => Promise<RunResult>;
+      let turns: Turn[] = [];
+      let providerRuns = 0;
+      let live = new Set<string>();
+
+      beforeEach(() => {
+        turns = [];
+        providerRuns = 0;
+        live = new Set();
+        inboxUrls.clear();
+        // Only scripted workers reach the real Actor scheduler; root and any
+        // other actor keep the suite's recording double.
+        vi.mocked(Actor.prototype.requestRun).mockRestore();
+        const realRequestRun = Actor.prototype.requestRun;
+        vi.spyOn(Actor.prototype, "requestRun").mockImplementation(function (this: Actor, nudge) {
+          requestRunCalls.push({ actorId: this.id, reason: "requestRun" });
+          if (live.has(this.id)) realRequestRun.call(this, nudge);
+        });
+      });
+
+      const localWorker = (context: ActorFactoryContext, options: ActorOptions): Actor => {
+        recordInbox(context, options);
+        return new Actor({
+          ...options,
+          resolveProvider: (config) => ({
+            name: "scripted",
+            providerName: config.provider,
+            model: config.model,
+            run: async () => {
+              const index = providerRuns++;
+              const turn = turns[index];
+              if (!turn) throw new Error(`unscripted provider run ${index}`);
+              return turn(index);
+            },
+          }),
+        });
+      };
+      const providerRunsSettleAt = async (count: number): Promise<void> => {
+        await vi.waitFor(() => expect(providerRuns).toBe(count), { timeout: 10_000 });
+        await settle();
+        expect(providerRuns).toBe(count);
+      };
+      const selecting =
+        (actorId: () => string, entryIds: () => string[], result: RunResult = ok): Turn =>
+        async () => {
+          const selection = await select(actorId(), entryIds());
+          if (selection.isError) throw new Error(JSON.stringify(selection.content));
+          return result;
+        };
+
+      it("gives selected unhandled work one recovery after a successful return, then exhausts it", async () => {
+        const mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        let entry = "";
+        turns = [
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+        ];
+        entry = deliver(mesh, workerId, "boundary work");
+
+        await providerRunsSettleAt(2);
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({ [entry]: 2 });
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toHaveLength(1);
+      });
+
+      it("keeps one run identity from queue through the durable row", async () => {
+        const seen: Array<[string, string]> = [];
+        let entry = "";
+        const mesh = await boot((context, options) => {
+          context.lifecycle.add({
+            onQueued: (event) => {
+              seen.push(["queued", event.runId]);
+            },
+            onStart: (event) => {
+              seen.push(["start", event.runId]);
+            },
+            onEnd: (event) => {
+              seen.push([event.terminal.kind, event.runId]);
+            },
+          });
+          return localWorker(context, options);
+        });
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        turns = [async () => ok];
+        entry = deliver(mesh, workerId, "identity work");
+
+        await providerRunsSettleAt(1);
+        const [row] = runRows(workerId);
+        expect(seen).toEqual([
+          ["queued", row?.id],
+          ["start", row?.id],
+          ["result", row?.id],
+        ]);
+        expect(unhandled(workerId)).toEqual([entry]);
+      });
+
+      it("exhausts the configured root's selected work without a parent notice", async () => {
+        const mesh = await boot(localWorker);
+        const senderId = spawnWorker(mesh);
+        live.add(rootId);
+        let entry = "";
+        turns = [
+          selecting(
+            () => rootId,
+            () => [entry]
+          ),
+          selecting(
+            () => rootId,
+            () => [entry]
+          ),
+        ];
+        const before = new Set(unhandled(rootId));
+        mesh.sendMessage(rootId, "root work", senderId);
+        entry = unhandled(rootId).find((id) => !before.has(id)) ?? "";
+
+        await providerRunsSettleAt(2);
+        expect(runRows(rootId)).toEqual([
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+        ]);
+        expect(budget(rootId)).toEqual({ [entry]: 2 });
+        expect(unhandled(rootId)).toContain(entry);
+        const notes = [rootId, senderId].flatMap((actorId) =>
+          getRepositories()
+            .inbox.list(actorId, { status: "all" })
+            .entries.map((item) => String(item.payload?.note ?? ""))
+        );
+        expect(notes.filter((note) => note.startsWith("[inbox recovery exhausted]"))).toEqual([]);
+      });
+
+      it("neither schedules nor spends recovery for work a successful return never selected", async () => {
+        const mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        turns = [async () => ok];
+        const entry = deliver(mesh, workerId, "unselected work");
+
+        await providerRunsSettleAt(1);
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({ outcome: "completed", success: 1, focus: null }),
+        ]);
+        expect(budget(workerId)).toEqual({});
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toEqual([]);
+      });
+
+      it("keeps per-entry budgets across a mixed selection", async () => {
+        const mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        let first = "";
+        let second = "";
+        turns = [
+          selecting(
+            () => workerId,
+            () => [first]
+          ),
+          // The first entry is now exhausted, the second still owns its one
+          // recovery, so the mixed return schedules another opportunity.
+          selecting(
+            () => workerId,
+            () => [first, second]
+          ),
+          selecting(
+            () => workerId,
+            () => [second]
+          ),
+        ];
+        first = deliver(mesh, workerId, "first work");
+        second = deliver(mesh, workerId, "second work");
+
+        await providerRunsSettleAt(3);
+        expect(runRows(workerId).map((row) => row.focus)).toEqual([
+          [first],
+          [first, second],
+          [second],
+        ]);
+        expect(budget(workerId)).toEqual({ [first]: 2, [second]: 2 });
+        expect(unhandled(workerId).sort()).toEqual([first, second].sort());
+        const notes = exhaustionNotes(rootId, workerId);
+        expect(notes).toHaveLength(2);
+        expect(notes.filter((note) => note.includes(first))).toHaveLength(1);
+        expect(notes.filter((note) => note.includes(second))).toHaveLength(1);
+      });
+
+      it("does not recover selected work after a failed provider return", async () => {
+        const mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        let entry = "";
+        turns = [
+          selecting(
+            () => workerId,
+            () => [entry],
+            { success: false, exitCode: 1, output: "provider failed" }
+          ),
+        ];
+        entry = deliver(mesh, workerId, "failing work");
+
+        await providerRunsSettleAt(1);
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({ outcome: "completed", success: 0, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({});
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toEqual([]);
+      });
+
+      it("books a pre-start abandonment without a run row, provider call or budget", async () => {
+        let workerId = "";
+        let entry = "";
+        const mesh = await boot((context, options) => {
+          // The queued opportunity loses its work before admission, so the
+          // Actor's admission check cancels the start it already announced.
+          context.lifecycle.add({
+            onQueued: () => {
+              getRepositories().inbox.markHandled(
+                workerId,
+                [entry],
+                undefined,
+                "handled elsewhere"
+              );
+            },
+          });
+          return localWorker(context, options);
+        });
+        workerId = spawnWorker(mesh);
+        live.add(workerId);
+        entry = deliver(mesh, workerId, "withdrawn work");
+
+        await vi.waitFor(() =>
+          expect(runEvents(workerId)).toContainEqual(
+            expect.objectContaining({ kind: "run_abandoned", detail: "start-cancelled" })
+          )
+        );
+        await settle();
+        expect(providerRuns).toBe(0);
+        expect(runRows(workerId)).toEqual([]);
+        expect(runEvents(workerId).map((event) => event.kind)).toEqual(["run_abandoned"]);
+        expect(budget(workerId)).toEqual({});
+      });
+
+      it("keeps a halted dispatch out of admission, run history and the budget", async () => {
+        new HaltSwitch(join(homeDir, "HALT")).halt("execution boundary halt");
+        const mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        const entry = deliver(mesh, workerId, "halted work");
+
+        await settle();
+        expect(providerRuns).toBe(0);
+        expect(runRows(workerId)).toEqual([]);
+        expect(runEvents(workerId)).toEqual([]);
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(budget(workerId)).toEqual({});
+      });
+
+      // CURRENT BEHAVIOR, NOT A CONTRACT (#1176): one failed terminal write
+      // leaves the in-memory claim and the open row naming the first run.
+      // Every later run then executes without a row of its own, selects onto
+      // that stale row, and is again given a recovery, so the one-recovery
+      // bound no longer holds. The script stops the loop with a failed return.
+      it("characterizes recovery after a local terminal accounting write failure", async () => {
+        const mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        let entry = "";
+        turns = [
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          async () => ({ success: false, exitCode: 1, output: "script stops the loop" }),
+        ];
+        failNextTerminalWrite();
+        entry = deliver(mesh, workerId, "accounting failure work");
+
+        await providerRunsSettleAt(4);
+        const rows = runRows(workerId);
+        expect(rows).toEqual([
+          expect.objectContaining({ outcome: null, success: null, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({});
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toEqual([]);
+        expect(runEvents(workerId).filter((event) => event.kind === "run_end")).toHaveLength(4);
+      });
+
+      it("keeps exhaustion across a restart after normal completion", async () => {
+        let mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        let entry = "";
+        turns = [
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+        ];
+        entry = deliver(mesh, workerId, "restart work");
+        await providerRunsSettleAt(2);
+
+        mesh = await restart(localWorker);
+        expect(mesh.get(workerId)).toBeInstanceOf(Actor);
+        await settle();
+        expect(providerRuns).toBe(2);
+        expect(budget(workerId)).toEqual({ [entry]: 2 });
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toHaveLength(1);
+      });
+
+      it("restores a full budget on restart after a local terminal accounting write failure", async () => {
+        let mesh = await boot(localWorker);
+        const workerId = spawnWorker(mesh);
+        live.add(workerId);
+        let entry = "";
+        turns = [
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          async () => ({ success: false, exitCode: 1, output: "script stops the loop" }),
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+          selecting(
+            () => workerId,
+            () => [entry]
+          ),
+        ];
+        failNextTerminalWrite();
+        entry = deliver(mesh, workerId, "restart accounting work");
+        await providerRunsSettleAt(2);
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({ outcome: null, focus: [entry] }),
+        ]);
+
+        mesh = await restart(localWorker);
+        await providerRunsSettleAt(4);
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({
+            outcome: "abandoned",
+            abandonReason: "service restarted before run completion",
+            focus: [entry],
+          }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({ [entry]: 2 });
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toHaveLength(1);
+      });
+    });
+
+    describe("follower ActorHandle", () => {
+      let follower: RemoteInstance | undefined;
+      beforeEach(() => {
+        follower = undefined;
+        inboxUrls.clear();
+      });
+
+      const remoteWorker = (context: ActorFactoryContext, options: ActorOptions): ActorHandle => {
+        recordInbox(context, options);
+        follower ??= new RemoteInstance("boundary-follower", process.platform, process.pid);
+        return new ActorHandle({
+          host: follower.createHost(context.record.id),
+          bootstrap: {
+            id: context.record.id,
+            cwd: options.cwd,
+            modelConfig: [...options.modelConfig],
+          },
+          context,
+          actorOptions: options,
+          snapshot: () => {
+            const record = context.getRecord();
+            if (!record) throw new Error("execution boundary follower record missing");
+            return {
+              record,
+              prompt: "execution boundary follower",
+              mcpServers: options.mcpServers,
+            };
+          },
+          saveSession: () => {},
+          onFailure: () => {},
+        });
+      };
+      const remote = (): RemoteInstance => {
+        if (!follower) throw new Error("follower worker was not constructed");
+        return follower;
+      };
+      /** Leader-to-follower wake commands: the follower's recovery opportunities. */
+      const wakes = (actorId: string): number =>
+        remote().commands.filter(
+          (command) =>
+            "actorId" in command && command.actorId === actorId && command.message.type === "wake"
+        ).length;
+      const wakesSettleAt = async (actorId: string, count: number): Promise<void> => {
+        await vi.waitFor(() => expect(wakes(actorId)).toBe(count));
+        await settle();
+        expect(wakes(actorId)).toBe(count);
+      };
+      const eventCount = (actorId: string, kind: string): number =>
+        runEvents(actorId).filter((event) => event.kind === kind).length;
+      const send = (
+        actorId: string,
+        message: Parameters<RemoteInstance["receive"]>[0]["message"]
+      ): void => {
+        remote().receive({ actorId, message });
+      };
+      /** Play one follower run: start, optionally select through the leader, then return. */
+      const playRun = async (
+        actorId: string,
+        entryIds: string[] | null,
+        result: RunResult = ok
+      ): Promise<void> => {
+        const starts = eventCount(actorId, "run_start");
+        const ends = eventCount(actorId, "run_end");
+        send(actorId, { type: "runStart", responsive: false, runId: randomUUID(), selected });
+        await vi.waitFor(() => expect(eventCount(actorId, "run_start")).toBe(starts + 1));
+        if (entryIds) {
+          const selection = await select(actorId, entryIds);
+          if (selection.isError) throw new Error(JSON.stringify(selection.content));
+        }
+        send(actorId, { type: "result", result });
+        await vi.waitFor(() => expect(eventCount(actorId, "run_end")).toBe(ends + 1));
+      };
+      const readyWorker = async (mesh: ActorMesh): Promise<string> => {
+        const workerId = spawnWorker(mesh, "boundary-follower");
+        send(workerId, { type: "ready", pid: 4242 });
+        return workerId;
+      };
+
+      it("gives selected unhandled work one recovery wake after a successful return, then exhausts it", async () => {
+        const mesh = await boot(remoteWorker);
+        const workerId = await readyWorker(mesh);
+        const entry = deliver(mesh, workerId, "follower work");
+        await wakesSettleAt(workerId, 1);
+
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({ [entry]: 2 });
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toHaveLength(1);
+      });
+
+      it("books a follower pre-start abandonment without a run row or budget", async () => {
+        const mesh = await boot(remoteWorker);
+        const workerId = await readyWorker(mesh);
+        const entry = deliver(mesh, workerId, "follower withdrawn work");
+        await wakesSettleAt(workerId, 1);
+
+        send(workerId, {
+          type: "queued",
+          runId: randomUUID(),
+          mode: "ordinary",
+          responsive: false,
+        });
+        send(workerId, {
+          type: "abandoned",
+          abandon: { reason: "start-cancelled", started: false },
+        });
+        await vi.waitFor(() => expect(eventCount(workerId, "run_abandoned")).toBe(1));
+        await wakesSettleAt(workerId, 1);
+
+        expect(runRows(workerId)).toEqual([]);
+        expect(runEvents(workerId).map((event) => event.kind)).toEqual(["run_abandoned"]);
+        expect(budget(workerId)).toEqual({});
+        expect(unhandled(workerId)).toEqual([entry]);
+      });
+
+      it("books a started follower abandonment as abandoned, outside the budget", async () => {
+        const mesh = await boot(remoteWorker);
+        const workerId = await readyWorker(mesh);
+        const entry = deliver(mesh, workerId, "follower coalesced work");
+        await wakesSettleAt(workerId, 1);
+
+        send(workerId, { type: "runStart", responsive: false, runId: randomUUID(), selected });
+        await vi.waitFor(() => expect(eventCount(workerId, "run_start")).toBe(1));
+        expect((await select(workerId, [entry])).isError).toBeFalsy();
+        send(workerId, { type: "abandoned", abandon: { reason: "coalesced", started: true } });
+        await vi.waitFor(() => expect(eventCount(workerId, "run_abandoned")).toBe(1));
+        await wakesSettleAt(workerId, 1);
+
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({
+            outcome: "abandoned",
+            abandonReason: "coalesced",
+            focus: [entry],
+          }),
+        ]);
+        expect(eventCount(workerId, "run_end")).toBe(0);
+        expect(budget(workerId)).toEqual({});
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toEqual([]);
+      });
+
+      // CURRENT BEHAVIOR, NOT A CONTRACT (#1176): the follower path shares the
+      // leader's accounting listener, so one failed terminal write unbounds
+      // recovery here exactly as it does locally.
+      it("characterizes recovery after a leader terminal accounting write failure", async () => {
+        const mesh = await boot(remoteWorker);
+        const workerId = await readyWorker(mesh);
+        const entry = deliver(mesh, workerId, "follower accounting work");
+        await wakesSettleAt(workerId, 1);
+        failNextTerminalWrite();
+
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 3);
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 4);
+
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({ outcome: null, success: null, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({});
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toEqual([]);
+      });
+
+      it("restores a full budget on leader restart after a terminal accounting write failure", async () => {
+        let mesh = await boot(remoteWorker);
+        const workerId = await readyWorker(mesh);
+        const entry = deliver(mesh, workerId, "follower restart work");
+        await wakesSettleAt(workerId, 1);
+        failNextTerminalWrite();
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+        // A failed return stops the loop before restart.
+        await playRun(workerId, [entry], { success: false, exitCode: 1, output: "stop" });
+        await wakesSettleAt(workerId, 2);
+
+        follower = undefined;
+        mesh = await restart(remoteWorker);
+        expect(mesh.get(workerId)).toBeInstanceOf(ActorHandle);
+        send(workerId, { type: "ready", pid: 4243 });
+        await wakesSettleAt(workerId, 1);
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+
+        expect(runRows(workerId)).toEqual([
+          expect.objectContaining({
+            outcome: "abandoned",
+            abandonReason: "service restarted before run completion",
+            focus: [entry],
+          }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+          expect.objectContaining({ outcome: "completed", success: 1, focus: [entry] }),
+        ]);
+        expect(budget(workerId)).toEqual({ [entry]: 2 });
+        expect(exhaustionNotes(rootId, workerId)).toHaveLength(1);
+      });
+
+      it("keeps exhaustion across a leader restart after normal completion", async () => {
+        let mesh = await boot(remoteWorker);
+        const workerId = await readyWorker(mesh);
+        const entry = deliver(mesh, workerId, "follower exhausted work");
+        await wakesSettleAt(workerId, 1);
+        await playRun(workerId, [entry]);
+        await playRun(workerId, [entry]);
+        await wakesSettleAt(workerId, 2);
+
+        follower = undefined;
+        mesh = await restart(remoteWorker);
+        send(workerId, { type: "ready", pid: 4243 });
+        await wakesSettleAt(workerId, 0);
+        expect(budget(workerId)).toEqual({ [entry]: 2 });
+        expect(unhandled(workerId)).toEqual([entry]);
+        expect(exhaustionNotes(rootId, workerId)).toHaveLength(1);
+      });
     });
   });
 
