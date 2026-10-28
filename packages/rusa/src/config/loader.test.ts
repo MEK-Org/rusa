@@ -74,6 +74,13 @@ describe("loadConfig customMcpServers", () => {
     );
   });
 
+  it("accepts a read-only server", () => {
+    const readOnly = { glass_goals: { ...customMcpServers.glass_goals, writeTools: [] } };
+    expect(loadConfig(writeConfig({ customMcpServers: readOnly })).customMcpServers).toEqual(
+      readOnly
+    );
+  });
+
   it.each([
     [{ glass_goals: { ...customMcpServers.glass_goals, userId: "caller:chosen" } }, /colon-free/],
     [
@@ -87,7 +94,10 @@ describe("loadConfig customMcpServers", () => {
       /not supported/,
     ],
     [{ GlassGoals: customMcpServers.glass_goals }, /capability name/],
-    [{ tracker: customMcpServers.glass_goals }, /must not shadow a built-in MCP server name/],
+    [
+      { glass_goals: { ...customMcpServers.glass_goals, readTools: [], writeTools: [] } },
+      /at least one tool/,
+    ],
   ])("rejects unsafe or ambiguous custom MCP configuration", (customMcpServers, message) => {
     expect(() => loadConfig(writeConfig({ customMcpServers }))).toThrow(message);
   });

@@ -28,7 +28,6 @@ import {
   type InstanceRole,
   type PeerConfig,
   type QuotaThrottleConfig,
-  RESERVED_MCP_SERVER_NAMES,
   type RusaConfig,
 } from "./types.js";
 
@@ -684,9 +683,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
           `${source} capability name must use lowercase letters, digits, or underscores`
         );
       }
-      if (RESERVED_MCP_SERVER_NAMES.has(capability)) {
-        throw new Error(`${source} must not shadow a built-in MCP server name`);
-      }
       if (typeof server !== "object" || server === null || Array.isArray(server)) {
         throw new Error(`${source} must be a mapping`);
       }
@@ -722,14 +718,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         const tools = server[key];
         if (
           !Array.isArray(tools) ||
-          tools.length === 0 ||
           tools.some((tool) => typeof tool !== "string" || !/^[A-Za-z0-9_.-]+$/.test(tool))
         ) {
-          throw new Error(`${source}.${key} must be a non-empty array of MCP tool names`);
+          throw new Error(`${source}.${key} must be an array of MCP tool names`);
         }
         if (new Set(tools).size !== tools.length) {
           throw new Error(`${source}.${key} must not contain duplicate tool names`);
         }
+      }
+      if (server.readTools.length + server.writeTools.length === 0) {
+        throw new Error(`${source} must list at least one tool in readTools or writeTools`);
       }
       if (server.readTools.some((tool) => server.writeTools.includes(tool))) {
         throw new Error(`${source} must classify each tool as read or write, not both`);

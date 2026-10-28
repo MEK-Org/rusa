@@ -1,8 +1,14 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { CustomMcpServerConfig } from "../config/types.js";
+import { type Logger, serializeError } from "../observability/logger.js";
 import { toolError } from "./result.js";
 
 const UPSTREAM_TIMEOUT_MS = 30_000;
@@ -24,6 +30,25 @@ export interface CustomStdioMcpOptions {
   actorId: string;
   server: ConfiguredCustomMcpServer;
   activeCapabilities: (actorId: string) => readonly string[];
+  logger?: Logger;
+}
+
+class NotGrantedError extends Error {}
+
+/**
+ * The access one grant confers on a configured server: `read` or `write` for
+ * exactly `<capability>:<configured-user-id>:read|write`, otherwise nothing.
+ * The mesh refuses any other shape at grant time; this re-check covers a row
+ * left behind by a later change to the configured user.
+ */
+export function customGrantAccess(
+  grant: string,
+  server: ConfiguredCustomMcpServer
+): Access | undefined {
+  const prefix = `${server.capability}:${server.config.userId}:`;
+  if (!grant.startsWith(prefix)) return undefined;
+  const permission = grant.slice(prefix.length);
+  return permission === "read" || permission === "write" ? permission : undefined;
 }
 
 function activeAccess(
@@ -32,20 +57,26 @@ function activeAccess(
   activeCapabilities: (actorId: string) => readonly string[]
 ): Set<Access> {
   const access = new Set<Access>();
-  const prefix = `${server.capability}:`;
-  for (const capability of activeCapabilities(actorId)) {
-    if (!capability.startsWith(prefix)) continue;
-    const [userId, permission, ...rest] = capability.slice(prefix.length).split(":");
-    if (userId !== server.config.userId || rest.length !== 0) continue;
-    if (permission === "read" || permission === "write") access.add(permission);
+  for (const grant of activeCapabilities(actorId)) {
+    const permission = customGrantAccess(grant, server);
+    if (permission) access.add(permission);
   }
   return access;
 }
 
+// A write grant includes reads: a writer has to find the node it changes.
 function permits(access: ReadonlySet<Access>, classification: Access): boolean {
   return classification === "read"
     ? access.has("read") || access.has("write")
     : access.has("write");
+}
+
+// The actor sees a bounded category; the operator log keeps the full error.
+function failureReason(error: unknown, signal?: AbortSignal): string {
+  if (signal?.aborted) return "cancelled";
+  if (error instanceof McpError && error.code === ErrorCode.RequestTimeout) return "timed out";
+  if (error instanceof McpError) return `returned protocol error ${error.code}`;
+  return "unavailable";
 }
 
 /**
@@ -54,37 +85,37 @@ function permits(access: ReadonlySet<Access>, classification: Access): boolean {
  * direct upstream endpoint: it sees only the standard local HTTP MCP server.
  */
 export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpServer {
-  const { actorId, server: configured, activeCapabilities } = options;
+  const { actorId, server: configured, activeCapabilities, logger } = options;
   const classifications = new Map<string, Access>([
     ...configured.config.readTools.map((name) => [name, "read"] as const),
     ...configured.config.writeTools.map((name) => [name, "write"] as const),
   ]);
   let upstream: UpstreamSession | undefined;
+  // Every launch decision runs behind the previous one, so concurrent calls on
+  // a cold session share one child instead of each spawning and orphaning one.
+  let pending: Promise<unknown> = Promise.resolve();
+  let closed = false;
 
-  const closeUpstream = async (): Promise<void> => {
-    const current = upstream;
-    upstream = undefined;
-    if (!current) return;
+  const closeSession = async (session: UpstreamSession): Promise<void> => {
     try {
-      await current.client.close();
+      await session.client.close();
     } catch {
       // Client close is best effort; the transport close below owns the child cleanup.
     }
     try {
-      await current.transport.close();
+      await session.transport.close();
     } catch {
       // The transport has a bounded termination sequence of its own.
     }
   };
 
-  const ensureUpstream = async (required: Access): Promise<UpstreamSession> => {
-    const access = activeAccess(actorId, configured, activeCapabilities);
-    if (!permits(access, required)) {
-      throw new Error(`custom MCP capability ${configured.capability} is not currently granted`);
-    }
-    const scope = access.has("write") ? "write" : "read";
-    if (upstream?.scope === scope) return upstream;
-    await closeUpstream();
+  const closeUpstream = async (): Promise<void> => {
+    const current = upstream;
+    upstream = undefined;
+    if (current) await closeSession(current);
+  };
+
+  const launch = async (scope: Access): Promise<UpstreamSession> => {
     const transport = new StdioClientTransport({
       command: configured.config.command,
       ...(configured.config.args ? { args: configured.config.args } : {}),
@@ -95,17 +126,57 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
         RUSA_MCP_USER_ID: configured.config.userId,
         RUSA_MCP_SCOPE: scope,
       },
-      stderr: "pipe",
+      // stdout carries the protocol, so stderr is the upstream's only log.
+      // Inheriting it lands diagnostics in the service log and can never fill
+      // an undrained pipe and stall the child.
+      stderr: "inherit",
     });
     const client = new Client({ name: "rusa-custom-mcp-proxy", version: "0.1.0" });
+    const session: UpstreamSession = { client, transport, scope };
     try {
-      await client.connect(transport);
-    } catch {
-      await transport.close().catch(() => undefined);
-      throw new Error("custom MCP upstream unavailable");
+      await client.connect(transport, { timeout: UPSTREAM_TIMEOUT_MS });
+    } catch (error) {
+      await closeSession(session);
+      throw error;
     }
-    upstream = { client, transport, scope };
-    return upstream;
+    if (closed) {
+      // The downstream session ended while this child was starting.
+      await closeSession(session);
+      throw new Error("custom MCP proxy session closed during upstream launch");
+    }
+    // A child that exits on its own is not reused: the next call relaunches.
+    client.onclose = () => {
+      if (upstream === session) upstream = undefined;
+    };
+    upstream = session;
+    return session;
+  };
+
+  const ensureUpstream = (required: Access): Promise<UpstreamSession> => {
+    const next = pending.then(async () => {
+      const access = activeAccess(actorId, configured, activeCapabilities);
+      if (!permits(access, required)) {
+        throw new NotGrantedError(`${configured.capability} is not currently granted`);
+      }
+      const scope = access.has("write") ? "write" : "read";
+      if (upstream?.scope === scope) return upstream;
+      // A scope change ends calls still in flight on the old child; the
+      // upstream never continues with a stale launch scope.
+      await closeUpstream();
+      return launch(scope);
+    });
+    pending = next.catch(() => undefined);
+    return next;
+  };
+
+  const logFailure = (operation: string, error: unknown, tool?: string): void => {
+    logger?.warn("custom_mcp_upstream_failed", {
+      actorId,
+      capability: configured.capability,
+      operation,
+      ...(tool ? { tool } : {}),
+      error: serializeError(error),
+    });
   };
 
   const proxy = new McpServer(
@@ -115,6 +186,7 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
   // StreamableHTTPServerTransport closes this protocol when its downstream
   // session goes away, which in turn terminates the private stdio child.
   proxy.server.onclose = () => {
+    closed = true;
     void closeUpstream();
   };
 
@@ -131,9 +203,10 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
             permits(access, classifications.get(tool.name) as Access)
         ),
       };
-    } catch {
-      // Tool discovery is not authorization. Do not reveal upstream failures,
-      // names, resources, or prompts to an actor that cannot use this surface.
+    } catch (error) {
+      // Discovery is not authorization: the actor sees an empty surface, and
+      // the operator log says why a granted actor has no tools.
+      if (!(error instanceof NotGrantedError)) logFailure("list_tools", error);
       return { tools: [] };
     }
   });
@@ -154,8 +227,12 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
         undefined,
         { signal: extra.signal, timeout: UPSTREAM_TIMEOUT_MS }
       );
-    } catch {
-      return toolError("custom MCP upstream unavailable");
+    } catch (error) {
+      if (error instanceof NotGrantedError) {
+        return toolError("custom MCP tool is not currently granted");
+      }
+      logFailure("call_tool", error, request.params.name);
+      return toolError(`custom MCP upstream ${failureReason(error, extra.signal)}`);
     }
   });
   return proxy;

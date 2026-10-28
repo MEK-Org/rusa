@@ -293,47 +293,18 @@ export interface CustomMcpServerConfig {
   args?: string[];
   /** Optional host working directory for the process. */
   cwd?: string;
-  /** Fixed external graph identity accepted by this configured server. */
+  /**
+   * Fixed external graph identity accepted by this configured server. This is
+   * the upstream process's launch binding and is independent of
+   * `understanding.glassGoals.username`, which configures Rusa's own
+   * Integrated Understanding store.
+   */
   userId: string;
-  /** Tool names this server may expose for a read grant. */
+  /** Tool names a read or write grant may call. */
   readTools: string[];
-  /** Tool names this server may expose for a write grant. */
+  /** Tool names only a write grant may call. */
   writeTools: string[];
 }
-
-/**
- * Names already emitted into a provider's MCP map. A configured custom server
- * must never replace one of these endpoints by sharing its provider-facing
- * name.
- */
-export const RESERVED_MCP_SERVER_NAMES = new Set([
-  "mesh",
-  "brief",
-  "chat-read",
-  "chat-write",
-  "dashboard-timing",
-  "inbox",
-  "mesh-chat-read",
-  "obligations",
-  "pnpm-install",
-  "quota",
-  "repo",
-  "slack-read",
-  "slack-write",
-  "tracker",
-  "understanding",
-  "understanding-write",
-  "distiller",
-  "e2e-instance",
-  "email-send",
-  "host-jobs",
-  "calendar-read",
-  "calendar-write",
-  "drive-read",
-  "quota-manual",
-  "update",
-  "pnpm-hardlinks",
-]);
 
 export interface UnderstandingMountConfig {
   /**
