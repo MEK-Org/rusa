@@ -1,146 +1,154 @@
-# Instance-owned execution prototype
+# Instance-owned execution draft
 
-This is the executable architecture sketch commissioned in
-[#1020](https://github.com/MEK-Org/rusa/issues/1020#issuecomment-6472108373).
-It explores the revised responsibility boundary from
-[the design discussion](https://github.com/MEK-Org/rusa/issues/1020#issuecomment-6471920617).
-It is a draft for evaluating the shape, not a replacement implementation ready
-to merge. Tests are untouched and no mesh review is requested.
+This draft changes the real follower startup and remote-actor path, following
+[the prototype request](https://github.com/MEK-Org/rusa/issues/1020#issuecomment-6472108373)
+and [the clarification to modify real code](https://github.com/MEK-Org/rusa/issues/1020#issuecomment-6472650796).
+The earlier isolated sketch has been removed. Tests are untouched; no mesh
+review or merge is requested. This is for assessing the responsibility boundary.
 
-The main change is **where the existing coordinator lives**. An execution
-instance gets an ordinary `ActorMesh`, hence its existing `RunManager` and
-`Actor` machinery, over its own SQLite inbox and run records. The leader can
-supply quota observations initially. Each executor owns the pacing clocks,
-admission, prompt assembly, run lifecycle and selected-work recovery. There is
-no per-run reserve/prepare/commit exchange with the leader.
+The main change is **where the existing coordinator lives**. `rusa start` on a
+follower now composes an ordinary `ActorMesh`, its existing `RunManager` and
+`Actor`, over its own SQLite inbox, sessions, focus and run records. The leader
+supplies cached pacing information initially. Each executor owns admission,
+prompt assembly, subprocess lifecycle and selected-work recovery. A leader
+acknowledgement does not admit or finish a run.
 
 ```mermaid
 flowchart LR
-  Control["Global control owner\nhierarchy · obligations · grants · placement"]
-  Control -->|installed metadata + quota observations| Executor
-  subgraph Executor[Execution instance]
-    Inbox[Local durable inbox] --> Runs[Existing RunManager + Actor]
-    Runs --> Local[Local runs · prompts · sessions · recovery counts]
+  Leader[Global control owner] -->|installed actor snapshot + pacing observations| Follower
+  Leader -->|small inbox events| Inbox
+  subgraph Follower[Execution instance]
+    Inbox[Local SQLite inbox] --> Runs[Existing RunManager + Actor]
+    Runs --> Records[Local prompts · output · sessions · recovery counts]
+    Runs --> Tools[Local inbox and message MCPs]
   end
-  Origin[Entity owner] -->|small ordinary event| Inbox
-  Executor -->|explicit authorized entity fetch| Origin
-  Runs -. ordinary failure event to parent .-> Parent[Parent's execution instance]
-  Viewer[Dashboard consumer] -. explicit snapshot/detail read .-> Executor
+  Tools -->|explicit authorized read, then cache| Origin[Message owner]
+  Runs -. ordinary failure message event .-> Parent[Parent execution owner]
+  Viewer[Interested consumer] -. explicit executionRead .-> Follower
 ```
 
-## Read the code in this order
+## Read the diff in this order
 
-1. [`PrototypeInstance` construction](../../../packages/rusa/src/remote-instances/prototype/instance.ts)
-   composes the existing local runtime. The local `completedFocusEntryCounts`
-   callback is the important recovery boundary: receipt delivery is not an
-   input. `submitPoolGate` and `ProviderPacer` are also existing primitives;
-   there is no second scheduler implementation.
-2. `receive` commits a small reference-bearing event to the destination inbox.
-   The existing SQLite append handles duplicates and sends an advisory local
-   wake after commit. A transport ACK would acknowledge that receipt, not a
-   run's completion.
-3. `sendMessage`, `serveMessage` and `readMessage` show a body stored on its
-   origin, an event with a source reference, and an explicit authorized fetch
-   into the recipient's local cache. Uncached content is unavailable while
-   its origin is offline; a received notification still remains durable.
-4. The local lifecycle subscriber stores run results. Success queues no leader
-   message. Failure queues an ordinary parent notification containing only a
-   run reference and failure status. Its delivery does not settle the run.
-5. [`demo.ts`](../../../packages/rusa/src/remote-instances/prototype/demo.ts)
-   composes two instances with separate real SQLite databases and deterministic
-   providers. Peer transport is an in-process queue with an offline switch.
+1. [`commands/start-follower.ts`](../../../packages/rusa/src/commands/start-follower.ts)
+   composes `ExecutionInstance` over this host's execution repositories and a
+   loopback MCP server, then connects it to the existing `FollowerInstance`
+   poll loop. Installed work is resumed locally before registration. Opening
+   the local database reconciles interrupted open runs.
+2. [`execution-instance.ts`](../../../packages/rusa/src/remote-instances/execution-instance.ts)
+   supplies the existing local runtime with local provider admission, prompt
+   construction, sessions, inbox MCP selection/handling, run accounting and
+   `completedFocusEntryCounts`. The lifecycle stores results here. Failure
+   uses the existing `routeRunFailure`; its diagnostic stays in a local
+   message body, and its small ordinary event is addressed to the parent.
+   Success sends no mandatory run-end event.
+3. [`actor-projection.ts`](../../../packages/rusa/src/remote-instances/actor-projection.ts)
+   replaces the leader's `ActorHandle` for a peer that negotiates this path.
+   It installs control snapshots and hands off event references. It holds no
+   admission ticket, run id, provider reservation or completion acknowledgement.
+   `executionRead` obtains a timestamped state snapshot; it is a read, not a
+   settlement operation.
+4. [`e2e-adapter.ts`](../../../packages/rusa/src/remote-instances/e2e-adapter.ts)
+   is also the production worker factory. The existing leader `start.ts`
+   wires its inbox and pacing observations into the projection. The legacy
+   handle/runtime remain for peers that do not negotiate instance execution.
+5. [`follower-hub.ts`](../../../packages/rusa/src/remote-instances/follower-hub.ts)
+   negotiates the additive draft capability, samples leader pacing at most
+   once per 20 seconds, and routes ordinary instance events. The authenticated
+   peer must own the sender; the sender must have the recipient handle or
+   parent relationship. Incoming message envelopes are reconstructed without
+   bodies. Explicit message reads check the requester is hosted on the peer
+   and the origin checks participation in the message.
+6. [`execution-actor-repository.ts`](../../../packages/rusa/src/remote-instances/execution-actor-repository.ts)
+   stores installed foreign parent/address-book references in the existing
+   versioned cache. The `actors` table has local foreign keys: copying a child
+   alone otherwise requires copying its remote tree too. This small adapter
+   avoids inventing peer actors or granting a follower global hierarchy writes.
+   No schema or migration is changed.
 
-The new instance wrapper is an isolated composition root, analogous to the
-current follower composition, rather than a new runtime abstraction. It exists
-to make this ownership boundary readable without rewriting the daemon first.
+## Event and entity boundary
 
-## Run it
+The ordinary message notification carries its event identity, recipient,
+source, timestamp, message id, origin instance, priority and delivery role.
+It carries no message body, prompt or output. SQLite commits and deduplicates
+it before the advisory local scheduling notification.
 
-From the repository root, with the submodule initialized and dependencies installed:
+The message owner stores the body. `mesh-chat-read.get_message`, with the
+origin instance from the inbox reference, reads it explicitly. On a follower,
+the fetched result is cached under an origin-qualified key and checked against
+its id and participants. A received event remains durable when its origin is
+offline; uncached content is unavailable until that origin can answer. This is
+[the accepted tradeoff](https://github.com/MEK-Org/rusa/issues/1020#issuecomment-6471920617).
 
-```sh
-pnpm --filter rusa exec tsup src/remote-instances/prototype/demo.ts --no-config --format esm --out-dir dist/instance-prototype --external better-sqlite3
-node packages/rusa/dist/instance-prototype/demo.js
-```
+The follower's existing authenticated poll/event channel transports these
+operations. No direct peer database access is introduced. The capability is
+advertised by `rusa start`; the standalone legacy follower entry point stays on
+the legacy path. A leader needs an explicit `instance.id` to advertise the
+new execution capability, so message origins have a stable configured name.
 
-It creates disposable databases under a fresh temporary directory and prints
-that directory in `demo_artifacts`. It never reads an installed instance's
-configuration or state, connects to a provider, or invokes an external CLI.
-The existing migration runner initializes these empty databases; no migration
-or schema is added or changed by this prototype.
+## Observed validation
 
-The structured output shows these scenarios:
+A disposable synthetic harness exercised the actual `composeFollowerStart`,
+`FollowerHub`, `ActorProjection` and `FollowerInstance`, separate leader/follower
+SQLite databases, and the production loopback inbox/message MCP servers. Its
+provider was synthetic: it invoked MCPs and returned outcomes without starting
+an external provider CLI. The harness was not added to the test suite.
 
-| Record | What to inspect |
-| --- | --- |
-| `demo_finished_without_leader` | One completed executor run, zero unhandled entries, zero outgoing completion events while the leader is unreachable. |
-| `demo_next_run_without_leader` | A second completed run under the same local coordinator, still without contacting the leader. |
-| `demo_uncached_body_offline` | The inbox notification remains, its body is not cached, and failure queues an ordinary small parent event. |
-| `demo_body_fetched_after_reconnect` | An explicit fetch caches the body; local reconciliation then handles the retained work. |
-| `demo_recovery_budget_after_recreation` | The deliberately unhandled selection reaches two successful returns locally. Recreating the coordinator over the same database preserves that count and does not grant another retry. |
+[The sanitized observations](observations.json) record:
 
-Delivery deliberately repeats every event; inbox deduplication prevents a
-second durable copy. Eager message caching in the first two scenarios is
-explicit demo setup, not default event content. The successful provider's
-result includes the bodies it actually read, retained in the local database.
+- Two received notifications completed in two local runs after the leader
+  gateway was closed during the first run. Local pending work became zero;
+  the leader recorded zero runs. The handoff used only `quota`, `install`,
+  `inbox`, `wake` and `executionRead` commands.
+- A body fetched before disconnect remained readable from the local cache.
+  The other, uncached body could not be fetched while the origin was offline.
+- A later failed local run stored its diagnostic locally and queued one
+  ordinary `mesh.message` event for the parent, containing a message reference
+  and no diagnostic text.
+- A deliberately unhandled selected entry reached two successful local
+  returns and remained unhandled. Restarting actual follower composition over
+  the same database, without connecting to the leader, preserved that count
+  and launched no extra retry.
 
-## What would change in the daemon
-
-| Current boundary | Proposed boundary illustrated here |
-| --- | --- |
-| `start.ts` creates leader-side scheduling for remote actors; `actor-runtime.ts` asks the leader for `beforeRun`, `admit`, provider-attempt acknowledgement and completion. | Shared local runtime composition on either role. `start-follower.ts` supplies local stores and local actor-scoped tools instead of per-run RPC callbacks. |
-| Leader inbox and run state drive remote execution. | Execution-owner inbox and run state drive execution. Global control state remains owned by its control service; installed metadata is a local read model. |
-| A peer session participates in launch and completion bookkeeping. | Peer sessions carry ordinary event delivery, explicit reads and control operations. Losing a session changes availability, not a provider's observed termination. |
-| Remote execution sends prompts/output or completion metadata to satisfy coordination. | Local retention, with small events only for interested consumers and explicit reads for content. Success needs no mandatory leader event. |
-| Central scheduling owns quota reservations. | Initially the leader supplies quota observations; local pacers own starts. Observations are neither reservations nor a promise about other CLI usage. |
-
-`snapshot()` is a bounded owner-side read showing how the dashboard can ask for
-current state. It carries observation timestamps and no output. A production
-overview would use cached snapshots with freshness/offline markers and refresh
-asynchronously. Details query their owner, and live output is a separate
-on-demand stream. This prototype implements neither dashboard wiring nor the
-projection cache.
+TypeScript checking and bundling the changed startup/worker paths were also
+run. No tests were added, edited or run. Synthetic startup does not establish
+real-provider, desktop or sandbox behavior.
 
 ## Deliberate gaps
 
-- **No daemon activation:** normal `start`, the current follower path and
-  #1119 remain unchanged. The source is reached only through the command above.
-  There is no negotiated wire change or N/N−1 compatibility implementation.
-- **Transport:** the demo's outgoing queue is in memory. It does not survive a
-  process crash, and storing a body plus enqueueing its event is not atomic.
-  A durable ordinary-event outbox and authenticated, bounded ingress are still
-  required; that delivery problem must not become a run-completion protocol.
-  This demo does not establish network, retry, ACK or process-restart safety.
-- **Control authority:** `install` is a manually supplied static snapshot, not
-  a replicated global store or an actor API. No actor MCP tools are mounted.
-  The reused mesh's mutable global APIs must not be exposed over this cache.
-  Authority refresh, placement changes, new global mutations and stale-grant
-  policy need integration. Offline autonomy cannot promise immediate remote
-  revocation; the sketch does not decide that policy implicitly.
-- **Quota:** observations contain only an illustrative derived pacing interval.
-  There is no new scrape endpoint, production quota codec, exhaustion/halt
-  handling, model-lane normalization, freshness policy or persistence of the
-  observation. The last interval stays in memory while disconnected; after
-  recreation this demo starts without one. Full quota policy belongs in the
-  shared local composition, with its source replaceable by local scraping.
-- **Entities:** only message bodies have fetch/cache wiring. Run references
-  show the same shape, but run detail reads, owner-keyed cache identity,
-  integrity checks, retention, fetch cancellation and live output are not
-  implemented. The demo trusts its synthetic transport's requester identity.
-- **Lifecycle:** the existing common actor implements runs and interruption,
-  and local selected-work counters are real. Synthetic providers launch no
-  subprocess. Crash/open-run reconciliation, token accounting, sandbox and
-  desktop locks, native/portable context parity, attributed writes and MCP
-  lifecycle composition are not demonstrated. The reused mesh still contains
-  singleton-backed token accounting, which must become owner-local before
-  this composition can serve real providers. Cross-instance exhausted-work
-  escalation also needs to use ordinary delivery; this sketch only forwards
-  provider failures. No termination/recovery guarantee is inferred from a
-  peer disconnect.
+- **Delivery:** the existing outgoing follower queue is still in memory and
+  clears on leader-incarnation changes. Storing a body and enqueueing its event
+  is not atomic. Leader-to-follower delivery replays retained source inbox
+  copies; handled state is not yet projected back, so the leader's inbox view
+  remains stale. A durable ordinary-event outbox and projection reconciliation
+  remain work; neither should turn back into run-completion acknowledgement.
+- **Control and tools:** installed actor metadata is a control snapshot, not
+  global authority. This draft mounts local inbox and message tools only.
+  Global obligations, attribution of external writes, brief/ledger tools and
+  state, full spawn/retire/admin tools, grants, reply-handle introductions,
+  placement transitions and remote recovery-clearance tools are not integrated.
+  It does not decide a fresh-grant or disconnected-revocation policy implicitly.
+- **Quota:** the leader supplies derived per-candidate pacing intervals, not
+  account reservations. `observedAt` is the sampling time of that cached view.
+  Full provider/model lane sharing, exhaustion/halt responses, quota freshness,
+  persistence of observations and local scraping remain incomplete. A restarted
+  executor currently starts without its old pacing observation. This draft
+  makes no shared-account allocation guarantee.
+- **Context and accounting:** native sessions and recent local output are
+  wired. Portable brief/ledger parity, pending configuration transitions,
+  token-accounting parity, crash timing and local accounting-write failures
+  still need validation. The small metadata adapter is not an approved final
+  storage design.
+- **Reads and dashboard:** message fetch/cache is the implemented example.
+  Run-detail reads, leader-side remote-message caching, overview refresh and
+  freshness/offline presentation, event subscriptions and the separate live
+  output stream remain unimplemented. The current projection can be stale;
+  this draft does not claim dashboard correctness or appearance acceptance.
+- **Compatibility:** capability negotiation retains the legacy path. Mixed
+  releases, downgrade after local installation, reconnect/incarnation replay,
+  protocol hardening and update/drain parity have not been established. Do not
+  infer those guarantees from the successful synthetic run.
 
-Moving all state into a managed database would change persistence without
-settling execution ownership. Keeping the existing per-run distributed
-handshake would preserve the coordination boundary this prototype is meant to
-reconsider. This sketch therefore reuses the local runtime and makes the
-remaining transport/control work explicit rather than completing either of
-those alternatives.
+Moving to a managed database would change persistence without deciding execution
+ownership. Keeping the old per-run handshake would retain the responsibility
+boundary being reconsidered. This draft instead changes the real composition
+while reusing the existing local runtime and exposing the unfinished seams.

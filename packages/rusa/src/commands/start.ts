@@ -3103,6 +3103,31 @@ async function composeStart(
       logger: log,
       triggerStore: followerTriggerStore,
       allowedFollowerIds,
+      ...(identity.instanceId
+        ? {
+            instanceExecution: {
+              instanceId: identity.instanceId,
+              actor: (id) => actors.get(id),
+              inbox: inboxStore,
+              message: (id) => getRepositories().meshChat.getById(id),
+              quota: (followerId) =>
+                actors
+                  .list()
+                  .filter((record) => record.executionConfig?.executionTarget === followerId)
+                  .flatMap((record) =>
+                    (record.modelConfig ?? []).map((entry) => ({
+                      provider: entry.provider,
+                      model: entry.model,
+                      observedAt: new Date().toISOString(),
+                      intervalMs: candidatePacerFor(
+                        providerThrottleKey(entry.provider, config),
+                        entry.model
+                      ).governingInterval,
+                    }))
+                  ),
+            },
+          }
+        : {}),
     });
     await followerHub.listen(config.followers.bind, config.followers.port);
     const hub = followerHub;
@@ -3115,7 +3140,19 @@ async function composeStart(
   }
 
   const followerWorkerFactory = followerHub
-    ? instanceWorkerFactory(config, followerHub, { logger: log })
+    ? instanceWorkerFactory(config, followerHub, {
+        logger: log,
+        inbox: inboxStore,
+        leaderInstanceId: identity.instanceId,
+        quota: (record) =>
+          (record.modelConfig ?? []).map((entry) => ({
+            provider: entry.provider,
+            model: entry.model,
+            observedAt: new Date().toISOString(),
+            intervalMs: candidatePacerFor(providerThrottleKey(entry.provider, config), entry.model)
+              .governingInterval,
+          })),
+      })
     : undefined;
   const createWorkerActor = opts?.e2e?.createWorkerActor ?? followerWorkerFactory;
   // The mesh is built before the configured voice client. The closure keeps
@@ -3834,7 +3871,24 @@ async function composeStart(
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
-          createMeshChatMcpServer(getRepositories().meshChat, id)
+          createMeshChatMcpServer(
+            {
+              getById: (messageId) => getRepositories().meshChat.getById(messageId),
+              listForActor: (actorId, options) =>
+                getRepositories().meshChat.listForActor(actorId, options),
+              ...(followerHub
+                ? {
+                    readRemote: (
+                      ref: import("../remote-instances/protocol.js").InstanceEntityRef
+                    ) => {
+                      if (!followerHub) throw new Error("Instance entity reads unavailable");
+                      return followerHub.readMessage(id, ref);
+                    },
+                  }
+                : {}),
+            },
+            id
+          )
         );
         const pnpmInstallUrl = mcpHttp.addServer(`${id}:${PNPM_INSTALL_MCP_NAME}`, () =>
           createPnpmInstallMcpServer(

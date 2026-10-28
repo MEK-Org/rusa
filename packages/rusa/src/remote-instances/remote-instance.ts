@@ -12,6 +12,7 @@ import type {
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
   FollowerUpdateStatusPhase,
+  InstanceEntityRef,
   LeaderCommand,
   MaterialReadReply,
 } from "./protocol.js";
@@ -248,6 +249,17 @@ export class RemoteInstance {
   private readonly fileOps = new Map<string, PendingFileOp>();
   /** Set when this generation offered bounded execution and the hub echoed it (#1020). */
   boundedExecution = false;
+  ownsExecution = false;
+  lastQuotaSentAt = 0;
+  private readonly entityReads = new Map<
+    string,
+    {
+      actorId: string;
+      resolve: (value: unknown) => void;
+      reject: (err: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   private readonly materialReads = new Map<string, PendingMaterialRead>();
 
   constructor(
@@ -474,6 +486,25 @@ export class RemoteInstance {
     pending.resolve(parseMaterialReadReply(message.result, pending.request));
   }
 
+  /** Explicit owner-authorized entity read; ordinary runs never call this. */
+  entityRead(requesterId: string, ref: InstanceEntityRef): Promise<unknown> {
+    if (!this.ownsExecution) return Promise.reject(new Error("Instance entity reads unsupported"));
+    if (this.entityReads.size >= 16) return Promise.reject(new Error("Instance entity reads busy"));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.entityReads.delete(requestId);
+        reject(new Error("Entity origin unavailable"));
+      }, 5000);
+      timer.unref();
+      this.entityReads.set(requestId, { actorId: requesterId, resolve, reject, timer });
+      this.enqueueCommand({
+        actorId: requesterId,
+        message: { type: "entityRead", requestId, requesterId, ref },
+      });
+    });
+  }
+
   receive(event: {
     actorId: string;
     message:
@@ -502,6 +533,15 @@ export class RemoteInstance {
         };
         this.setUpdateStatus(status);
       }
+      return;
+    }
+    if (event.message.type === "entityReadResult") {
+      const pending = this.entityReads.get(event.message.requestId);
+      if (!pending || pending.actorId !== event.actorId) return;
+      this.entityReads.delete(event.message.requestId);
+      clearTimeout(pending.timer);
+      if (event.message.error) pending.reject(new Error(event.message.error));
+      else pending.resolve(event.message.value);
       return;
     }
     if (event.message.type === "fileOpResult") {
@@ -564,6 +604,11 @@ export class RemoteInstance {
       );
     }
     this.materialReads.clear();
+    for (const pending of this.entityReads.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Entity origin disconnected"));
+    }
+    this.entityReads.clear();
   }
 }
 
