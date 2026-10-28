@@ -4,6 +4,7 @@ import type { ActorRecord } from "../actor/actor-record.js";
 import type { ActorRunMode, RunNudge } from "../actor/trigger-runner.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
+import type { InboxPayload } from "../repositories/inbox-repository.js";
 
 /** Existing follower gateway request-body bound, including the JSON envelope. */
 export const FOLLOWER_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -43,6 +44,28 @@ export interface BoundedExecutionCapability {
   version: 1;
 }
 export const BOUNDED_EXECUTION_CAPABILITY: BoundedExecutionCapability = { version: 1 };
+
+/** Draft #1020: installed actors use this instance's ordinary coordinator. */
+export const INSTANCE_EXECUTION_CAPABILITY = { version: 1 } as const;
+export interface QuotaObservation {
+  provider: string;
+  model?: string;
+  observedAt: string;
+  intervalMs: number;
+}
+export interface InstanceEntityRef {
+  instance: string;
+  kind: "message" | "run";
+  id: string;
+}
+/** Serializable inbox notification; entity content is fetched explicitly. */
+export interface InstanceInboxEvent {
+  id: string;
+  actorId: string;
+  source: string;
+  deliveredAt: string;
+  payload: InboxPayload;
+}
 
 /** One fragment of an event transfer, posted to `/events/transfer`. */
 export interface EventTransferFragment {
@@ -221,6 +244,11 @@ export interface FollowerFileOperationResult {
 }
 
 export type LeaderCommand =
+  | { type: "install"; record: ActorRecord }
+  | { type: "inbox"; entries: InstanceInboxEvent[] }
+  | { type: "quota"; observations: QuotaObservation[] }
+  | { type: "executionRead" }
+  | { type: "entityRead"; requestId: string; requesterId: string; ref: InstanceEntityRef }
   | { type: "init"; bootstrap: Bootstrap }
   /** Replace the follower Actor's next-run pool without resetting its runtime. */
   | {
@@ -269,6 +297,9 @@ export type MaterialReadReply =
   | { status: "error"; error: string };
 
 export type ActorEvent =
+  | { type: "inboxEvent"; fromId: string; entry: InstanceInboxEvent }
+  | { type: "entityReadResult"; requestId: string; value?: unknown; error?: string }
+  | { type: "executionSnapshot"; observedAt: string; state: ActorRuntimeState }
   | { type: "ready"; pid: number }
   /** The follower's observed outcome of a leader preemption request. */
   | {

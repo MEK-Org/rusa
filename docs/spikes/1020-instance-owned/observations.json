@@ -1,0 +1,54 @@
+{
+  "scope": "Disposable synthetic providers; actual follower startup, HTTP and MCP boundaries; no external provider CLI",
+  "observations": [
+    {
+      "firstBody": "synthetic body 2"
+    },
+    {
+      "beforeDisconnect": {
+        "localPending": 2,
+        "leaderRuns": 0,
+        "localCompleted": 0
+      }
+    },
+    {
+      "cachedOfflineBody": "synthetic body 2"
+    },
+    {
+      "uncachedOfflineBodyUnavailable": true
+    },
+    {
+      "afterDisconnect": {
+        "providerCalls": 2,
+        "localCompleted": 2,
+        "localPending": 0,
+        "leaderCompleted": 0,
+        "commands": ["quota", "install", "inbox", "wake", "executionRead"]
+      }
+    },
+    {
+      "ordinaryFailure": {
+        "events": 1,
+        "type": "mesh.message",
+        "entityKind": "message",
+        "containsDiagnostic": false,
+        "parentNotified": true,
+        "storedLocally": true
+      }
+    },
+    {
+      "recovery": {
+        "providerCalls": 5,
+        "completedFocusCount": 2,
+        "unhandled": 1
+      }
+    },
+    {
+      "offlineRestart": {
+        "providerCalls": 5,
+        "completedFocusCount": 2,
+        "unhandled": 1
+      }
+    }
+  ]
+}
