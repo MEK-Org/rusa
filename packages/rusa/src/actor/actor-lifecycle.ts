@@ -1,5 +1,6 @@
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import type { RunResult } from "../providers/types.js";
+import type { RunTokenUsage } from "../providers/token-accounting.js";
+import type { RunResult, RunTermination } from "../providers/types.js";
 import type { InjectRecord } from "./portable-context.js";
 import type { ActorRunMode } from "./trigger-runner.js";
 
@@ -36,6 +37,11 @@ export interface ActorLifecycleStartEvent extends ActorLifecycleQueuedEvent {
    * (#1020): `host` is the follower that started it, where they are read from.
    */
   material?: { version: 1; host: string };
+  /**
+   * The execution instance that owes this run a durable terminal receipt
+   * (#1020). Absent for local runs and for hosts that did not negotiate one.
+   */
+  durableHost?: string;
 }
 
 /** Internal observation only: never added to mesh_events or run logs. */
@@ -52,11 +58,40 @@ export interface ActorLifecycleErrorEvent extends ActorLifecycleRunEvent {
   error: unknown;
 }
 
-export type ActorLifecycleAbandonmentReason = "start-cancelled" | "coalesced" | "unreported";
+/**
+ * `host-unavailable` and `termination-unresolved` are leader-side only
+ * (#1020): the leader released its claim on a receipt-backed remote run
+ * without observed termination, because the host went away or reported a
+ * result whose provider exit nobody observed. Its outcome is unknown, not
+ * failed; only the host's durable receipt records a terminal.
+ */
+export type ActorLifecycleAbandonmentReason =
+  | "start-cancelled"
+  | "coalesced"
+  | "unreported"
+  | "host-unavailable"
+  | "termination-unresolved";
 
 export type ActorLifecycleTerminal =
   | { kind: "result"; result: RunResult }
-  | { kind: "abandoned"; reason: ActorLifecycleAbandonmentReason; started: boolean };
+  | {
+      kind: "abandoned";
+      reason: ActorLifecycleAbandonmentReason;
+      started: boolean;
+      /**
+       * Termination evidence from the provider call this run settled, if it
+       * settled one (#1119). Absent means nothing observed a provider end.
+       */
+      termination?: RunTermination;
+      /**
+       * Set by the leader when this releases a receipt-backed remote run's
+       * claim with its termination unresolved (#1119 ruling): both durable
+       * rows stay open for the host's receipt, and `cause` is diagnosis,
+       * never an outcome. `tokenUsage` is what the provider reported before
+       * that unproven end: consumption so far, not final usage.
+       */
+      unresolved?: { cause: string; tokenUsage?: RunTokenUsage };
+    };
 
 export interface ActorLifecycleEndEvent extends ActorLifecycleRunEvent {
   /** Every queued run has exactly one terminal event, including an abandonment. */

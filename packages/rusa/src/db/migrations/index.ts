@@ -57,6 +57,7 @@ import { configuredActorImport } from "./0060_configured_actor_import.js";
 import { portableBriefRevisions } from "./0062_portable_brief_revisions.js";
 import { meshChatResponsive } from "./0063_mesh_chat_responsive.js";
 import { metricSamples } from "./0064_metric_samples.js";
+import { instanceRunReceipts } from "./0065_instance_run_receipts.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -126,4 +127,5 @@ export const migrations: Migration[] = [
   portableBriefRevisions,
   meshChatResponsive,
   metricSamples,
+  instanceRunReceipts,
 ];

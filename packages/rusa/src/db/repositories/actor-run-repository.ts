@@ -221,13 +221,18 @@ export class ActorRunRepository {
     if (result.changes !== 1) throw new Error(`active actor run not found: ${id}`);
   }
 
-  /** Close runs left open by a prior process before admitting new work. */
+  /**
+   * Close runs left open by a prior process before admitting new work. A
+   * remote run started under the receipt contract (#1020) is not this
+   * process's to close: its executing host reports the terminal, and until
+   * then its outcome is unknown rather than abandoned.
+   */
   abandonOpen(reason: string, endedAt = new Date().toISOString()): number {
     return this.db
       .prepare(
         `UPDATE actor_runs
          SET ended_at = ?, outcome = 'abandoned', abandon_reason = ?
-         WHERE outcome IS NULL`
+         WHERE outcome IS NULL AND id NOT IN (SELECT run_id FROM instance_runs)`
       )
       .run(endedAt, reason).changes;
   }
@@ -295,16 +300,24 @@ export class ActorRunRepository {
    * Count successful completed runs by selected inbox entry for one actor.
    * The grouped read is the durable retry budget: callers may exclude the
    * terminal row they are currently processing so lifecycle listener ordering
-   * cannot affect whether one recovery remains.
+   * cannot affect whether one recovery remains. A receipt-backed run counts
+   * only from its successful transport return (`instance_runs.returned_at`),
+   * never from its receipt (#1119): a withheld receipt cannot grant extra
+   * recoveries, and a receipt that closes a run whose return was never seen
+   * spends nothing.
    */
   completedFocusEntryCounts(actorId: string, excludeRunId?: string): ReadonlyMap<string, number> {
     const rows = this.db
       .prepare(
         `SELECT json_each.value AS entry_id, COUNT(DISTINCT r.id) AS run_count
-         FROM actor_runs r, json_each(r.focus_entry_ids_json)
+         FROM actor_runs r
+         JOIN json_each(r.focus_entry_ids_json)
+         LEFT JOIN instance_runs i ON i.run_id = r.id
          WHERE r.actor_id = ?
-           AND r.outcome = 'completed'
-           AND r.success = 1
+           AND CASE
+             WHEN i.run_id IS NULL THEN r.outcome = 'completed' AND r.success = 1
+             ELSE i.returned_at IS NOT NULL
+           END
            AND (? IS NULL OR r.id != ?)
          GROUP BY json_each.value`
       )

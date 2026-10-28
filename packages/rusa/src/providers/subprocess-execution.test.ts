@@ -327,3 +327,84 @@ describe("runSubprocess helper-level unit coverage ", () => {
     expect(result.abortReason).toBe(STALL_WATCHDOG_ABORT_REASON);
   });
 });
+
+describe("runSubprocess termination evidence (#1119)", () => {
+  beforeEach(() => {
+    vi.spyOn(process, "kill").mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const config = {
+    command: "mock-command",
+    args: [],
+    cwd: "/mock-cwd",
+    timeoutMs: 1000,
+    buildKilledResult: (attribution: TerminationAttribution) => ({
+      success: false,
+      output: attribution.output,
+      exitCode: attribution.exitCode,
+    }),
+    buildSignalResult: (attribution: TerminationAttribution) => ({
+      success: false,
+      output: attribution.output,
+      exitCode: attribution.exitCode,
+    }),
+    buildExitResult: (output: string, exitCode: number) => ({
+      success: exitCode === 0,
+      output,
+      exitCode,
+    }),
+    buildSpawnErrorResult: (err: Error) => ({ success: false, output: err.message, exitCode: -1 }),
+  };
+  const spawned = () => {
+    const child = new MockChild();
+    spawnFn.mockReturnValue(child as unknown as ChildProcessWithoutNullStreams);
+    return child;
+  };
+
+  it("is observed only when the direct child's close settles the run", async () => {
+    const exited = spawned();
+    const exit = runSubprocess(config);
+    exited.emit("close", 3, null);
+    expect(await exit).toMatchObject({ exitCode: 3, termination: "observed" });
+
+    const signalled = spawned();
+    const signal = runSubprocess(config);
+    signalled.emit("close", null, "SIGSEGV");
+    expect((await signal).termination).toBe("observed");
+  });
+
+  it("is unproven on timeout, even when close follows the settled run", async () => {
+    vi.useFakeTimers();
+    const child = spawned();
+    const run = runSubprocess({ ...config, timeoutMs: 50 });
+    vi.advanceTimersByTime(50);
+    child.emit("close", null, "SIGKILL");
+    expect((await run).termination).toBe("unproven");
+  });
+
+  it("is unproven on abort", async () => {
+    const child = spawned();
+    const controller = new AbortController();
+    const run = runSubprocess({ ...config, signal: controller.signal });
+    controller.abort(RUN_CEILING_ABORT_REASON);
+    child.emit("close", null, "SIGKILL");
+    expect((await run).termination).toBe("unproven");
+  });
+
+  it("is unproven on a child error event and on a spawn that throws", async () => {
+    const child = spawned();
+    const errored = runSubprocess(config);
+    child.emit("error", new Error("ENOENT"));
+    expect((await errored).termination).toBe("unproven");
+
+    spawnFn.mockImplementationOnce(() => {
+      throw new Error("spawn EAGAIN");
+    });
+    expect((await runSubprocess(config)).termination).toBe("unproven");
+  });
+});

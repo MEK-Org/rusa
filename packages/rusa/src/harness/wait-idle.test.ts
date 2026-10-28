@@ -76,6 +76,22 @@ describe("summarizeActivity", () => {
     expect(summarizeActivity(events, "w").runClosures).toBe(0);
   });
 
+  it("counts an unresolved claim release as a closure, never as a run end (#1119)", () => {
+    // A receipt-backed remote run released with its termination unresolved:
+    // the claim is free, so the waiter may proceed, but no outcome was seen.
+    const unresolved: MeshEvent = {
+      ...mk("run_abandoned"),
+      id: "abandon-unresolved",
+      detail: "termination-unresolved",
+      payload: JSON.stringify({ started: true, termination: "unresolved" }),
+    };
+    expect(summarizeActivity([RS, unresolved], "w")).toEqual({
+      runStarts: 1,
+      runEnds: 0,
+      runClosures: 1,
+    });
+  });
+
   it("windows activity strictly after afterEventId", () => {
     const historicalRS = { ...mk("run_start"), id: "rs-historical" };
     const stepRS = { ...mk("run_start"), id: "rs-step" };

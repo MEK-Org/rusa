@@ -5,6 +5,11 @@ import {
   request as proxyRequest,
   type ServerResponse,
 } from "node:http";
+import type { RunReceiptEnvelope } from "../db/repositories/run-receipt.js";
+import {
+  type InstanceRunReceiptRepository,
+  RunReceiptConflictLimitError,
+} from "../db/repositories/run-receipt-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { McpServerSpec } from "../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
@@ -24,12 +29,16 @@ import type {
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
   LeaderCommand,
+  RunReceiptPostResult,
+  RunReceiptsCapability,
+  RunReceiptsReply,
 } from "./protocol.js";
 import {
   BOUNDED_EXECUTION_CAPABILITY,
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
   INSTANCE_PROTOCOL_VERSION,
   OLDEST_FOLLOWER_PROTOCOL_VERSION,
+  RUN_RECEIPTS_MAX_PER_REQUEST,
 } from "./protocol.js";
 import {
   FollowerDedupeTracker,
@@ -87,6 +96,31 @@ export interface FollowerHubOptions {
    * only harnesses and tests do.
    */
   allowedFollowerIds?: Iterable<string>;
+  /**
+   * The leader's durable receipt store (#1020). Without it the hub never
+   * negotiates receipts, and every follower keeps the legacy run contract.
+   */
+  runReceipts?: Pick<InstanceRunReceiptRepository, "apply">;
+}
+
+const RECEIPT_DIGEST = /^[0-9a-f]{64}$/;
+const RECEIPT_RUN_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/** The envelope's own shape; {@link InstanceRunReceiptRepository.apply} validates the receipt. */
+function parseReceiptEnvelope(value: unknown): RunReceiptEnvelope | undefined {
+  const candidate = value as Partial<Record<keyof RunReceiptEnvelope, unknown>> | null;
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const { runId, digest, receipt } = candidate;
+  if (
+    typeof runId !== "string" ||
+    !RECEIPT_RUN_ID.test(runId) ||
+    typeof digest !== "string" ||
+    !RECEIPT_DIGEST.test(digest) ||
+    typeof receipt !== "string"
+  ) {
+    return undefined;
+  }
+  return { runId, digest, receipt };
 }
 
 function isFollowerEvent(event: unknown): event is FollowerEvent {
@@ -208,6 +242,7 @@ export class FollowerHub {
   });
   private origin = "";
   private readonly allowedFollowerIds?: ReadonlySet<string>;
+  private readonly runReceipts?: FollowerHubOptions["runReceipts"];
   constructor(
     private readonly token: string,
     opts?: FollowerHubOptions
@@ -218,6 +253,7 @@ export class FollowerHub {
     this.eventTransfers = opts?.eventTransfers ?? new EventTransferReceiver();
     this.triggerStore = opts?.triggerStore;
     if (opts?.allowedFollowerIds) this.allowedFollowerIds = new Set(opts.allowedFollowerIds);
+    this.runReceipts = opts?.runReceipts;
     if (this.triggerStore) {
       this.reconciler = new FollowerUpdateReconciler(this.triggerStore, this, {
         logger: this.log,
@@ -648,6 +684,7 @@ export class FollowerHub {
             ...(existing.boundedExecution
               ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY }
               : {}),
+            ...this.receiptCapability(existing),
           });
           return;
         }
@@ -672,6 +709,10 @@ export class FollowerHub {
         FollowerHub.STALE_AFTER_MS
       );
       follower.boundedExecution = offersBoundedExecution(body);
+      // Fixed for the generation, and before any host opens on it.
+      follower.runReceipts =
+        this.runReceipts !== undefined &&
+        (body.runReceipts as { version?: unknown } | undefined)?.version === 1;
       this.followers.set(follower.id, follower);
       this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
@@ -680,6 +721,7 @@ export class FollowerHub {
         pid: follower.pid,
         commitSha: follower.commitSha,
         protocolVersion: follower.protocolVersion,
+        runReceipts: follower.runReceipts,
       });
       for (const listener of this.onRegisterListeners) {
         try {
@@ -694,6 +736,7 @@ export class FollowerHub {
         leaderToken: this.leaderToken,
         eventTransfer: this.eventTransfers.capability,
         ...(follower.boundedExecution ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY } : {}),
+        ...this.receiptCapability(follower),
       });
       return;
     }
@@ -767,6 +810,10 @@ export class FollowerHub {
       reply(res, 200, {});
       return;
     }
+    if (path === "/receipts") {
+      this.acceptReceipts(follower, body, res);
+      return;
+    }
     if (path === "/events/transfer") {
       const step = this.eventTransfers.accept(follower.id, follower.generation, body, (eventId) =>
         follower.eventOutcome(eventId)
@@ -804,6 +851,88 @@ export class FollowerHub {
       return;
     }
     reply(res, 404, {});
+  }
+
+  private receiptCapability(follower: RemoteInstance): { runReceipts?: RunReceiptsCapability } {
+    if (!this.runReceipts || !follower.runReceipts) return {};
+    return { runReceipts: { version: 1 } };
+  }
+
+  /**
+   * Apply a follower's durable run receipts (#1020). The session has already
+   * authenticated the instance, which is the only one whose receipts this
+   * request may carry. Each receipt is answered on its own: one the store
+   * cannot validate or write is refused and stays pending on the host.
+   */
+  private acceptReceipts(
+    follower: RemoteInstance,
+    body: Record<string, unknown>,
+    res: ServerResponse
+  ): void {
+    const store = this.runReceipts;
+    if (!store || !follower.runReceipts) {
+      reply(res, 409, { error: "Run receipts were not negotiated for this session" });
+      return;
+    }
+    const receipts = body.receipts;
+    if (!Array.isArray(receipts) || receipts.length > RUN_RECEIPTS_MAX_PER_REQUEST) {
+      reply(res, 400, { error: "Invalid receipts" });
+      return;
+    }
+    const results: RunReceiptPostResult[] = [];
+    for (const value of receipts) {
+      const envelope = parseReceiptEnvelope(value);
+      if (!envelope) {
+        const rawRunId = (value as { runId?: unknown } | null)?.runId;
+        if (typeof rawRunId === "string") results.push({ runId: rawRunId, status: "invalid" });
+        this.log.warn("instance_receipt_invalid", {
+          followerId: follower.id,
+          runId: typeof rawRunId === "string" ? rawRunId.slice(0, 128) : undefined,
+          reason: "malformed envelope",
+        });
+        continue;
+      }
+      try {
+        const { outcome, receipt } = store.apply(follower.id, envelope);
+        results.push(
+          outcome.status === "conflict"
+            ? { runId: envelope.runId, status: outcome.status, kind: outcome.kind }
+            : { runId: envelope.runId, status: outcome.status }
+        );
+        const fields = {
+          followerId: follower.id,
+          runId: envelope.runId,
+          actorId: receipt.actorId,
+          receiptOutcome: receipt.outcome,
+        };
+        if (outcome.status === "applied") {
+          this.log.info("instance_receipt_applied", {
+            ...fields,
+            actorRunClosed: outcome.actorRunClosed,
+          });
+        } else if (outcome.status === "conflict") {
+          this.log.warn("instance_receipt_conflict", { ...fields, kind: outcome.kind });
+        }
+      } catch (err) {
+        results.push({ runId: envelope.runId, status: "invalid" });
+        if (err instanceof RunReceiptConflictLimitError) {
+          // Nothing was stored. The receipt stays pending on its host and is
+          // refused again on each flush while the identity is at the bound.
+          this.log.error("instance_receipt_conflict_limit", {
+            followerId: follower.id,
+            runId: envelope.runId,
+            kind: err.kind,
+          });
+          continue;
+        }
+        this.log.warn("instance_receipt_invalid", {
+          followerId: follower.id,
+          runId: envelope.runId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    reply(res, 200, { results } satisfies RunReceiptsReply);
   }
 
   private acceptEvent(follower: RemoteInstance, event: FollowerEvent): boolean {

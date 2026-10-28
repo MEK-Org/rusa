@@ -236,6 +236,8 @@ export class OpenRouterProvider implements CodingProvider {
         success: result.success,
         output,
         exitCode: result.success ? 0 : 1,
+        // The process's own settlement is the run's termination evidence.
+        termination: processResult.termination,
         // Pi message.model is a configuration echo, not upstream read-back.
       };
     } finally {

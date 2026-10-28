@@ -1,7 +1,7 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { formatSigtermResult, type TerminationAttribution } from "./termination-attribution.js";
-import type { RunResult } from "./types.js";
+import type { RunResult, RunTermination } from "./types.js";
 
 /**
  * Reduce a synchronous spawn rejection to what is safe to put in a run record.
@@ -103,7 +103,11 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       // run directly. `describeSpawnRejection` is what keeps the rejected value
       // out of the resulting run record.
       config.cleanup?.();
-      resolve(config.buildSpawnErrorResult(describeSpawnRejection(err)));
+      // No process exists, but nothing observed one end either (#1119).
+      resolve({
+        ...config.buildSpawnErrorResult(describeSpawnRejection(err)),
+        termination: "unproven",
+      });
       return;
     }
 
@@ -139,15 +143,20 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       resolve(resolvedValue);
     };
 
+    // Termination evidence travels on the result itself (#1119). Only the
+    // direct child's `close` is an observed exit. A timeout, an abort or an
+    // `error` settles right after signalling the group, whose delivery
+    // `killGroup` cannot confirm, so those results stay unproven.
     const settleKilled = (
       build: (sig: TerminationAttribution) => RunResult,
-      sigtermResult: TerminationAttribution
+      sigtermResult: TerminationAttribution,
+      termination: RunTermination
     ) => {
       const res = build(sigtermResult);
       if (res.abortReason === undefined) {
         res.abortReason = sigtermResult.abortReason;
       }
-      settle(res);
+      settle({ ...res, termination });
     };
 
     // Own the timeout in Node (not spawn's `timeout`, whose SIGTERM leaves the
@@ -156,14 +165,14 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       killGroup();
       config.onStdoutEnd?.(chunks, "termination");
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
-      settleKilled(config.buildKilledResult, sigtermResult);
+      settleKilled(config.buildKilledResult, sigtermResult, "unproven");
     }, config.timeoutMs);
 
     const onAbort = () => {
       killGroup();
       config.onStdoutEnd?.(chunks, "termination");
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
-      settleKilled(config.buildKilledResult, sigtermResult);
+      settleKilled(config.buildKilledResult, sigtermResult, "unproven");
     };
     if (config.signal?.aborted) {
       // Signal was already aborted before we registered — handle immediately.
@@ -203,7 +212,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
 
     child.on("error", (err) => {
       killGroup();
-      settle(config.buildSpawnErrorResult(err));
+      settle({ ...config.buildSpawnErrorResult(err), termination: "unproven" });
     });
 
     if (config.onDuplex) {
@@ -232,7 +241,10 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
           });
         } catch {
           killGroup();
-          settle(config.buildSpawnErrorResult(new Error("Subprocess duplex setup failed")));
+          settle({
+            ...config.buildSpawnErrorResult(new Error("Subprocess duplex setup failed")),
+            termination: "unproven",
+          });
         }
       });
     }
@@ -242,11 +254,11 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       if (signal === "SIGTERM" || signal === "SIGKILL") {
         config.onStdoutEnd?.(chunks, "termination");
         const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
-        settleKilled((sig) => config.buildSignalResult(sig, signal), sigtermResult);
+        settleKilled((sig) => config.buildSignalResult(sig, signal), sigtermResult, "observed");
         return;
       }
       const exitCode = code ?? 1;
-      settle(config.buildExitResult(chunks.join(""), exitCode));
+      settle({ ...config.buildExitResult(chunks.join(""), exitCode), termination: "observed" });
     });
   });
 }

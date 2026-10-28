@@ -112,12 +112,13 @@ async function abandonLifecycleRun(
   actor: Actor,
   runId: string,
   reason: ActorLifecycleAbandonmentReason,
-  started: boolean
+  started: boolean,
+  unresolved?: { cause: string }
 ): Promise<void> {
   await actor.lifecycle.emit("onEnd", {
     actorId: actor.id,
     runId,
-    terminal: { kind: "abandoned", reason, started },
+    terminal: { kind: "abandoned", reason, started, ...(unresolved ? { unresolved } : {}) },
   });
 }
 
@@ -3240,6 +3241,59 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       const notes = mechanicalNotes(rootId);
       expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(true);
+    });
+
+    // #1119 ruling: a receipt-backed remote run whose provider exit nobody
+    // observed (a timeout, abort or error) only releases its claim. The cause
+    // stays visible, but nothing reads it as the run's success or failure.
+    it("labels an unresolved termination as a released claim, with no run_end or failure notice", async () => {
+      const workerId = "unresolved-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+      const events = (kinds: string[]) =>
+        getRepositories().meshEvents.listEventsByActors([workerId], { limit: 20, kinds }).events;
+
+      for (const cause of ["timeout: provider timed out", "error: spawn failed"]) {
+        const runId = await startRun(actor);
+        selectParentMessage(mesh, workerId);
+        await abandonLifecycleRun(actor, runId, "termination-unresolved", true, { cause });
+      }
+      expect(events(["run_end"])).toEqual([]);
+      expect(
+        events(["run_abandoned"])
+          .map((event) => ({
+            detail: event.detail,
+            body: event.body,
+            payload: JSON.parse(event.payload ?? "{}"),
+            started: abandonedRunHadStarted(event.payload),
+          }))
+          .sort((a, b) => String(a.body).localeCompare(String(b.body)))
+      ).toEqual([
+        {
+          detail: "termination-unresolved",
+          body: "error: spawn failed",
+          payload: { started: true, termination: "unresolved" },
+          started: true,
+        },
+        {
+          detail: "termination-unresolved",
+          body: "timeout: provider timed out",
+          payload: { started: true, termination: "unresolved" },
+          started: true,
+        },
+      ]);
+      expect(mechanicalNotes(rootId).some((note) => note.startsWith("[run failed]"))).toBe(false);
+
+      // The same wiring still reports an observed failure as one.
+      const observed = await startRun(actor);
+      await endLifecycleRun(actor, observed, {
+        success: false,
+        exitCode: 1,
+        output: "observed failure",
+        termination: "observed",
+      });
+      expect(events(["run_end"]).map((event) => event.success)).toEqual([false]);
+      expect(mechanicalNotes(rootId).some((note) => note.startsWith("[run failed]"))).toBe(true);
     });
 
     // #189: a capped run used to be filtered out before the failure route, so

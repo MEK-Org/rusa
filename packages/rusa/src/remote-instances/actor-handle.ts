@@ -12,6 +12,7 @@ import {
 } from "../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import type { RunTokenUsage } from "../providers/token-accounting.js";
 import type { RunResult } from "../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import {
@@ -72,6 +73,8 @@ export class ActorHandle implements MeshActor {
   private runStartTime?: number;
   /** When the leader received the open run's `runStart`. */
   private runStartedAt?: Date;
+  /** The instance owing the open run a durable receipt (#1020), if any. */
+  private runDurableHost?: string;
   /**
    * When the leader handed the open admission, and with it the prompt snapshot,
    * to the follower: the watermark a running interrupt sets. Nothing delivered
@@ -804,7 +807,19 @@ export class ActorHandle implements MeshActor {
     // the leader actually admitted is terminated here, so an idle disconnect or
     // a boot timeout books nothing.
     const terminate = () => {
-      if (this.runOpen) {
+      if (this.runOpen && this.runDurableHost !== undefined) {
+        // The host still owns this run and will report its real terminal as a
+        // receipt (#1020). Losing the connection is not an exit; fabricating
+        // one here would race, and could contradict, that receipt. This only
+        // releases the claim.
+        this.log.warn("remote_run_host_unavailable", {
+          actorId: this.id,
+          runId: this.startedRunId,
+          durableHost: this.runDurableHost,
+          error: error.message,
+        });
+        void this.endQueuedRun("host-unavailable", true, { cause: error.message });
+      } else if (this.runOpen) {
         void this.endRun({ success: false, output: error.message, exitCode: -1 });
       } else if (this.queuedRunId && !retained) {
         void this.endQueuedRun("start-cancelled", false);
@@ -831,6 +846,7 @@ export class ActorHandle implements MeshActor {
     const runId = this.startedRunId;
     if (!this.runOpen || !runId) return;
     this.runOpen = false;
+    this.runDurableHost = undefined;
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
     const elapsedMs =
@@ -854,20 +870,50 @@ export class ActorHandle implements MeshActor {
     });
   }
 
+  /**
+   * End the open run with the host's result. A receipt-backed run (#1020)
+   * whose provider exit was not observed has no terminal yet: the result is
+   * a diagnosis, the claim is released as `termination-unresolved`, and
+   * neither a `run_end` nor a failure notice asserts an outcome the host's
+   * receipt has not (#1119 ruling). An observed result ends as before.
+   */
+  private endWithResult(result: RunResult): void | Promise<void> {
+    if (!this.runOpen || this.runDurableHost === undefined || result.termination === "observed") {
+      return this.endRun(result);
+    }
+    this.log.warn("remote_run_termination_unresolved", {
+      actorId: this.id,
+      runId: this.startedRunId,
+      durableHost: this.runDurableHost,
+      success: result.success,
+      exitCode: result.exitCode,
+      abortReason: result.abortReason,
+    });
+    const cause = result.abortReason ? `${result.abortReason}: ${result.output}` : result.output;
+    return this.endQueuedRun("termination-unresolved", true, {
+      cause,
+      ...(result.tokenUsage ? { tokenUsage: result.tokenUsage } : {}),
+    });
+  }
+
   private endQueuedRun(
     reason: ActorLifecycleAbandonmentReason,
-    started: boolean
+    started: boolean,
+    unresolved?: { cause: string; tokenUsage?: RunTokenUsage }
   ): void | Promise<void> {
     const runId = started ? this.startedRunId : this.queuedRunId;
     if (!runId) return;
     this.runOpen = false;
+    this.runDurableHost = undefined;
+    this.runStartTime = undefined;
+    this.runStartedAt = undefined;
     this.admittedAt = undefined;
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
     return this.opts.context.lifecycle.emit("onEnd", {
       actorId: this.id,
       runId,
-      terminal: { kind: "abandoned", reason, started },
+      terminal: { kind: "abandoned", reason, started, ...(unresolved ? { unresolved } : {}) },
     });
   }
 
@@ -1065,7 +1111,7 @@ export class ActorHandle implements MeshActor {
           mode: message.mode,
         });
       case "result":
-        return this.endRun(message.result);
+        return this.endWithResult(message.result);
       case "error": {
         const runId = this.startedRunId ?? this.queuedRunId;
         if (runId) {
@@ -1102,6 +1148,9 @@ export class ActorHandle implements MeshActor {
           this.interruptedRunId = undefined;
         }
         this.startedRunId = this.queuedRunId;
+        // Captured per run: a rebind to a channel without receipts must not
+        // change the contract a run was opened under.
+        this.runDurableHost = this.channel.durableHost;
         // Mark the terminal claim before awaiting observers. The first
         // lifecycle listener starts synchronously, so accounting is open; a
         // follower disconnect in an observer's await gap must still close it.
@@ -1124,6 +1173,7 @@ export class ActorHandle implements MeshActor {
           ...(message.material?.version === 1 && this.channel.nodeId
             ? { material: { version: 1 as const, host: this.channel.nodeId } }
             : {}),
+          ...(this.runDurableHost === undefined ? {} : { durableHost: this.runDurableHost }),
         });
       case "runPrompt":
         if (message.runId !== this.startedRunId) return;
@@ -1152,8 +1202,17 @@ export class ActorHandle implements MeshActor {
         break;
       case "abandoned":
         // An abandoned run is already terminal on the leader side; it has no
-        // run end left to record.
-        return this.endQueuedRun(message.abandon.reason, message.abandon.started);
+        // run end left to record. A receipt-backed one whose provider exit was
+        // not observed is labelled unresolved: its durable rows stay open.
+        return this.endQueuedRun(
+          message.abandon.reason,
+          message.abandon.started,
+          message.abandon.started &&
+            this.runDurableHost !== undefined &&
+            message.abandon.termination !== "observed"
+            ? { cause: `host abandoned the run: ${message.abandon.reason}` }
+            : undefined
+        );
       case "coalesced":
         hooks?.onCoalesceAborted?.(message.count, message.ageMs);
         break;
@@ -1207,7 +1266,7 @@ export class ActorHandle implements MeshActor {
             case "complete": {
               const result = this.checkedResult(request.result);
               this.opts.onEvent?.({ type: "result", result });
-              const endResult = this.endRun(result);
+              const endResult = this.endWithResult(result);
               if (endResult && typeof (endResult as Promise<void>).then === "function") {
                 return (endResult as Promise<void>).then(() => {
                   this.send({ type: "reply", requestId });

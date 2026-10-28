@@ -434,6 +434,7 @@ it("settles through real pipes, reaps the peer and retains usage without a subsc
     success: true,
     output: "ping-unique",
     exitCode: 0,
+    termination: "observed",
   });
   const peer = await waitForPeerProgress(peerMarkerPath);
   expect(() => process.kill(peer.pid, 0)).toThrow();
@@ -499,7 +500,7 @@ it.skipIf(!bwrapCapable)(
       sandbox: { worktreePath: actor },
       mcpServers: [{ name: "inbox", url: "http://synthetic.invalid" }],
     });
-    expect(result).toEqual({ success: true, output: prompt, exitCode: 0 });
+    expect(result).toEqual({ success: true, output: prompt, exitCode: 0, termination: "observed" });
     expect(await readFile(probe.ownFile, "utf8")).toBe("updated");
     expect(await readFile(probe.hostFile, "utf8")).toBe("private");
   },
