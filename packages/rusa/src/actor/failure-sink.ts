@@ -223,13 +223,7 @@ export async function routeRunFailure(
   const summary = `(${exitDesc})${diagnostic ? `\n\n${diagnostic}` : ""}`;
 
   let leadLine: string | undefined;
-  if (result.failure?.kind === "provider-capacity") {
-    // Pool attempts may also include genuine quota exhaustion, so this names
-    // only the capacity observation and denies nothing about other attempts.
-    leadLine =
-      `provider run ${providerLabel ?? "unknown provider/model"} failed: a temporary provider capacity rejection was reported. ` +
-      "That rejection is not a quota reading and implies no reset timer.";
-  } else if (result.failure?.stage === "provider-selection") {
+  if (result.failure?.stage === "provider-selection") {
     // Established at the resolver boundary: nothing ran, so nothing exhausted.
     leadLine = `could not prepare ${providerLabel ?? "the configured provider/model"}.\nProvider was not invoked.`;
   }
@@ -295,15 +289,10 @@ export function isResponsivePreemption(result: RunResult): boolean {
  * A failed run's sanitized diagnostic, clipped to `budget` (#980). A caught
  * exception's own message says what went wrong; its stack does not, and a long
  * one would push the message out of the budget. Output (the stack, or an
- * ordinary CLI exit's own text) is the fallback only without a message. A
- * capacity failure's output already carries its reason plus any pool aggregate,
- * so it stays the diagnostic.
+ * ordinary CLI exit's own text) is the fallback only without a message.
  */
 export function failureDiagnostic(result: RunResult, budget = FAILURE_DIAGNOSTIC_BUDGET): string {
-  const message =
-    result.failure?.kind !== "provider-capacity" && result.failure?.message.trim()
-      ? result.failure.message
-      : undefined;
+  const message = result.failure?.message.trim() ? result.failure.message : undefined;
   return clipFailureDiagnostic(sanitizeFailureText(message ?? result.output ?? ""), budget);
 }
 
