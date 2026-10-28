@@ -4,11 +4,8 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { stringify as toYaml } from "yaml";
 import {
-  androidApplicationIdProblem,
-  deriveAndroidApplicationId,
-} from "./android-application-id.js";
-import {
   type AndroidBranding,
+  deriveAndroidApplicationId,
   escapeAndroidString,
   formatAndroidBuildReceipt,
   resolveAndroidBranding,
@@ -19,29 +16,18 @@ const JPEG_BYTES = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from("
 const FLUTTER_APP_DIR = "/app";
 
 describe("Android application id", () => {
-  it("accepts legal package names", () => {
-    for (const id of ["com.siliconfamiliar.dashboard", "org.mek.rusa.dashboard", "a.b", "A1.b_2"]) {
-      expect(androidApplicationIdProblem(id)).toBeNull();
-    }
-  });
-
-  it("rejects illegal package names with a reason", () => {
-    expect(androidApplicationIdProblem("dashboard")).toMatch(/two dot-separated segments/);
-    expect(androidApplicationIdProblem("com.9lives.app")).toMatch(/start with a letter/);
-    expect(androidApplicationIdProblem("com.silicon-familiar.app")).toMatch(/only letters/);
-    expect(androidApplicationIdProblem("com..app")).toMatch(/segment ""/);
-    expect(androidApplicationIdProblem("com.new.app")).toMatch(/Java reserved word/);
-  });
-
   it("derives com.<handle with non-[A-Za-z0-9_] stripped>.dashboard", () => {
     expect(deriveAndroidApplicationId("silicon-familiar")).toBe("com.siliconfamiliar.dashboard");
     expect(deriveAndroidApplicationId("Ember_Familiar")).toBe("com.Ember_Familiar.dashboard");
   });
 
   it("fails loudly when the stripped handle is not a legal segment", () => {
-    expect(() => deriveAndroidApplicationId("---")).toThrow(/rootActor.handle "---".*segment ""/);
-    expect(() => deriveAndroidApplicationId("9-lives")).toThrow(/start with a letter/);
-    expect(() => deriveAndroidApplicationId("new")).toThrow(/Java reserved word/);
+    expect(() => deriveAndroidApplicationId("---")).toThrow(
+      /rootActor.handle "---".*"" must start with a letter/
+    );
+    expect(() => deriveAndroidApplicationId("9-lives")).toThrow(
+      /"9lives" must start with a letter/
+    );
   });
 });
 
@@ -120,6 +106,14 @@ describe("resolveAndroidBranding", () => {
       /rootActor\.handle "9-lives" does not yield a legal Android application id \(com\.9lives\.dashboard\)/
     );
   });
+
+  it("fails the build loudly on a configured root avatar it cannot find", () => {
+    writeConfig({ rootActor: { handle: "silicon-familiar", avatar: "missing/root.png" } });
+
+    expect(() => resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR })).toThrow(
+      /rootActor\.avatar "missing\/root\.png" is not a file/
+    );
+  });
 });
 
 describe("Android branding resources", () => {
@@ -164,19 +158,17 @@ describe("Android branding resources", () => {
     expect(icon).toContain('android:drawable="@drawable/rusa_launcher_image"');
   });
 
-  it("receipts the resolution and the reinstall note for a new id", () => {
-    const receipt = formatAndroidBuildReceipt(branding(), "/out/app-release.apk");
+  it("receipts the resolution, and the reinstall note only for a new id", () => {
+    const receipt = formatAndroidBuildReceipt(branding(), "/out/flutter-apk");
     expect(receipt).toContain("label:          Silicon Familiar");
     expect(receipt).toContain("application id: com.siliconfamiliar.dashboard");
-    expect(receipt).toContain("apk:            /out/app-release.apk");
+    expect(receipt).toContain("apk output:     /out/flutter-apk");
     expect(receipt).toMatch(/uninstall that one by hand/);
     expect(receipt).toMatch(/registered in Firebase for com\.siliconfamiliar\.dashboard/);
-  });
 
-  it("omits the reinstall note when the id is unchanged", () => {
-    const receipt = formatAndroidBuildReceipt(
+    const unchanged = formatAndroidBuildReceipt(
       branding({ applicationId: "org.mek.rusa.dashboard" })
     );
-    expect(receipt).not.toMatch(/uninstall/);
+    expect(unchanged).not.toMatch(/uninstall/);
   });
 });

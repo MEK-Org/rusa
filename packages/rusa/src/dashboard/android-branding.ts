@@ -3,10 +3,6 @@ import { dirname, join, resolve } from "node:path";
 import { resolveRootHandle } from "../actor/handle-generator.js";
 import { rootBrandingImage } from "../avatar/avatars.js";
 import { loadConfig } from "../config/loader.js";
-import {
-  deriveAndroidApplicationId,
-  LEGACY_ANDROID_APPLICATION_ID,
-} from "./android-application-id.js";
 import { resolveDashboardBranding } from "./branding.js";
 
 /**
@@ -30,6 +26,28 @@ export interface AndroidBranding {
   /** Its sniffed type: aapt2 rejects a JPEG behind a `.png` name. */
   iconType: string;
   iconSource: string;
+}
+
+/** The id every build used before #1191; still the id of an unbranded build. */
+export const LEGACY_ANDROID_APPLICATION_ID = "org.mek.rusa.dashboard";
+
+/**
+ * The application id for a root handle: `com.<handle>.dashboard` with every
+ * character outside `[A-Za-z0-9_]` stripped, so `silicon-familiar` →
+ * `com.siliconfamiliar.dashboard`. There is deliberately no config override.
+ * Throws, naming the handle, when what remains is not a legal package segment
+ * (empty or not starting with a letter): the build fails rather than guessing.
+ */
+export function deriveAndroidApplicationId(handle: string): string {
+  const segment = handle.replace(/[^A-Za-z0-9_]/g, "");
+  const id = `com.${segment}.dashboard`;
+  if (!/^[A-Za-z]/.test(segment)) {
+    throw new Error(
+      `rootActor.handle "${handle}" does not yield a legal Android application id (${id}): ` +
+        `"${segment}" must start with a letter`
+    );
+  }
+  return id;
 }
 
 /** Built-in names per `RUSA_INSTANCE`, as `scripts/build-dashboard-ui.mjs` bakes them. */
@@ -64,6 +82,15 @@ export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): 
     : "built-in default (no rootActor.handle)";
 
   const image = rootBrandingImage(rootIdentity);
+  // The server resolves a relative avatar against its own cwd, which this build
+  // does not share: a configured image that is not found here fails the build
+  // rather than baking the bundled icon into an APK meant to show the root's.
+  if (!image && config.rootActor?.avatar) {
+    throw new Error(
+      `rootActor.avatar "${config.rootActor.avatar}" is not a file from ${process.cwd()}; ` +
+        "configure an absolute path or upload the root image from the dashboard"
+    );
+  }
   const iconPath =
     image?.path ?? resolve(options.flutterAppDir, "web/icons", instance, "Icon-maskable-512.png");
   const iconType = image?.contentType ?? "image/png";
@@ -133,14 +160,14 @@ export function writeAndroidBrandingResources(branding: AndroidBranding, resDir:
 }
 
 /** The build's receipt: what it resolved, and what changing the id costs. */
-export function formatAndroidBuildReceipt(branding: AndroidBranding, apkPath?: string): string {
+export function formatAndroidBuildReceipt(branding: AndroidBranding, outputDir?: string): string {
   const lines = [
     "Android dashboard branding",
     `  label:          ${branding.label} (${branding.labelSource})`,
     `  application id: ${branding.applicationId} (${branding.applicationIdSource})`,
     `  launcher icon:  ${branding.iconPath} (${branding.iconSource})`,
   ];
-  if (apkPath) lines.push(`  apk:            ${apkPath}`);
+  if (outputDir) lines.push(`  apk output:     ${outputDir}`);
   if (branding.applicationId !== LEGACY_ANDROID_APPLICATION_ID) {
     lines.push(
       "",
