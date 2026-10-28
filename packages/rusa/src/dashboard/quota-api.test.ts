@@ -2146,6 +2146,12 @@ describe("dead-reckoned lane estimates (#759)", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-quota-estimate-"));
     const store = new SharedQuotaStore(join(root, "quota.db"));
     try {
+      // SharedQuotaStore prunes against its real clock on every raw write.
+      // Keep this synthetic timeline recent so retention cannot remove the
+      // first pacing point before the API gets to estimate it.
+      const nowMs = Date.now() - 60 * 60 * 1000;
+      const stamp = (minutesFromNow: number) =>
+        new Date(nowMs + minutesFromNow * 60 * 1000).toISOString();
       const record = (scrapedAt: string, limits: ProviderQuotaSnapshot["limits"]) => {
         const state: ProviderQuotaSnapshot = {
           provider: "claude",
@@ -2163,18 +2169,18 @@ describe("dead-reckoned lane estimates (#759)", () => {
         label: "Current session",
         kind: "session" as const,
         percentLeft: 90,
-        resetAtIso: at("15:00"),
+        resetAtIso: stamp(90),
       };
       const weekly = (percentLeft: number) => ({
         label: "Weekly",
         kind: "weekly" as const,
         percentLeft,
-        resetAtIso: RESET,
+        resetAtIso: stamp(4 * 24 * 60),
       });
-      record(at("10:00"), [session, weekly(80)]);
-      record(at("12:00"), [session, weekly(70)]);
+      record(stamp(-210), [session, weekly(80)]);
+      record(stamp(-90), [session, weekly(70)]);
       // The newest scrape missed the weekly panel.
-      record(at("13:00"), [session]);
+      record(stamp(-30), [session]);
       const counts = () =>
         store.db
           .prepare(
@@ -2183,18 +2189,22 @@ describe("dead-reckoned lane estimates (#759)", () => {
           )
           .get();
       const before = counts();
+      expect(
+        store.listHistorySince("claude", stamp(-240)).filter((row) => row.kind === "weekly")
+      ).toHaveLength(2);
 
       const snapshot = await buildQuotaSnapshot({
         getQuota: async () =>
           store.getLatestSnapshot("claude") ?? { provider: "claude", status: "unknown" },
         providers: ["claude"],
-        now: () => Date.parse(at("13:30")),
+        now: () => nowMs,
         listHistory: (provider, sinceIso) => store.listHistorySince(provider, sinceIso),
       });
 
       expect(snapshot.providers[0].windows).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ id: "weekly", usedPercent: 37.5, estimated: true }),
+          expect.objectContaining({ id: "session", usedPercent: 10, estimated: false }),
         ])
       );
       expect(counts()).toEqual(before);
