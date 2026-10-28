@@ -7511,10 +7511,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         claude: { cliCommand: "claude" },
         openrouter: {
           cliCommand: "openrouter",
-          openrouterPoc: {
-            authDir: homeDir,
-            artifactDir: homeDir,
-          },
+          openrouterPoc: {},
         },
       },
       rootActor: {

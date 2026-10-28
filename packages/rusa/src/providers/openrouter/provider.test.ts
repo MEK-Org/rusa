@@ -10,6 +10,7 @@ import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { routeRunFailure } from "../../actor/failure-sink.js";
+import type { McpServerSpec } from "../types.js";
 import { OpenRouterProvider } from "./provider.js";
 
 vi.mock("../../config/loader.js", () => ({
@@ -22,9 +23,14 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-async function fixture(options: { peerMode?: "failure" | "wait" } = {}) {
+async function fixture(options: { peerMode?: "failure" | "stream" | "wait" } = {}) {
   const root = await mkdtemp(join(tmpdir(), "openrouter-provider-test-"));
   roots.push(root);
+  execFileSync("git", ["init", "--quiet", root]);
+  await writeFile(join(root, "README.md"), "synthetic repository\n");
+  const rusaHome = join(root, "rusa-home");
+  vi.stubEnv("RUSA_HOME", rusaHome);
+  vi.stubEnv("PI_CODING_AGENT_DIR", root);
   const apiKeyPath = join(root, "auth.json");
   await writeFile(
     apiKeyPath,
@@ -51,12 +57,11 @@ async function fixture(options: { peerMode?: "failure" | "wait" } = {}) {
   const config = {
     openrouterPoc: {
       piCommand,
-      authDir: root,
-      artifactDir: join(root, "artifacts"),
     },
   };
   return {
     root,
+    artifactDir: join(rusaHome, "artifacts", "openrouter"),
     peerMarkerPath,
     apiKeyPath,
     config,
@@ -92,17 +97,23 @@ function createOpenRouterActor(
   root: string,
   provider: OpenRouterProvider,
   lifecycle: ReturnType<typeof createActorLifecycle>,
-  options: { id?: string; log?: (chunk: string) => void; timeoutMs?: number } = {}
+  options: {
+    id?: string;
+    log?: (chunk: string) => void;
+    mcpServers?: McpServerSpec[];
+    prompt?: () => string;
+    timeoutMs?: number;
+  } = {}
 ): Actor {
   return new Actor({
     id: options.id ?? "child",
     cwd: root,
     modelConfig: [{ provider: "openrouter", model: "vendor/fixed-model" }],
     resolveProvider: () => provider,
-    mcpServers: [],
+    mcpServers: options.mcpServers ?? [],
     loadSessionId: () => undefined,
     saveSessionId: () => {},
-    buildPrompt: () => ({ prompt: "synthetic peer" }),
+    buildPrompt: () => ({ prompt: options.prompt?.() ?? "synthetic peer" }),
     debounceMs: 0,
     lifecycle,
     log: options.log,
@@ -422,8 +433,78 @@ it("uses a static Pi login without changing the source profile", async () => {
   );
   await expect(provider.run({ cwd: root, prompt: "ping" })).rejects.toThrow(/launch pi/);
 });
-it("settles through real pipes, reaps the peer and retains usage without a subscription token record", async () => {
-  const { root, peerMarkerPath, provider } = await fixture();
+
+it("keeps a nonempty actor repository and its marker across two fresh Actor runs", async () => {
+  const { root, provider } = await fixture();
+  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+  const ended: Array<Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined> = [];
+  let prompt = "repository-write";
+  const lifecycle = createActorLifecycle([
+    {
+      onEnd: (event) => {
+        if (event.terminal.kind === "result") ended.push(event.terminal.result);
+      },
+    },
+  ]);
+  const actor = createOpenRouterActor(root, provider, lifecycle, {
+    mcpServers: [{ name: "inbox", url: "http://synthetic.invalid" }],
+    prompt: () => prompt,
+  });
+  try {
+    actor.requestRun({ priority: "responsive" });
+    await vi.waitFor(() => expect(ended).toHaveLength(1), { timeout: 10_000 });
+    prompt = "repository-read";
+    actor.requestRun({ priority: "responsive" });
+    await vi.waitFor(() => expect(ended).toHaveLength(2), { timeout: 10_000 });
+
+    expect(ended).toEqual([
+      expect.objectContaining({ success: true, output: "repository-write" }),
+      expect.objectContaining({ success: true, output: "repository-read" }),
+    ]);
+    expect(await readFile(join(root, "repository-marker"), "utf8")).toBe("first invocation\n");
+  } finally {
+    actor.close();
+  }
+}, 15_000);
+
+it("renders Pi text and tool events through Actor while liveness remains invisible", async () => {
+  const { root, provider } = await fixture({ peerMode: "stream" });
+  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+  const live: string[] = [];
+  let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
+  const lifecycle = createActorLifecycle([
+    {
+      onEnd: (event) => {
+        if (event.terminal.kind === "result") ended = event.terminal.result;
+      },
+    },
+  ]);
+  const actor = createOpenRouterActor(root, provider, lifecycle, {
+    log: (chunk) => live.push(chunk),
+    mcpServers: [{ name: "inbox", url: "http://synthetic.invalid" }],
+  });
+  try {
+    actor.requestRun({ priority: "responsive" });
+    await vi.waitFor(() => expect(ended).toBeDefined(), { timeout: 10_000 });
+
+    expect(ended).toMatchObject({ success: true, output: "streamed reply" });
+    expect(live).toEqual(
+      expect.arrayContaining([
+        "streamed ",
+        "reply",
+        "\n[MCP inbox:read]\n",
+        "\n[Tool error: inbox:read failed]\n",
+      ])
+    );
+    expect(live).not.toContain(".");
+    expect(live.join("")).not.toContain("not rendered");
+  } finally {
+    actor.close();
+  }
+}, 15_000);
+
+it("settles through real pipes, reaps the peer and retains usage in its internal artifact directory", async () => {
+  const { root, artifactDir, peerMarkerPath, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const result = await provider.run({
     cwd: root,
@@ -437,32 +518,29 @@ it("settles through real pipes, reaps the peer and retains usage without a subsc
   });
   const peer = await waitForPeerProgress(peerMarkerPath);
   expect(() => process.kill(peer.pid, 0)).toThrow();
-  const artifacts = await readdir(join(root, "artifacts"));
+  const artifacts = await readdir(artifactDir);
   expect(artifacts).toHaveLength(1);
-  const receipt = await readFile(join(root, "artifacts", artifacts[0] as string), "utf8");
+  const receipt = await readFile(join(artifactDir, artifacts[0] as string), "utf8");
   expect(JSON.parse(receipt).requests[0].usage).toEqual({ input: 3, output: 2 });
   expect(receipt).not.toContain("synthetic-not-a-real-key");
 }, 10000);
 
-it("leaves cwd untouched when artifact storage is not requested", async () => {
+it("rejects a direct unsupported reasoning-effort selection before launching Pi", async () => {
   const { root, config } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
-  const { artifactDir: _artifactDir, ...paths } = config.openrouterPoc;
-  const provider = new OpenRouterProvider("test", { openrouterPoc: paths }, "vendor/fixed-model");
-  const cwd = join(root, "nonexistent-workspace");
-  expect((await provider.run({ cwd, prompt: "ping" })).success).toBe(true);
-  await expect(readdir(cwd)).rejects.toThrow(/ENOENT/);
+  const provider = new OpenRouterProvider("test", config, "vendor/fixed-model", "high");
+  await expect(provider.run({ cwd: root, prompt: "ping" })).rejects.toThrow(/reasoning-effort/);
 });
 
 it("retains distinct artifacts for concurrent invocations", async () => {
-  const { root, provider } = await fixture();
+  const { root, artifactDir, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const results = await Promise.all([
     provider.run({ cwd: root, prompt: "one" }),
     provider.run({ cwd: root, prompt: "two" }),
   ]);
   expect(results.every((result) => result.success)).toBe(true);
-  expect(await readdir(join(root, "artifacts"))).toHaveLength(2);
+  expect(await readdir(artifactDir)).toHaveLength(2);
 });
 
 let bwrapCapable = false;
@@ -479,6 +557,7 @@ it.skipIf(!bwrapCapable)(
     const sibling = join(root, "workers", "sibling");
     const secrets = join(root, "secrets");
     await Promise.all([actor, sibling, secrets].map((path) => mkdir(path, { recursive: true })));
+    execFileSync("git", ["init", "--quiet", actor]);
     const hostRoot = await mkdtemp(join(process.cwd(), ".openrouter-host-probe-"));
     roots.push(hostRoot);
     const probe = {
@@ -500,18 +579,17 @@ it.skipIf(!bwrapCapable)(
       mcpServers: [{ name: "inbox", url: "http://synthetic.invalid" }],
     });
     expect(result).toEqual({ success: true, output: prompt, exitCode: 0 });
+    expect(await readFile(join(actor, ".cwd-receipt"), "utf8")).toBe(actor);
     expect(await readFile(probe.ownFile, "utf8")).toBe("updated");
     expect(await readFile(probe.hostFile, "utf8")).toBe("private");
   },
   15000
 );
 
-it("resolves a relative Pi login directory against the host cwd", async () => {
-  const { root, config } = await fixture();
+it("resolves the selected saved Pi login directory against the host cwd", async () => {
+  const { root, provider } = await fixture();
   vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   vi.stubEnv("PI_CODING_AGENT_DIR", relative(process.cwd(), root));
-  const { authDir: _authDir, ...paths } = config.openrouterPoc;
-  const provider = new OpenRouterProvider("test", { openrouterPoc: paths }, "vendor/fixed-model");
   expect((await provider.run({ cwd: root, prompt: "ping" })).success).toBe(true);
 });
 

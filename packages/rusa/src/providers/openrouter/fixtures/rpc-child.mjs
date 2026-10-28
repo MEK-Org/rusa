@@ -1,6 +1,7 @@
 // Synthetic peer only. No Pi imports, credentials, network or model requests.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { accessSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -47,13 +48,32 @@ lines.on("line", (line) => {
     assert.throws(() =>
       writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "auth.json"), "changed")
     );
-    assert.equal(process.cwd(), join(process.env.HOME, "work"));
+    writeFileSync(join(process.cwd(), ".cwd-receipt"), process.cwd());
     assert.equal(readFileSync(probe.ownFile, "utf8"), "own");
     writeFileSync(probe.ownFile, "updated");
     assert.throws(() => accessSync(probe.siblingFile));
     assert.throws(() => accessSync(probe.secretFile));
     assert.equal(readFileSync(probe.hostFile, "utf8"), "private");
     assert.throws(() => writeFileSync(probe.hostFile, "changed"));
+  }
+  if (command.type === "prompt" && command.message === "repository-write") {
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).trim(),
+      "true"
+    );
+    execFileSync("node", ["--version"], { stdio: "ignore" });
+    execFileSync("gh", ["--version"], { stdio: "ignore" });
+    writeFileSync(join(process.cwd(), "repository-marker"), "first invocation\n");
+  }
+  if (command.type === "prompt" && command.message === "repository-read") {
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).trim(),
+      "true"
+    );
+    assert.equal(
+      readFileSync(join(process.cwd(), "repository-marker"), "utf8"),
+      "first invocation\n"
+    );
   }
   const data =
     command.type === "get_state"
@@ -94,6 +114,38 @@ lines.on("line", (line) => {
     emit({ type: "agent_settled" });
     return;
   }
+  if (mode === "stream") {
+    emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "streamed " },
+    });
+    emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "reply" },
+    });
+    emit({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "toolcall_start",
+        contentIndex: 1,
+        id: "call-stream",
+        toolName: "mcp__inbox__read",
+      },
+    });
+    emit({
+      type: "tool_execution_start",
+      toolCallId: "call-stream",
+      toolName: "mcp__inbox__read",
+      args: { private: "not rendered" },
+    });
+    emit({
+      type: "tool_execution_end",
+      toolCallId: "call-stream",
+      toolName: "mcp__inbox__read",
+      result: { content: [{ type: "text", text: "not rendered" }] },
+      isError: true,
+    });
+  }
   emit({
     type: "message_end",
     message: {
@@ -101,7 +153,7 @@ lines.on("line", (line) => {
       provider: "openrouter",
       model: "vendor/fixed-model",
       stopReason: "stop",
-      content: [{ type: "text", text: command.message }],
+      content: [{ type: "text", text: mode === "stream" ? "streamed reply" : command.message }],
       usage: { input: 3, output: 2 },
     },
   });

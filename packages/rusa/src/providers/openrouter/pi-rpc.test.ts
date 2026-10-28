@@ -23,6 +23,7 @@ function fixture(
     reject?: string;
     beforePromptResponse?: (invocation: PiRpcInvocation) => void;
     onProgress?: () => void;
+    onOutput?: (chunk: string) => void;
     maxOutputBytes?: number;
     maxRequests?: number;
   } = {}
@@ -60,7 +61,8 @@ function fixture(
     options.effort === null ? undefined : (options.effort ?? "high"),
     options.maxOutputBytes,
     options.maxRequests,
-    options.onProgress
+    options.onProgress,
+    options.onOutput
   );
   return { invocation, transport, commands };
 }
@@ -136,6 +138,51 @@ describe("Pi RPC portable invocation spike", () => {
     assistant(f.invocation);
     wire(f.invocation, { type: "agent_settled" });
     await result;
+  });
+
+  it("renders text and tool activity while keeping opaque provider diagnostics out of live output", async () => {
+    const live: string[] = [];
+    const f = fixture({ onOutput: (chunk) => live.push(chunk) });
+    const { result } = await start(f);
+    wire(f.invocation, {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hello" },
+    });
+    wire(f.invocation, {
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "toolcall_start",
+        id: "call-1",
+        toolName: "mcp__tracker__get_issue",
+      },
+    });
+    wire(f.invocation, {
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "mcp__tracker__get_issue",
+      result: { content: [{ type: "text", text: "SECRET tool body" }] },
+      isError: true,
+    });
+    wire(f.invocation, {
+      type: "message_update",
+      assistantMessageEvent: { type: "error", error: "SECRET provider diagnostic" },
+    });
+    assistant(f.invocation);
+    wire(f.invocation, { type: "agent_settled" });
+
+    expect(await result).toMatchObject({
+      success: false,
+      reason: "Pi reported an execution error",
+    });
+    expect(live).toEqual(
+      expect.arrayContaining([
+        "hello",
+        "\n[MCP tracker:get_issue]\n",
+        "\n[Tool error: tracker:get_issue failed]\n",
+        "\n[Error]: Pi reported a provider error\n",
+      ])
+    );
+    expect(live.join("\n")).not.toContain("SECRET");
   });
 
   it.each([

@@ -44,7 +44,7 @@ const providerAdapters = {
   kimi: { create: (name, config, model) => new KimiProvider(name, config, model) },
   copilot: { create: (name, config, model) => new CopilotProvider(name, config, model) },
   openrouter: {
-    create: (name, config, model) => new OpenRouterProvider(name, config, model),
+    create: (name, config, model, effort) => new OpenRouterProvider(name, config, model, effort),
   },
   fake: { create: (name) => new FakeProvider(undefined, name) },
 } satisfies Readonly<Record<ProviderCommand, ProviderAdapter>>;

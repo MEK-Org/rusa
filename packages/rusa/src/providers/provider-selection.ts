@@ -1,4 +1,3 @@
-import { isAbsolute } from "node:path";
 import type { RusaConfig } from "../config/types.js";
 import { isAntigravityGeminiModel, validateModelPin } from "./model-catalog.js";
 import {
@@ -71,15 +70,9 @@ export function validateProviderSelection(
     (process.env.RUSA_OPENROUTER_POC !== "1" ||
       !poc ||
       !model?.trim() ||
-      (poc.piCommand !== undefined && !poc.piCommand.trim()) ||
-      ![
-        ...(poc.authDir === undefined ? [] : [poc.authDir]),
-        ...(poc.artifactDir === undefined ? [] : [poc.artifactDir]),
-      ].every((path) => typeof path === "string" && isAbsolute(path)))
+      (poc.piCommand !== undefined && !poc.piCommand.trim()))
   ) {
-    throw new Error(
-      "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, explicit paths and model"
-    );
+    throw new Error("OpenRouter prototype requires RUSA_OPENROUTER_POC=1, openrouterPoc and model");
   }
   const selection = normalizeModelEffortSelection(capabilityName, model, effort);
   if (model !== undefined && !selection.model) {
