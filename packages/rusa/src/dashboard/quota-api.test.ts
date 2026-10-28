@@ -2149,7 +2149,7 @@ describe("dead-reckoned lane estimates (#759)", () => {
       // SharedQuotaStore prunes against its real clock on every raw write.
       // Keep this synthetic timeline recent so retention cannot remove the
       // first pacing point before the API gets to estimate it.
-      const nowMs = Date.now() - 60 * 60 * 1000;
+      const nowMs = Date.now();
       const stamp = (minutesFromNow: number) =>
         new Date(nowMs + minutesFromNow * 60 * 1000).toISOString();
       const record = (scrapedAt: string, limits: ProviderQuotaSnapshot["limits"]) => {
