@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:wakelock_plus_platform_interface/messages.g.dart';
 
+import 'package:rusa_dashboard/assistant_platform.dart';
 import 'package:rusa_dashboard/io_session.dart';
 import 'package:rusa_dashboard/io_session_client.dart';
 import 'package:rusa_dashboard/models.dart';
@@ -160,6 +161,24 @@ class _FakeAudioPlugin {
   }
 }
 
+/// A headset route whose [acquire] answers [routed], optionally held open.
+class _FakeHeadset implements HeadsetRoute {
+  bool routed = true;
+  Completer<void>? gate;
+  int acquires = 0;
+  int releases = 0;
+
+  @override
+  Future<bool> acquire() async {
+    acquires++;
+    await gate?.future;
+    return routed;
+  }
+
+  @override
+  Future<void> release() async => releases++;
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -220,6 +239,69 @@ void main() {
         await expectLater(recorder.stop(), throwsStateError);
       },
     );
+
+    group('with a headset route', () {
+      late _FakeHeadset headset;
+
+      setUp(() {
+        headset = _FakeHeadset();
+        recorder = IoVoiceRecorder(
+          temporaryDirectory: () async => tmp,
+          headset: headset,
+        );
+      });
+
+      Map<Object?, Object?> androidConfig() =>
+          plugin.startArgs!['androidConfig']! as Map<Object?, Object?>;
+
+      test('records the routed headset and releases it on stop', () async {
+        await recorder.start();
+
+        expect(headset.acquires, 1);
+        expect(plugin.startArgs!['numChannels'], 1);
+        expect(plugin.startArgs!['sampleRate'], 16000);
+        expect(androidConfig()['audioSource'], 'voiceCommunication');
+        expect(androidConfig()['manageBluetooth'], isFalse);
+        expect(headset.releases, 0);
+
+        final clip = await recorder.stop();
+        expect(clip.mimeType, 'audio/mp4');
+        expect(headset.releases, 1);
+      });
+
+      test('without a headset records the phone and holds nothing', () async {
+        headset.routed = false;
+        await recorder.start();
+
+        expect(plugin.startArgs!['numChannels'], 2);
+        expect(androidConfig()['audioSource'], 'defaultSource');
+
+        await recorder.stop();
+        expect(headset.releases, 0);
+      });
+
+      test('cancel releases the route', () async {
+        await recorder.start();
+        await recorder.cancel();
+
+        expect(plugin.calls, containsAllInOrder(['cancel', 'dispose']));
+        expect(headset.releases, 1);
+      });
+
+      test('cancel while routing releases the late route', () async {
+        headset.gate = Completer<void>();
+        final start = recorder.start();
+        await pumpEventQueue();
+
+        await recorder.cancel();
+        expect(headset.releases, 0);
+        headset.gate!.complete();
+
+        await expectLater(start, throwsStateError);
+        expect(plugin.calls, isNot(contains('start')));
+        expect(headset.releases, 1);
+      });
+    });
 
     test('cancel discards an active recording', () async {
       await recorder.start();

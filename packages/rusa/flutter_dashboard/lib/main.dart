@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'api.dart';
 import 'app.dart';
+import 'assistant_page.dart';
 import 'breakpoints.dart';
 import 'dashboard_title.dart';
 import 'io_session.dart';
@@ -29,6 +30,28 @@ void main() {
       bootstrapSession: platformBootstrapSession,
       browserHooksBuilder: platformBrowserHooksBuilder,
       pageBuilder: (context, session) => DashboardPage(session: session),
+    ),
+  );
+}
+
+/// The Android assist activity's entrypoint (`AssistActivity.kt`): the same
+/// sign-in shell, with the walkie-to-root screen as its page.
+@pragma('vm:entry-point')
+void assistMain() {
+  WidgetsFlutterBinding.ensureInitialized();
+  platformInit();
+  final assistant = platformCreateAssistant();
+  runApp(
+    RusaDashboardApp(
+      title: resolveDashboardTitle(platformDocumentTitle),
+      bootstrapSession: platformBootstrapSession,
+      browserHooksBuilder: platformBrowserHooksBuilder,
+      pageBuilder: (context, session) => AssistantPage(
+        createApi: () => platformCreateDashboardApi(session),
+        createWalkieDeps: (api) =>
+            platformCreateWalkieDeps(api, session, headset: assistant),
+        signals: assistant,
+      ),
     ),
   );
 }
@@ -118,6 +141,7 @@ class _DashboardPageState extends State<DashboardPage> {
                       : null,
                   onNavigation: widget.session.visit,
                   profilePhotoUrl: widget.session.profilePhotoUrl,
+                  assistantRole: platformCreateAssistant(),
                   store: _store,
                   understandingBuilder: (_) {
                     final session = widget.session;

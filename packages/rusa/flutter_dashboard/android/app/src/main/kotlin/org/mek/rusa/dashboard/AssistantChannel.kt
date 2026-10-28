@@ -1,0 +1,116 @@
+package org.mek.rusa.dashboard
+
+import android.Manifest
+import android.app.Activity
+import android.app.role.RoleManager
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.Settings
+import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+
+/**
+ * The `org.mek.rusa.dashboard/assistant` channel (`assistant_io.dart`): the
+ * assistant role's status and settings page, and the headset microphone route.
+ */
+class AssistantChannel(
+    private val activity: Activity,
+    messenger: BinaryMessenger,
+) : MethodChannel.MethodCallHandler {
+    private val channel = MethodChannel(messenger, NAME)
+    val headset = HeadsetRoute(activity) { channel.invokeMethod("routeLost", null) }
+    private var pendingSettings: MethodChannel.Result? = null
+
+    init {
+        channel.setMethodCallHandler(this)
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "roleStatus" -> result.success(roleStatus())
+            "openAssistantSettings" -> openAssistantSettings(result)
+            "acquireHeadset" -> headset.acquire { routed -> result.success(routed) }
+            "releaseHeadset" -> {
+                headset.release()
+                result.success(null)
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    fun trigger() = channel.invokeMethod("trigger", null)
+
+    private fun roleStatus(): Map<String, Boolean> {
+        val roles = activity.getSystemService(RoleManager::class.java)
+        val available = roles?.isRoleAvailable(RoleManager.ROLE_ASSISTANT) == true
+        return mapOf(
+            "available" to available,
+            "held" to (available && roles!!.isRoleHeld(RoleManager.ROLE_ASSISTANT)),
+        )
+    }
+
+    /**
+     * The assistant role is not requestable, so setup is the system page. Ask
+     * for the trigger's permissions first: the assist screen can open over the
+     * lock screen, where a permission prompt is no place to start.
+     */
+    private fun openAssistantSettings(result: MethodChannel.Result) {
+        val missing = triggerPermissions().filter {
+            activity.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            startSettings()
+            result.success(null)
+            return
+        }
+        pendingSettings?.success(null)
+        pendingSettings = result
+        activity.requestPermissions(missing.toTypedArray(), PERMISSION_REQUEST)
+    }
+
+    /** Consumes this channel's permission result; false for anyone else's. */
+    fun onRequestPermissionsResult(requestCode: Int): Boolean {
+        if (requestCode != PERMISSION_REQUEST) return false
+        val result = pendingSettings ?: return true
+        pendingSettings = null
+        startSettings()
+        result.success(null)
+        return true
+    }
+
+    private fun startSettings() {
+        for (action in listOf(
+            Settings.ACTION_VOICE_INPUT_SETTINGS,
+            Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS,
+        )) {
+            try {
+                activity.startActivity(Intent(action))
+                return
+            } catch (_: ActivityNotFoundException) {
+                // Try the broader page.
+            }
+        }
+    }
+
+    private fun triggerPermissions(): List<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            listOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            listOf(Manifest.permission.RECORD_AUDIO)
+        }
+
+    fun dispose() {
+        channel.setMethodCallHandler(null)
+        pendingSettings?.success(null)
+        pendingSettings = null
+        headset.close()
+    }
+
+    companion object {
+        const val NAME = "org.mek.rusa.dashboard/assistant"
+        private const val PERMISSION_REQUEST = 0x7253
+    }
+}
