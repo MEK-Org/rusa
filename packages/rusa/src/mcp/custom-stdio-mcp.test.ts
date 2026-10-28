@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -164,6 +166,33 @@ describe("configured host-side stdio MCP proxy", () => {
 
     const after = await call(client, "read_goal");
     expect(after.pid).not.toBe(before.pid);
+  });
+
+  it("ends a child still starting when the downstream session closes", async () => {
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const dir = mkdtempSync(join(tmpdir(), "rusa-custom-mcp-"));
+    const pidFile = join(dir, "pid");
+    try {
+      const client = await connect("reader", { args: [fixture, "--never-initialize", pidFile] });
+      const discovery = client.listTools().catch(() => undefined);
+      await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(alive(pid)).toBe(true);
+
+      await client.close();
+      // Well inside the 30-second initialization timeout.
+      await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 2_000 });
+      await discovery;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discovers a permitted tool listed on a later upstream page", async () => {
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const client = await connect("reader", { args: [fixture, "--paged"] });
+
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(["read_goal"]);
   });
 
   it("logs why a granted actor sees no tools when the upstream cannot start", async () => {

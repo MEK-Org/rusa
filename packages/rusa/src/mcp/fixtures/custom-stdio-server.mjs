@@ -1,5 +1,35 @@
+import { writeFileSync } from "node:fs";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+
+const [mode, pidFile] = process.argv.slice(2);
+
+if (mode === "--never-initialize") {
+  // A synthetic upstream stuck in startup: it never answers initialize and,
+  // like any stdio server, exits once its stdin closes.
+  writeFileSync(pidFile, String(process.pid));
+  process.stdin.on("end", () => process.exit(0));
+  process.stdin.resume();
+  await new Promise(() => {});
+}
+
+if (mode === "--paged") {
+  // A synthetic upstream whose permitted tool is only on the second page.
+  const paged = new Server(
+    { name: "synthetic-paged", version: "0.1.0" },
+    { capabilities: { tools: {} } }
+  );
+  const page = (name) => ({ name, inputSchema: { type: "object" } });
+  paged.setRequestHandler(ListToolsRequestSchema, async (request) =>
+    request.params?.cursor === "page-2"
+      ? { tools: [page("read_goal")] }
+      : { tools: [page("unconfigured_tool")], nextCursor: "page-2" }
+  );
+  await paged.connect(new StdioServerTransport());
+  await new Promise(() => {});
+}
 
 const launchContext = () => ({
   content: [

@@ -6,6 +6,7 @@ import {
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
+  type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { CustomMcpServerConfig } from "../config/types.js";
 import { type Logger, serializeError } from "../observability/logger.js";
@@ -91,6 +92,9 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
     ...configured.config.writeTools.map((name) => [name, "write"] as const),
   ]);
   let upstream: UpstreamSession | undefined;
+  // The child still initializing, so a closing downstream session can end it
+  // at once instead of after the initialization timeout.
+  let starting: UpstreamSession | undefined;
   // Every launch decision runs behind the previous one, so concurrent calls on
   // a cold session share one child instead of each spawning and orphaning one.
   let pending: Promise<unknown> = Promise.resolve();
@@ -133,11 +137,14 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
     });
     const client = new Client({ name: "rusa-custom-mcp-proxy", version: "0.1.0" });
     const session: UpstreamSession = { client, transport, scope };
+    starting = session;
     try {
       await client.connect(transport, { timeout: UPSTREAM_TIMEOUT_MS });
     } catch (error) {
       await closeSession(session);
       throw error;
+    } finally {
+      starting = undefined;
     }
     if (closed) {
       // The downstream session ended while this child was starting.
@@ -187,6 +194,7 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
   // session goes away, which in turn terminates the private stdio child.
   proxy.server.onclose = () => {
     closed = true;
+    if (starting) void closeSession(starting);
     void closeUpstream();
   };
 
@@ -195,9 +203,20 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
     if (access.size === 0) return { tools: [] };
     try {
       const current = await ensureUpstream(access.has("write") ? "write" : "read");
-      const listed = await current.client.listTools(undefined, { timeout: UPSTREAM_TIMEOUT_MS });
+      // The proxy filters, so it follows every upstream page and answers with
+      // one; a single deadline bounds the whole walk.
+      const deadline = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
+      const tools: Tool[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await current.client.listTools(cursor === undefined ? undefined : { cursor }, {
+          signal: deadline,
+        });
+        tools.push(...page.tools);
+        cursor = page.nextCursor;
+      } while (cursor !== undefined);
       return {
-        tools: listed.tools.filter(
+        tools: tools.filter(
           (tool) =>
             classifications.has(tool.name) &&
             permits(access, classifications.get(tool.name) as Access)
