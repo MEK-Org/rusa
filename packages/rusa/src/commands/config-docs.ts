@@ -145,6 +145,8 @@ Top-level fields:
   invocationDebug          Optional. Full invocation artifact capture controls.
   observability            Optional. Operational alerting controls.
   understanding            Optional. Integrated Understanding settings (rootNodeId, glassGoals backend).
+  customMcpServers         Optional. Host-owned stdio MCP servers, each reachable only through an explicit
+                           per-user read or write grant. See docs/custom-mcp.md.
   glassGoals               Optional legacy IU storage section (prefer nesting under understanding.glassGoals).
   smokeTest                Optional legacy runtime smoke-test settings.
 
@@ -331,6 +333,21 @@ understanding.glassGoals:
                            Optional path to a Firebase service account key.
   rootNodeId               Legacy remote-backed knowledge graph root. Usually written
                            by rusa understanding seed-from-ops.
+
+customMcpServers.<capability>:
+
+  Each key is a lowercase capability name that must not reuse a built-in MCP server or
+  capability name; Rusa refuses to start otherwise. Configuring an entry grants no actor
+  access: an actor needs <capability>:<userId>:read or <capability>:<userId>:write, and
+  write includes read. See docs/custom-mcp.md.
+  command                  Required. Host executable launched as a private stdio MCP child per session.
+  args                     Optional list of fixed string arguments.
+  cwd                      Optional working directory for the child.
+  userId                   Required colon-free upstream user, passed as RUSA_MCP_USER_ID with
+                           RUSA_MCP_SCOPE. No other environment is configurable; env is rejected.
+  readTools                Required list, possibly empty. Tool names a read or write grant may call.
+  writeTools               Required list, possibly empty. Tool names only a write grant may call.
+                           Each name appears in one list, and at least one list is non-empty.
 
 glassGoals:
 

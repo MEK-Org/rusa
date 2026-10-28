@@ -39,6 +39,12 @@ describe("config docs", () => {
     );
   });
 
+  it("documents host-owned custom MCP servers and their grant shape", () => {
+    expect(CONFIG_DOCS).toContain("customMcpServers.<capability>:");
+    expect(CONFIG_DOCS).toContain("<capability>:<userId>:read or <capability>:<userId>:write");
+    expect(CONFIG_DOCS).toContain("docs/custom-mcp.md");
+  });
+
   it("documents the quickstart profile", () => {
     expect(CONFIG_DOCS).toContain("profile: quickstart");
     expect(CONFIG_DOCS).toContain("local git bridge delivery");
