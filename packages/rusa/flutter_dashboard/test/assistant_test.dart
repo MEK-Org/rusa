@@ -279,6 +279,43 @@ void main() {
       expect(walkie.recorder.startCalls, 0);
     });
 
+    testWidgets('a superseded Retry leaves the current start\'s walkie off', (
+      tester,
+    ) async {
+      api.threadsResult = [makeThread('child', parent: 'gone')];
+      await pumpPage(tester);
+      expect(find.text('No active root actor'), findsOneWidget);
+
+      api.threadsResult = [makeThread('root')];
+      final first = Completer<ThreadsSnapshot>();
+      final second = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.addAll([first, second]);
+      await tester.tap(find.text('Retry'));
+      await tester.pump();
+      await tester.tap(find.text('Retry'));
+      await tester.pump();
+
+      ThreadsSnapshot snapshot() => ThreadsSnapshot(
+        halted: false,
+        threads: api.threadsResult,
+        rootActorId: 'root',
+      );
+      second.complete(snapshot());
+      await tester.pump();
+      await tester.pump();
+      expect(walkie.recorder.startCalls, 1);
+      first.complete(snapshot());
+      await tester.pump();
+      await tester.pump();
+
+      await tester.tap(find.byKey(const ValueKey('walkie-off')));
+      await tester.pump();
+      await tester.pump();
+      expect(closed, 1);
+      expect(walkie.recorder.startCalls, 1);
+      await unmount(tester);
+    });
+
     testWidgets('closing while voice starts releases it unrecorded', (
       tester,
     ) async {

@@ -67,8 +67,11 @@ class _AssistantPageState extends State<AssistantPage> {
       throw StateError('Voice is not available on this device');
     }
     final snapshot = await _api.fetchThreads();
-    await _enabledSub?.cancel();
+    // Only the current start may drop the previous walkie-off listener.
+    if (stale()) throw StateError('Assist screen closed');
+    final previousEnabled = _enabledSub;
     _enabledSub = null;
+    await previousEnabled?.cancel();
     if (stale()) throw StateError('Assist screen closed');
     final root = resolveRootActorId(snapshot);
     if (root == null) throw StateError('No active root actor');
