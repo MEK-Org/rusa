@@ -22,6 +22,8 @@ export default defineConfig({
     "quota/coordinator-metrics": "src/quota/coordinator-metrics.ts",
     "quota/shared-store": "src/quota/shared-store.ts",
     "commands/coordinator-path-check": "src/commands/coordinator-path-check.ts",
+    // `scripts/build-android.mjs` resolves the APK's branding from config.yaml.
+    "dashboard/android-branding": "src/dashboard/android-branding.ts",
   },
   format: ["esm"],
   target: "node20",

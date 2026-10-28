@@ -8,6 +8,13 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Instance branding (#1191). `pnpm --filter rusa run build:android` resolves the
+// application id and a generated resource directory (launcher label and icon)
+// from config.yaml and passes them here; a plain `flutter build apk` keeps the
+// unbranded scaffold.
+val rusaApplicationId = project.findProperty("rusaApplicationId") as String? ?: "org.mek.rusa.dashboard"
+val rusaBrandingRes = project.findProperty("rusaBrandingRes") as String?
+
 android {
     namespace = "org.mek.rusa.dashboard"
     compileSdk = 36
@@ -23,11 +30,19 @@ android {
     }
 
     defaultConfig {
-        applicationId = "org.mek.rusa.dashboard"
+        applicationId = rusaApplicationId
         minSdk = 29
         targetSdk = 34
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders["rusaAppLabel"] =
+            if (rusaBrandingRes != null) "@string/rusa_app_label" else "Rusa"
+        manifestPlaceholders["rusaAppIcon"] =
+            if (rusaBrandingRes != null) "@mipmap/rusa_launcher" else "@mipmap/ic_launcher"
+    }
+
+    if (rusaBrandingRes != null) {
+        sourceSets.getByName("main").res.srcDir(rusaBrandingRes)
     }
 
     signingConfigs {
