@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MCP_HEADERS_TIMEOUT_MS, MCP_KEEP_ALIVE_TIMEOUT_MS } from "../mcp/http-server.js";
 import type { Logger } from "../observability/logger.js";
 import { FollowerEventQueue } from "./follower-event-queue.js";
 import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
@@ -253,6 +254,19 @@ describe("leader follower gateway", () => {
       );
       const origin = await hub.listen("127.0.0.1", 0);
       expect(origin).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it("configures keep-alive and headers timeouts matching the MCP HTTP server (#1194)", async () => {
+    const token = randomBytes(32).toString("hex");
+    const hub = new FollowerHub(token);
+    try {
+      await hub.listen("127.0.0.1", 0);
+      const server = (hub as unknown as { server: import("node:http").Server }).server;
+      expect(server.keepAliveTimeout).toBe(MCP_KEEP_ALIVE_TIMEOUT_MS);
+      expect(server.headersTimeout).toBe(MCP_HEADERS_TIMEOUT_MS);
     } finally {
       await hub.close();
     }
