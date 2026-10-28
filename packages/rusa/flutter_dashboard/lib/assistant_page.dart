@@ -71,7 +71,7 @@ class _AssistantPageState extends State<AssistantPage> {
     _enabledSub = null;
     if (stale()) throw StateError('Assist screen closed');
     final root = resolveRootActorId(snapshot.threads);
-    if (root == null) throw StateError('No active root actor');
+    if (root == null) throw StateError('No single active root actor');
     unawaited(_controller?.dispose());
     final controller = WalkieController(
       actorId: root,
@@ -134,6 +134,15 @@ class _AssistantPageState extends State<AssistantPage> {
     super.dispose();
   }
 
+  /// The screen can show over the lock screen, so an unexpected failure (a
+  /// socket error naming the server, an HTTP error body) goes to the log, not
+  /// the page. The page's own [StateError]s are written to be shown.
+  String _errorText(Object? error) {
+    if (error is StateError) return error.message;
+    debugPrint('Assist screen failed to start: $error');
+    return "Couldn't reach Rusa";
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -152,10 +161,10 @@ class _AssistantPageState extends State<AssistantPage> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(switch (snapshot.error) {
-                      StateError(:final message) => message,
-                      final error => '$error',
-                    }, style: const TextStyle(color: MeshColors.textSecondary)),
+                    Text(
+                      _errorText(snapshot.error),
+                      style: const TextStyle(color: MeshColors.textSecondary),
+                    ),
                     TextButton(
                       onPressed: () => setState(() {
                         _ready = _start();

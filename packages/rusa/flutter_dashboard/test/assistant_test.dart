@@ -19,18 +19,7 @@ import 'fakes.dart';
 
 void main() {
   group('resolveRootActorId', () {
-    test('prefers the actor whose id is root', () {
-      expect(
-        resolveRootActorId([
-          makeThread('other-top'),
-          makeThread('root'),
-          makeThread('child', parent: 'root'),
-        ]),
-        'root',
-      );
-    });
-
-    test('falls back to the first active parentless actor', () {
+    test('is the one active parentless actor, whatever its id', () {
       expect(
         resolveRootActorId([
           makeThread('root', status: 'retired'),
@@ -38,6 +27,17 @@ void main() {
           makeThread('top'),
         ]),
         'top',
+      );
+    });
+
+    test('is null with several active parentless actors', () {
+      expect(
+        resolveRootActorId([
+          makeThread('root'),
+          makeThread('detached'),
+          makeThread('child', parent: 'root'),
+        ]),
+        isNull,
       );
     });
 
@@ -142,7 +142,7 @@ void main() {
       await pumpPage(tester);
 
       expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
-      expect(find.text('No active root actor'), findsOneWidget);
+      expect(find.text('No single active root actor'), findsOneWidget);
       expect(walkie.recorder.startCalls, 0);
 
       api.threadsResult = [makeThread('root')];
@@ -150,6 +150,21 @@ void main() {
       await tester.pump();
       await tester.pump();
       expect(walkie.recorder.startCalls, 1);
+      await unmount(tester);
+    });
+
+    testWidgets('shows a fixed message, not the raw failure', (tester) async {
+      api.threadsError = DashboardApiException(
+        Uri.parse('https://dash.example/api/mesh/threads'),
+        500,
+        'internal detail',
+      );
+      await pumpPage(tester);
+
+      expect(find.text("Couldn't reach Rusa"), findsOneWidget);
+      expect(find.textContaining('dash.example'), findsNothing);
+      expect(find.textContaining('internal detail'), findsNothing);
+      expect(walkie.recorder.startCalls, 0);
       await unmount(tester);
     });
 
@@ -186,7 +201,7 @@ void main() {
     testWidgets('closing during a Retry start starts nothing', (tester) async {
       api.threadsResult = [makeThread('child', parent: 'gone')];
       await pumpPage(tester);
-      expect(find.text('No active root actor'), findsOneWidget);
+      expect(find.text('No single active root actor'), findsOneWidget);
 
       api.threadsResult = [makeThread('root')];
       final gate = Completer<ThreadsSnapshot>();

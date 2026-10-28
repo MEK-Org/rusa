@@ -51,15 +51,14 @@ abstract interface class AssistantSignals {
 abstract interface class AssistantPlatform
     implements AssistantRole, HeadsetRoute, AssistantSignals {}
 
-/// The walkie recipient for the assist trigger: the root actor. Prefers the
-/// actor whose id is `root`, else the first active actor without a parent.
+/// The walkie recipient for the assist trigger: the root actor, which is the
+/// one active actor without a parent. The threads list does not mark root
+/// itself, and an operator can detach another actor to the top level, so with
+/// several parentless actors this answers null rather than guess.
 String? resolveRootActorId(List<ThreadDto> threads) {
-  final active = threads.where((t) => t.status == 'active');
-  for (final thread in active) {
-    if (thread.id == 'root') return thread.id;
-  }
-  for (final thread in active) {
-    if (thread.parentId == null) return thread.id;
-  }
-  return null;
+  final tops = [
+    for (final thread in threads)
+      if (thread.status == 'active' && thread.parentId == null) thread.id,
+  ];
+  return tops.length == 1 ? tops.single : null;
 }

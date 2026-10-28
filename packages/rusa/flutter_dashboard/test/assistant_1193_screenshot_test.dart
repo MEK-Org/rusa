@@ -1,5 +1,6 @@
-// Review captures for #1193: the phone drawer's default-assistant entry
-// (unset and held) and the assist screen recording to root. All data is
+// Review captures for #1193: the phone drawer before the change (no
+// assistant entry, as without the role), its default-assistant entry (unset
+// and held), and the assist screen recording to root. All data is
 // synthetic; no API is called.
 // Run: flutter test test/assistant_1193_screenshot_test.dart
 import 'package:flutter/material.dart';
@@ -32,7 +33,7 @@ void main() {
     await tester.runAsync(() async {
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.binding.setSurfaceSize(_phone);
-      for (final held in [false, true]) {
+      for (final held in [null, false, true]) {
         final store = DashboardStore(api: FakeApi(), stream: FakeStream());
         addTearDown(store.dispose);
         final key = GlobalKey();
@@ -47,12 +48,14 @@ void main() {
                   store: store,
                   selected: DashboardView.overview,
                   onSelect: (_) {},
-                  assistantRole: FakeAssistant(
-                    roleStatus: AssistantRoleStatus(
-                      available: true,
-                      held: held,
-                    ),
-                  ),
+                  assistantRole: held == null
+                      ? null
+                      : FakeAssistant(
+                          roleStatus: AssistantRoleStatus(
+                            available: true,
+                            held: held,
+                          ),
+                        ),
                 ),
               ),
             ),
@@ -60,11 +63,16 @@ void main() {
         );
         await tester.pump();
         await tester.pump();
-        expect(find.byKey(const ValueKey('drawer-assistant')), findsOne);
-        await captureBoundary(
-          key,
-          'screenshots/1193_drawer_assistant_${held ? 'held' : 'unset'}.png',
+        expect(
+          find.byKey(const ValueKey('drawer-assistant')),
+          held == null ? findsNothing : findsOne,
         );
+        final name = switch (held) {
+          null => 'before',
+          true => 'assistant_held',
+          false => 'assistant_unset',
+        };
+        await captureBoundary(key, 'screenshots/1193_drawer_$name.png');
         await tester.pumpWidget(const SizedBox.shrink());
       }
     });
