@@ -286,20 +286,18 @@ export interface GlassGoalsConfig {
 }
 
 /**
- * An operator-owned stdio MCP server exposed only through a grantable,
- * per-actor loopback endpoint. The configured user is an upstream launch
+ * An independently running host HTTP JSON service exposed only through a grantable,
+ * per-actor loopback endpoint. The configured user is a trusted request
  * binding, never a tool argument supplied by an actor.
  */
 export interface CustomMcpServerConfig {
-  /** Executable launched on the host for one proxied MCP session. */
-  command: string;
-  /** Fixed arguments for the host-owned process. */
-  args?: string[];
-  /** Optional host working directory for the process. */
-  cwd?: string;
+  /** Absolute Unix socket path for the independently running HTTP service. */
+  socketPath: string;
+  /** Plain filename under RUSA_HOME/secrets containing the host bearer token. */
+  tokenFile: string;
   /**
    * Fixed external graph identity accepted by this configured server. This is
-   * the upstream process's launch binding and is independent of
+   * the upstream request's trusted binding and is independent of
    * `understanding.glassGoals.username`, which configures Rusa's own
    * Integrated Understanding store.
    */

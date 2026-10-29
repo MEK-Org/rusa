@@ -60,15 +60,15 @@ describe("loadConfig deployBranch", () => {
 describe("loadConfig customMcpServers", () => {
   const customMcpServers = {
     glass_goals: {
-      command: "goals-mcp",
-      args: ["serve"],
+      socketPath: "/tmp/synthetic-goals.sock",
+      tokenFile: "synthetic-goals-token",
       userId: "configured-user",
       readTools: ["read_goal"],
       writeTools: ["write_goal"],
     },
   };
 
-  it("accepts a fixed-user custom stdio server without granting it to an actor", () => {
+  it("accepts a fixed-user custom HTTP service without granting it to an actor", () => {
     expect(loadConfig(writeConfig({ customMcpServers })).customMcpServers).toEqual(
       customMcpServers
     );
@@ -82,6 +82,11 @@ describe("loadConfig customMcpServers", () => {
   });
 
   it.each([
+    [{ glass_goals: { ...customMcpServers.glass_goals, socketPath: "relative.sock" } }, /absolute/],
+    [{ glass_goals: { ...customMcpServers.glass_goals, tokenFile: "../outside" } }, /plain secret/],
+    [{ glass_goals: { ...customMcpServers.glass_goals, tokenFile: " .. " } }, /plain secret/],
+    [{ glass_goals: { ...customMcpServers.glass_goals, command: "old-stdio" } }, /not supported/],
+    [{ glass_goals: { ...customMcpServers.glass_goals, userId: "user\r\nheader" } }, /colon-free/],
     [{ glass_goals: { ...customMcpServers.glass_goals, userId: "caller:chosen" } }, /colon-free/],
     [
       {

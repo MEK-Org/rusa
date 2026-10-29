@@ -159,7 +159,8 @@ describe("grantable capabilities allow-list ", () => {
       ...STUB_DEPS,
       customMcpServers: {
         glass_goals: {
-          command: "synthetic-goals-mcp",
+          socketPath: "/tmp/synthetic-goals.sock",
+          tokenFile: "synthetic-goals-token",
           userId: "configured-user",
           readTools: ["read_goal"],
           writeTools: ["write_goal"],
@@ -206,7 +207,8 @@ describe("grantable capabilities allow-list ", () => {
 
   it("refuses a custom server that would take a built-in or reserved name", () => {
     const custom = {
-      command: "synthetic-goals-mcp",
+      socketPath: "/tmp/synthetic-goals.sock",
+      tokenFile: "synthetic-goals-token",
       userId: "configured-user",
       readTools: ["read_goal"],
       writeTools: [],
