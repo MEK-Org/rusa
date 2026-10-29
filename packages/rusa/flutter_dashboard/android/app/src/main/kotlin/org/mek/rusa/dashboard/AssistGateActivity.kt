@@ -15,8 +15,13 @@ import android.os.Bundle
  * One gate serves one trigger. A trigger while the unlock prompt is up reaches
  * this gate as onNewIntent (singleTop) and opens nothing more. Configuration
  * changes don't recreate it, and a gate restored from saved state finishes.
+ *
  * Leaving the screen with the prompt still up, as when the screen turns off,
- * finishes it, so a later unrelated unlock opens nothing.
+ * finishes it. SystemUI reports a cancel only for a prompt that is fully
+ * showing when it hides, so one hidden mid-animation leaves this request
+ * pending, and a later unrelated unlock would report it as succeeded.
+ * KeyguardManager drops the callback once its activity is destroyed, so the
+ * finished gate opens nothing.
  */
 class AssistGateActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {

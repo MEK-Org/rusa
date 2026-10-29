@@ -42,6 +42,7 @@ class _AssistantPageState extends State<AssistantPage> {
   final _subs = <StreamSubscription<Object?>>[];
   StreamSubscription<bool>? _enabledSub;
   int _attempt = 0;
+  bool _ended = false;
   bool _disposed = false;
 
   @override
@@ -124,6 +125,9 @@ class _AssistantPageState extends State<AssistantPage> {
   Future<void> _end() async {
     // A start still in flight is now stale and discards what it built.
     _attempt++;
+    // A trigger can bring the closing screen back to the front before it
+    // finishes; it shows nothing of the ended session to tap.
+    if (mounted) setState(() => _ended = true);
     // Cancelled now, walkie off below cannot also close the screen.
     unawaited(_enabledSub?.cancel());
     _enabledSub = null;
@@ -177,6 +181,7 @@ class _AssistantPageState extends State<AssistantPage> {
         child: FutureBuilder<WalkieController>(
           future: _ready,
           builder: (context, snapshot) {
+            if (_ended) return const SizedBox.shrink();
             final controller = snapshot.data;
             if (controller != null) {
               return WalkiePanel(controller: controller, expanded: true);

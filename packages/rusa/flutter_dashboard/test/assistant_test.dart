@@ -11,6 +11,7 @@ import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
+import 'package:rusa_dashboard/widgets/walkie_panel.dart';
 
 import 'fakes.dart';
 
@@ -183,6 +184,9 @@ void main() {
       expect(walkie.wakeLock.releaseCalls, 1);
       // Native closes the screen; the page does not close it a second time.
       expect(closed, 0);
+      // A trigger can bring the closing screen back to the front before it
+      // finishes; it shows no panel of the ended session to tap.
+      expect(find.byType(WalkiePanel), findsNothing);
 
       // A trigger reaching the closing screen starts nothing.
       assistant.triggerCtrl.add(null);
