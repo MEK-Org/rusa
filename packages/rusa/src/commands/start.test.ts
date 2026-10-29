@@ -22,6 +22,7 @@ import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.j
 import {
   type ActorFactoryContext,
   ActorMesh,
+  type MeshActor,
   RetirementBlockedError,
 } from "../actor/actor-mesh.js";
 import {
@@ -2809,6 +2810,85 @@ describe("runStart webhook event routing (Phase 4)", () => {
     warnSpy.mockRestore();
 
     expect(warns.some((w) => w.startsWith("[update]"))).toBe(false);
+  });
+
+  it("wires a configured HTTP service through startup and the provider MCP map", async () => {
+    const socketPath = join(homeDir, "graph.sock");
+    mkdirSync(join(homeDir, "secrets"), { mode: 0o700 });
+    writeFileSync(join(homeDir, "secrets", "graph-token"), "synthetic-host-token", { mode: 0o600 });
+    const configPath = join(homeDir, "config.yaml");
+    writeFileSync(
+      configPath,
+      readFileSync(configPath, "utf8") +
+        toYaml({
+          customMcpServers: {
+            glass_goals: {
+              socketPath,
+              tokenFile: "graph-token",
+              userId: "synthetic-user",
+              readTools: ["read_goal"],
+              writeTools: [],
+            },
+          },
+        })
+    );
+    const requests: Array<{
+      auth: string | undefined;
+      user: unknown;
+      scope: unknown;
+      method: unknown;
+    }> = [];
+    const service = createServer((req, res) => {
+      requests.push({
+        auth: req.headers.authorization,
+        user: req.headers["rusa-mcp-user-id"],
+        scope: req.headers["rusa-mcp-scope"],
+        method: req.method,
+      });
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ content: [{ type: "text", text: "synthetic graph" }] }));
+    });
+    await new Promise<void>((resolve) => service.listen(socketPath, resolve));
+    const client = new Client({ name: "configured-http-service-test", version: "0.0.0" });
+    try {
+      const handles = await new Promise<{ mesh: ActorMesh; root: MeshActor }>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (ready) => {
+              shutdownFn = ready.shutdown;
+              if (!ready.root) throw new Error("configured actor missing");
+              resolve({ mesh: ready.mesh, root: ready.root });
+            },
+          },
+        });
+      });
+      const options = (
+        handles.root as unknown as {
+          opts: { mcpServers: Array<{ name: string; url: string }> };
+        }
+      ).opts;
+      handles.mesh.grantCapability(handles.root.id, "glass_goals:synthetic-user:read", rootId);
+      const spec = options.mcpServers.find((server) => server.name === "glass_goals");
+      if (!spec) throw new Error("custom service was not mounted");
+      expect(JSON.stringify(spec)).not.toContain("synthetic-host-token");
+      expect(JSON.stringify(spec)).not.toContain(socketPath);
+      await client.connect(new StreamableHTTPClientTransport(new URL(spec.url)));
+      expect(await client.callTool({ name: "read_goal" })).toMatchObject({
+        content: [{ text: "synthetic graph" }],
+      });
+      expect(requests).toEqual([
+        {
+          auth: "Bearer synthetic-host-token",
+          user: "synthetic-user",
+          scope: "read",
+          method: "GET",
+        },
+      ]);
+    } finally {
+      await client.close();
+      service.closeAllConnections();
+      await new Promise<void>((resolve) => service.close(() => resolve()));
+    }
   });
 
   it("adds a live capability grant to the cached provider config for the next run", async () => {

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
@@ -686,32 +686,36 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       if (typeof server !== "object" || server === null || Array.isArray(server)) {
         throw new Error(`${source} must be a mapping`);
       }
-      if (typeof server.command !== "string" || !server.command.trim()) {
-        throw new Error(`${source}.command must be a non-empty string`);
-      }
-      server.command = server.command.trim();
-      if (server.args !== undefined) {
-        if (!Array.isArray(server.args) || server.args.some((arg) => typeof arg !== "string")) {
-          throw new Error(`${source}.args must be an array of strings when set`);
+      for (const legacy of ["command", "args", "cwd", "env"]) {
+        if (legacy in server) {
+          throw new Error(
+            `${source}.${legacy} is not supported; configure an independently running HTTP service`
+          );
         }
       }
-      if (server.cwd !== undefined) {
-        if (typeof server.cwd !== "string" || !server.cwd.trim()) {
-          throw new Error(`${source}.cwd must be a non-empty string when set`);
-        }
-        server.cwd = server.cwd.trim();
+      if (
+        typeof server.socketPath !== "string" ||
+        !isAbsolute(server.socketPath) ||
+        server.socketPath.includes("\0")
+      ) {
+        throw new Error(`${source}.socketPath must be an absolute Unix socket path`);
       }
-      if ("env" in (server as object)) {
-        throw new Error(
-          `${source}.env is not supported; the host-owned executable must resolve its own credentials`
-        );
+      if (
+        typeof server.tokenFile !== "string" ||
+        !server.tokenFile.trim() ||
+        /[/\\\r\n]/.test(server.tokenFile) ||
+        server.tokenFile.includes("\0") ||
+        [".", ".."].includes(server.tokenFile.trim())
+      ) {
+        throw new Error(`${source}.tokenFile must be a plain secret filename`);
       }
+      server.tokenFile = server.tokenFile.trim();
       if (
         typeof server.userId !== "string" ||
         !server.userId.trim() ||
-        server.userId.includes(":")
+        /[^\x21-\x7e]|:/.test(server.userId)
       ) {
-        throw new Error(`${source}.userId must be a non-empty colon-free string`);
+        throw new Error(`${source}.userId must be a non-empty visible-ASCII colon-free string`);
       }
       server.userId = server.userId.trim();
       for (const key of ["readTools", "writeTools"] as const) {

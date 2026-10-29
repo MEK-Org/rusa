@@ -23,7 +23,7 @@ import {
   createCalendarWriteMcpServer,
 } from "./calendar-mcp.js";
 import { CHAT_WRITE_MCP_NAME, createChatWriteMcpServer } from "./chat-mcp.js";
-import { createCustomStdioMcpServer, customGrantAccess } from "./custom-stdio-mcp.js";
+import { createCustomHttpMcpServer, customGrantAccess } from "./custom-http-mcp.js";
 import {
   createDistillerServer,
   DISTILLER_MCP_NAME,
@@ -116,8 +116,10 @@ export interface GrantableServerDeps {
   quotaManual?: QuotaManualMcpDeps;
   /** Current grants, read at every proxied custom-MCP invocation. */
   activeCapabilitiesForActor?: (actorId: string) => readonly string[];
-  /** Operator-configured, host-owned stdio integrations keyed by capability. */
+  /** Operator-configured, host HTTP service integrations keyed by capability. */
   customMcpServers?: Record<string, CustomMcpServerConfig>;
+  /** Host secret directory; credentials never enter actor configuration. */
+  customMcpSecretsDir?: string;
   /**
    * Names a custom server must not take beyond the grantable servers built
    * here: the always-mounted worker endpoints and capabilities that have no
@@ -298,9 +300,10 @@ export function buildGrantableServers(
     }
     const server = { capability, config };
     const factory: GrantableServerFactory = (selfId) =>
-      createCustomStdioMcpServer({
+      createCustomHttpMcpServer({
         actorId: selfId,
         server,
+        secretsDir: deps.customMcpSecretsDir,
         // Absent wiring fails closed, including for the configured default actor.
         activeCapabilities: deps.activeCapabilitiesForActor ?? (() => []),
         logger: deps.logger,
