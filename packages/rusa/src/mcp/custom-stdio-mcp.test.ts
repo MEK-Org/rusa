@@ -14,7 +14,7 @@ import type { Logger } from "../observability/logger.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { createCustomStdioMcpServer } from "./custom-stdio-mcp.js";
+import { createCustomMcpServer } from "./custom-mcp.js";
 import {
   buildGrantableServers,
   type GrantableServerDeps,
@@ -41,7 +41,7 @@ async function connect(
   overrides: Partial<CustomMcpServerConfig> = {},
   logger?: Logger
 ): Promise<Client> {
-  const proxy = createCustomStdioMcpServer({
+  const proxy = createCustomMcpServer({
     actorId,
     server: { capability: "glass_goals", config: { ...config, ...overrides } },
     activeCapabilities: (id) => grants.get(id) ?? [],

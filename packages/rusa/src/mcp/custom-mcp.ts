@@ -1,5 +1,10 @@
+import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   CallToolRequestSchema,
@@ -8,11 +13,17 @@ import {
   McpError,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { assertSecretContainment } from "../config/secrets.js";
 import type { CustomMcpServerConfig } from "../config/types.js";
 import { type Logger, serializeError } from "../observability/logger.js";
 import { toolError } from "./result.js";
 
 const UPSTREAM_TIMEOUT_MS = 30_000;
+
+/** Fixed graph user sent to a configured HTTP service on every request. */
+export const CUSTOM_MCP_USER_HEADER = "Rusa-Mcp-User-Id";
+/** Current `read` or `write` scope of one upstream HTTP session. */
+export const CUSTOM_MCP_SCOPE_HEADER = "Rusa-Mcp-Scope";
 
 type Access = "read" | "write";
 
@@ -23,18 +34,33 @@ export interface ConfiguredCustomMcpServer {
 
 interface UpstreamSession {
   client: Client;
-  transport: StdioClientTransport;
+  transport: StdioClientTransport | StreamableHTTPClientTransport;
   scope: Access;
 }
 
-export interface CustomStdioMcpOptions {
+export interface CustomMcpOptions {
   actorId: string;
   server: ConfiguredCustomMcpServer;
   activeCapabilities: (actorId: string) => readonly string[];
+  /** Host secrets directory holding an HTTP server's `tokenFile`. */
+  secretsDir?: string;
   logger?: Logger;
 }
 
 class NotGrantedError extends Error {}
+
+// A 404 for an established session means the service no longer knows it,
+// typically after a restart; it did not process the request, so one retry
+// on a fresh session is safe even for a write.
+function isExpiredSession(error: unknown): boolean {
+  return error instanceof StreamableHTTPError && error.code === 404;
+}
+
+// A failure below the protocol leaves the session unusable; the next call
+// starts a fresh one instead of reusing it.
+function isTransportFailure(error: unknown, signal?: AbortSignal): boolean {
+  return !signal?.aborted && !(error instanceof McpError) && !(error instanceof NotGrantedError);
+}
 
 /**
  * The access one grant confers on a configured server: `read` or `write` for
@@ -80,13 +106,22 @@ function failureReason(error: unknown, signal?: AbortSignal): string {
   return "unavailable";
 }
 
+// Only the DELETE that ends a session gets a deadline here: a request's own
+// timeout already bounds the others, and a GET event stream is long-lived.
+const boundedFetch: typeof fetch = (input, init) =>
+  init?.method === "DELETE"
+    ? fetch(input, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) })
+    : fetch(input, init);
+
 /**
- * Proxy one configured host-side stdio MCP process through a fresh per-actor
- * loopback session. The actor never receives the command, environment, or a
- * direct upstream endpoint: it sees only the standard local HTTP MCP server.
+ * Proxy one configured upstream through a fresh per-actor loopback session:
+ * either a private host-side stdio process, or a private MCP session on an
+ * independently running local HTTP service. The actor never receives the
+ * command, environment, service endpoint or token: it sees only the standard
+ * local HTTP MCP server.
  */
-export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpServer {
-  const { actorId, server: configured, activeCapabilities, logger } = options;
+export function createCustomMcpServer(options: CustomMcpOptions): McpServer {
+  const { actorId, server: configured, activeCapabilities, secretsDir, logger } = options;
   const classifications = new Map<string, Access>([
     ...configured.config.readTools.map((name) => [name, "read"] as const),
     ...configured.config.writeTools.map((name) => [name, "write"] as const),
@@ -101,6 +136,15 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
   let closed = false;
 
   const closeSession = async (session: UpstreamSession): Promise<void> => {
+    // An HTTP session is ended on the service, which keeps running; stdio
+    // children end with their transport below.
+    if (session.transport instanceof StreamableHTTPClientTransport && session.transport.sessionId) {
+      try {
+        await session.transport.terminateSession();
+      } catch {
+        // A service that is gone or slow expires the session on its own.
+      }
+    }
     try {
       await session.client.close();
     } catch {
@@ -113,6 +157,45 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
     }
   };
 
+  const openTransport = (scope: Access): UpstreamSession["transport"] => {
+    const { url, tokenFile, command, args, cwd, userId } = configured.config;
+    if (url) {
+      // The service's token is read per session from the host secrets
+      // directory, so a rotated file takes effect at the next session.
+      if (!tokenFile || !secretsDir) throw new Error("custom MCP service token is not configured");
+      const token = readFileSync(assertSecretContainment(tokenFile, secretsDir), "utf-8").trim();
+      if (!token) throw new Error("custom MCP service token file is empty");
+      return new StreamableHTTPClientTransport(new URL(url), {
+        // The same identity contract as stdio, plus the host-held token: no
+        // actor id and no caller-controlled user or scope.
+        requestInit: {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            [CUSTOM_MCP_USER_HEADER]: userId,
+            [CUSTOM_MCP_SCOPE_HEADER]: scope,
+          },
+        },
+        fetch: boundedFetch,
+      });
+    }
+    if (!command) throw new Error("custom MCP server has neither command nor url");
+    return new StdioClientTransport({
+      command,
+      ...(args ? { args } : {}),
+      ...(cwd ? { cwd } : {}),
+      // This is the complete upstream identity contract. It intentionally has
+      // no actor id, caller-controlled user or scope input, or raw credential.
+      env: {
+        RUSA_MCP_USER_ID: userId,
+        RUSA_MCP_SCOPE: scope,
+      },
+      // stdout carries the protocol, so stderr is the upstream's only log.
+      // Inheriting it lands diagnostics in the service log and can never fill
+      // an undrained pipe and stall the child.
+      stderr: "inherit",
+    });
+  };
+
   const closeUpstream = async (): Promise<void> => {
     const current = upstream;
     upstream = undefined;
@@ -122,21 +205,7 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
   const launch = async (scope: Access): Promise<UpstreamSession> => {
     // A launch queued behind one the close already ended must not replace it.
     if (closed) throw new Error("custom MCP proxy session closed before upstream launch");
-    const transport = new StdioClientTransport({
-      command: configured.config.command,
-      ...(configured.config.args ? { args: configured.config.args } : {}),
-      ...(configured.config.cwd ? { cwd: configured.config.cwd } : {}),
-      // This is the complete upstream identity contract. It intentionally has
-      // no actor id, caller-controlled user or scope input, or raw credential.
-      env: {
-        RUSA_MCP_USER_ID: configured.config.userId,
-        RUSA_MCP_SCOPE: scope,
-      },
-      // stdout carries the protocol, so stderr is the upstream's only log.
-      // Inheriting it lands diagnostics in the service log and can never fill
-      // an undrained pipe and stall the child.
-      stderr: "inherit",
-    });
+    const transport = openTransport(scope);
     const client = new Client({ name: "rusa-custom-mcp-proxy", version: "0.1.0" });
     const session: UpstreamSession = { client, transport, scope };
     starting = session;
@@ -169,13 +238,40 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
       }
       const scope = access.has("write") ? "write" : "read";
       if (upstream?.scope === scope) return upstream;
-      // A scope change ends calls still in flight on the old child; the
-      // upstream never continues with a stale launch scope.
+      // A scope change ends calls still in flight on the old session; the
+      // upstream never continues with a stale scope.
       await closeUpstream();
       return launch(scope);
     });
     pending = next.catch(() => undefined);
     return next;
+  };
+
+  const discard = (session: UpstreamSession): void => {
+    if (upstream !== session) return;
+    upstream = undefined;
+    void closeSession(session);
+  };
+
+  // Run one upstream request. A session the service has forgotten is replaced
+  // and the request retried once; any other failure below the protocol drops
+  // the session so the next request reconnects.
+  const withUpstream = async <T>(
+    required: Access,
+    request: (session: UpstreamSession) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> => {
+    const attempt = async (retry: boolean): Promise<T> => {
+      const session = await ensureUpstream(required);
+      try {
+        return await request(session);
+      } catch (error) {
+        if (isTransportFailure(error, signal)) discard(session);
+        if (retry && isExpiredSession(error)) return attempt(false);
+        throw error;
+      }
+    };
+    return attempt(true);
   };
 
   const logFailure = (operation: string, error: unknown, tool?: string): void => {
@@ -193,7 +289,8 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
     { capabilities: { tools: {} } }
   );
   // StreamableHTTPServerTransport closes this protocol when its downstream
-  // session goes away, which in turn terminates the private stdio child.
+  // session goes away, which in turn terminates the private stdio child or
+  // ends the private session on the HTTP service.
   proxy.server.onclose = () => {
     closed = true;
     if (starting) void closeSession(starting);
@@ -204,19 +301,26 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
     const access = activeAccess(actorId, configured, activeCapabilities);
     if (access.size === 0) return { tools: [] };
     try {
-      const current = await ensureUpstream(access.has("write") ? "write" : "read");
       // The proxy filters, so it follows every upstream page and answers with
       // one; a single deadline bounds the whole walk.
       const deadline = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
-      const tools: Tool[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await current.client.listTools(cursor === undefined ? undefined : { cursor }, {
-          signal: deadline,
-        });
-        tools.push(...page.tools);
-        cursor = page.nextCursor;
-      } while (cursor !== undefined);
+      const tools = await withUpstream(
+        access.has("write") ? "write" : "read",
+        async (current) => {
+          const listed: Tool[] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await current.client.listTools(
+              cursor === undefined ? undefined : { cursor },
+              { signal: deadline }
+            );
+            listed.push(...page.tools);
+            cursor = page.nextCursor;
+          } while (cursor !== undefined);
+          return listed;
+        },
+        deadline
+      );
       return {
         tools: tools.filter(
           (tool) =>
@@ -239,14 +343,18 @@ export function createCustomStdioMcpServer(options: CustomStdioMcpOptions): McpS
       return toolError("custom MCP tool is not currently granted");
     }
     try {
-      const current = await ensureUpstream(classification);
-      return await current.client.callTool(
-        {
-          name: request.params.name,
-          ...(request.params.arguments ? { arguments: request.params.arguments } : {}),
-        },
-        undefined,
-        { signal: extra.signal, timeout: UPSTREAM_TIMEOUT_MS }
+      return await withUpstream(
+        classification,
+        (current) =>
+          current.client.callTool(
+            {
+              name: request.params.name,
+              ...(request.params.arguments ? { arguments: request.params.arguments } : {}),
+            },
+            undefined,
+            { signal: extra.signal, timeout: UPSTREAM_TIMEOUT_MS }
+          ),
+        extra.signal
       );
     } catch (error) {
       if (error instanceof NotGrantedError) {

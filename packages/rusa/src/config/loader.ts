@@ -119,6 +119,30 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
  * Load and parse the config.yaml file from the rusa home directory.
  * Also loads .env if present.
  */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * A custom MCP service is reachable only on the leader's own loopback
+ * interface, and the URL carries no credential: the token comes from
+ * `tokenFile`, so the configured URL is safe to log.
+ */
+function parseCustomMcpUrl(value: unknown, source: string): string {
+  let url: URL;
+  try {
+    if (typeof value !== "string") throw new Error("not a string");
+    url = new URL(value.trim());
+  } catch {
+    throw new Error(`${source}.url must be an absolute http URL`);
+  }
+  if (url.protocol !== "http:" || !LOOPBACK_HOSTS.has(url.hostname)) {
+    throw new Error(`${source}.url must be a loopback http URL (127.0.0.1, localhost or [::1])`);
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error(`${source}.url must not carry credentials, a query or a fragment`);
+  }
+  return url.href;
+}
+
 export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConfig {
   const mcHome = home ?? resolveHome();
 
@@ -686,10 +710,39 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       if (typeof server !== "object" || server === null || Array.isArray(server)) {
         throw new Error(`${source} must be a mapping`);
       }
-      if (typeof server.command !== "string" || !server.command.trim()) {
-        throw new Error(`${source}.command must be a non-empty string`);
+      if ((server.command === undefined) === (server.url === undefined)) {
+        throw new Error(`${source} must set exactly one of command or url`);
       }
-      server.command = server.command.trim();
+      if (server.url !== undefined) {
+        server.url = parseCustomMcpUrl(server.url, source);
+        for (const key of ["args", "cwd"] as const) {
+          if (server[key] !== undefined) {
+            throw new Error(`${source}.${key} applies only to a command server`);
+          }
+        }
+        if (typeof server.tokenFile !== "string" || !server.tokenFile.trim()) {
+          throw new Error(`${source}.tokenFile must name a secret file when url is set`);
+        }
+        server.tokenFile = server.tokenFile.trim();
+        if (
+          server.tokenFile.includes("/") ||
+          server.tokenFile.includes("\\") ||
+          server.tokenFile === "." ||
+          server.tokenFile === ".."
+        ) {
+          throw new Error(
+            `${source}.tokenFile must be a basename directly under RUSA_HOME/secrets`
+          );
+        }
+      } else {
+        if (typeof server.command !== "string" || !server.command.trim()) {
+          throw new Error(`${source}.command must be a non-empty string`);
+        }
+        server.command = server.command.trim();
+        if (server.tokenFile !== undefined) {
+          throw new Error(`${source}.tokenFile applies only to a url server`);
+        }
+      }
       if (server.args !== undefined) {
         if (!Array.isArray(server.args) || server.args.some((arg) => typeof arg !== "string")) {
           throw new Error(`${source}.args must be an array of strings when set`);

@@ -145,8 +145,8 @@ Top-level fields:
   invocationDebug          Optional. Full invocation artifact capture controls.
   observability            Optional. Operational alerting controls.
   understanding            Optional. Integrated Understanding settings (rootNodeId, glassGoals backend).
-  customMcpServers         Optional. Host-owned stdio MCP servers, each reachable only through an explicit
-                           per-user read or write grant. See docs/custom-mcp.md.
+  customMcpServers         Optional. Host-owned stdio or local HTTP MCP servers, each reachable only
+                           through an explicit per-user read or write grant. See docs/custom-mcp.md.
   glassGoals               Optional legacy IU storage section (prefer nesting under understanding.glassGoals).
   smokeTest                Optional legacy runtime smoke-test settings.
 
@@ -340,11 +340,19 @@ customMcpServers.<capability>:
   capability name; Rusa refuses to start otherwise. Configuring an entry grants no actor
   access: an actor needs <capability>:<userId>:read or <capability>:<userId>:write, and
   write includes read. See docs/custom-mcp.md.
-  command                  Required. Host executable launched as a private stdio MCP child per session.
-  args                     Optional list of fixed string arguments.
-  cwd                      Optional working directory for the child.
+  Set exactly one of command (a stdio child Rusa launches per session) or url (a
+  service the operator runs independently).
+  command                  Host executable launched as a private stdio MCP child per session.
+  args                     Optional list of fixed string arguments for command.
+  cwd                      Optional working directory for the command child.
+  url                      Loopback http Streamable HTTP endpoint (127.0.0.1, localhost or [::1]) of a
+                           running service. Rusa opens one private session per proxied session and
+                           never starts or stops the service.
+  tokenFile                Required with url. Basename of the service's bearer token directly under
+                           RUSA_HOME/secrets; never shown to actors.
   userId                   Required colon-free upstream user, passed as RUSA_MCP_USER_ID with
-                           RUSA_MCP_SCOPE. No other environment is configurable; env is rejected.
+                           RUSA_MCP_SCOPE to a command, or as the Rusa-Mcp-User-Id and Rusa-Mcp-Scope
+                           headers to a url. No other environment is configurable; env is rejected.
   readTools                Required list, possibly empty. Tool names a read or write grant may call.
   writeTools               Required list, possibly empty. Tool names only a write grant may call.
                            Each name appears in one list, and at least one list is non-empty.

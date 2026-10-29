@@ -81,6 +81,41 @@ describe("loadConfig customMcpServers", () => {
     );
   });
 
+  const service = {
+    url: "http://127.0.0.1:7319/mcp",
+    tokenFile: "glass-goals-mcp-token",
+    userId: "configured-user",
+    readTools: ["read_goal"],
+    writeTools: ["write_goal"],
+  };
+
+  it("accepts a running local HTTP service with a host secret token", () => {
+    expect(
+      loadConfig(writeConfig({ customMcpServers: { glass_goals: service } })).customMcpServers
+    ).toEqual({ glass_goals: service });
+    const ipv6 = { ...service, url: "http://[::1]:7319/mcp" };
+    expect(
+      loadConfig(writeConfig({ customMcpServers: { glass_goals: ipv6 } })).customMcpServers
+        ?.glass_goals?.url
+    ).toBe("http://[::1]:7319/mcp");
+  });
+
+  it.each([
+    [{ ...service, command: "goals-mcp" }, /exactly one of command or url/],
+    [{ ...service, url: undefined }, /exactly one of command or url/],
+    [{ ...service, url: "http://graph.example.com/mcp" }, /loopback http URL/],
+    [{ ...service, url: "https://127.0.0.1/mcp" }, /loopback http URL/],
+    [{ ...service, url: "http://user:pass@127.0.0.1/mcp" }, /credentials/],
+    [{ ...service, url: "http://127.0.0.1/mcp?token=x" }, /credentials, a query/],
+    [{ ...service, url: "not a url" }, /absolute http URL/],
+    [{ ...service, tokenFile: undefined }, /tokenFile must name a secret file/],
+    [{ ...service, tokenFile: "../token" }, /basename directly under RUSA_HOME\/secrets/],
+    [{ ...service, args: ["--x"] }, /args applies only to a command server/],
+    [{ ...customMcpServers.glass_goals, tokenFile: "t" }, /tokenFile applies only to a url server/],
+  ])("rejects an unsafe or ambiguous HTTP service entry", (glass_goals, message) => {
+    expect(() => loadConfig(writeConfig({ customMcpServers: { glass_goals } }))).toThrow(message);
+  });
+
   it.each([
     [{ glass_goals: { ...customMcpServers.glass_goals, userId: "caller:chosen" } }, /colon-free/],
     [

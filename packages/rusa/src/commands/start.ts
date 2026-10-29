@@ -2985,6 +2985,7 @@ async function composeStart(
       }),
     quotaManual: { client: quotaCoordinatorClient },
     customMcpServers: config.customMcpServers,
+    secretsDir: secretsDirPath(mcHome),
     reservedCapabilityNames: new Set([
       AGENT_EXEC_MCP_NAME,
       ...WORKER_MCP_NAMES,
