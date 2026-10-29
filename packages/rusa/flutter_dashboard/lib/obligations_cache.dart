@@ -3,6 +3,51 @@ import 'dart:convert';
 import 'models.dart';
 import 'obligation_store.dart';
 
+typedef _PersistedSnapshotEnvelope = ({
+  String scope,
+  String principalId,
+  String savedAt,
+});
+
+const _maxPersistedSnapshotAge = Duration(days: 7);
+const _maxPersistedSnapshotFutureSkew = Duration(minutes: 1);
+
+int _encodedSize(String value) => utf8.encode(value).length;
+
+_PersistedSnapshotEnvelope? _parsePersistedSnapshotEnvelope(
+  Object? decoded, {
+  required int schemaVersion,
+  required int maxSerializedBytes,
+  int? serializedByteCount,
+}) {
+  if (decoded is! Map || decoded['version'] != schemaVersion) return null;
+  final byteCount = serializedByteCount ?? _encodedSize(jsonEncode(decoded));
+  if (byteCount < 0 || byteCount > maxSerializedBytes) return null;
+  final scope = decoded['scope'];
+  final principalId = decoded['principalId'];
+  final savedAt = decoded['savedAt'];
+  if (scope is! String || principalId is! String || savedAt is! String) {
+    return null;
+  }
+  return (scope: scope, principalId: principalId, savedAt: savedAt);
+}
+
+bool _persistedSnapshotUsableAt({
+  required String savedScope,
+  required String savedPrincipalId,
+  required String savedAt,
+  required String scope,
+  required String principalId,
+  required DateTime now,
+}) {
+  if (savedScope != scope || savedPrincipalId != principalId) return false;
+  final written = DateTime.tryParse(savedAt);
+  if (written == null) return false;
+  final age = now.toUtc().difference(written.toUtc());
+  return age >= -_maxPersistedSnapshotFutureSkew &&
+      age <= _maxPersistedSnapshotAge;
+}
+
 /// One persisted capture of the obligations forest, written after an authoritative
 /// `/api/mesh/obligations/forest` sync and replayed on the next return or reload
 /// after the viewing principal is resolved, before the background forest request
@@ -38,10 +83,10 @@ class PersistedObligationsSnapshot {
   static const int maxSerializedBytes = 512 * 1024;
 
   /// Captures older than this are ignored on load.
-  static const Duration maxAge = Duration(days: 7);
+  static const Duration maxAge = _maxPersistedSnapshotAge;
 
   /// Small wall-clock adjustments between save and reload are expected.
-  static const Duration maxFutureSkew = Duration(minutes: 1);
+  static const Duration maxFutureSkew = _maxPersistedSnapshotFutureSkew;
 
   factory PersistedObligationsSnapshot.capture({
     required String scope,
@@ -71,7 +116,7 @@ class PersistedObligationsSnapshot {
   /// Lets the browser adapter reject an oversized raw localStorage value before
   /// paying to parse it.
   static bool rawFitsStorageBudget(String raw) =>
-      encodedSize(raw) <= maxSerializedBytes;
+      _encodedSize(raw) <= maxSerializedBytes;
 
   /// Parses a persisted payload, or returns null when it is from another schema
   /// version, is larger than the budget, or is not the shape this reader
@@ -83,21 +128,16 @@ class PersistedObligationsSnapshot {
     int? serializedByteCount,
   }) {
     try {
-      if (decoded is! Map) return null;
-      if (decoded['version'] != schemaVersion) return null;
-      final byteCount = serializedByteCount ?? encodedSize(jsonEncode(decoded));
-      if (byteCount < 0 || byteCount > maxSerializedBytes) return null;
-      final scope = decoded['scope'];
-      final principalId = decoded['principalId'];
-      final savedAt = decoded['savedAt'];
-      final rawTrees = decoded['trees'];
+      final envelope = _parsePersistedSnapshotEnvelope(
+        decoded,
+        schemaVersion: schemaVersion,
+        maxSerializedBytes: maxSerializedBytes,
+        serializedByteCount: serializedByteCount,
+      );
+      if (envelope == null) return null;
+      final rawTrees = (decoded as Map)['trees'];
 
-      if (scope is! String ||
-          principalId is! String ||
-          savedAt is! String ||
-          rawTrees is! List) {
-        return null;
-      }
+      if (rawTrees is! List) return null;
 
       final trees = <ObligationTreeDto>[];
       for (final raw in rawTrees) {
@@ -106,9 +146,9 @@ class PersistedObligationsSnapshot {
       }
 
       return PersistedObligationsSnapshot(
-        scope: scope,
-        principalId: principalId,
-        savedAt: savedAt,
+        scope: envelope.scope,
+        principalId: envelope.principalId,
+        savedAt: envelope.savedAt,
         trees: trees,
       );
     } catch (_) {
@@ -123,15 +163,17 @@ class PersistedObligationsSnapshot {
     required String principalId,
     required DateTime now,
   }) {
-    if (this.scope != scope) return false;
-    if (this.principalId != principalId) return false;
-    final written = DateTime.tryParse(savedAt);
-    if (written == null) return false;
-    final age = now.toUtc().difference(written.toUtc());
-    return age >= -maxFutureSkew && age <= maxAge;
+    return _persistedSnapshotUsableAt(
+      savedScope: this.scope,
+      savedPrincipalId: this.principalId,
+      savedAt: savedAt,
+      scope: scope,
+      principalId: principalId,
+      now: now,
+    );
   }
 
-  static int encodedSize(String value) => utf8.encode(value).length;
+  static int encodedSize(String value) => _encodedSize(value);
 }
 
 /// One persisted capture of the shared obligation store (#992), written after
@@ -218,7 +260,7 @@ class PersistedObligationEntitiesSnapshot {
   String encode() => jsonEncode(toJson());
 
   static bool rawFitsStorageBudget(String raw) =>
-      PersistedObligationsSnapshot.encodedSize(raw) <= maxSerializedBytes;
+      _encodedSize(raw) <= maxSerializedBytes;
 
   /// Parses a persisted payload, or returns null for another schema version,
   /// an oversized payload or an unexpected shape. Never throws.
@@ -227,30 +269,24 @@ class PersistedObligationEntitiesSnapshot {
     int? serializedByteCount,
   }) {
     try {
-      if (decoded is! Map) return null;
-      if (decoded['version'] != schemaVersion) return null;
-      final byteCount =
-          serializedByteCount ??
-          PersistedObligationsSnapshot.encodedSize(jsonEncode(decoded));
-      if (byteCount < 0 || byteCount > maxSerializedBytes) return null;
-      final scope = decoded['scope'];
-      final principalId = decoded['principalId'];
-      final savedAt = decoded['savedAt'];
-      final queries = decoded['queries'];
-      final obligations = decoded['obligations'];
-      final blockers = decoded['blockers'];
-      if (scope is! String ||
-          principalId is! String ||
-          savedAt is! String ||
-          queries is! List ||
-          obligations is! List ||
-          blockers is! Map) {
+      final envelope = _parsePersistedSnapshotEnvelope(
+        decoded,
+        schemaVersion: schemaVersion,
+        maxSerializedBytes: maxSerializedBytes,
+        serializedByteCount: serializedByteCount,
+      );
+      if (envelope == null) return null;
+      final container = decoded as Map;
+      final queries = container['queries'];
+      final obligations = container['obligations'];
+      final blockers = container['blockers'];
+      if (queries is! List || obligations is! List || blockers is! Map) {
         return null;
       }
       return PersistedObligationEntitiesSnapshot(
-        scope: scope,
-        principalId: principalId,
-        savedAt: savedAt,
+        scope: envelope.scope,
+        principalId: envelope.principalId,
+        savedAt: envelope.savedAt,
         queries: [
           for (final q in queries.cast<Map<dynamic, dynamic>>())
             ObligationQuery(
@@ -282,12 +318,14 @@ class PersistedObligationEntitiesSnapshot {
     required String principalId,
     required DateTime now,
   }) {
-    if (this.scope != scope || this.principalId != principalId) return false;
-    final written = DateTime.tryParse(savedAt);
-    if (written == null) return false;
-    final age = now.toUtc().difference(written.toUtc());
-    return age >= -PersistedObligationsSnapshot.maxFutureSkew &&
-        age <= PersistedObligationsSnapshot.maxAge;
+    return _persistedSnapshotUsableAt(
+      savedScope: this.scope,
+      savedPrincipalId: this.principalId,
+      savedAt: savedAt,
+      scope: scope,
+      principalId: principalId,
+      now: now,
+    );
   }
 }
 
