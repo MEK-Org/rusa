@@ -2821,6 +2821,13 @@ describe("quota MCP server", () => {
         expect(missed.every((m) => m.scrapeFailed)).toBe(true);
       });
 
+      const cancelledCapture = {
+        success: false,
+        output: "\n[Task terminated by SIGTERM (source unattributed)]",
+        exitCode: 143,
+        cancelled: true,
+      };
+
       it("keeps capture failure distinct from a clean read, an absent window, and an extraction failure", async () => {
         const cases: Array<{
           name: string;
@@ -2868,12 +2875,7 @@ describe("quota MCP server", () => {
           },
           {
             name: "cancelled capture",
-            run: {
-              success: false,
-              output: "\n[Task terminated by SIGTERM (source unattributed)]",
-              exitCode: 143,
-              cancelled: true,
-            },
+            run: cancelledCapture,
             llm: () => mockGenerateContent.mockResolvedValue(noPanel),
             parseError: "claude /usage capture failed",
             extracted: false,
@@ -2924,13 +2926,8 @@ describe("quota MCP server", () => {
         ]);
       });
 
+      // Two cancelled captures are the table's "cancelled capture" case above.
       describe("retrying a cancelled capture once (#1195)", () => {
-        const cancelled = {
-          success: false,
-          output: "\n[Task terminated by SIGTERM (source unattributed)]",
-          exitCode: 143,
-          cancelled: true,
-        };
         const panel = "Current week (all models): 39% used";
         const retriedAt = "2026-09-30T16:30:31.000Z";
         const scrapesSinceBaseline = () =>
@@ -2952,7 +2949,7 @@ describe("quota MCP server", () => {
           mockClaudeProvider.run = vi.fn(async () => {
             const i = vi.mocked(mockClaudeProvider.run).mock.calls.length - 1;
             now = Date.parse(completions[i] ?? probeAt);
-            return runs[i] ?? cancelled;
+            return runs[i] ?? cancelledCapture;
           });
           return new QuotaService({
             config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
@@ -2982,7 +2979,7 @@ describe("quota MCP server", () => {
               }),
           });
           const service = serviceWithClock(
-            [cancelled, { success: true, output: panel, exitCode: 0 }],
+            [cancelledCapture, { success: true, output: panel, exitCode: 0 }],
             ["2026-09-30T16:30:30.000Z", retriedAt]
           );
 
@@ -3000,31 +2997,12 @@ describe("quota MCP server", () => {
           ]);
         });
 
-        it("records two cancelled captures as one failed scrape", async () => {
-          mockGenerateContent.mockResolvedValue(noPanel);
-          const service = serviceWithClock(
-            [cancelled, cancelled],
-            ["2026-09-30T16:30:30.000Z", retriedAt]
-          );
-
-          const outcome = await service.getQuotaProbeOutcome("claude");
-
-          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
-          expect(mockGenerateContent).not.toHaveBeenCalled();
-          expect(String(outcome.error)).toContain("claude /usage capture failed");
-          const rows = scrapesSinceBaseline();
-          expect(rows).toHaveLength(1);
-          expect(rows[0]?.scraped_at).toBe(retriedAt);
-          expect(rows[0]?.parse_error).toContain("claude /usage capture failed");
-          expect(store.listScrapeOutcomesSince("claude", baselineAt)).toEqual([
-            { observedAt: baselineAt, outcome: "parsed" },
-            { observedAt: retriedAt, outcome: "failed" },
-          ]);
-        });
-
         it("records the first cancellation when the retry cannot run", async () => {
           mockGenerateContent.mockResolvedValue(noPanel);
-          const service = serviceWithClock([cancelled], ["2026-09-30T16:30:30.000Z", retriedAt]);
+          const service = serviceWithClock(
+            [cancelledCapture],
+            ["2026-09-30T16:30:30.000Z", retriedAt]
+          );
           const run = vi.mocked(mockClaudeProvider.run);
           const first = run.getMockImplementation();
           run.mockImplementation(async (opts) => {
@@ -3041,7 +3019,7 @@ describe("quota MCP server", () => {
           expect(scrapesSinceBaseline()).toEqual([
             {
               scraped_at: retriedAt,
-              raw_output: cancelled.output,
+              raw_output: cancelledCapture.output,
               parse_error: expect.stringContaining("claude /usage capture failed"),
             },
           ]);
