@@ -547,7 +547,7 @@ export interface RusaConfig {
   /** Provider-neutral Integrated Understanding settings. */
   understanding?: UnderstandingConfig;
   /**
-   * Optional host-owned stdio MCP integrations, keyed by their grant capability
+   * Optional host-owned HTTP MCP integrations, keyed by their grant capability
    * (for example `glass_goals`). No entry grants any actor access by itself.
    */
   customMcpServers?: Record<string, CustomMcpServerConfig>;

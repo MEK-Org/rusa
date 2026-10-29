@@ -29,9 +29,19 @@ let dir: string;
 let secretsDir: string;
 let config: CustomMcpServerConfig;
 let service: http.Server;
-let mode: "normal" | "hang" | "bad-json" | "large" | "error";
+let mode:
+  | "normal"
+  | "hang"
+  | "hold-response"
+  | "drop-write-response"
+  | "tool-error"
+  | "bad-json"
+  | "large"
+  | "error";
 let calls: Array<{ method: string | undefined; path: string; scope: string | undefined }>;
 let aborted: number;
+let mutations: number;
+let heldResponses: Array<() => void>;
 const grants = new Map<string, string[]>();
 const connected: Client[] = [];
 const credential = "synthetic-service-token";
@@ -98,23 +108,35 @@ async function startService(): Promise<void> {
       const args = JSON.parse(
         req.method === "GET" ? (url.searchParams.get("arguments") ?? "{}") : body
       );
-      res.end(
-        JSON.stringify({
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                contextId,
-                visits: ++visits,
-                userId: req.headers["rusa-mcp-user-id"],
-                scope,
-                args,
-                actorId: req.headers["rusa-mcp-actor-id"] ?? null,
-              }),
-            },
-          ],
-        })
-      );
+      if (req.method === "POST") mutations++;
+      if (mode === "drop-write-response" && req.method === "POST") {
+        req.socket.destroy();
+        return;
+      }
+      if (mode === "tool-error") {
+        res.end(
+          JSON.stringify({ isError: true, content: [{ type: "text", text: "No such goal" }] })
+        );
+        return;
+      }
+      const response = JSON.stringify({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              contextId,
+              visits: ++visits,
+              userId: req.headers["rusa-mcp-user-id"],
+              scope,
+              args,
+              actorId: req.headers["rusa-mcp-actor-id"] ?? null,
+            }),
+          },
+        ],
+      });
+      const send = () => res.end(response);
+      if (mode === "hold-response") heldResponses.push(send);
+      else send();
     });
   });
   await new Promise<void>((resolve, reject) => {
@@ -179,6 +201,8 @@ beforeEach(async () => {
   mode = "normal";
   calls = [];
   aborted = 0;
+  mutations = 0;
+  heldResponses = [];
   await startService();
 });
 
@@ -213,7 +237,7 @@ describe("configured host HTTP JSON service", () => {
       scope: "write",
       contextId: first.contextId,
     });
-    expect((await call(reader, "read_goal")).scope).toBe("read");
+    expect((await call(writer, "read_goal")).scope).toBe("read");
     expect(calls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "POST", "GET"]);
     const count = calls.length;
     expect(await reader.callTool({ name: "write_goal" })).toMatchObject({ isError: true });
@@ -249,20 +273,26 @@ describe("configured host HTTP JSON service", () => {
     expect(calls).toHaveLength(count);
   });
 
-  it("cancels an in-flight write when the next request observes reduced scope", async () => {
-    grants.set("writer", ["glass_goals:configured-user:write"]);
-    const client = await connect("writer");
-    mode = "hang";
-    const pending = client.callTool({ name: "write_goal" });
-    await vi.waitFor(() => expect(calls).toHaveLength(1));
-    grants.set("writer", ["glass_goals:configured-user:read"]);
+  it.each([
+    ["read", "write", "read_goal", "write_goal"],
+    ["write", "read", "write_goal", "read_goal"],
+  ] as const)("keeps an admitted request alive across a %s-to-%s scope change", async (before, after, admitted, next) => {
+    grants.set("actor", [`glass_goals:configured-user:${before}`]);
+    const client = await connect("actor");
+    mode = "hold-response";
+    const pending = client.callTool({ name: admitted });
+    await vi.waitFor(() => expect(heldResponses).toHaveLength(1));
+    grants.set("actor", [`glass_goals:configured-user:${after}`]);
     mode = "normal";
-    expect((await call(client, "read_goal")).scope).toBe("read");
-    expect(await pending).toMatchObject({
-      isError: true,
-      content: [{ text: "custom MCP upstream cancelled" }],
-    });
-    await vi.waitFor(() => expect(aborted).toBe(1));
+    expect((await call(client, next)).scope).toBe(after);
+    heldResponses[0]?.();
+    expect(await pending).not.toMatchObject({ isError: true });
+    expect(aborted).toBe(0);
+    expect(mutations).toBe(1);
+    if (after === "read") {
+      expect(await client.callTool({ name: "write_goal" })).toMatchObject({ isError: true });
+      expect(mutations).toBe(1);
+    }
   });
 
   it("reuses service graph context across concurrent calls and client reconnects", async () => {
@@ -282,7 +312,7 @@ describe("configured host HTTP JSON service", () => {
     });
   });
 
-  it("recovers on the next request after service restart and never retries writes", async () => {
+  it("recovers on the next request after service restart", async () => {
     grants.set("writer", ["glass_goals:configured-user:write"]);
     const client = await connect("writer");
     const before = await call(client, "read_goal");
@@ -291,6 +321,28 @@ describe("configured host HTTP JSON service", () => {
     await startService();
     expect((await call(client, "read_goal")).contextId).not.toBe(before.contextId);
     expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("does not retry a committed write whose response connection is lost", async () => {
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const client = await connect("writer");
+    mode = "drop-write-response";
+    expect(await client.callTool({ name: "write_goal" })).toMatchObject({
+      isError: true,
+      content: [{ text: "custom MCP upstream unavailable" }],
+    });
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    expect(mutations).toBe(1);
+  });
+
+  it("preserves caller-safe tool errors supplied by the trusted service", async () => {
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const client = await connect("reader");
+    mode = "tool-error";
+    expect(await client.callTool({ name: "read_goal" })).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "No such goal" }],
+    });
   });
 
   it.each([

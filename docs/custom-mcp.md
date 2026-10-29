@@ -52,9 +52,16 @@ The service rejects a tool invoked with the wrong HTTP method, unknown users,
 invalid tokens and insufficient scope. GET operations have no mutations. Empty
 tool arguments are `{}`. URL components use percent encoding; no upstream MCP
 initialize/session/streaming protocol is involved. Successful responses use
-HTTP 200. Tool-level errors can use `isError`; HTTP failures return a generic
-unavailable error to the actor. Rusa excludes upstream error bodies, arguments
-and authentication from its failure logs.
+HTTP 200. Discovery carries the actor's current effective scope; each tool call
+carries only the scope its configured classification requires.
+
+The trusted service owns the safety of valid tool results, including `isError`
+domain errors: it must return caller-safe messages and replace internal exceptions
+with generic errors, excluding host tokens, paths and backing-store details.
+Rusa preserves those valid results; it cannot distinguish a useful domain error
+from an unsafe exception encoded as one. HTTP, transport, JSON and result-schema
+failures return a generic unavailable error to the actor. Rusa excludes their
+upstream bodies, arguments and authentication from its failure logs.
 
 Rusa limits request targets to 8 KiB, POST bodies to 1 MiB and responses to
 16 MiB, with a 30-second deadline. Requests exceeding those bounds fail.
@@ -67,9 +74,11 @@ The proxy exposes only explicitly classified `readTools` / `writeTools` and
 rechecks current actor grants during discovery and every invocation. It does
 not forward upstream resources or prompts. Revocation removes the per-actor
 endpoint and closes downstream sessions; an invocation racing teardown is also
-checked. A scope change affects subsequent requests and cancels requests still
-in flight under the previous scope. A service can never shadow a built-in MCP
-server, worker endpoint or reserved capability.
+checked. A scope change affects subsequent requests; requests already admitted
+retain their own authority and may finish. A later request does not cancel them.
+Cancellation or revocation cannot undo a write already committed by the service.
+A service can never shadow a built-in MCP server, worker endpoint or reserved
+capability.
 
 Leader-local actors use the existing per-actor MCP endpoint. Follower actors use
 the established authenticated follower proxy; the service and its credentials

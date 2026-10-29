@@ -81,17 +81,11 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     ...configured.config.writeTools.map((name) => [name, "write"] as const),
   ]);
   const inflight = new Set<AbortController>();
-  let scope: Access | undefined;
   let closed = false;
 
   const request = async (path: string, required: Access, body?: unknown, signal?: AbortSignal) => {
     const access = activeAccess(actorId, configured, activeCapabilities);
     if (closed || !permits(access, required)) throw new NotGrantedError();
-    const nextScope = access.has("write") ? "write" : "read";
-    if (scope !== nextScope) {
-      for (const controller of inflight) controller.abort();
-      scope = nextScope;
-    }
     // Read the contained host secret on each request so rotation needs no
     // actor-session restart. Never send credentials to an actor or log them.
     const token = readFileSync(
@@ -126,7 +120,7 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
             headers: {
               authorization: `Bearer ${token}`,
               "Rusa-Mcp-User-Id": configured.config.userId,
-              "Rusa-Mcp-Scope": nextScope,
+              "Rusa-Mcp-Scope": required,
               ...(encoded === undefined
                 ? {}
                 : {
@@ -222,6 +216,9 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     try {
       const path = `/v1/tools/${encodeURIComponent(call.params.name)}`;
       const args = call.params.arguments ?? {};
+      // Valid tool results, including domain errors, are service-owned public
+      // output. The trusted service must sanitize exceptions before returning
+      // them; transport, status and malformed-result failures are redacted here.
       return CallToolResultSchema.parse(
         await request(
           classification === "read"

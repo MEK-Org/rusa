@@ -2812,7 +2812,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(warns.some((w) => w.startsWith("[update]"))).toBe(false);
   });
 
-  it("composes configured HTTP services with host secrets and live per-actor grants", async () => {
+  it("wires a configured HTTP service through startup and the provider MCP map", async () => {
     const socketPath = join(homeDir, "graph.sock");
     mkdirSync(join(homeDir, "secrets"), { mode: 0o700 });
     writeFileSync(join(homeDir, "secrets", "graph-token"), "synthetic-host-token", { mode: 0o600 });
@@ -2846,13 +2846,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         method: req.method,
       });
       res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify(
-          req.url === "/v1/tools"
-            ? { tools: [{ name: "read_goal", inputSchema: { type: "object" } }] }
-            : { content: [{ type: "text", text: "synthetic graph" }] }
-        )
-      );
+      res.end(JSON.stringify({ content: [{ type: "text", text: "synthetic graph" }] }));
     });
     await new Promise<void>((resolve) => service.listen(socketPath, resolve));
     const client = new Client({ name: "configured-http-service-test", version: "0.0.0" });
@@ -2873,36 +2867,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
           opts: { mcpServers: Array<{ name: string; url: string }> };
         }
       ).opts;
-      expect(options.mcpServers.some((server) => server.name === "glass_goals")).toBe(false);
-      expect(requests).toEqual([]);
-      expect(() =>
-        handles.mesh.grantCapability(handles.root.id, "glass_goals:other-user:read", rootId)
-      ).toThrow();
       handles.mesh.grantCapability(handles.root.id, "glass_goals:synthetic-user:read", rootId);
       const spec = options.mcpServers.find((server) => server.name === "glass_goals");
       if (!spec) throw new Error("custom service was not mounted");
       expect(JSON.stringify(spec)).not.toContain("synthetic-host-token");
       expect(JSON.stringify(spec)).not.toContain(socketPath);
       await client.connect(new StreamableHTTPClientTransport(new URL(spec.url)));
-      expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(["read_goal"]);
       expect(await client.callTool({ name: "read_goal" })).toMatchObject({
         content: [{ text: "synthetic graph" }],
       });
-      expect(requests).toEqual(
-        Array.from({ length: 2 }, () => ({
+      expect(requests).toEqual([
+        {
           auth: "Bearer synthetic-host-token",
           user: "synthetic-user",
           scope: "read",
           method: "GET",
-        }))
-      );
-      await handles.mesh.revokeCapability(
-        handles.root.id,
-        "glass_goals:synthetic-user:read",
-        rootId
-      );
-      expect(options.mcpServers.some((server) => server.name === "glass_goals")).toBe(false);
-      expect(service.listening).toBe(true);
+        },
+      ]);
     } finally {
       await client.close();
       service.closeAllConnections();
