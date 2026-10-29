@@ -3021,6 +3021,31 @@ describe("quota MCP server", () => {
             { observedAt: retriedAt, outcome: "failed" },
           ]);
         });
+
+        it("records the first cancellation when the retry cannot run", async () => {
+          mockGenerateContent.mockResolvedValue(noPanel);
+          const service = serviceWithClock([cancelled], ["2026-09-30T16:30:30.000Z", retriedAt]);
+          const run = vi.mocked(mockClaudeProvider.run);
+          const first = run.getMockImplementation();
+          run.mockImplementation(async (opts) => {
+            const result = await first?.(opts);
+            if (run.mock.calls.length > 1) throw new Error("sandbox setup failed");
+            return result as RunResult;
+          });
+
+          const outcome = await service.getQuotaProbeOutcome("claude");
+
+          expect(run).toHaveBeenCalledTimes(2);
+          expect(mockGenerateContent).not.toHaveBeenCalled();
+          expect(String(outcome.error)).toContain("claude /usage capture failed");
+          expect(scrapesSinceBaseline()).toEqual([
+            {
+              scraped_at: retriedAt,
+              raw_output: cancelled.output,
+              parse_error: expect.stringContaining("claude /usage capture failed"),
+            },
+          ]);
+        });
       });
 
       it("publishes failed for a scrape whose stored parsed state cannot be decoded", () => {
