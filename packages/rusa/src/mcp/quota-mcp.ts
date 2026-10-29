@@ -1670,14 +1670,21 @@ export class QuotaService {
       worktreePath: actorDir,
     };
 
-    let result: RunResult;
-    try {
-      result = await providerInstance.run({
+    const capture = () =>
+      providerInstance.run({
         prompt: "/usage",
         cwd: actorDir,
         sandbox,
         timeoutMs: 30_000,
       });
+    let result: RunResult;
+    try {
+      result = await capture();
+      // A capture killed at its ceiling holds no panel (#847), and under host
+      // load the next attempt usually completes. Retry once within this scrape,
+      // so a slow capture records one reading instead of a failed scrape that
+      // raises a missed-window alarm per lane (#1195).
+      if (result.cancelled) result = await capture();
     } catch (err) {
       return {
         provider: "claude",
