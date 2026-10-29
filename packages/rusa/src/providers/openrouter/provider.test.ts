@@ -65,6 +65,7 @@ async function fixture(options: { peerMode?: "failure" | "stream" | "wait" } = {
     peerMarkerPath,
     apiKeyPath,
     config,
+    executableRoot,
     provider: new OpenRouterProvider("test", config, "vendor/fixed-model"),
   };
 }
@@ -121,7 +122,10 @@ function createOpenRouterActor(
   });
 }
 
-it("dispatches the openrouter provider name to Pi through cliCommand", () => {
+it("dispatches the openrouter provider name to Pi through cliCommand", async () => {
+  const { root, executableRoot } = await fixture();
+  // Configured providers resolve their executable from PATH, like every other adapter.
+  vi.stubEnv("PATH", `${executableRoot}:${process.env.PATH ?? ""}`);
   const config = {
     github: { account: "test" },
     providers: { openrouter: { cliCommand: "pi" }, legacy: { cliCommand: "openrouter" } },
@@ -133,11 +137,16 @@ it("dispatches the openrouter provider name to Pi through cliCommand", () => {
     model: "vendor/fixed-model",
     name: "vendor/fixed-model (openrouter)",
   });
+  expect(await provider.run({ cwd: root, prompt: "ping-resolved" })).toEqual({
+    success: true,
+    output: "ping-resolved",
+    exitCode: 0,
+  });
   // The former adapter key no longer names an implementation.
   expect(() => resolveProvider(config, "legacy", "vendor/fixed-model")).toThrow(
     /No implementation for CLI command "openrouter"/
   );
-});
+}, 10000);
 
 it("requires a model and refuses native sessions before inference", async () => {
   const { root, config, provider } = await fixture();
