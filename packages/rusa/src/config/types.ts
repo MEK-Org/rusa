@@ -59,8 +59,12 @@ export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
   dailyCap?: string;
-  /** Explicit opt-in for the Pi/OpenRouter proof of concept. */
-  openrouterPoc?: { piCommand?: string; authDir?: string; artifactDir?: string };
+  /**
+   * Explicit opt-in for the Pi/OpenRouter proof of concept. Pi comes from the
+   * service PATH and its saved login from PI_CODING_AGENT_DIR (or Pi's default).
+   * piCommand is the deliberate escape hatch for a separately installed binary.
+   */
+  openrouterPoc?: { piCommand?: string };
   /**
    * Codex only: route every Codex refresh through the daemon's host-owned
    * broker so launched processes never hold or write the canonical login
@@ -279,6 +283,29 @@ export interface GlassGoalsConfig {
    * to anchor subsequent runs to the correct conceptual root.
    */
   rootNodeId?: string;
+}
+
+/**
+ * An independently running host HTTP JSON service exposed only through a grantable,
+ * per-actor loopback endpoint. The configured user is a trusted request
+ * binding, never a tool argument supplied by an actor.
+ */
+export interface CustomMcpServerConfig {
+  /** Absolute Unix socket path for the independently running HTTP service. */
+  socketPath: string;
+  /** Plain filename under RUSA_HOME/secrets containing the host bearer token. */
+  tokenFile: string;
+  /**
+   * Fixed external graph identity accepted by this configured server. This is
+   * the upstream request's trusted binding and is independent of
+   * `understanding.glassGoals.username`, which configures Rusa's own
+   * Integrated Understanding store.
+   */
+  userId: string;
+  /** Tool names a read or write grant may call. */
+  readTools: string[];
+  /** Tool names only a write grant may call. */
+  writeTools: string[];
 }
 
 export interface UnderstandingMountConfig {
@@ -519,6 +546,11 @@ export interface RusaConfig {
   observability?: ObservabilityConfig;
   /** Provider-neutral Integrated Understanding settings. */
   understanding?: UnderstandingConfig;
+  /**
+   * Optional host-owned HTTP MCP integrations, keyed by their grant capability
+   * (for example `glass_goals`). No entry grants any actor access by itself.
+   */
+  customMcpServers?: Record<string, CustomMcpServerConfig>;
   /**
    * @deprecated Legacy top-level Glass Goals configuration.
    * Prefer nesting under `understanding.glassGoals` . Retained as a compatibility fallback.

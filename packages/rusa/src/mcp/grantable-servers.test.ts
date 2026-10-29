@@ -154,6 +154,77 @@ describe("grantable capabilities allow-list ", () => {
     expect(() => servers.get("pnpm-hardlinks")?.("0b2c3d4e-steward", [])).not.toThrow();
   });
 
+  it("mounts an operator-configured custom server only through its parameterized grant", async () => {
+    const servers = buildGrantableServers({
+      ...STUB_DEPS,
+      customMcpServers: {
+        glass_goals: {
+          socketPath: "/tmp/synthetic-goals.sock",
+          tokenFile: "synthetic-goals-token",
+          userId: "configured-user",
+          readTools: ["read_goal"],
+          writeTools: ["write_goal"],
+        },
+      },
+      activeCapabilitiesForActor: () => [],
+    });
+    const mountedFactories = new Map<string, () => McpServer>();
+    const mcpHttp = {
+      addServer: (name: string, factory: () => McpServer) => {
+        mountedFactories.set(name, factory);
+        return `http://mcp/${name}`;
+      },
+      removeServer: async (name: string) => {
+        mountedFactories.delete(name);
+      },
+    };
+
+    expect(mountGrantedServers("reader", [], servers, mcpHttp)).toEqual([]);
+    // A row that no longer matches the configured user or scope shape never
+    // reaches the provider's MCP map.
+    for (const stale of [
+      "glass_goals",
+      "glass_goals:another-user:write",
+      "glass_goals:configured-user:bogus",
+    ]) {
+      expect(mountGrantedServers("reader", [stale], servers, mcpHttp)).toEqual([]);
+    }
+    expect(mountedFactories.size).toBe(0);
+    expect(
+      mountGrantedServers("reader", ["glass_goals:configured-user:read"], servers, mcpHttp)
+    ).toEqual([{ name: "glass_goals", url: "http://mcp/reader:glass_goals" }]);
+    expect(mountedFactories.has("reader:glass_goals")).toBe(true);
+
+    await handleCapabilityRevoked(
+      "reader",
+      "glass_goals:configured-user:read",
+      () => ["glass_goals:another-user:write"],
+      servers,
+      mcpHttp
+    );
+    expect(mountedFactories.has("reader:glass_goals")).toBe(false);
+  });
+
+  it("refuses a custom server that would take a built-in or reserved name", () => {
+    const custom = {
+      socketPath: "/tmp/synthetic-goals.sock",
+      tokenFile: "synthetic-goals-token",
+      userId: "configured-user",
+      readTools: ["read_goal"],
+      writeTools: [],
+    };
+    expect(() =>
+      buildGrantableServers({ ...STUB_DEPS, customMcpServers: { distiller: custom } })
+    ).toThrow(/must not reuse a built-in MCP server or capability name/);
+    expect(() =>
+      buildGrantableServers({
+        ...STUB_DEPS,
+        customMcpServers: { secret: custom },
+        reservedCapabilityNames: new Set(["secret"]),
+      })
+    ).toThrow(/customMcpServers\.secret must not reuse/);
+  });
+
   it("serves the bounded mesh_events read only behind a `distiller` grant (#537)", async () => {
     // The read has no principal of its own: it exists on an actor's endpoint set
     // exactly when a `distiller` grant row does, and leaves with it. The

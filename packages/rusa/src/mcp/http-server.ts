@@ -81,8 +81,8 @@ function safeEqual(a: string, b: string): boolean {
 const MAX_WAKE_BODY_BYTES = 8 * 1024;
 const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 256 * 1024;
 // Keep loopback MCP connections alive longer than the coding client's pooled idle window (MEK-Org/rusa#294).
-const MCP_KEEP_ALIVE_TIMEOUT_MS = 120_000;
-const MCP_HEADERS_TIMEOUT_MS = 121_000;
+export const MCP_KEEP_ALIVE_TIMEOUT_MS = 120_000;
+export const MCP_HEADERS_TIMEOUT_MS = 121_000;
 
 /** Keep request-derived diagnostics useful without admitting unbounded client input. */
 const MAX_MCP_LOG_METADATA_LENGTH = 128;

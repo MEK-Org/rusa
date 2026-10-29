@@ -2,8 +2,8 @@
 
 This is the first part of the no-schema fixture spike proposed in
 [#808](https://github.com/MEK-Org/rusa/issues/808). It implements the Pi RPC wire
-boundary for one fresh portable invocation. It is not registered as a production
-provider. Importing it cannot launch a harness or spend inference credit.
+boundary for one fresh portable invocation. It is not production-ready:
+importing the protocol boundary alone cannot launch a harness or spend inference credit.
 
 The contract targets `@earendil-works/pi-coding-agent@0.99.2`, source
 `005af57d88ee23b33778f343a9595b32e67ff788`. The opt-in [offline executable receipt](../../../../../docs/spikes/808-pi-offline/README.md)
@@ -52,7 +52,7 @@ this interface in memory. The subprocess fixtures use real stdin/stdout pipes to
 synthetic Node peer. Neither is captured evidence that the released Pi binary
 works with Rusa.
 
-## Before production registration
+## Before production enablement
 
 The rest of #808 remains open. A production adapter needs the following evidence:
 
@@ -109,9 +109,11 @@ descendant cleanup verification and real Pi compatibility remain open.
 
 The opt-in adapter supports fresh worker runs through the shared actor bwrap
 launcher. The invocation's private Pi state is rebound after the shared `/tmp`
-shadow, and Pi starts in its empty working directory. Actor-bound MCP settings,
-admission checks, the minimal child environment and RPC supervision also apply
-inside bwrap. Native-session resume and computer use remain unsupported.
+shadow, while Pi starts in the resolved actor working directory. Actor-bound MCP
+settings, admission checks, the selected saved login, the shared utility PATH and
+RPC supervision also apply inside bwrap. Native-session resume and computer use
+remain unsupported; portable context is required and no reasoning-effort selector
+is supported.
 
 `provider.test.ts` runs a synthetic RPC peer through real bwrap when available.
 It checks writable actor files, hidden sibling files and ungranted secrets,

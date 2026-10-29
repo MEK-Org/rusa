@@ -3,9 +3,9 @@
     <!-- Walkie mode records voice memos. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <application
-        android:label="Rusa"
+        android:label="${rusaAppLabel}"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="${rusaAppIcon}"
         android:allowBackup="false"
         android:networkSecurityConfig="@xml/network_security_config">
         <activity

@@ -1,8 +1,13 @@
 import { StringDecoder } from "node:string_decoder";
+import {
+  formatExecutingNotice,
+  formatLiveError,
+  formatMcpInvocationNotice,
+  formatRunCommandNotice,
+  formatToolError,
+} from "../live-output.js";
 
-/** Wire contract pinned to @earendil-works/pi-coding-agent 0.99.2 (#808).
- * Experimental: deliberately absent from the provider registry and scheduler.
- */
+/** Wire contract pinned to @earendil-works/pi-coding-agent 0.99.2 (#808). */
 type RecordValue = Record<string, unknown>;
 class PiAdmissionError extends Error {}
 
@@ -11,6 +16,31 @@ function object(value: unknown): RecordValue {
     throw new Error("Invalid Pi RPC object");
   }
   return value as RecordValue;
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function toolName(value: unknown): string {
+  // Tool names are rendered to the live stream. Preserve only the identifier
+  // alphabet Pi uses so a malformed protocol record cannot format the display.
+  return typeof value === "string" && /^[A-Za-z0-9_.-]{1,120}$/.test(value) ? value : "tool";
+}
+
+function toolNotice(name: string, args?: unknown): string {
+  const mcp = /^mcp__([A-Za-z0-9_.-]+)__([A-Za-z0-9_.-]+)$/.exec(name);
+  if (mcp) return formatMcpInvocationNotice(mcp[1] as string, mcp[2] as string);
+  if (name === "bash" && args && typeof args === "object" && !Array.isArray(args)) {
+    const command = text((args as RecordValue).command);
+    if (command) return formatRunCommandNotice(command);
+  }
+  return formatExecutingNotice(name);
+}
+
+function readableToolName(name: string): string {
+  const mcp = /^mcp__([A-Za-z0-9_.-]+)__([A-Za-z0-9_.-]+)$/.exec(name);
+  return mcp ? `${mcp[1] as string}:${mcp[2] as string}` : name;
 }
 
 /** Strict LF framing, including split UTF-8 and literal Unicode separators.
@@ -114,10 +144,10 @@ export class PiRpcInvocation {
   constructor(
     private readonly transport: PiRpcTransport,
     private readonly model: string,
-    private readonly effort?: string,
     private readonly maxOutputBytes = 1024 * 1024,
     private readonly maxRequests = 1000,
-    private readonly onProgress?: () => void
+    private readonly onProgress?: () => void,
+    private readonly onOutput?: (chunk: string) => void
   ) {
     if (
       !Number.isSafeInteger(maxOutputBytes) ||
@@ -161,7 +191,7 @@ export class PiRpcInvocation {
 
   private async prepare(prompt: string): Promise<void> {
     try {
-      // Read back exact identity: CLI model selection is fuzzy and thinking is clamped.
+      // Read back exact identity: CLI model selection is fuzzy.
       const state = object(await this.command("get_state"));
       const selected = state.model;
       if (selected === null || typeof selected !== "object" || Array.isArray(selected)) {
@@ -171,8 +201,6 @@ export class PiRpcInvocation {
       if (model.provider !== "openrouter" || model.id !== this.model) {
         throw new PiAdmissionError("Pi resolved a different provider or model");
       }
-      if (this.effort !== undefined && state.thinkingLevel !== this.effort)
-        throw new PiAdmissionError("Pi changed requested effort");
       if (
         state.isStreaming !== false ||
         state.isCompacting !== false ||
@@ -181,13 +209,6 @@ export class PiRpcInvocation {
         state.sessionFile != null
       ) {
         throw new PiAdmissionError("Pi session is not fresh and idle");
-      }
-      if (this.effort !== undefined) {
-        // get_state exposes raw agent state; capability validation is separate.
-        const levels = object(await this.command("get_available_thinking_levels"));
-        if (!Array.isArray(levels.levels) || !levels.levels.includes(this.effort)) {
-          throw new PiAdmissionError("Pi does not support requested effort");
-        }
       }
       await this.command("set_auto_retry", { enabled: false });
       await this.command("set_auto_compaction", { enabled: false });
@@ -264,6 +285,7 @@ export class PiRpcInvocation {
       return;
     }
     this.reportExecutionProgress();
+    this.renderLiveEvent(record);
     if (
       record.type === "extension_error" ||
       (record.type === "message_update" &&
@@ -333,6 +355,51 @@ export class PiRpcInvocation {
     }
     // agent_end is deliberately not settlement. Progress and tool events are
     // consumed without retaining arbitrary tool output or double-counting usage.
+  }
+
+  /**
+   * Pi's stdout is a protocol stream, not a terminal transcript. Render only
+   * readable assistant deltas, tool starts and bounded semantic failures; each
+   * record has already separately ticked liveness through reportExecutionProgress.
+   * Pi 0.99.2 reports a provider failure only as an assistant message_end whose
+   * structured stopReason is "error" or "aborted"; its errorMessage is upstream
+   * free text, so it is neither parsed nor forwarded.
+   */
+  private renderLiveEvent(record: RecordValue): void {
+    if (record.type === "message_update") {
+      const event = record.assistantMessageEvent;
+      if (!event || typeof event !== "object" || Array.isArray(event)) return;
+      const update = event as RecordValue;
+      if (update.type === "text_delta" || update.type === "thinking_delta") {
+        const delta = text(update.delta);
+        if (delta) this.onOutput?.(delta);
+      }
+      return;
+    }
+    if (record.type === "message_end") {
+      const message = object(record.message);
+      if (message.role !== "assistant") return;
+      if (message.stopReason === "error") {
+        this.onOutput?.(formatLiveError("Pi reported a provider error"));
+      } else if (message.stopReason === "aborted") {
+        this.onOutput?.(formatLiveError("Pi request was aborted"));
+      }
+      return;
+    }
+    // Announce a tool once, when it actually executes with complete arguments.
+    if (record.type === "tool_execution_start") {
+      this.onOutput?.(toolNotice(toolName(record.toolName), record.args));
+      return;
+    }
+    if (record.type === "tool_execution_end") {
+      if (record.isError === true) {
+        this.onOutput?.(formatToolError(`${readableToolName(toolName(record.toolName))} failed`));
+      }
+      return;
+    }
+    if (record.type === "extension_error") {
+      this.onOutput?.(formatLiveError("Pi extension failed"));
+    }
   }
 
   private maybeFinish(): void {

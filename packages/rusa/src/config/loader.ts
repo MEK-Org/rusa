@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
@@ -665,6 +665,77 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         throw new Error(`config.yaml: ${source}.rootNodeId must be a non-empty string when set`);
       }
       gg.rootNodeId = gg.rootNodeId.trim();
+    }
+  }
+
+  if (parsed.customMcpServers !== undefined) {
+    if (
+      typeof parsed.customMcpServers !== "object" ||
+      parsed.customMcpServers === null ||
+      Array.isArray(parsed.customMcpServers)
+    ) {
+      throw new Error("config.yaml: customMcpServers must be a mapping when set");
+    }
+    for (const [capability, server] of Object.entries(parsed.customMcpServers)) {
+      const source = `config.yaml: customMcpServers.${capability}`;
+      if (!/^[a-z][a-z0-9_]{0,63}$/.test(capability)) {
+        throw new Error(
+          `${source} capability name must use lowercase letters, digits, or underscores`
+        );
+      }
+      if (typeof server !== "object" || server === null || Array.isArray(server)) {
+        throw new Error(`${source} must be a mapping`);
+      }
+      for (const legacy of ["command", "args", "cwd", "env"]) {
+        if (legacy in server) {
+          throw new Error(
+            `${source}.${legacy} is not supported; configure an independently running HTTP service`
+          );
+        }
+      }
+      if (
+        typeof server.socketPath !== "string" ||
+        !isAbsolute(server.socketPath) ||
+        server.socketPath.includes("\0")
+      ) {
+        throw new Error(`${source}.socketPath must be an absolute Unix socket path`);
+      }
+      if (
+        typeof server.tokenFile !== "string" ||
+        !server.tokenFile.trim() ||
+        /[/\\\r\n]/.test(server.tokenFile) ||
+        server.tokenFile.includes("\0") ||
+        [".", ".."].includes(server.tokenFile.trim())
+      ) {
+        throw new Error(`${source}.tokenFile must be a plain secret filename`);
+      }
+      server.tokenFile = server.tokenFile.trim();
+      if (
+        typeof server.userId !== "string" ||
+        !server.userId.trim() ||
+        /[^\x21-\x7e]|:/.test(server.userId)
+      ) {
+        throw new Error(`${source}.userId must be a non-empty visible-ASCII colon-free string`);
+      }
+      server.userId = server.userId.trim();
+      for (const key of ["readTools", "writeTools"] as const) {
+        const tools = server[key];
+        if (
+          !Array.isArray(tools) ||
+          tools.some((tool) => typeof tool !== "string" || !/^[A-Za-z0-9_.-]+$/.test(tool))
+        ) {
+          throw new Error(`${source}.${key} must be an array of MCP tool names`);
+        }
+        if (new Set(tools).size !== tools.length) {
+          throw new Error(`${source}.${key} must not contain duplicate tool names`);
+        }
+      }
+      if (server.readTools.length + server.writeTools.length === 0) {
+        throw new Error(`${source} must list at least one tool in readTools or writeTools`);
+      }
+      if (server.readTools.some((tool) => server.writeTools.includes(tool))) {
+        throw new Error(`${source} must classify each tool as read or write, not both`);
+      }
     }
   }
   // geminiApiKey and mistralApiKey are optional at config-validation time;

@@ -139,7 +139,9 @@ The server serves the Firebase *Web* app's public configuration; a native client
 must identify as an Android app in the same Firebase project. One-time operator
 setup, in the Firebase Console (Project Settings → General → Your apps):
 
-1. Add an Android app with package name `org.mek.rusa.dashboard`.
+1. Add an Android app whose package name is the APK's application id: the
+   `application id` line `pnpm --filter rusa run build:android` prints (see
+   [Android launcher branding](#android-launcher-branding)).
 2. Register the SHA-1 and SHA-256 fingerprints of the key that signs the APK
    (`./gradlew signingReport` in `packages/rusa/flutter_dashboard/android`).
    Release builds sign with the keystore named by `android/key.properties`; without
@@ -154,7 +156,7 @@ setup, in the Firebase Console (Project Settings → General → Your apps):
    origin:
 
 ```sh
-flutter build apk --release \
+pnpm --filter rusa run build:android -- --release \
   --dart-define=RUSA_SERVER_URL=https://dashboard.example.com \
   --dart-define=RUSA_FIREBASE_ANDROID_APP_ID=1:000000000000:android:0000000000000000 \
   --dart-define=RUSA_GOOGLE_SERVER_CLIENT_ID=000000000000-example.apps.googleusercontent.com
@@ -166,6 +168,25 @@ missing define, rather than offering a sign-in that cannot succeed. As on the
 web, do not commit a `google-services.json` or generated Firebase options.
 Admission is the same email allowlist; registering the Android app grants no
 additional access.
+
+### Android launcher branding
+
+`build:android` brands the APK from `config.yaml` the way the web dashboard
+brands its tab and PWA: `rootActor.handle` becomes the launcher name
+(`silicon-familiar` → `Silicon Familiar`) and the root's own image (uploaded
+from the dashboard, else `rootActor.avatar`) becomes the launcher icon. Each
+falls back on its own to the built-in "Rusa" name and dashboard icon. The
+application id is derived only: `com.<handle>.dashboard` with every character
+outside `[A-Za-z0-9_]` stripped, or `org.mek.rusa.dashboard` when no handle is
+configured. A configured `root-actor`, the default handle, keeps the "Rusa"
+name but still derives `com.rootactor.dashboard`. There is no config override; a handle that leaves a segment not
+starting with a letter (empty, or digit- or underscore-leading) fails the
+build, and so does a configured `rootActor.avatar` the build cannot find (it
+resolves a relative path against its own working directory, so prefer an
+absolute one). The build prints what it resolved. A new application id
+installs as a separate app (uninstall the old one by hand) and needs its own
+Firebase Android app registration. A bare `flutter build apk` builds the
+unbranded `org.mek.rusa.dashboard`.
 
 ## Visits, inactivity, and logout
 

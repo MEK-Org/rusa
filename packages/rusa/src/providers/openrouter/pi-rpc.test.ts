@@ -6,7 +6,6 @@ type WireRecord = Record<string, unknown>;
 const model = "vendor/fixed-model";
 const state = {
   model: { provider: "openrouter", id: model },
-  thinkingLevel: "high",
   isStreaming: false,
   isCompacting: false,
   pendingMessageCount: 0,
@@ -16,13 +15,12 @@ const state = {
 function fixture(
   options: {
     state?: WireRecord;
-    levels?: string[];
-    effort?: string | null;
     afterResponse?: (command: WireRecord) => Promise<void>;
     disposition?: string;
     reject?: string;
     beforePromptResponse?: (invocation: PiRpcInvocation) => void;
     onProgress?: () => void;
+    onOutput?: (chunk: string) => void;
     maxOutputBytes?: number;
     maxRequests?: number;
   } = {}
@@ -38,11 +36,9 @@ function fixture(
       const data =
         command.type === "get_state"
           ? (options.state ?? state)
-          : command.type === "get_available_thinking_levels"
-            ? { levels: options.levels ?? ["off", "high"] }
-            : command.type === "prompt"
-              ? { disposition: options.disposition ?? "started" }
-              : undefined;
+          : command.type === "prompt"
+            ? { disposition: options.disposition ?? "started" }
+            : undefined;
       wire(invocation, {
         type: "response",
         id: command.id,
@@ -57,10 +53,10 @@ function fixture(
   invocation = new PiRpcInvocation(
     transport,
     model,
-    options.effort === null ? undefined : (options.effort ?? "high"),
     options.maxOutputBytes,
     options.maxRequests,
-    options.onProgress
+    options.onProgress,
+    options.onOutput
   );
   return { invocation, transport, commands };
 }
@@ -105,7 +101,6 @@ describe("Pi RPC portable invocation spike", () => {
     expect(f.transport.close).toHaveBeenCalledOnce();
     expect(f.commands.map((c) => c.type)).toEqual([
       "get_state",
-      "get_available_thinking_levels",
       "set_auto_retry",
       "set_auto_compaction",
       "prompt",
@@ -138,10 +133,61 @@ describe("Pi RPC portable invocation spike", () => {
     await result;
   });
 
+  it("renders text and each executed tool once while keeping opaque diagnostics out of live output", async () => {
+    const live: string[] = [];
+    const f = fixture({ onOutput: (chunk) => live.push(chunk) });
+    const { result } = await start(f);
+    wire(f.invocation, {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hello" },
+    });
+    // Pi streams toolcall_start before arguments; only execution is announced.
+    for (const [id, toolName] of [
+      ["call-1", "mcp__tracker__get_issue"],
+      ["call-2", "bash"],
+    ]) {
+      wire(f.invocation, {
+        type: "message_update",
+        assistantMessageEvent: { type: "toolcall_start", id, toolName },
+      });
+    }
+    wire(f.invocation, {
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "mcp__tracker__get_issue",
+      args: { issue: "SECRET argument" },
+    });
+    wire(f.invocation, {
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "mcp__tracker__get_issue",
+      result: { content: [{ type: "text", text: "SECRET tool body" }] },
+      isError: true,
+    });
+    wire(f.invocation, {
+      type: "tool_execution_start",
+      toolCallId: "call-2",
+      toolName: "bash",
+      args: { command: "git status" },
+    });
+    // Pi 0.99.2 reports provider failure as message_end with a structured stopReason.
+    assistant(f.invocation, { stopReason: "error", errorMessage: "SECRET 400 upstream text" });
+    wire(f.invocation, { type: "agent_settled" });
+
+    expect(await result).toMatchObject({ success: false });
+    expect(live).toEqual([
+      "hello",
+      "\n[MCP tracker:get_issue]\n",
+      "\n[Tool error: tracker:get_issue failed]\n",
+      "\n[run_command: git status]\n",
+      "\n[Error]: Pi reported a provider error\n",
+    ]);
+    expect(live.join("\n")).not.toContain("SECRET");
+  });
+
   it.each([
     { ...state, model: { provider: "anthropic", id: model } },
     { ...state, model: { provider: "openrouter", id: "fuzzy-substitution" } },
-    { ...state, thinkingLevel: "medium" },
     { ...state, pendingMessageCount: 1 },
     { ...state, messageCount: 1 },
     { ...state, sessionFile: "/ambient/session.jsonl" },
@@ -153,12 +199,6 @@ describe("Pi RPC portable invocation spike", () => {
     expect(f.commands.some((c) => c.type === "prompt")).toBe(false);
   });
 
-  it("rejects unsupported effort before sending a prompt", async () => {
-    const f = fixture({ levels: ["off"] });
-    expect(await f.invocation.run("task")).toMatchObject({ success: false });
-    expect(f.commands.some((c) => c.type === "prompt")).toBe(false);
-  });
-
   it.each(["handled", "queued"])("rejects %s prompt disposition", async (disposition) => {
     const f = fixture({ disposition });
     expect(await f.invocation.run("task")).toMatchObject({ success: false });
@@ -166,7 +206,6 @@ describe("Pi RPC portable invocation spike", () => {
 
   it.each([
     "get_state",
-    "get_available_thinking_levels",
     "set_auto_retry",
     "set_auto_compaction",
     "prompt",
@@ -297,7 +336,7 @@ describe("Pi RPC portable invocation spike", () => {
       },
       close: vi.fn(),
     };
-    const invocation = new PiRpcInvocation(transport, model, "high");
+    const invocation = new PiRpcInvocation(transport, model);
     const result = await invocation.run("task");
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).not.toContain("SECRET");
@@ -306,7 +345,7 @@ describe("Pi RPC portable invocation spike", () => {
 
   it("cancels while startup readback is pending", async () => {
     const transport: PiRpcTransport = { write: vi.fn(async () => {}), close: vi.fn() };
-    const invocation = new PiRpcInvocation(transport, model, "high");
+    const invocation = new PiRpcInvocation(transport, model);
     const result = invocation.run("task");
     await invocation.cancel();
     expect(await result).toMatchObject({ success: false, reason: "Pi invocation cancelled" });
@@ -321,7 +360,7 @@ describe("Pi RPC portable invocation spike", () => {
       },
       close: vi.fn(),
     };
-    const invocation = new PiRpcInvocation(transport, model, "high");
+    const invocation = new PiRpcInvocation(transport, model);
     const result = invocation.run("task");
     await invocation.cancel();
     expect(await result).toMatchObject({ success: false, reason: "Pi invocation cancelled" });
@@ -432,7 +471,7 @@ describe("Pi RPC portable invocation spike", () => {
   });
 
   it("returns only final assistant text while retaining all turn usage", async () => {
-    const f = fixture({ effort: null, state: { ...state, thinkingLevel: "off" } });
+    const f = fixture();
     const { result } = await start(f);
     assistant(f.invocation, {
       stopReason: "toolUse",
@@ -445,7 +484,6 @@ describe("Pi RPC portable invocation spike", () => {
       output: "🧠\u2028one\u2029two",
       requests: [expect.any(Object), expect.any(Object)],
     });
-    expect(f.commands.some((c) => c.type === "get_available_thinking_levels")).toBe(false);
   });
 
   it("frames split UTF-8, CRLF, and multiple records through the invocation", async () => {
