@@ -61,8 +61,8 @@ class AssistantChannel(
 
     /**
      * The assistant role is not requestable, so setup is the system page. Ask
-     * for the trigger's permissions first: the assist screen can open over the
-     * lock screen, where a permission prompt is no place to start.
+     * for the trigger's permissions first, so a trigger can start recording
+     * at once instead of opening on a permission prompt.
      */
     private fun openAssistantSettings(result: MethodChannel.Result) {
         val missing = triggerPermissions().filter {

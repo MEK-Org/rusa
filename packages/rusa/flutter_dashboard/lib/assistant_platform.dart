@@ -11,8 +11,8 @@ abstract interface class AssistantRole {
   Future<AssistantRoleStatus> status();
 
   /// Ask for the microphone and Bluetooth permissions the assist trigger
-  /// needs (it may run over the lock screen, where a prompt is awkward), then
-  /// open the system's digital-assistant settings.
+  /// needs (so a trigger records at once instead of opening on a prompt),
+  /// then open the system's digital-assistant settings.
   Future<void> openSettings();
 }
 

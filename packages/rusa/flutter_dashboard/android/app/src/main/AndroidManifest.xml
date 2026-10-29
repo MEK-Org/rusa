@@ -36,25 +36,18 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <!-- The assistant role's activity: the assist gesture (ASSIST) and a
-             headset's assistant button (VOICE_COMMAND) open walkie recording
-             to root, over the lock screen, in a task of its own. -->
+        <!-- The assistant role's entry point: the assist gesture (ASSIST) and a
+             headset's assistant button (VOICE_COMMAND). It draws nothing; on a
+             locked phone it shows over the keyguard only to ask for the unlock,
+             then opens the assist screen. -->
         <activity
-            android:name=".AssistActivity"
+            android:name=".AssistGateActivity"
             android:exported="true"
-            android:launchMode="singleTask"
             android:taskAffinity="org.mek.rusa.dashboard.assist"
             android:excludeFromRecents="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
-            android:theme="@style/LaunchTheme"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
-            android:hardwareAccelerated="true"
-            android:windowSoftInputMode="adjustResize">
-            <meta-data
-              android:name="io.flutter.embedding.android.NormalTheme"
-              android:resource="@style/NormalTheme"
-              />
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.intent.action.ASSIST"/>
                 <category android:name="android.intent.category.DEFAULT"/>
@@ -63,6 +56,23 @@
                 <action android:name="android.intent.action.VOICE_COMMAND"/>
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
+        </activity>
+        <!-- The assist screen: walkie recording to root, in a task of its own.
+             Only the gate starts it, and it never shows over the keyguard. -->
+        <activity
+            android:name=".AssistActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity="org.mek.rusa.dashboard.assist"
+            android:excludeFromRecents="true"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
         </activity>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

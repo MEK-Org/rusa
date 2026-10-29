@@ -10,9 +10,9 @@ import 'voice_platform.dart';
 import 'walkie_controller.dart';
 import 'widgets/walkie_panel.dart';
 
-/// The screen Android's assist trigger opens: walkie mode to the root actor,
-/// already recording. It can show over the lock screen, so it reaches nothing
-/// else of the dashboard. Another trigger, or the headset ending its voice
+/// The screen Android's assist trigger opens once the phone is unlocked
+/// (`AssistGateActivity.kt`): walkie mode to the root actor, already
+/// recording. It reaches nothing else of the dashboard. Another trigger, or the headset ending its voice
 /// recognition, stops and sends; turning walkie off closes the screen.
 class AssistantPage extends StatefulWidget {
   const AssistantPage({
@@ -137,9 +137,9 @@ class _AssistantPageState extends State<AssistantPage> {
     super.dispose();
   }
 
-  /// The screen can show over the lock screen, so an unexpected failure (a
-  /// socket error naming the server, an HTTP error body) goes to the log, not
-  /// the page. The page's own [StateError]s are written to be shown.
+  /// An unexpected failure (a socket error naming the server, an HTTP error
+  /// body) goes to the log, not this minimal screen. The page's own
+  /// [StateError]s are written to be shown.
   String _errorText(Object? error) {
     if (error is StateError) return error.message;
     debugPrint('Assist screen failed to start: $error');
