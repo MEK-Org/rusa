@@ -56,15 +56,13 @@ export type InstanceIdentity =
   | { role: "follower"; instanceId: string };
 
 export interface ProviderConfig {
-  /** CLI command name, e.g. "claude", "codex", "agy" */
+  /**
+   * CLI command name, e.g. "claude", "codex", "agy", "pi". It selects the
+   * adapter and names the executable, so OpenRouter is configured as
+   * `providers.openrouter: { cliCommand: pi }`.
+   */
   cliCommand?: string;
   dailyCap?: string;
-  /**
-   * Explicit opt-in for the Pi/OpenRouter proof of concept. Pi comes from the
-   * service PATH and its saved login from PI_CODING_AGENT_DIR (or Pi's default).
-   * piCommand is the deliberate escape hatch for a separately installed binary.
-   */
-  openrouterPoc?: { piCommand?: string };
   /**
    * Codex only: route every Codex refresh through the daemon's host-owned
    * broker so launched processes never hold or write the canonical login

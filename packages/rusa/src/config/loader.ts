@@ -376,6 +376,14 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
           "Remove the key."
       );
     }
+    // OpenRouter is an ordinary provider now. Its former opt-in block (and the
+    // piCommand inside it) would otherwise be silently ignored.
+    if (providerConfig && "openrouterPoc" in providerConfig) {
+      throw new Error(
+        `config.yaml: providers.${providerName}.openrouterPoc has been removed: OpenRouter is an ` +
+          "ordinary provider that runs Pi through cliCommand. Delete the key and set cliCommand: pi."
+      );
+    }
     if (providerConfig && "authBroker" in providerConfig) {
       if (providerName !== "codex") {
         throw new Error(

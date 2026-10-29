@@ -11,7 +11,7 @@ import { assertOwnedListeners } from "./ownership.mjs";
 
 const require = createRequire(resolve("packages/rusa/package.json"));
 const Database = require("better-sqlite3");
-const [piCommand = "pi", model = "openai/gpt-4.1-mini"] = process.argv.slice(2);
+const [model = "openai/gpt-4.1-mini"] = process.argv.slice(2);
 for (const key of [
   "GIT_AUTHOR_NAME",
   "GIT_AUTHOR_EMAIL",
@@ -32,12 +32,7 @@ await writeFile(
     github: { account: "rusa-e2e-bot" },
     providers: {
       claude: { cliCommand: "claude" },
-      openrouter: {
-        cliCommand: "openrouter",
-        openrouterPoc: {
-          piCommand,
-        },
-      },
+      openrouter: { cliCommand: "pi" },
     },
     rootActor: { provider: "openrouter", model, context: { type: "portable", mode: "tail" } },
     sandbox: "container-boundary",
@@ -60,7 +55,6 @@ const child = spawn(
     "240",
   ],
   {
-    env: { ...process.env, RUSA_OPENROUTER_POC: "1" },
     stdio: ["ignore", log.fd, log.fd],
   }
 );

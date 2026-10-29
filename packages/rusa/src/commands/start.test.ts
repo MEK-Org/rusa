@@ -8272,10 +8272,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       providers: {
         antigravity: { cliCommand: "agy" },
         claude: { cliCommand: "claude" },
-        openrouter: {
-          cliCommand: "openrouter",
-          openrouterPoc: {},
-        },
+        openrouter: { cliCommand: "pi" },
       },
       rootActor: {
         provider: "claude",
@@ -8284,16 +8281,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
-
-    const prevPoc = process.env.RUSA_OPENROUTER_POC;
-    process.env.RUSA_OPENROUTER_POC = "1";
-    onTestFinished(() => {
-      if (prevPoc === undefined) {
-        delete process.env.RUSA_OPENROUTER_POC;
-      } else {
-        process.env.RUSA_OPENROUTER_POC = prevPoc;
-      }
-    });
 
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
@@ -8357,7 +8344,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     expect(() => {
       activeMesh.setActorContext(openrouterWorkerId, "native", rootId);
-    }).toThrow(/OpenRouter prototype requires portable context/);
+    }).toThrow(/OpenRouter requires portable context/);
     expect(activeMesh.actors.get(openrouterWorkerId)?.context?.type).toBe("portable");
     expect(activeMesh.actors.get(openrouterWorkerId)?.desiredContextConfig).toBeUndefined();
   });

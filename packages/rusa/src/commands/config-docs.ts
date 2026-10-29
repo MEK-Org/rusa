@@ -162,7 +162,7 @@ providers:
   providers is a map from provider name to provider configuration. The provider name is the
   logical name used by model routing, while cliCommand selects the executable for CLI providers.
 
-  cliCommand               Required. The CLI executable. Example: claude, codex, agy, kimi, copilot.
+  cliCommand               Required. The CLI executable. Example: claude, codex, agy, kimi, copilot, pi (OpenRouter).
   dailyCap                 Optional string budget marker, for example "$50".
 
 quota:

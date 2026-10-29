@@ -27,34 +27,19 @@ describe("validateProviderSelection", () => {
   });
 });
 
-it("requires opt-in paths and portable context, and refuses effort for the PoC", async () => {
+it("runs openrouter through the pi command with a model, portable context and no effort", async () => {
   const { validateModelConfigPool } = await import("./model-config.js");
-  const config = {
-    providers: {
-      openrouter: {
-        cliCommand: "openrouter",
-        openrouterPoc: {},
-      },
-    },
-  } as unknown as RusaConfig;
+  // The minimal config: the provider name stays "openrouter" for routing while
+  // cliCommand selects the Pi adapter and names its executable.
+  const config = { providers: { openrouter: { cliCommand: "pi" } } } as unknown as RusaConfig;
   const entry = { provider: "openrouter", model: "vendor/model" };
-  vi.stubEnv("RUSA_OPENROUTER_POC", "");
-  expect(() => validateProviderSelection(config, entry.provider, entry.model)).toThrow(/requires/);
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
-  try {
-    expect(() => validateModelConfigPool(config, entry, { portable: false })).toThrow(/portable/);
-    expect(validateModelConfigPool(config, entry, { portable: true })[0]).toEqual(entry);
-    expect(() => validateProviderSelection(config, entry.provider, entry.model, "high")).toThrow(
-      /reasoning-effort/
-    );
-    expect(() =>
-      validateProviderSelection(
-        { providers: { openrouter: {} } } as unknown as RusaConfig,
-        entry.provider,
-        entry.model
-      )
-    ).toThrow(/requires/);
-  } finally {
-    vi.unstubAllEnvs();
-  }
+  expect(validateProviderSelection(config, entry.provider, entry.model)).toEqual({
+    model: entry.model,
+  });
+  expect(() => validateProviderSelection(config, entry.provider)).toThrow(/requires a model/);
+  expect(() => validateModelConfigPool(config, entry, { portable: false })).toThrow(/portable/);
+  expect(validateModelConfigPool(config, entry, { portable: true })[0]).toEqual(entry);
+  expect(() => validateProviderSelection(config, entry.provider, entry.model, "high")).toThrow(
+    /reasoning-effort/
+  );
 });

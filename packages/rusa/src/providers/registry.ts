@@ -22,7 +22,8 @@ export {
 
 // Keyed by CLI command (the `cliCommand` resolved in getProvider). Antigravity's
 // binary is `agy`, so it registers under "agy" while its provider name is
-// "antigravity".
+// "antigravity". OpenRouter runs through Pi the same way: "pi" here, while the
+// configured provider name stays "openrouter".
 interface ProviderAdapter {
   create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
 }
@@ -43,7 +44,7 @@ const providerAdapters = {
   },
   kimi: { create: (name, config, model) => new KimiProvider(name, config, model) },
   copilot: { create: (name, config, model) => new CopilotProvider(name, config, model) },
-  openrouter: {
+  pi: {
     create: (name, config, model) => new OpenRouterProvider(name, config, model),
   },
   fake: { create: (name) => new FakeProvider(undefined, name) },
