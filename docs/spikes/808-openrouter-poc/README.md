@@ -23,6 +23,8 @@ error. Command-based API key entries are unsupported. No mesh key file or
 Worker runs use the shared bwrap launcher. Native session resumes and computer
 use remain unsupported; portable context and a model are required.
 The `pi` executable and its Node runtime must be available on the service PATH.
+There is no separate executable-path override, as for every other provider. To
+use a separately installed Pi, put it, or a wrapper named `pi`, on that PATH.
 
 ## Run
 

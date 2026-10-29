@@ -23,7 +23,9 @@ export {
 // Keyed by CLI command (the `cliCommand` resolved in getProvider). Antigravity's
 // binary is `agy`, so it registers under "agy" while its provider name is
 // "antigravity". OpenRouter runs through Pi the same way: "pi" here, while the
-// configured provider name stays "openrouter".
+// configured provider name stays "openrouter". The Pi adapter is OpenRouter-only
+// (it passes `--provider openrouter`), so `cliCommand: pi` means Pi via OpenRouter.
+// Its throttle lane is therefore `pi`, as Antigravity's is `agy`.
 interface ProviderAdapter {
   create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
 }
