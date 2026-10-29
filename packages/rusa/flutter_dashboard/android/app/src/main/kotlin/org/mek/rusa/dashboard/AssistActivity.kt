@@ -1,8 +1,6 @@
 package org.mek.rusa.dashboard
 
-import android.app.KeyguardManager
 import android.content.Intent
-import android.os.PowerManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 
@@ -12,7 +10,7 @@ import io.flutter.embedding.engine.FlutterEngine
  * ACTION_VOICE_COMMAND for a headset's assistant button (HFP AT+BVRA). It runs
  * the `assistMain` Dart entrypoint, which opens walkie recording to root. A
  * trigger while it is open reaches Dart as `trigger` and stops and sends. It
- * never shows over the keyguard, and the session ends when the phone locks.
+ * never shows over the keyguard, and the session ends once it leaves the screen.
  */
 class AssistActivity : FlutterActivity() {
     private var assistant: AssistantChannel? = null
@@ -39,15 +37,15 @@ class AssistActivity : FlutterActivity() {
     }
 
     /**
-     * Turning the screen off or locking the phone ends the session, so nothing
-     * keeps recording or playing behind the keyguard.
+     * Leaving the screen ends the session: locking, screen off, Home or another
+     * app. A stopped activity gets no later callback when the phone then locks,
+     * so finishing here is what keeps nothing recording or playing behind the
+     * keyguard. Finishing destroys this activity's engine, and the record and
+     * audioplayers plugins release their recorders and players on detach.
      */
     override fun onStop() {
         super.onStop()
-        if (isChangingConfigurations) return
-        val locked = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
-        val screenOff = getSystemService(PowerManager::class.java)?.isInteractive == false
-        if (locked || screenOff) finish()
+        if (!isChangingConfigurations) finish()
     }
 
     /**
