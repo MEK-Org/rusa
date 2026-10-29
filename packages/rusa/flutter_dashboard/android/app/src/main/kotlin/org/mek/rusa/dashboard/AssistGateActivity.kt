@@ -11,10 +11,17 @@ import android.os.Bundle
  * unlocked phone: on a locked one this draws nothing over the keyguard but
  * the system's unlock prompt, and opens [AssistActivity] only once the user
  * has unlocked. Cancelling the prompt opens nothing.
+ *
+ * One gate serves one trigger. A trigger while the unlock prompt is up reaches
+ * this gate as onNewIntent (singleTop) and opens nothing more. Configuration
+ * changes don't recreate it, and a gate restored from saved state finishes.
+ * Leaving the screen with the prompt still up, as when the screen turns off,
+ * finishes it, so a later unrelated unlock opens nothing.
  */
 class AssistGateActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState != null) return finish()
         val keyguard = getSystemService(KeyguardManager::class.java)
         if (keyguard?.isKeyguardLocked != true) {
             openAssistant()
@@ -28,6 +35,11 @@ class AssistGateActivity : Activity() {
                 override fun onDismissError() = finish()
             },
         )
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) finish()
     }
 
     /**

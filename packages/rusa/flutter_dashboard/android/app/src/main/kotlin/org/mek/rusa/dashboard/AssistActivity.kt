@@ -1,6 +1,8 @@
 package org.mek.rusa.dashboard
 
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 
@@ -14,6 +16,8 @@ import io.flutter.embedding.engine.FlutterEngine
  */
 class AssistActivity : FlutterActivity() {
     private var assistant: AssistantChannel? = null
+    private val main = Handler(Looper.getMainLooper())
+    private var ending = false
 
     override fun getDartEntrypointFunctionName(): String = "assistMain"
 
@@ -31,6 +35,8 @@ class AssistActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // A closing screen has no session left to stop and send.
+        if (ending) return
         val channel = assistant ?: return
         answerHeadset(intent, channel)
         channel.trigger()
@@ -40,12 +46,27 @@ class AssistActivity : FlutterActivity() {
      * Leaving the screen ends the session: locking, screen off, Home or another
      * app. A stopped activity gets no later callback when the phone then locks,
      * so finishing here is what keeps nothing recording or playing behind the
-     * keyguard. Finishing destroys this activity's engine, and the record and
-     * audioplayers plugins release their recorders and players on detach.
+     * keyguard. Dart ends the session first, as walkie off does: the recorder
+     * cancels, deleting the partial take, and the server's voice session is
+     * disabled. The deadline bounds a slow server; the record and audioplayers
+     * plugins release whatever is left when the engine detaches.
      */
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) finish()
+        if (isChangingConfigurations || ending) return
+        ending = true
+        val close = Runnable { if (!isFinishing) finish() }
+        main.postDelayed(close, END_DEADLINE_MS)
+        val channel = assistant ?: return close.run()
+        channel.end {
+            main.removeCallbacks(close)
+            close.run()
+        }
+    }
+
+    override fun onDestroy() {
+        main.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 
     /**
@@ -74,5 +95,9 @@ class AssistActivity : FlutterActivity() {
     ) {
         if (assistant?.onRequestPermissionsResult(requestCode) == true) return
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    }
+
+    companion object {
+        private const val END_DEADLINE_MS = 3_000L
     }
 }

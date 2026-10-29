@@ -45,6 +45,11 @@ abstract interface class AssistantSignals {
   /// The routed headset microphone went away, as when the headset button ends
   /// its voice recognition.
   Stream<void> get routeLost;
+
+  /// Ends the session when the assist screen is closing because it left the
+  /// screen. The screen closes once the returned future settles, or after a
+  /// native deadline. Null when no page owns the screen.
+  abstract Future<void> Function()? onEnd;
 }
 
 /// The whole native surface, as the one assistant channel serves it.

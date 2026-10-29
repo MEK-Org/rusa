@@ -1767,6 +1767,8 @@ class FakeAssistant implements AssistantPlatform {
   Stream<void> get triggers => triggerCtrl.stream;
   @override
   Stream<void> get routeLost => routeLostCtrl.stream;
+  @override
+  Future<void> Function()? onEnd;
 
   @override
   Future<AssistantRoleStatus> status() async =>

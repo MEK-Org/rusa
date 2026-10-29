@@ -164,6 +164,63 @@ void main() {
       expect(closed, 1);
     });
 
+    testWidgets('leaving the screen discards the take and ends the session', (
+      tester,
+    ) async {
+      await pumpPage(tester);
+      expect(walkie.recorder.startCalls, 1);
+
+      var ended = false;
+      unawaited(assistant.onEnd!().then((_) => ended = true));
+      await tester.pump();
+      await tester.pump();
+
+      expect(ended, isTrue);
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(walkie.recorder.stopCalls, 0);
+      expect(api.memoSends, isEmpty);
+      expect(api.disabledVoiceSessions, hasLength(1));
+      expect(walkie.wakeLock.releaseCalls, 1);
+      // Native closes the screen; the page does not close it a second time.
+      expect(closed, 0);
+
+      // A trigger reaching the closing screen starts nothing.
+      assistant.triggerCtrl.add(null);
+      await tester.pump();
+      expect(walkie.recorder.startCalls, 1);
+      await unmount(tester);
+      expect(assistant.onEnd, isNull);
+    });
+
+    testWidgets('leaving the screen during the root lookup starts nothing', (
+      tester,
+    ) async {
+      final gate = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(gate);
+      await pumpPage(tester);
+
+      var ended = false;
+      unawaited(assistant.onEnd!().then((_) => ended = true));
+      await tester.pump();
+      // Ending waits for the start in flight to settle.
+      expect(ended, isFalse);
+
+      gate.complete(
+        ThreadsSnapshot(
+          halted: false,
+          threads: api.threadsResult,
+          rootActorId: 'root',
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(ended, isTrue);
+      expect(walkie.streams, isEmpty);
+      expect(walkie.recorder.startCalls, 0);
+      await unmount(tester);
+    });
+
     testWidgets('says so when there is no root actor to address', (
       tester,
     ) async {
@@ -478,6 +535,36 @@ void main() {
       expect(await assistant.acquire(), isFalse);
       await assistant.release();
       expect(calls, ['acquireHeadset', 'releaseHeadset']);
+    });
+
+    test('answers native\'s end once the session has ended', () async {
+      final assistant = IoAssistantChannel(channel: channel);
+      final ending = Completer<void>();
+      assistant.onEnd = () => ending.future;
+      var replied = false;
+      unawaited(
+        messenger.handlePlatformMessage(
+          channel.name,
+          const StandardMethodCodec().encodeMethodCall(const MethodCall('end')),
+          (_) => replied = true,
+        ),
+      );
+      await pumpEventQueue();
+      expect(replied, isFalse);
+
+      ending.complete();
+      await pumpEventQueue();
+      expect(replied, isTrue);
+
+      // With no page to end, native gets its answer at once.
+      assistant.onEnd = null;
+      replied = false;
+      await messenger.handlePlatformMessage(
+        channel.name,
+        const StandardMethodCodec().encodeMethodCall(const MethodCall('end')),
+        (_) => replied = true,
+      );
+      expect(replied, isTrue);
     });
 
     test('forwards native triggers and route loss', () async {

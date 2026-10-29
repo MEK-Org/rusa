@@ -53,6 +53,7 @@ class _AssistantPageState extends State<AssistantPage> {
     if (signals != null) {
       _subs.add(signals.triggers.listen((_) => unawaited(_onTrigger())));
       _subs.add(signals.routeLost.listen((_) => unawaited(_onRouteLost())));
+      signals.onEnd = _end;
     }
     _ready = _start();
   }
@@ -117,6 +118,26 @@ class _AssistantPageState extends State<AssistantPage> {
     }
   }
 
+  /// The screen is closing because it left the screen. End the session
+  /// before the engine goes, as walkie off does: the recorder cancels, which
+  /// deletes the partial take, and the server's voice session is disabled.
+  Future<void> _end() async {
+    // A start still in flight is now stale and discards what it built.
+    _attempt++;
+    // Cancelled now, walkie off below cannot also close the screen.
+    unawaited(_enabledSub?.cancel());
+    _enabledSub = null;
+    final controller = _controller;
+    _controller = null;
+    final pending = _ready;
+    await controller?.dispose();
+    try {
+      await pending;
+    } catch (_) {
+      // A failed or discarded start holds nothing.
+    }
+  }
+
   void _close() {
     final onClose = widget.onClose;
     if (onClose != null) {
@@ -129,6 +150,8 @@ class _AssistantPageState extends State<AssistantPage> {
   @override
   void dispose() {
     _disposed = true;
+    final signals = widget.signals;
+    if (signals != null && signals.onEnd == _end) signals.onEnd = null;
     for (final sub in _subs) {
       unawaited(sub.cancel());
     }

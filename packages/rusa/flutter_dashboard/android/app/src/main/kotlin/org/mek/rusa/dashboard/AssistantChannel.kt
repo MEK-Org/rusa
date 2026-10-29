@@ -50,6 +50,17 @@ class AssistantChannel(
 
     fun trigger() = channel.invokeMethod("trigger", null)
 
+    /** Asks Dart to end the session; [done] runs once it has, or failed to. */
+    fun end(done: () -> Unit) = channel.invokeMethod(
+        "end",
+        null,
+        object : MethodChannel.Result {
+            override fun success(result: Any?) = done()
+            override fun error(code: String, message: String?, details: Any?) = done()
+            override fun notImplemented() = done()
+        },
+    )
+
     private fun roleStatus(): Map<String, Boolean> {
         val roles = activity.getSystemService(RoleManager::class.java)
         val available = roles?.isRoleAvailable(RoleManager.ROLE_ASSISTANT) == true

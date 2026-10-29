@@ -43,6 +43,8 @@
         <activity
             android:name=".AssistGateActivity"
             android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:taskAffinity="org.mek.rusa.dashboard.assist"
             android:excludeFromRecents="true"
             android:showWhenLocked="true"

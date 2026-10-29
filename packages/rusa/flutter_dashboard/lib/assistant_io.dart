@@ -6,8 +6,8 @@ import 'assistant_platform.dart';
 
 /// The `assistant_platform.dart` seams over the activity's
 /// `org.mek.rusa.dashboard/assistant` channel (`AssistantChannel.kt`). Both
-/// activities register the channel; only the assist activity sends
-/// `trigger`, and only a routed headset sends `routeLost`.
+/// activities register the channel; only the assist activity sends `trigger`
+/// and `end`, and only a routed headset sends `routeLost`.
 class IoAssistantChannel implements AssistantPlatform {
   IoAssistantChannel({MethodChannel channel = const MethodChannel(kName)})
     : _channel = channel {
@@ -26,12 +26,17 @@ class IoAssistantChannel implements AssistantPlatform {
   @override
   Stream<void> get routeLost => _routeLost.stream;
 
+  @override
+  Future<void> Function()? onEnd;
+
   Future<Object?> _handle(MethodCall call) async {
     switch (call.method) {
       case 'trigger':
         _triggers.add(null);
       case 'routeLost':
         _routeLost.add(null);
+      case 'end':
+        await onEnd?.call();
     }
     return null;
   }
