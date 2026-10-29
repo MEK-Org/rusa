@@ -1680,17 +1680,23 @@ export class QuotaService {
     let result: RunResult;
     try {
       result = await capture();
-      // A capture killed at its ceiling holds no panel (#847), and under host
-      // load the next attempt usually completes. Retry once within this scrape,
-      // so a slow capture records one reading instead of a failed scrape that
-      // raises a missed-window alarm per lane (#1195).
-      if (result.cancelled) result = await capture();
     } catch (err) {
       return {
         provider: "claude",
         status: "unknown",
         message: `claude /usage run failed: ${err instanceof Error ? err.message : String(err)}`,
       };
+    }
+    // A capture killed at its ceiling holds no panel (#847). Retry it once
+    // within this scrape, so a capture that completes on the second attempt
+    // records one reading instead of a failed scrape that raises a
+    // missed-window alarm per lane (#1195). How often an immediate retry
+    // completes under host load is unmeasured; #1195 defers notice coalescing
+    // until it is. A retry that cannot run keeps the observed cancellation,
+    // which still records the #847 capture failure.
+    if (result.cancelled) {
+      const cancelled = result;
+      result = await capture().catch(() => cancelled);
     }
 
     const output = result.output;
