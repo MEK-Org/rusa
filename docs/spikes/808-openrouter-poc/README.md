@@ -6,12 +6,12 @@ OpenRouter through Pi, send a ping over fake human chat and verify the nonce
 comes back through the chat-write MCP tool. The runner also requires a successful
 run settlement before shutting down the instance.
 
-This is an explicit host-execution prototype, not production activation. Set
-`RUSA_OPENROUTER_POC=1` and configure `providers.openrouter.openrouterPoc: {}`.
+OpenRouter is an ordinary provider: configure `providers.openrouter: { cliCommand: pi }`.
+`cliCommand` selects the Pi adapter and names the executable, the same way
+`antigravity` runs `agy`; the provider name stays `openrouter` for model routing.
 Launch the installed `pi` on the service PATH, then run `/login openrouter`.
 The saved login comes from the selected `PI_CODING_AGENT_DIR` or Pi's normal
-`~/.pi/agent` location. `openrouterPoc.piCommand` is the deliberate override
-when the service must select a separately installed executable. The adapter validates the
+`~/.pi/agent` location. The adapter validates the
 OpenRouter entry and exposes the selected existing
 `auth.json` through a read-only bind for workers or a symlink for unsandboxed
 launches. The whole saved profile is visible to Pi, including other provider
@@ -21,9 +21,8 @@ error. Command-based API key entries are unsupported. No mesh key file or
 `OPENROUTER_API_KEY` is supplied. The operator's auth file is never modified.
 
 Worker runs use the shared bwrap launcher. Native session resumes and computer
-use remain unsupported; portable context and the opt-in flag are required.
-The executable must be available on the service PATH, or `piCommand` must name
-its installed path. Its Node runtime must also be on PATH.
+use remain unsupported; portable context and a model are required.
+The `pi` executable and its Node runtime must be available on the service PATH.
 
 ## Run
 
@@ -34,7 +33,7 @@ that provider account; no paid request runs in CI.
 ```sh
 pnpm --filter rusa exec tsup
 # Supply the operator-approved Git identity variables for the scratch commit.
-node docs/spikes/808-openrouter-poc/smoke.mjs pi openai/gpt-4.1-mini
+node docs/spikes/808-openrouter-poc/smoke.mjs openai/gpt-4.1-mini
 ```
 
 The script uses loopback ports 8323–8327. It creates a private base config and
