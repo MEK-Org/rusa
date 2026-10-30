@@ -288,8 +288,9 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     const access = activeAccess(actorId, configured, activeCapabilities);
     if (access.size === 0) return { tools: [] };
     try {
-      // The service lists every tool whatever the scope; rusa's own
-      // classification decides what this actor may see and call.
+      // Discovery carries the actor's effective scope, so the service lists
+      // what that scope allows; rusa's own classification then decides what
+      // this actor may see and call.
       const result = ListToolsResultSchema.parse(
         await withUpstream(access.has("write") ? "write" : "read", extra.signal, (upstream) =>
           upstream.listTools(undefined, { signal: extra.signal })

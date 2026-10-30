@@ -49,7 +49,7 @@ The service is an ordinary MCP server speaking the official protocol revision
 | Request | Response |
 | --- | --- |
 | `POST /mcp` on the socket, `server/discover` | the server's identity, revisions and capabilities |
-| `POST /mcp`, `tools/list` | the complete tool catalog with `readOnlyHint` annotations |
+| `POST /mcp`, `tools/list` | the tools the request's scope allows, with `readOnlyHint` annotations |
 | `POST /mcp`, `tools/call` | the MCP `CallToolResult` for one tool |
 
 Every request is a plain JSON-RPC request answered with plain JSON on the same
@@ -59,9 +59,10 @@ All requests carry `Authorization: Bearer <host-token>`,
 Rusa exchange opens its own connection: a `server/discover` probe for the
 pinned revision followed by the one request. Discovery carries the actor's
 current effective scope; each tool call carries only the scope its configured
-classification requires. The service lists every tool whatever the scope and
-enforces scope on invocation; Rusa's `readTools` / `writeTools` classification
-decides what an actor sees and calls.
+classification requires. The service lists only the tools the request's scope
+allows (`write` includes `read`) and knows no other tool at that scope; Rusa's
+`readTools` / `writeTools` classification then decides what an actor sees and
+calls.
 
 The service refuses an invalid token or unknown user with HTTP 401
 `invalid_token` and a call beyond the granted scope with HTTP 403

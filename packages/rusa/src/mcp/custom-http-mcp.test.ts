@@ -85,7 +85,9 @@ async function startService(): Promise<void> {
     ({ requestInfo }) => {
       const headers = requestInfo?.headers;
       const upstream = new UpstreamMcpServer({ name: "synthetic-graph", version: "0.0.0" });
-      for (const name of ["read_goal", "write_goal", "unclassified"]) {
+      // Like the host service, list write tools only to a write-scoped caller.
+      const write = headers?.get("rusa-mcp-scope") === "write";
+      for (const name of write ? ["read_goal", "write_goal", "unclassified"] : ["read_goal"]) {
         upstream.registerTool(
           name,
           {
@@ -447,8 +449,9 @@ describe("configured host MCP service", () => {
   });
 
   it("surfaces an upstream scope refusal as a redacted tool error", async () => {
-    // A misclassified write tool is sent with read scope; the service's
-    // 403 insufficient_scope verdict stands, with no step-up attempt.
+    // A misclassified write tool is sent with read scope and the service
+    // answers with the SDK's 403 insufficient_scope challenge; that verdict
+    // stands, with no step-up attempt.
     grants.set("reader", ["glass_goals:configured-user:read"]);
     const warn = vi.fn();
     const client = await connect(
