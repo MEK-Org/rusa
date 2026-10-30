@@ -717,7 +717,7 @@ export class SharedQuotaStore {
    * a retry arriving after its `quota_scrapes` row has been pruned is rejected
    * by ordering (`stale_observation`) rather than replayed anyway.
    */
-  pruneRawScrapes(nowMs = Date.now()): number {
+  pruneRawScrapes(nowMs: number): number {
     if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
     const cutoff = new Date(nowMs - QUOTA_RAW_RETENTION_MS).toISOString();
     return (
@@ -728,7 +728,7 @@ export class SharedQuotaStore {
     );
   }
 
-  pruneObservations(nowMs = Date.now()): number {
+  pruneObservations(nowMs: number): number {
     if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
     const cutoff = new Date(nowMs - QUOTA_OBSERVATION_RETENTION_MS).toISOString();
     return this.db
