@@ -14,9 +14,11 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { createMcpHandler, McpServer as UpstreamMcpServer } from "@modelcontextprotocol/server";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
+import { z } from "zod";
 import { Actor, type ActorOptions, type PromptBuild } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import {
@@ -2838,15 +2840,40 @@ describe("runStart webhook event routing (Phase 4)", () => {
       scope: unknown;
       method: unknown;
     }> = [];
-    const service = createServer((req, res) => {
+    // The service speaks only stateless MCP 2026-07-28 over the socket, as the
+    // official server SDK serves it; each exchange is a discovery probe and
+    // then the one request, carrying the actor's effective scope.
+    const handler = createMcpHandler(
+      () => {
+        const upstream = new UpstreamMcpServer({ name: "synthetic-graph", version: "0.0.0" });
+        upstream.registerTool(
+          "read_goal",
+          { inputSchema: z.looseObject({}), annotations: { readOnlyHint: true } },
+          async () => ({ content: [{ type: "text", text: "synthetic graph" }] })
+        );
+        return upstream;
+      },
+      { responseMode: "json", legacy: "reject" }
+    );
+    const service = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = Buffer.concat(chunks).toString("utf8");
       requests.push({
         auth: req.headers.authorization,
         user: req.headers["rusa-mcp-user-id"],
         scope: req.headers["rusa-mcp-scope"],
-        method: req.method,
+        method: (JSON.parse(body) as { method?: string }).method,
       });
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ content: [{ type: "text", text: "synthetic graph" }] }));
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(req.headers)) {
+        if (typeof value === "string" && name !== "content-length") headers.set(name, value);
+      }
+      const response = await handler.fetch(
+        new Request(`http://localhost${req.url ?? "/"}`, { method: req.method, headers, body })
+      );
+      res.writeHead(response.status, Object.fromEntries(response.headers));
+      res.end(await response.text());
     });
     await new Promise<void>((resolve) => service.listen(socketPath, resolve));
     const client = new Client({ name: "configured-http-service-test", version: "0.0.0" });
@@ -2876,14 +2903,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(await client.callTool({ name: "read_goal" })).toMatchObject({
         content: [{ text: "synthetic graph" }],
       });
-      expect(requests).toEqual([
-        {
+      expect(requests).toEqual(
+        ["server/discover", "tools/call"].map((method) => ({
           auth: "Bearer synthetic-host-token",
           user: "synthetic-user",
           scope: "read",
-          method: "GET",
-        },
-      ]);
+          method,
+        }))
+      );
     } finally {
       await client.close();
       service.closeAllConnections();

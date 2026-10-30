@@ -145,7 +145,7 @@ Top-level fields:
   invocationDebug          Optional. Full invocation artifact capture controls.
   observability            Optional. Operational alerting controls.
   understanding            Optional. Integrated Understanding settings (rootNodeId, glassGoals backend).
-  customMcpServers         Optional. Host HTTP JSON services, each reachable only through an explicit
+  customMcpServers         Optional. Host MCP services on Unix sockets, each reachable only through an explicit
                            per-user read or write grant. See docs/custom-mcp.md.
   glassGoals               Optional legacy IU storage section (prefer nesting under understanding.glassGoals).
   smokeTest                Optional legacy runtime smoke-test settings.

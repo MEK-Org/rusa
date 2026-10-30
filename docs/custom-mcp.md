@@ -1,6 +1,6 @@
 # Host-owned custom MCP services
 
-`customMcpServers` connects an independently running HTTP JSON service behind
+`customMcpServers` connects an independently running MCP service behind
 Rusa's existing per-actor MCP endpoint. The service owns its graph context,
 authentication and persistent cache. It stays running when an actor disconnects;
 Rusa neither starts it nor shuts it down. This follows the quota coordinator's
@@ -38,47 +38,67 @@ its graph context by trusted project/backend/authenticated user. It validates
 scope separately for every request, allowing authorized reader and writer
 clients to reuse graph context without sharing mutable authorization state.
 
-The small service contract agreed in [issue #1185](https://github.com/MEK-Org/rusa/issues/1185#issuecomment-6495285893) is:
+## Service contract
+
+The service is an ordinary MCP server speaking the official protocol revision
+`2026-07-28` over stateless Streamable HTTP, as served by the TypeScript SDK's
+`@modelcontextprotocol/server` 2.x `createMcpHandler`. Rusa is a pinned
+`@modelcontextprotocol/client` 2.x client: it never falls back to the 2025
+`initialize` handshake, so a legacy-only server is refused, not negotiated with.
 
 | Request | Response |
 | --- | --- |
-| `GET /v1/tools` | MCP `ListToolsResult` JSON with the complete tool catalog |
-| `GET /v1/tools/<encoded-name>?arguments=<encoded-JSON-object>` | MCP `CallToolResult` JSON for a read tool |
-| `POST /v1/tools/<encoded-name>` with a JSON arguments object | MCP `CallToolResult` JSON for a write tool |
+| `POST /mcp` on the socket, `server/discover` | the server's identity, revisions and capabilities |
+| `POST /mcp`, `tools/list` | the tools the request's scope allows, with `readOnlyHint` annotations |
+| `POST /mcp`, `tools/call` | the MCP `CallToolResult` for one tool |
 
+Every request is a plain JSON-RPC request answered with plain JSON on the same
+exchange (no session, SSE stream or `mcp-session-id`); `Host` is `localhost`.
 All requests carry `Authorization: Bearer <host-token>`,
-`Rusa-Mcp-User-Id: <configured-user>` and `Rusa-Mcp-Scope: read|write`.
-The service rejects a tool invoked with the wrong HTTP method, unknown users,
-invalid tokens and insufficient scope. GET operations have no mutations. Empty
-tool arguments are `{}`. URL components use percent encoding; no upstream MCP
-initialize/session/streaming protocol is involved. Successful responses use
-HTTP 200. Discovery carries the actor's current effective scope; each tool call
-carries only the scope its configured classification requires.
+`rusa-mcp-user-id: <configured-user>` and `rusa-mcp-scope: read|write`. Each
+Rusa exchange opens its own connection: a `server/discover` probe for the
+pinned revision followed by the one request. Discovery carries the actor's
+current effective scope; each tool call carries only the scope its configured
+classification requires. The service lists only the tools the request's scope
+allows (`write` includes `read`) and knows no other tool at that scope; Rusa's
+`readTools` / `writeTools` classification then decides what an actor sees and
+calls. A tool called at a scope that does not list it is therefore unknown to
+the service, which answers the ordinary JSON-RPC tool-not-found error; Rusa
+reports that as unavailable, like any other failed call.
+
+The service refuses an invalid token with HTTP 401 `invalid_token`, and a
+configured user it does not act for or a scope header it does not recognise
+with HTTP 403 `insufficient_scope`: the SDK's bearer challenge responses. Rusa
+makes no step-up or re-authorization attempt: a refusal surfaces to the actor
+as a generic `custom MCP upstream refused` tool error, or empty discovery,
+with the status code but none of the challenge detail in Rusa's log.
 
 The trusted service owns the safety of valid tool results, including `isError`
 domain errors: it must return caller-safe messages and replace internal exceptions
 with generic errors, excluding host tokens, paths and backing-store details.
 Rusa preserves those valid results; it cannot distinguish a useful domain error
-from an unsafe exception encoded as one. HTTP, transport, JSON and result-schema
-failures return a generic unavailable error to the actor. Rusa excludes their
-upstream bodies, arguments and authentication from its failure logs.
+from an unsafe exception encoded as one. HTTP, transport, JSON, negotiation and
+result-schema failures return a generic unavailable error to the actor. Rusa
+excludes their upstream bodies, arguments and authentication from its failure
+logs; SDK error messages quote response text and are never logged.
 
-Rusa limits request targets to 8 KiB, POST bodies to 1 MiB and responses to
-16 MiB, with a 30-second deadline. Requests exceeding those bounds fail.
-Cancelling an MCP call or closing its downstream session aborts only its HTTP
-requests; it leaves the service and warm graph context alive. A later request
-opens a fresh connection. No request is automatically retried, including a
-write whose connection failed after its outcome became uncertain.
+Rusa limits request bodies to 1 MiB and responses to 16 MiB, with a 30-second
+deadline per exchange. A request exceeding its bound fails without being sent.
+Cancelling an MCP call or closing its downstream
+session aborts only its HTTP exchange; it leaves the service and warm graph
+context alive. A later request opens a fresh connection. No request is
+automatically retried, including a write whose connection failed after its
+outcome became uncertain.
 
 The proxy exposes only explicitly classified `readTools` / `writeTools` and
 rechecks current actor grants during discovery and every invocation. It does
-not forward upstream resources or prompts. Revocation removes the per-actor
-endpoint and closes downstream sessions; an invocation racing teardown is also
-checked. A scope change affects subsequent requests; requests already admitted
-retain their own authority and may finish. A later request does not cancel them.
-Cancellation or revocation cannot undo a write already committed by the service.
-A service can never shadow a built-in MCP server, worker endpoint or reserved
-capability.
+not forward upstream resources, prompts, subscriptions or notifications.
+Revocation removes the per-actor endpoint and closes downstream sessions; an
+invocation racing teardown is also checked. A scope change affects subsequent
+requests; requests already admitted retain their own authority and may finish.
+A later request does not cancel them. Cancellation or revocation cannot undo a
+write already committed by the service. A service can never shadow a built-in
+MCP server, worker endpoint or reserved capability.
 
 Leader-local actors use the existing per-actor MCP endpoint. Follower actors use
 the established authenticated follower proxy; the service and its credentials
@@ -88,12 +108,16 @@ empty discovery or a bounded tool error and is attempted anew on the next call.
 Windows named pipes, remote service URLs and actor-owned service startup are
 not supported by this configuration. The former `command`, `args`, `cwd` and
 `env` stdio fields are rejected; update that configuration to the service fields.
+The earlier bespoke `/v1/tools` HTTP JSON contract is no longer spoken.
 
-`src/mcp/custom-http-mcp.test.ts` exercises a real synthetic Unix-socket HTTP
-service through the configured factory, per-actor MCP sessions, mesh grants and
+`src/mcp/custom-http-mcp.test.ts` exercises a real synthetic Unix-socket MCP
+service, built on the official server SDK with legacy requests rejected,
+through the configured factory, per-actor MCP sessions, mesh grants and
 follower proxy. It covers denied/wrong-user access, read/write and cross-actor
-scope isolation, invocation-time revocation, graph context reuse across calls
-and client reconnects, service restart, authentication rotation, cancellation,
-deadlines, size bounds and redacted errors. Actual Glass Goals executable
-composition is validated separately with synthetic graphs; these tests do not
-authorize personal graph access, live configuration or deployment.
+scope isolation, invocation-time revocation, upstream scope refusal, graph
+context reuse across calls and client reconnects, service restart,
+authentication rotation, cancellation, deadlines, size bounds and redacted
+errors, and asserts that no exchange ever used the legacy handshake. Actual
+Glass Goals executable composition is validated separately with synthetic
+graphs; these tests do not authorize personal graph access, live configuration
+or deployment.
