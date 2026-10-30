@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart' show MissingPluginException;
 import 'package:rusa_dashboard/actor_hierarchy_cache.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/assistant_platform.dart';
 import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/avatar_platform.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
@@ -225,6 +227,7 @@ class FakeApi extends DashboardApi {
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
   Object? threadsError;
+  String? rootActorId = 'root';
   final timingInteractions =
       <({DashboardInteraction interaction, String outcome})>[];
   List<EventPage> eventPages = [];
@@ -294,6 +297,7 @@ class FakeApi extends DashboardApi {
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
       supportedVoices: supportedVoices,
+      rootActorId: rootActorId,
     );
   }
 
@@ -1541,8 +1545,10 @@ VoiceAnnouncement makeAnnouncement(
   String actor = 'a',
   String? text,
   String createdAt = '2026-07-17T00:00:00Z',
+  String? sessionId,
 }) => VoiceAnnouncement(
   id: id,
+  sessionId: sessionId,
   actorId: actor,
   text: text ?? 'reply $id',
   audioUrl: '/api/mesh/voice/audio/$id',
@@ -1745,4 +1751,35 @@ class FakeStream implements MeshStreamSource {
   void connect(List<String> actors) => connectCalls.add(actors);
   @override
   void dispose() {}
+}
+
+/// The Android assistant channel: a role status (null: no native half), and
+/// trigger and route-loss signals the test fires.
+class FakeAssistant implements AssistantPlatform {
+  FakeAssistant({this.roleStatus});
+
+  AssistantRoleStatus? roleStatus;
+  int settingsOpened = 0;
+  final triggerCtrl = StreamController<void>.broadcast();
+  final routeLostCtrl = StreamController<void>.broadcast();
+
+  @override
+  Stream<void> get triggers => triggerCtrl.stream;
+  @override
+  Stream<void> get routeLost => routeLostCtrl.stream;
+  @override
+  Future<void> Function()? onEnd;
+
+  @override
+  Future<AssistantRoleStatus> status() async =>
+      roleStatus ?? (throw MissingPluginException());
+
+  @override
+  Future<void> openSettings() async => settingsOpened++;
+
+  @override
+  Future<bool> acquire() async => false;
+
+  @override
+  Future<void> release() async {}
 }

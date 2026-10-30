@@ -711,10 +711,16 @@ class ThreadsSnapshot {
     this.halt,
     this.haltBrake,
     this.availabilityHolds,
+    this.rootActorId,
   });
 
   final bool halted;
   final List<ThreadDto> threads;
+
+  /// Root's actor id, as the server's mesh resolves it. Every parentless
+  /// thread carries the root handle, so this is what identifies root. Null
+  /// against an older server, or one with no live mesh: root unknown.
+  final String? rootActorId;
   final RuntimeCursor? runtimeCursor;
 
   /// The supported voices across providers, as reported by the server — the
@@ -765,6 +771,7 @@ class ThreadsSnapshot {
     availabilityHolds: (j['availabilityHolds'] as List<dynamic>?)
         ?.map((e) => AvailabilityHoldDto.fromJson(e as Map<String, dynamic>))
         .toList(),
+    rootActorId: j['rootActorId'] as String?,
   );
 }
 
@@ -1902,9 +1909,13 @@ class VoiceAnnouncement {
     required this.audioUrl,
     required this.mime,
     required this.createdAt,
+    this.sessionId,
   });
 
   final String id;
+
+  /// The walkie session the reply answered, or null for one outside any.
+  final String? sessionId;
 
   /// The actor whose message is being spoken.
   final String actorId;
@@ -1927,6 +1938,7 @@ class VoiceAnnouncement {
         audioUrl: j['audioUrl'] as String? ?? '',
         mime: j['mime'] as String? ?? 'audio/wav',
         createdAt: j['createdAt'] as String? ?? '',
+        sessionId: j['sessionId'] as String?,
       );
 }
 

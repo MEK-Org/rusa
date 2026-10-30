@@ -2577,6 +2577,10 @@ export async function handleMeshApiRequest(
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
+      // Root's actor id, as the mesh itself resolves the root alias. Every
+      // parentless actor carries the root handle, so a client that must
+      // address root (the Android assist trigger, #1193) reads it here.
+      rootActorId: deps.resolveActorId?.("root") ?? null,
       userPrincipalId,
       supportedVoices: deps.supportedVoices ?? buildSupportedVoiceCatalog(),
     });

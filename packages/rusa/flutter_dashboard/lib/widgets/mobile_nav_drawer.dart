@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
+import '../assistant_platform.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -21,6 +24,7 @@ class MobileNavDrawer extends StatelessWidget {
     this.onLogout,
     this.profilePhotoUrl,
     this.profileDisplayName,
+    this.assistantRole,
   });
 
   final DashboardStore store;
@@ -36,6 +40,9 @@ class MobileNavDrawer extends StatelessWidget {
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
   final String? profileDisplayName;
+
+  /// Android's assistant role, when the platform has one.
+  final AssistantRole? assistantRole;
 
   @override
   Widget build(BuildContext context) {
@@ -82,6 +89,8 @@ class MobileNavDrawer extends StatelessWidget {
                       onSelect: onSelect,
                     ),
                   const SizedBox(height: 8),
+                  if (assistantRole != null)
+                    _AssistantRoleItem(role: assistantRole!),
                 ],
               ),
             ),
@@ -180,6 +189,77 @@ class _DrawerNavItem extends StatelessWidget {
       onTap: () {
         Navigator.of(context).maybePop();
         onSelect(destination.targetFrom(selected));
+      },
+    );
+  }
+}
+
+/// Android's assistant role: whether Rusa holds it, and a tap through to the
+/// system page that assigns it, since apps cannot request this role. Hidden
+/// until the status arrives, and on devices without the role.
+class _AssistantRoleItem extends StatefulWidget {
+  const _AssistantRoleItem({required this.role});
+
+  final AssistantRole role;
+
+  @override
+  State<_AssistantRoleItem> createState() => _AssistantRoleItemState();
+}
+
+class _AssistantRoleItemState extends State<_AssistantRoleItem> {
+  // The drawer is rebuilt each time it opens, so a choice made in settings
+  // shows on the next open.
+  late final Future<AssistantRoleStatus> _status = widget.role.status();
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<AssistantRoleStatus>(
+      future: _status,
+      builder: (context, snap) {
+        final status = snap.data;
+        if (status == null || !status.available) {
+          return const SizedBox.shrink();
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Divider(height: 1, color: MeshColors.border),
+            const SizedBox(height: 8),
+            ListTile(
+              key: const ValueKey('drawer-assistant'),
+              leading: const Icon(
+                Icons.assistant_outlined,
+                size: 20,
+                color: MeshColors.textSecondary,
+              ),
+              title: const Text(
+                'Default assistant',
+                style: TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              subtitle: Text(
+                status.held
+                    ? 'The assist gesture opens walkie to root'
+                    : 'Not set. Choose Rusa in Android settings',
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+              trailing: status.held
+                  ? const Icon(Icons.check, size: 18, color: MeshColors.accent)
+                  : null,
+              onTap: () {
+                Navigator.of(context).maybePop();
+                unawaited(widget.role.openSettings());
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+        );
       },
     );
   }

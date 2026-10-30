@@ -9,6 +9,7 @@ import 'package:record/record.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'api.dart';
+import 'assistant_platform.dart';
 import 'io_session.dart';
 import 'io_session_events.dart';
 import 'models.dart';
@@ -23,14 +24,16 @@ import 'voice_platform.dart';
 /// Imported only from the IO bootstrap.
 
 /// Wire the real device deps once at startup. [transport] is the session's
-/// own device transport (every IO session carries one).
+/// own device transport (every IO session carries one). The assist screen
+/// passes a [headset] so its recordings use a connected headset microphone.
 WalkieDeps ioWalkieDeps(
   DashboardApi api,
   DashboardSession session,
-  IoSessionTransport transport,
-) => WalkieDeps(
+  IoSessionTransport transport, {
+  HeadsetRoute? headset,
+}) => WalkieDeps(
   api: api,
-  recorder: IoVoiceRecorder(),
+  recorder: IoVoiceRecorder(headset: headset),
   player: IoVoicePlayer(
     client: transport.client,
     baseUrl: transport.baseUrl,
@@ -46,15 +49,36 @@ WalkieDeps ioWalkieDeps(
 const _kRecordConfig = RecordConfig(encoder: AudioEncoder.aacLc);
 const _kRecordMime = 'audio/mp4';
 
+/// Capture from a routed headset: the HFP voice path is narrowband mono and is
+/// served to the communication source. The plugin's own Bluetooth handling
+/// stays off so it cannot race [HeadsetRoute] for the SCO link.
+const _kHeadsetRecordConfig = RecordConfig(
+  encoder: AudioEncoder.aacLc,
+  bitRate: 32000,
+  sampleRate: 16000,
+  numChannels: 1,
+  androidConfig: AndroidRecordConfig(
+    manageBluetooth: false,
+    audioSource: AndroidAudioSource.voiceCommunication,
+  ),
+);
+
 class IoVoiceRecorder implements VoiceRecorder {
   IoVoiceRecorder({
     AudioRecorder Function()? createRecorder,
     Future<Directory> Function()? temporaryDirectory,
+    HeadsetRoute? headset,
   }) : _createRecorder = createRecorder ?? AudioRecorder.new,
-       _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory;
+       _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
+       _headset = headset;
 
   final AudioRecorder Function() _createRecorder;
   final Future<Directory> Function() _temporaryDirectory;
+  final HeadsetRoute? _headset;
+
+  /// The start generation holding the headset route, so a superseded start
+  /// never releases a route a newer session acquired.
+  int? _routeGeneration;
 
   AudioRecorder? _recorder;
   String? _path;
@@ -79,7 +103,22 @@ class IoVoiceRecorder implements VoiceRecorder {
       if (generation != _generation) {
         throw StateError('recording superseded before it started');
       }
-      await recorder.start(_kRecordConfig, path: path);
+      final headset = _headset;
+      if (headset != null) {
+        // Held from the request, so a cancel while the route is still
+        // pending releases it at once rather than when it settles.
+        _routeGeneration = generation;
+        if (!await headset.acquire() && _routeGeneration == generation) {
+          _routeGeneration = null;
+        }
+      }
+      if (generation != _generation) {
+        throw StateError('recording superseded before it started');
+      }
+      await recorder.start(
+        _routeGeneration == generation ? _kHeadsetRecordConfig : _kRecordConfig,
+        path: path,
+      );
       if (generation != _generation) {
         await recorder.cancel();
         throw StateError('recording superseded by a newer session');
@@ -87,7 +126,10 @@ class IoVoiceRecorder implements VoiceRecorder {
       _recorder = recorder;
       _path = path;
     } catch (_) {
-      if (_recorder != recorder) await recorder.dispose();
+      if (_recorder != recorder) {
+        await recorder.dispose();
+        await _releaseRoute(generation);
+      }
       rethrow;
     }
   }
@@ -114,6 +156,7 @@ class IoVoiceRecorder implements VoiceRecorder {
         } catch (_) {}
       }
       await recorder.dispose();
+      await _releaseRoute();
     }
   }
 
@@ -127,12 +170,23 @@ class IoVoiceRecorder implements VoiceRecorder {
     final recorder = _recorder;
     _recorder = null;
     _path = null;
-    if (recorder == null) return;
-    try {
-      // The plugin deletes the partial file on cancel.
-      await recorder.cancel();
-    } catch (_) {}
-    await recorder.dispose();
+    if (recorder != null) {
+      try {
+        // The plugin deletes the partial file on cancel.
+        await recorder.cancel();
+      } catch (_) {}
+      await recorder.dispose();
+    }
+    await _releaseRoute();
+  }
+
+  /// Release the headset route held by [generation], or by any session when
+  /// none is given.
+  Future<void> _releaseRoute([int? generation]) async {
+    final owner = _routeGeneration;
+    if (owner == null || (generation != null && generation != owner)) return;
+    _routeGeneration = null;
+    await _headset?.release();
   }
 }
 

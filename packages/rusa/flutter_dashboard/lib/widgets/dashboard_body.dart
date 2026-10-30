@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../assistant_platform.dart';
 import '../breakpoints.dart';
 import '../dashboard_url.dart';
 import '../dashboard_url_core.dart';
@@ -40,12 +41,16 @@ class DashboardBody extends StatefulWidget {
     this.onLogout,
     this.onNavigation,
     this.profilePhotoUrl,
+    this.assistantRole,
   });
 
   final DashboardStore store;
   final VoidCallback? onLogout;
   final Future<void> Function()? onNavigation;
   final String? profilePhotoUrl;
+
+  /// Android's assistant role, offered from the phone drawer; null elsewhere.
+  final AssistantRole? assistantRole;
 
   /// Builds the Integrated Understanding view shown when its nav item is active.
   /// Injected by the web entrypoint (main.dart) so THIS file stays free of the
@@ -259,6 +264,7 @@ class _DashboardBodyState extends State<DashboardBody> {
                 onLogout: widget.onLogout,
                 profilePhotoUrl: widget.profilePhotoUrl,
                 profileDisplayName: widget.store.operatorDisplayName,
+                assistantRole: widget.assistantRole,
               ),
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),

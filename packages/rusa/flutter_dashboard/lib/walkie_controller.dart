@@ -103,6 +103,7 @@ class WalkieController {
     required String actorId,
     required WalkieDeps deps,
     this.onTransfer,
+    this.sessionRepliesOnly = false,
   }) : _actorId = actorId,
        _deps = deps,
        _available = BehaviorSubject<bool?>.seeded(deps.voiceAvailable);
@@ -115,6 +116,11 @@ class WalkieController {
 
   /// Lets the containing dashboard select the recipient without closing this controller.
   final void Function(String targetActorId)? onTransfer;
+
+  /// Queue only replies to this session's own memos. The live stream already
+  /// carries nothing else; this also keeps unplayed replies from earlier
+  /// sessions out of the backlog, leaving them for the next ordinary session.
+  final bool sessionRepliesOnly;
 
   final _enabled = BehaviorSubject<bool>.seeded(false);
   final _connection = BehaviorSubject<WalkieConnection>.seeded(
@@ -301,6 +307,7 @@ class WalkieController {
       final items = await _deps.api.fetchVoiceBacklog(backlogActorId);
       if (!_enabled.value) return;
       for (final frame in items) {
+        if (sessionRepliesOnly && frame.sessionId != _sessionId) continue;
         _enqueue(frame, backlogActorId: backlogActorId);
       }
     } on DashboardApiException catch (e) {
