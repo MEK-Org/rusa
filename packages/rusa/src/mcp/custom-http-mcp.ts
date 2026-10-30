@@ -89,8 +89,12 @@ function permits(access: ReadonlySet<Access>, classification: Access): boolean {
  * socket option of its own. Node's `fetch` cannot dial a Unix socket without
  * an extra dependency, so this adapts `node:http` to the Web `Response` the
  * transport reads. Each exchange is one connection: the service is stateless
- * and nothing is kept open between calls. The response is buffered under a
- * cap; the service answers in plain JSON, never a stream.
+ * and nothing is kept open between calls. The response is buffered whole
+ * under a cap before the transport reads it. The contract has the service
+ * answer in plain JSON (its handler runs in the SDK's `json` response mode);
+ * a one-shot SSE answer would still be buffered and read, so nothing here
+ * depends on it. The request bound is applied here, on the exact body the
+ * service would receive, so an oversized request never dials the socket.
  */
 function fetchOverSocket(socketPath: string): typeof fetch {
   return (input, init) =>
@@ -198,7 +202,7 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
   const withUpstream = async <T>(
     required: Access,
     signal: AbortSignal | undefined,
-    operation: (upstream: Client) => Promise<T>
+    operation: (upstream: Client, cancellation: AbortSignal) => Promise<T>
   ): Promise<T> => {
     const access = activeAccess(actorId, configured, activeCapabilities);
     if (closed || !permits(access, required)) throw new NotGrantedError();
@@ -240,8 +244,11 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     const abort = () => void transport.close().catch(() => {});
     cancellation.addEventListener("abort", abort, { once: true });
     try {
+      // The listener never fires for a signal that is already aborted, hence
+      // the check first.
+      cancellation.throwIfAborted();
       await upstream.connect(transport, { signal: cancellation, timeout: UPSTREAM_TIMEOUT_MS });
-      return await operation(upstream);
+      return await operation(upstream, cancellation);
     } catch (error) {
       if (deadline.aborted) throw new Error("timed out");
       if (cancellation.aborted) throw new Error("cancelled");
@@ -292,8 +299,10 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       // what that scope allows; rusa's own classification then decides what
       // this actor may see and call.
       const result = ListToolsResultSchema.parse(
-        await withUpstream(access.has("write") ? "write" : "read", extra.signal, (upstream) =>
-          upstream.listTools(undefined, { signal: extra.signal })
+        await withUpstream(
+          access.has("write") ? "write" : "read",
+          extra.signal,
+          (upstream, cancellation) => upstream.listTools(undefined, { signal: cancellation })
         )
       );
       const currentAccess = activeAccess(actorId, configured, activeCapabilities);
@@ -314,18 +323,16 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     if (!classification || !permits(access, classification)) {
       return toolError("custom MCP tool is not currently granted");
     }
-    const args = call.params.arguments ?? {};
-    if (Buffer.byteLength(JSON.stringify(args)) > MAX_REQUEST_BYTES) {
-      logFailure("call_tool", new RequestTooLargeError(), call.params.name);
-      return toolError("custom MCP request too large");
-    }
     try {
       // Valid tool results, including domain errors, are service-owned public
       // output. The trusted service must sanitize exceptions before returning
       // them; transport, status and malformed-result failures are redacted here.
       return CallToolResultSchema.parse(
-        await withUpstream(classification, extra.signal, (upstream) =>
-          upstream.callTool({ name: call.params.name, arguments: args }, { signal: extra.signal })
+        await withUpstream(classification, extra.signal, (upstream, cancellation) =>
+          upstream.callTool(
+            { name: call.params.name, arguments: call.params.arguments ?? {} },
+            { signal: cancellation }
+          )
         )
       );
     } catch (error) {

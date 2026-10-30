@@ -62,14 +62,16 @@ current effective scope; each tool call carries only the scope its configured
 classification requires. The service lists only the tools the request's scope
 allows (`write` includes `read`) and knows no other tool at that scope; Rusa's
 `readTools` / `writeTools` classification then decides what an actor sees and
-calls.
+calls. A tool called at a scope that does not list it is therefore unknown to
+the service, which answers the ordinary JSON-RPC tool-not-found error; Rusa
+reports that as unavailable, like any other failed call.
 
-The service refuses an invalid token or unknown user with HTTP 401
-`invalid_token` and a call beyond the granted scope with HTTP 403
-`insufficient_scope`, the SDK's bearer challenge responses. Rusa makes no
-step-up or re-authorization attempt: a refusal surfaces to the actor as a
-generic `custom MCP upstream refused` tool error, or empty discovery, with the
-status code but none of the challenge detail in Rusa's log.
+The service refuses an invalid token with HTTP 401 `invalid_token`, and a
+configured user it does not act for or a scope header it does not recognise
+with HTTP 403 `insufficient_scope`: the SDK's bearer challenge responses. Rusa
+makes no step-up or re-authorization attempt: a refusal surfaces to the actor
+as a generic `custom MCP upstream refused` tool error, or empty discovery,
+with the status code but none of the challenge detail in Rusa's log.
 
 The trusted service owns the safety of valid tool results, including `isError`
 domain errors: it must return caller-safe messages and replace internal exceptions
@@ -80,9 +82,9 @@ result-schema failures return a generic unavailable error to the actor. Rusa
 excludes their upstream bodies, arguments and authentication from its failure
 logs; SDK error messages quote response text and are never logged.
 
-Rusa limits tool arguments and request bodies to 1 MiB and responses to
-16 MiB, with a 30-second deadline per exchange. Requests exceeding those bounds
-fail without being sent. Cancelling an MCP call or closing its downstream
+Rusa limits request bodies to 1 MiB and responses to 16 MiB, with a 30-second
+deadline per exchange. A request exceeding its bound fails without being sent.
+Cancelling an MCP call or closing its downstream
 session aborts only its HTTP exchange; it leaves the service and warm graph
 context alive. A later request opens a fresh connection. No request is
 automatically retried, including a write whose connection failed after its

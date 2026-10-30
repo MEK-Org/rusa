@@ -7,7 +7,13 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpHandler, McpServer as UpstreamMcpServer } from "@modelcontextprotocol/server";
+import {
+  createMcpHandler,
+  OAuthError,
+  OAuthErrorCode,
+  requireBearerAuth,
+  McpServer as UpstreamMcpServer,
+} from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ActorMesh } from "../actor/actor-mesh.js";
@@ -31,9 +37,13 @@ let dir: string;
 let secretsDir: string;
 let config: CustomMcpServerConfig;
 let service: http.Server;
+// Failure modes other than `hang-discover` and `legacy` apply to `tools/call`
+// after a successful `server/discover`, so they exercise the connected path.
 let mode:
   | "normal"
   | "hang"
+  | "hang-discover"
+  | "legacy"
   | "hold-response"
   | "drop-write-response"
   | "tool-error"
@@ -57,21 +67,33 @@ const credential = "synthetic-service-token";
 const toolCalls = (name?: string) =>
   calls.filter((c) => c.method === "tools/call" && (name === undefined || c.tool === name));
 
-function challenge(
-  res: http.ServerResponse,
-  status: 401 | 403,
-  error: "invalid_token" | "insufficient_scope",
-  detail: string
-): void {
-  // The shape the official server SDK's bearer middleware answers with.
-  res.writeHead(status, {
-    "content-type": "application/json",
-    "www-authenticate": `Bearer error="${error}", error_description="${detail}"${
-      error === "insufficient_scope" ? ', scope="write"' : ""
-    }`,
+// The host service's bearer gate: the SDK's own `requireBearerAuth`, fed a
+// verifier that answers like the service does. A wrong token is an invalid
+// token (401); a user the service does not act for, or a scope it does not
+// recognise, is insufficient scope (403). The challenge shape is the SDK's.
+const gate = (headers: http.IncomingHttpHeaders) =>
+  requireBearerAuth({
+    verifier: {
+      async verifyAccessToken(token) {
+        if (token !== credential) {
+          throw new OAuthError(OAuthErrorCode.InvalidToken, "private rejection detail");
+        }
+        if (headers["rusa-mcp-user-id"] !== "configured-user") {
+          throw new OAuthError(OAuthErrorCode.InsufficientScope, "private rejection detail");
+        }
+        const scope = headers["rusa-mcp-scope"];
+        if (scope !== "read" && scope !== "write") {
+          throw new OAuthError(OAuthErrorCode.InsufficientScope, "private rejection detail");
+        }
+        return {
+          token,
+          clientId: "configured-user",
+          scopes: scope === "write" ? ["read", "write"] : ["read"],
+          expiresAt: Math.floor(Date.now() / 1000) + 60,
+        };
+      },
+    },
   });
-  res.end(JSON.stringify({ error, error_description: detail }));
-}
 
 // One independently listening MCP service owns this synthetic graph for the
 // whole test. It speaks only the 2026-07-28 Streamable HTTP era: a legacy
@@ -82,11 +104,11 @@ async function startService(): Promise<void> {
   const contextId = randomBytes(8).toString("hex");
   let visits = 0;
   const handler = createMcpHandler(
-    ({ requestInfo }) => {
+    ({ requestInfo, authInfo }) => {
       const headers = requestInfo?.headers;
       const upstream = new UpstreamMcpServer({ name: "synthetic-graph", version: "0.0.0" });
       // Like the host service, list write tools only to a write-scoped caller.
-      const write = headers?.get("rusa-mcp-scope") === "write";
+      const write = authInfo?.scopes.includes("write") === true;
       for (const name of write ? ["read_goal", "write_goal", "unclassified"] : ["read_goal"]) {
         upstream.registerTool(
           name,
@@ -142,40 +164,51 @@ async function startService(): Promise<void> {
       scope,
       protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
     });
-    if (
-      req.headers.authorization !== `Bearer ${credential}` ||
-      req.headers["rusa-mcp-user-id"] !== "configured-user" ||
-      !["read", "write"].includes(scope ?? "")
-    ) {
-      challenge(res, 401, "invalid_token", "private rejection detail");
-      return;
-    }
-    if (mode === "hang") return;
-    if (mode === "error") {
-      res.writeHead(500).end(credential);
-      return;
-    }
-    if (mode === "bad-json") {
-      res.writeHead(200, { "content-type": "application/json" }).end("not JSON");
-      return;
-    }
-    if (mode === "large") {
-      res
-        .writeHead(200, { "content-type": "application/json" })
-        .end("x".repeat(16 * 1024 * 1024 + 1));
-      return;
-    }
-    if (message.method === "tools/call" && tool === "write_goal" && scope !== "write") {
-      challenge(res, 403, "insufficient_scope", "private rejection detail");
-      return;
-    }
     const headers = new Headers();
     for (const [name, value] of Object.entries(req.headers)) {
       if (typeof value === "string" && name !== "content-length") headers.set(name, value);
     }
-    const response = await handler.fetch(
-      new Request(`http://localhost${req.url ?? "/"}`, { method: req.method, headers, body })
-    );
+    const request = new Request(`http://localhost${req.url ?? "/"}`, {
+      method: req.method,
+      headers,
+      body,
+    });
+    const auth = await gate(req.headers)(request);
+    if (auth instanceof Response) {
+      res.writeHead(auth.status, Object.fromEntries(auth.headers)).end(await auth.text());
+      return;
+    }
+    if (message.method === "server/discover") {
+      if (mode === "hang-discover") return;
+      if (mode === "legacy") {
+        // What a 2025-era server answers to the version probe.
+        res.writeHead(200, { "content-type": "application/json" }).end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: (message as { id?: unknown }).id ?? null,
+            error: { code: -32601, message: "Method not found" },
+          })
+        );
+        return;
+      }
+    } else if (message.method === "tools/call") {
+      if (mode === "hang") return;
+      if (mode === "error") {
+        res.writeHead(500).end(credential);
+        return;
+      }
+      if (mode === "bad-json") {
+        res.writeHead(200, { "content-type": "application/json" }).end("not JSON");
+        return;
+      }
+      if (mode === "large") {
+        res
+          .writeHead(200, { "content-type": "application/json" })
+          .end("x".repeat(16 * 1024 * 1024 + 1));
+        return;
+      }
+    }
+    const response = await handler.fetch(request, { authInfo: auth });
     const text = await response.text();
     if (mode === "drop-write-response" && tool === "write_goal") {
       req.socket.destroy();
@@ -444,14 +477,32 @@ describe("configured host MCP service", () => {
       isError: true,
       content: [{ type: "text", text: "custom MCP upstream unavailable" }],
     });
+    // The failure arrived on the connected path, after the probe succeeded.
+    expect(calls.map((c) => c.method)).toEqual(["server/discover", "tools/call"]);
     expect(JSON.stringify(warn.mock.calls)).not.toContain(credential);
     expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
   });
 
-  it("surfaces an upstream scope refusal as a redacted tool error", async () => {
-    // A misclassified write tool is sent with read scope and the service
-    // answers with the SDK's 403 insufficient_scope challenge; that verdict
-    // stands, with no step-up attempt.
+  it("refuses a legacy-only server without falling back to initialize", async () => {
+    mode = "legacy";
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const warn = vi.fn();
+    const client = await connect("reader", {}, { warn } as unknown as Logger);
+    expect(await client.callTool({ name: "read_goal" })).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "custom MCP upstream unavailable" }],
+    });
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(calls.map((c) => c.method)).toEqual(["server/discover", "server/discover"]);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_upstream_failed",
+      expect.objectContaining({ reason: "unavailable", operation: "call_tool" })
+    );
+  });
+
+  it("reports a write tool misclassified as read as unavailable, with no write", async () => {
+    // Sent at read scope, the service knows no such tool and answers the
+    // ordinary tool-not-found error; nothing is stepped up or retried.
     grants.set("reader", ["glass_goals:configured-user:read"]);
     const warn = vi.fn();
     const client = await connect(
@@ -461,15 +512,14 @@ describe("configured host MCP service", () => {
     );
     expect(await client.callTool({ name: "write_goal" })).toMatchObject({
       isError: true,
-      content: [{ type: "text", text: "custom MCP upstream refused" }],
+      content: [{ type: "text", text: "custom MCP upstream unavailable" }],
     });
-    expect(toolCalls("write_goal")).toHaveLength(1);
+    expect(toolCalls("write_goal").map((c) => c.scope)).toEqual(["read"]);
     expect(mutations).toBe(0);
     expect(warn).toHaveBeenCalledWith(
       "custom_mcp_upstream_failed",
-      expect.objectContaining({ status: 403, reason: "refused", tool: "write_goal" })
+      expect.objectContaining({ reason: "unavailable", tool: "write_goal" })
     );
-    expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
   });
 
   it("refuses invalid upstream identity/authentication and observes host token rotation", async () => {
@@ -482,60 +532,87 @@ describe("configured host MCP service", () => {
       "custom_mcp_upstream_failed",
       expect.objectContaining({ status: 401, reason: "refused", operation: "list_tools" })
     );
-    expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
     writeFileSync(join(secretsDir, "service-token"), credential);
     expect((await client.listTools()).tools).toHaveLength(1);
+    // A configured user the service does not act for is refused with the
+    // SDK's 403 insufficient_scope challenge; that verdict stands.
     grants.set("wrong", ["glass_goals:another-user:write"]);
-    expect(await (await connect("wrong", { userId: "another-user" })).listTools()).toEqual({
-      tools: [],
+    const wrong = await connect("wrong", { userId: "another-user" }, { warn } as unknown as Logger);
+    expect(await wrong.listTools()).toEqual({ tools: [] });
+    expect(await wrong.callTool({ name: "write_goal" })).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "custom MCP upstream refused" }],
     });
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_upstream_failed",
+      expect.objectContaining({ status: 403, reason: "refused", tool: "write_goal" })
+    );
+    expect(mutations).toBe(0);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
   });
 
-  it("cancels hung requests on downstream close without stopping the service", async () => {
+  it("cancels a hung tool call on downstream close without stopping the service", async () => {
     mode = "hang";
     grants.set("reader", ["glass_goals:configured-user:read"]);
     const client = await connect("reader");
     const pending = client.callTool({ name: "read_goal" }).catch(() => undefined);
-    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    await vi.waitFor(() => expect(toolCalls()).toHaveLength(1));
     await client.close();
     await pending;
     await vi.waitFor(() => expect(aborted).toBeGreaterThan(0));
     expect(service.listening).toBe(true);
   });
 
-  it("applies the request deadline and caller cancellation", async () => {
+  it("applies the request deadline to a hung call and caller cancellation to a hung probe", async () => {
     mode = "hang";
     grants.set("reader", ["glass_goals:configured-user:read"]);
     const deadline = new AbortController();
     vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
     const client = await connect("reader");
     const pending = client.callTool({ name: "read_goal" });
-    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    await vi.waitFor(() => expect(toolCalls()).toHaveLength(1));
     deadline.abort();
     expect(await pending).toMatchObject({ content: [{ text: "custom MCP upstream timed out" }] });
     vi.restoreAllMocks();
+    // The version probe ignores the request signal; cancellation reaches it
+    // through the transport.
+    mode = "hang-discover";
     const cancelled = new AbortController();
     const second = client
       .callTool({ name: "read_goal" }, undefined, { signal: cancelled.signal })
       .catch(() => undefined);
-    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    await vi.waitFor(() => expect(calls).toHaveLength(3));
     cancelled.abort();
     await second;
     await vi.waitFor(() => expect(aborted).toBe(2));
+    // A signal already aborted when the call arrives sends nothing at all.
+    const count = calls.length;
+    const settled = new AbortController();
+    settled.abort();
+    await client
+      .callTool({ name: "read_goal" }, undefined, { signal: settled.signal })
+      .catch(() => undefined);
+    expect(calls).toHaveLength(count);
   });
 
-  it("bounds arguments before opening a service request", async () => {
+  it("bounds the request body before it is sent", async () => {
     grants.set("writer", ["glass_goals:configured-user:write"]);
-    const client = await connect("writer");
+    const warn = vi.fn();
+    const client = await connect("writer", {}, { warn } as unknown as Logger);
     for (const name of ["read_goal", "write_goal"]) {
       expect(
         await client.callTool({ name, arguments: { large: "x".repeat(1024 * 1024) } })
       ).toMatchObject({
         isError: true,
-        content: [{ type: "text", text: "custom MCP request too large" }],
+        content: [{ type: "text", text: "custom MCP upstream request too large" }],
       });
     }
-    expect(calls).toEqual([]);
+    expect(toolCalls()).toEqual([]);
+    expect(mutations).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_upstream_failed",
+      expect.objectContaining({ reason: "request too large", tool: "write_goal" })
+    );
   });
 });
 
