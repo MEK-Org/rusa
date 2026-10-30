@@ -1,6 +1,7 @@
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'app.dart';
+import 'assistant_platform.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'obligations_cache.dart';
@@ -41,8 +42,11 @@ ObligationsCache platformCreateObligationsCache() =>
 
 WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
-  DashboardSession session,
-) =>
+  DashboardSession session, {
+  HeadsetRoute? headset,
+}) =>
     null;
 
 AvatarFilePicker? platformCreateAvatarFilePicker() => null;
+
+AssistantPlatform? platformCreateAssistant() => null;

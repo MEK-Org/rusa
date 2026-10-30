@@ -4,6 +4,7 @@ import 'package:web/web.dart' as web;
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'app.dart';
+import 'assistant_platform.dart';
 import 'avatar_platform.dart';
 import 'avatar_upload_web.dart';
 import 'mesh_stream.dart';
@@ -55,8 +56,11 @@ ObligationsCache platformCreateObligationsCache() => WebObligationsCache();
 
 WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
-  DashboardSession session,
-) =>
+  DashboardSession session, {
+  HeadsetRoute? headset,
+}) =>
     webWalkieDeps(api, session);
 
 AvatarFilePicker platformCreateAvatarFilePicker() => WebAvatarFilePicker();
+
+AssistantPlatform? platformCreateAssistant() => null;

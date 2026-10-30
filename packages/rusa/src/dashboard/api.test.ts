@@ -1170,6 +1170,22 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
+  it("names root's actor id as the mesh resolves the root alias (#1193)", async () => {
+    const resolved = await call(
+      { ...deps, resolveActorId: (id: string) => (id === "root" ? UUID_A : id) },
+      "GET",
+      "/api/mesh/threads"
+    );
+    expect(JSON.parse(resolved.res.body).rootActorId).toBe(UUID_A);
+
+    const unresolved = await call(
+      { ...deps, resolveActorId: undefined },
+      "GET",
+      "/api/mesh/threads"
+    );
+    expect(JSON.parse(unresolved.res.body).rootActorId).toBeNull();
+  });
+
   it("serves the one server-side Chat Room roster, and 503s when it is not wired (#663)", async () => {
     const participants = [
       { actorId: "root", addedBy: null, addedAt: null },

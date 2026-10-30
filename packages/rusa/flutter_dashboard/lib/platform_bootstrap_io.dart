@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/widgets.dart';
 
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'app.dart';
+import 'assistant_io.dart';
+import 'assistant_platform.dart';
 import 'avatar_platform.dart';
 import 'avatar_upload_io.dart';
 import 'io_session.dart';
@@ -69,11 +72,25 @@ ObligationsCache platformCreateObligationsCache() =>
 
 WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
-  DashboardSession session,
-) => switch (session) {
-  final IoSessionTransport transport => ioWalkieDeps(api, session, transport),
+  DashboardSession session, {
+  HeadsetRoute? headset,
+}) => switch (session) {
+  final IoSessionTransport transport => ioWalkieDeps(
+    api,
+    session,
+    transport,
+    headset: headset,
+  ),
   _ => null,
 };
 
 AvatarFilePicker? platformCreateAvatarFilePicker() =>
     const IoAvatarFilePicker();
+
+/// One channel per engine: each activity runs its own engine and registers
+/// its own native half.
+final AssistantPlatform? _assistant = Platform.isAndroid
+    ? IoAssistantChannel()
+    : null;
+
+AssistantPlatform? platformCreateAssistant() => _assistant;
