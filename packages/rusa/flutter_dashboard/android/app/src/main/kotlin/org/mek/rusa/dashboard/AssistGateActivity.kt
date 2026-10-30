@@ -20,8 +20,9 @@ import android.os.Bundle
  * finishes it. SystemUI reports a cancel only for a prompt that is fully
  * showing when it hides, so one hidden mid-animation leaves this request
  * pending, and a later unrelated unlock would report it as succeeded.
- * KeyguardManager drops the callback once its activity is destroyed, so the
- * finished gate opens nothing.
+ * A finishing gate opens nothing: KeyguardManager checks for destruction
+ * only before posting the callback, so one queued while the gate was live
+ * can still arrive after this finish.
  */
 class AssistGateActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +53,7 @@ class AssistGateActivity : Activity() {
      * open one gets it through onNewIntent and stops and sends.
      */
     private fun openAssistant() {
+        if (isFinishing || isDestroyed) return
         startActivity(Intent(this, AssistActivity::class.java).setAction(intent.action))
         finish()
     }
