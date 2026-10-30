@@ -1,5 +1,12 @@
 import { readFileSync } from "node:fs";
 import http from "node:http";
+import net from "node:net";
+import {
+  Client,
+  InsufficientScopeError,
+  SdkHttpError,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   CallToolRequestSchema,
@@ -12,10 +19,17 @@ import type { CustomMcpServerConfig } from "../config/types.js";
 import type { Logger } from "../observability/logger.js";
 import { toolError } from "./result.js";
 
+/**
+ * The MCP revision rusa speaks to a custom server: the 2026-07-28 Streamable
+ * HTTP era, pinned. A server that only answers the 2025 `initialize`
+ * handshake is refused rather than negotiated down to.
+ */
+export const CUSTOM_MCP_PROTOCOL_VERSION = "2026-07-28";
+/** Path of the MCP endpoint on the configured Unix socket. */
+export const CUSTOM_MCP_ENDPOINT_PATH = "/mcp";
 const UPSTREAM_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
-const MAX_READ_PATH_BYTES = 8 * 1024;
 type Access = "read" | "write";
 
 export interface ConfiguredCustomMcpServer {
@@ -32,6 +46,7 @@ export interface CustomHttpMcpOptions {
 }
 
 class NotGrantedError extends Error {}
+class RequestTooLargeError extends Error {}
 
 /**
  * The access one grant confers on a configured server: `read` or `write` for
@@ -70,9 +85,99 @@ function permits(access: ReadonlySet<Access>, classification: Access): boolean {
 }
 
 /**
- * Adapt a separately running HTTP JSON service to the existing per-actor MCP
- * endpoint. Ordinary HTTP over a host Unix socket follows the coordinator's
- * transport pattern; no actor session owns the service or its graph context.
+ * `fetch` over the service's Unix socket for the SDK transport, which has no
+ * socket option of its own. Node's `fetch` cannot dial a Unix socket without
+ * an extra dependency, so this adapts `node:http` to the Web `Response` the
+ * transport reads. Each exchange is one connection: the service is stateless
+ * and nothing is kept open between calls. The response is buffered under a
+ * cap; the service answers in plain JSON, never a stream.
+ */
+function fetchOverSocket(socketPath: string): typeof fetch {
+  return (input, init) =>
+    new Promise<Response>((resolve, reject) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const body = init?.body;
+      if (body !== undefined && body !== null && typeof body !== "string") {
+        reject(new Error("unsupported request body"));
+        return;
+      }
+      if (body && Buffer.byteLength(body) > MAX_REQUEST_BYTES) {
+        reject(new RequestTooLargeError());
+        return;
+      }
+      const headers: Record<string, string> = {};
+      new Headers(init?.headers).forEach((value, name) => {
+        headers[name] = value;
+      });
+      // The service checks Host like any local HTTP server; the socket path
+      // is the real address.
+      headers.host = url.host;
+      if (body) headers["content-length"] = String(Buffer.byteLength(body));
+      // Dial the socket here rather than through `socketPath`: an unusable
+      // path (over the kernel's length limit, say) makes the dial fail before
+      // the HTTP client listens for it, and that failure would otherwise
+      // escape as an uncaught exception. Without an agent, node uses this
+      // connection once and closes it.
+      const socket = net.connect({ path: socketPath });
+      socket.on("error", reject);
+      const req = http.request(
+        {
+          createConnection: () => socket,
+          path: `${url.pathname}${url.search}`,
+          method: init?.method ?? "GET",
+          headers,
+          ...(init?.signal ? { signal: init.signal } : {}),
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          let bytes = 0;
+          res.on("data", (chunk: Buffer) => {
+            bytes += chunk.length;
+            if (bytes > MAX_RESPONSE_BYTES) {
+              res.destroy(new Error("service response too large"));
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on("error", reject);
+          res.on("end", () => {
+            const responseHeaders = new Headers();
+            for (const [name, value] of Object.entries(res.headers)) {
+              if (typeof value === "string") responseHeaders.set(name, value);
+              else if (Array.isArray(value)) responseHeaders.set(name, value.join(", "));
+            }
+            const status = res.statusCode ?? 0;
+            try {
+              resolve(
+                new Response([204, 205, 304].includes(status) ? null : Buffer.concat(chunks), {
+                  status,
+                  statusText: res.statusMessage ?? "",
+                  headers: responseHeaders,
+                })
+              );
+            } catch (error) {
+              reject(error);
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.end(body ?? undefined);
+    });
+}
+
+function refused(error: unknown): boolean {
+  return (
+    error instanceof InsufficientScopeError ||
+    (error instanceof SdkHttpError && (error.status === 401 || error.status === 403))
+  );
+}
+
+/**
+ * Adapt a separately running MCP service to the existing per-actor MCP
+ * endpoint. The service speaks the official MCP 2026-07-28 Streamable HTTP
+ * contract over a host Unix socket, following the coordinator's transport
+ * pattern; no actor session owns the service or its graph context.
  */
 export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpServer {
   const { actorId, server: configured, activeCapabilities, logger } = options;
@@ -80,10 +185,21 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     ...configured.config.readTools.map((name) => [name, "read"] as const),
     ...configured.config.writeTools.map((name) => [name, "write"] as const),
   ]);
+  const endpoint = new URL(`http://localhost${CUSTOM_MCP_ENDPOINT_PATH}`);
   const inflight = new Set<AbortController>();
   let closed = false;
 
-  const request = async (path: string, required: Access, body?: unknown, signal?: AbortSignal) => {
+  /**
+   * One upstream exchange: a fresh stateless connection carrying the host
+   * credential, the configured user and the scope this call needs. The
+   * service holds no session, so a client per request costs one extra
+   * `server/discover` round trip on the local socket and nothing else.
+   */
+  const withUpstream = async <T>(
+    required: Access,
+    signal: AbortSignal | undefined,
+    operation: (upstream: Client) => Promise<T>
+  ): Promise<T> => {
     const access = activeAccess(actorId, configured, activeCapabilities);
     if (closed || !permits(access, required)) throw new NotGrantedError();
     // Read the contained host secret on each request so rotation needs no
@@ -93,13 +209,6 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       "utf8"
     ).trim();
     if (!token || /[^\x21-\x7e]/.test(token)) throw new Error("invalid service credential");
-    const encoded = body === undefined ? undefined : JSON.stringify(body);
-    if (
-      Buffer.byteLength(path) > MAX_READ_PATH_BYTES ||
-      (encoded !== undefined && Buffer.byteLength(encoded) > MAX_REQUEST_BYTES)
-    ) {
-      throw new Error("custom MCP request too large");
-    }
     const controller = new AbortController();
     inflight.add(controller);
     const deadline = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
@@ -108,77 +217,64 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       deadline,
       ...(signal ? [signal] : []),
     ]);
+    const transport = new StreamableHTTPClientTransport(endpoint, {
+      fetch: fetchOverSocket(configured.config.socketPath),
+      requestInit: {
+        headers: {
+          authorization: `Bearer ${token}`,
+          "rusa-mcp-user-id": configured.config.userId,
+          "rusa-mcp-scope": required,
+        },
+      },
+      // A scope refusal is the service's verdict on this configured user;
+      // there is no OAuth flow to step up through.
+      onInsufficientScope: "throw",
+    });
+    const upstream = new Client(
+      { name: "rusa", version: "0.1.0" },
+      { versionNegotiation: { mode: { pin: CUSTOM_MCP_PROTOCOL_VERSION } } }
+    );
+    // The connect-time version probe runs before the protocol layer attaches
+    // and ignores the request signal, so cancellation closes the transport
+    // outright: that aborts whatever HTTP exchange is in flight.
+    const abort = () => void transport.close().catch(() => {});
+    cancellation.addEventListener("abort", abort, { once: true });
     try {
-      return await new Promise<unknown>((resolve, reject) => {
-        const req = http.request(
-          {
-            socketPath: configured.config.socketPath,
-            path,
-            method: encoded === undefined ? "GET" : "POST",
-            agent: false,
-            signal: cancellation,
-            headers: {
-              authorization: `Bearer ${token}`,
-              "Rusa-Mcp-User-Id": configured.config.userId,
-              "Rusa-Mcp-Scope": required,
-              ...(encoded === undefined
-                ? {}
-                : {
-                    "content-type": "application/json",
-                    "content-length": Buffer.byteLength(encoded),
-                  }),
-            },
-          },
-          (res) => {
-            if (res.statusCode !== 200) {
-              res.destroy();
-              reject(new Error(`service HTTP status ${res.statusCode}`));
-              return;
-            }
-            const chunks: Buffer[] = [];
-            let bytes = 0;
-            res.on("data", (chunk: Buffer) => {
-              bytes += chunk.length;
-              if (bytes > MAX_RESPONSE_BYTES) {
-                res.destroy(new Error("service response too large"));
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on("error", reject);
-            res.on("end", () => {
-              try {
-                resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-              } catch {
-                reject(new Error("invalid service JSON"));
-              }
-            });
-          }
-        );
-        req.on("error", reject);
-        req.end(encoded);
-      });
+      await upstream.connect(transport, { signal: cancellation, timeout: UPSTREAM_TIMEOUT_MS });
+      return await operation(upstream);
     } catch (error) {
       if (deadline.aborted) throw new Error("timed out");
       if (cancellation.aborted) throw new Error("cancelled");
       throw error;
     } finally {
+      cancellation.removeEventListener("abort", abort);
       inflight.delete(controller);
+      await upstream.close().catch(() => {});
     }
   };
 
   const logFailure = (operation: string, error: unknown, tool?: string): void => {
-    // Do not serialize a request or server error body containing host auth.
+    // Only a coarse reason and status are logged: SDK errors quote the
+    // service's response text, which may carry host auth detail.
     logger?.warn("custom_mcp_upstream_failed", {
       actorId,
       capability: configured.capability,
       operation,
       ...(tool ? { tool } : {}),
-      reason:
-        error instanceof Error && ["timed out", "cancelled"].includes(error.message)
-          ? error.message
-          : "unavailable",
+      ...(error instanceof SdkHttpError
+        ? { status: error.status }
+        : error instanceof InsufficientScopeError
+          ? { status: 403 }
+          : {}),
+      reason: failureReason(error),
     });
+  };
+  const failureReason = (error: unknown): string => {
+    if (error instanceof Error && ["timed out", "cancelled"].includes(error.message)) {
+      return error.message;
+    }
+    if (error instanceof RequestTooLargeError) return "request too large";
+    return refused(error) ? "refused" : "unavailable";
   };
   const proxy = new McpServer(
     { name: configured.capability, version: "0.1.0" },
@@ -192,8 +288,12 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     const access = activeAccess(actorId, configured, activeCapabilities);
     if (access.size === 0) return { tools: [] };
     try {
+      // The service lists every tool whatever the scope; rusa's own
+      // classification decides what this actor may see and call.
       const result = ListToolsResultSchema.parse(
-        await request("/v1/tools", access.has("write") ? "write" : "read", undefined, extra.signal)
+        await withUpstream(access.has("write") ? "write" : "read", extra.signal, (upstream) =>
+          upstream.listTools(undefined, { signal: extra.signal })
+        )
       );
       const currentAccess = activeAccess(actorId, configured, activeCapabilities);
       return {
@@ -213,32 +313,27 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     if (!classification || !permits(access, classification)) {
       return toolError("custom MCP tool is not currently granted");
     }
+    const args = call.params.arguments ?? {};
+    if (Buffer.byteLength(JSON.stringify(args)) > MAX_REQUEST_BYTES) {
+      logFailure("call_tool", new RequestTooLargeError(), call.params.name);
+      return toolError("custom MCP request too large");
+    }
     try {
-      const path = `/v1/tools/${encodeURIComponent(call.params.name)}`;
-      const args = call.params.arguments ?? {};
       // Valid tool results, including domain errors, are service-owned public
       // output. The trusted service must sanitize exceptions before returning
       // them; transport, status and malformed-result failures are redacted here.
       return CallToolResultSchema.parse(
-        await request(
-          classification === "read"
-            ? `${path}?arguments=${encodeURIComponent(JSON.stringify(args))}`
-            : path,
-          classification,
-          classification === "write" ? args : undefined,
-          extra.signal
+        await withUpstream(classification, extra.signal, (upstream) =>
+          upstream.callTool({ name: call.params.name, arguments: args }, { signal: extra.signal })
         )
       );
     } catch (error) {
       if (error instanceof NotGrantedError)
         return toolError("custom MCP tool is not currently granted");
       logFailure("call_tool", error, call.params.name);
-      const reason = extra.signal.aborted
-        ? "cancelled"
-        : error instanceof Error && ["timed out", "cancelled"].includes(error.message)
-          ? error.message
-          : "unavailable";
-      return toolError(`custom MCP upstream ${reason}`);
+      return toolError(
+        `custom MCP upstream ${extra.signal.aborted ? "cancelled" : failureReason(error)}`
+      );
     }
   });
   return proxy;

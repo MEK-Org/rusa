@@ -7,7 +7,9 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createMcpHandler, McpServer as UpstreamMcpServer } from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { CAPABILITY_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
@@ -16,7 +18,7 @@ import type { Logger } from "../observability/logger.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { createCustomHttpMcpServer } from "./custom-http-mcp.js";
+import { CUSTOM_MCP_PROTOCOL_VERSION, createCustomHttpMcpServer } from "./custom-http-mcp.js";
 import {
   buildGrantableServers,
   type GrantableServerDeps,
@@ -38,7 +40,13 @@ let mode:
   | "bad-json"
   | "large"
   | "error";
-let calls: Array<{ method: string | undefined; path: string; scope: string | undefined }>;
+interface Call {
+  method: string | undefined;
+  tool: string | undefined;
+  scope: string | undefined;
+  protocolVersion: string | undefined;
+}
+let calls: Call[];
 let aborted: number;
 let mutations: number;
 let heldResponses: Array<() => void>;
@@ -46,23 +54,98 @@ const grants = new Map<string, string[]>();
 const connected: Client[] = [];
 const credential = "synthetic-service-token";
 
-// One independently listening service owns this synthetic graph for the whole
-// test. No MCP session or caller can create, release or select its identity.
+const toolCalls = (name?: string) =>
+  calls.filter((c) => c.method === "tools/call" && (name === undefined || c.tool === name));
+
+function challenge(
+  res: http.ServerResponse,
+  status: 401 | 403,
+  error: "invalid_token" | "insufficient_scope",
+  detail: string
+): void {
+  // The shape the official server SDK's bearer middleware answers with.
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "www-authenticate": `Bearer error="${error}", error_description="${detail}"${
+      error === "insufficient_scope" ? ', scope="write"' : ""
+    }`,
+  });
+  res.end(JSON.stringify({ error, error_description: detail }));
+}
+
+// One independently listening MCP service owns this synthetic graph for the
+// whole test. It speaks only the 2026-07-28 Streamable HTTP era: a legacy
+// `initialize` is rejected, and every request is served statelessly by a
+// fresh per-request server. No MCP session or caller can create, release or
+// select its graph identity.
 async function startService(): Promise<void> {
   const contextId = randomBytes(8).toString("hex");
   let visits = 0;
-  service = http.createServer((req, res) => {
+  const handler = createMcpHandler(
+    ({ requestInfo }) => {
+      const headers = requestInfo?.headers;
+      const upstream = new UpstreamMcpServer({ name: "synthetic-graph", version: "0.0.0" });
+      for (const name of ["read_goal", "write_goal", "unclassified"]) {
+        upstream.registerTool(
+          name,
+          {
+            inputSchema: z.looseObject({}),
+            annotations: { readOnlyHint: name === "read_goal" },
+          },
+          async (args) => {
+            if (name === "write_goal") mutations++;
+            if (mode === "tool-error") {
+              return { isError: true, content: [{ type: "text", text: "No such goal" }] };
+            }
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    contextId,
+                    visits: ++visits,
+                    userId: headers?.get("rusa-mcp-user-id"),
+                    scope: headers?.get("rusa-mcp-scope"),
+                    args,
+                    actorId: headers?.get("rusa-mcp-actor-id") ?? null,
+                  }),
+                },
+              ],
+            };
+          }
+        );
+      }
+      return upstream;
+    },
+    { responseMode: "json", legacy: "reject" }
+  );
+  service = http.createServer(async (req, res) => {
     res.on("close", () => {
       if (!res.writableEnded) aborted++;
     });
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = Buffer.concat(chunks).toString("utf8");
+    let message: { method?: string; params?: { name?: string } } = {};
+    try {
+      message = JSON.parse(body);
+    } catch {
+      // A non-JSON body is recorded with no method.
+    }
     const scope = req.headers["rusa-mcp-scope"] as string | undefined;
-    calls.push({ method: req.method, path: req.url ?? "", scope });
+    const tool = message.params?.name;
+    calls.push({
+      method: message.method,
+      tool,
+      scope,
+      protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
+    });
     if (
       req.headers.authorization !== `Bearer ${credential}` ||
       req.headers["rusa-mcp-user-id"] !== "configured-user" ||
       !["read", "write"].includes(scope ?? "")
     ) {
-      res.writeHead(403).end("private rejection detail");
+      challenge(res, 401, "invalid_token", "private rejection detail");
       return;
     }
     if (mode === "hang") return;
@@ -71,73 +154,35 @@ async function startService(): Promise<void> {
       return;
     }
     if (mode === "bad-json") {
-      res.end("not JSON");
+      res.writeHead(200, { "content-type": "application/json" }).end("not JSON");
       return;
     }
     if (mode === "large") {
-      res.end("x".repeat(16 * 1024 * 1024 + 1));
+      res
+        .writeHead(200, { "content-type": "application/json" })
+        .end("x".repeat(16 * 1024 * 1024 + 1));
       return;
     }
-    const url = new URL(req.url ?? "/", "http://local");
-    if (url.pathname === "/v1/tools" && req.method === "GET") {
-      res.end(
-        JSON.stringify({
-          tools: ["read_goal", "write_goal", "unclassified"].map((name) => ({
-            name,
-            inputSchema: { type: "object" },
-          })),
-        })
-      );
+    if (message.method === "tools/call" && tool === "write_goal" && scope !== "write") {
+      challenge(res, 403, "insufficient_scope", "private rejection detail");
       return;
     }
-    const name = decodeURIComponent(url.pathname.slice("/v1/tools/".length));
-    if (
-      !(
-        (name === "read_goal" && req.method === "GET") ||
-        (name === "write_goal" && req.method === "POST" && scope === "write")
-      )
-    ) {
-      res.writeHead(403).end();
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (typeof value === "string" && name !== "content-length") headers.set(name, value);
+    }
+    const response = await handler.fetch(
+      new Request(`http://localhost${req.url ?? "/"}`, { method: req.method, headers, body })
+    );
+    const text = await response.text();
+    if (mode === "drop-write-response" && tool === "write_goal") {
+      req.socket.destroy();
       return;
     }
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-    req.on("end", () => {
-      const args = JSON.parse(
-        req.method === "GET" ? (url.searchParams.get("arguments") ?? "{}") : body
-      );
-      if (req.method === "POST") mutations++;
-      if (mode === "drop-write-response" && req.method === "POST") {
-        req.socket.destroy();
-        return;
-      }
-      if (mode === "tool-error") {
-        res.end(
-          JSON.stringify({ isError: true, content: [{ type: "text", text: "No such goal" }] })
-        );
-        return;
-      }
-      const response = JSON.stringify({
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              contextId,
-              visits: ++visits,
-              userId: req.headers["rusa-mcp-user-id"],
-              scope,
-              args,
-              actorId: req.headers["rusa-mcp-actor-id"] ?? null,
-            }),
-          },
-        ],
-      });
-      const send = () => res.end(response);
-      if (mode === "hold-response") heldResponses.push(send);
-      else send();
-    });
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    const send = () => res.end(text);
+    if (mode === "hold-response" && message.method === "tools/call") heldResponses.push(send);
+    else send();
   });
   await new Promise<void>((resolve, reject) => {
     service.once("error", reject);
@@ -210,13 +255,19 @@ afterEach(async () => {
   await Promise.all(connected.splice(0).map((client) => client.close()));
   service.closeAllConnections();
   await new Promise<void>((resolve) => service.close(() => resolve()));
+  // Exclusively MCP v2: no exchange in any test fell back to the legacy
+  // handshake, and every request claimed the pinned revision.
+  expect(calls.map((c) => c.method)).not.toContain("initialize");
+  expect(new Set(calls.map((c) => c.protocolVersion))).toEqual(
+    new Set(calls.length === 0 ? [] : [CUSTOM_MCP_PROTOCOL_VERSION])
+  );
   grants.clear();
   vi.restoreAllMocks();
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe("configured host HTTP JSON service", () => {
-  it("filters discovery and uses GET reads / POST writes with fixed identity and independent scopes", async () => {
+describe("configured host MCP service", () => {
+  it("filters discovery and calls tools over stateless MCP with fixed identity and independent scopes", async () => {
     grants.set("reader", ["glass_goals:configured-user:read"]);
     grants.set("writer", ["glass_goals:configured-user:write"]);
     const reader = await connect("reader");
@@ -225,6 +276,10 @@ describe("configured host HTTP JSON service", () => {
     expect((await writer.listTools()).tools.map((t) => t.name)).toEqual([
       "read_goal",
       "write_goal",
+    ]);
+    expect(calls.filter((c) => c.method === "tools/list").map((c) => c.scope)).toEqual([
+      "read",
+      "write",
     ]);
     const first = await call(reader, "read_goal", { id: "a/b ?&=#" });
     expect(first).toMatchObject({
@@ -238,7 +293,17 @@ describe("configured host HTTP JSON service", () => {
       contextId: first.contextId,
     });
     expect((await call(writer, "read_goal")).scope).toBe("read");
-    expect(calls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "POST", "GET"]);
+    expect(toolCalls().map((c) => [c.tool, c.scope])).toEqual([
+      ["read_goal", "read"],
+      ["write_goal", "write"],
+      ["read_goal", "read"],
+    ]);
+    // Each exchange is its own stateless connection: a version probe, then
+    // the one request. Nothing else is sent and no session is kept.
+    expect(new Set(calls.map((c) => c.method))).toEqual(
+      new Set(["server/discover", "tools/list", "tools/call"])
+    );
+    expect(calls.filter((c) => c.method === "server/discover")).toHaveLength(5);
     const count = calls.length;
     expect(await reader.callTool({ name: "write_goal" })).toMatchObject({ isError: true });
     expect(await writer.callTool({ name: "unclassified" })).toMatchObject({ isError: true });
@@ -320,7 +385,26 @@ describe("configured host HTTP JSON service", () => {
     expect(await client.callTool({ name: "write_goal" })).toMatchObject({ isError: true });
     await startService();
     expect((await call(client, "read_goal")).contextId).not.toBe(before.contextId);
-    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+    expect(toolCalls("write_goal")).toHaveLength(0);
+  });
+
+  it("reports an unusable socket path as unavailable instead of crashing the host", async () => {
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    // Longer than the kernel allows for a Unix socket address: the dial fails
+    // before any HTTP exchange starts.
+    const socketPath = join(dir, `${"x".repeat(120)}.sock`);
+    const client = await connect("writer", { socketPath }, { warn } as unknown as Logger);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(await client.callTool({ name: "write_goal" })).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "custom MCP upstream unavailable" }],
+    });
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_upstream_failed",
+      expect.objectContaining({ reason: "unavailable", operation: "call_tool", tool: "write_goal" })
+    );
+    expect(calls).toEqual([]);
   });
 
   it("does not retry a committed write whose response connection is lost", async () => {
@@ -331,7 +415,7 @@ describe("configured host HTTP JSON service", () => {
       isError: true,
       content: [{ text: "custom MCP upstream unavailable" }],
     });
-    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    expect(toolCalls("write_goal")).toHaveLength(1);
     expect(mutations).toBe(1);
   });
 
@@ -362,11 +446,40 @@ describe("configured host HTTP JSON service", () => {
     expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
   });
 
+  it("surfaces an upstream scope refusal as a redacted tool error", async () => {
+    // A misclassified write tool is sent with read scope; the service's
+    // 403 insufficient_scope verdict stands, with no step-up attempt.
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const warn = vi.fn();
+    const client = await connect(
+      "reader",
+      { readTools: ["read_goal", "write_goal"], writeTools: [] },
+      { warn } as unknown as Logger
+    );
+    expect(await client.callTool({ name: "write_goal" })).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "custom MCP upstream refused" }],
+    });
+    expect(toolCalls("write_goal")).toHaveLength(1);
+    expect(mutations).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_upstream_failed",
+      expect.objectContaining({ status: 403, reason: "refused", tool: "write_goal" })
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
+  });
+
   it("refuses invalid upstream identity/authentication and observes host token rotation", async () => {
     grants.set("reader", ["glass_goals:configured-user:read"]);
-    const client = await connect("reader");
+    const warn = vi.fn();
+    const client = await connect("reader", {}, { warn } as unknown as Logger);
     writeFileSync(join(secretsDir, "service-token"), "wrong-token");
     expect(await client.listTools()).toEqual({ tools: [] });
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_upstream_failed",
+      expect.objectContaining({ status: 401, reason: "refused", operation: "list_tools" })
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private rejection");
     writeFileSync(join(secretsDir, "service-token"), credential);
     expect((await client.listTools()).tools).toHaveLength(1);
     grants.set("wrong", ["glass_goals:another-user:write"]);
@@ -411,17 +524,19 @@ describe("configured host HTTP JSON service", () => {
   it("bounds arguments before opening a service request", async () => {
     grants.set("writer", ["glass_goals:configured-user:write"]);
     const client = await connect("writer");
-    expect(
-      await client.callTool({ name: "read_goal", arguments: { large: "x".repeat(8192) } })
-    ).toMatchObject({ isError: true });
-    expect(
-      await client.callTool({ name: "write_goal", arguments: { large: "x".repeat(1024 * 1024) } })
-    ).toMatchObject({ isError: true });
+    for (const name of ["read_goal", "write_goal"]) {
+      expect(
+        await client.callTool({ name, arguments: { large: "x".repeat(1024 * 1024) } })
+      ).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: "custom MCP request too large" }],
+      });
+    }
     expect(calls).toEqual([]);
   });
 });
 
-describe("configured HTTP service through the mesh grant boundary", () => {
+describe("configured MCP service through the mesh grant boundary", () => {
   it("accepts only the configured grant shape, serves a follower-hosted grantee, and leaves the service running on revoke", async () => {
     const actors = new InMemoryActorRepository();
     const grantStore = new InMemoryCapabilityGrantStore();
