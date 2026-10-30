@@ -359,6 +359,39 @@ describe("SharedQuotaStore canonical observations", () => {
     }
   });
 
+  it("measures raw retention from the scrape being written, not from the wall clock (#1210)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-retention-clock-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const scrapedAts = () =>
+      (
+        store.db
+          .prepare("SELECT scraped_at FROM quota_scrapes ORDER BY scraped_at ASC")
+          .all() as Array<{ scraped_at: string }>
+      ).map((row) => row.scraped_at);
+    try {
+      // Readings old enough that the wall clock is far past their retention
+      // window: a replay of recorded history must keep them.
+      const baselineAt = "2020-01-01T00:00:00.000Z";
+      const laterAt = "2020-01-01T00:30:00.000Z";
+      store.recordRaw({ provider: "claude", scrapedAt: baselineAt, rawOutput: "baseline" });
+      store.recordRaw({ provider: "claude", scrapedAt: laterAt, rawOutput: "later" });
+      expect(scrapedAts()).toEqual([baselineAt, laterAt]);
+
+      // A reading past the window relative to the readings held prunes them.
+      const muchLaterAt = new Date(Date.parse(laterAt) + QUOTA_RAW_RETENTION_MS + 1).toISOString();
+      store.recordRaw({ provider: "claude", scrapedAt: muchLaterAt, rawOutput: "much later" });
+      expect(scrapedAts()).toEqual([muchLaterAt]);
+
+      expect(() =>
+        store.recordRaw({ provider: "claude", scrapedAt: "not a timestamp", rawOutput: "" })
+      ).toThrow(/scrapedAt is invalid/);
+      expect(scrapedAts()).toEqual([muchLaterAt]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("uses the compact schema and prunes raw scrape payloads after 30 days", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-retention-"));
     roots.push(root);
@@ -1522,7 +1555,7 @@ describe("SharedQuotaStore retention and indexing", () => {
         "five_hour"
       );
 
-      // Codex weekly: 1 older observation (5d ago) + 1 current observation at evalTime (baseTime + 30d)
+      // Codex weekly: 1 older observation (5d ago)
       recordObservation(
         store,
         "codex",
@@ -1531,25 +1564,31 @@ describe("SharedQuotaStore retention and indexing", () => {
         new Date(baseTime + 2 * dayMs).toISOString(),
         "weekly"
       );
+      const countObservations = () =>
+        (store.db.prepare("SELECT count(*) AS n FROM quota_observations").get() as { n: number }).n;
+      expect(countObservations()).toBe(6);
+
+      // A current codex observation at evalTime (baseTime + 30d). Writing it
+      // prunes at its own time (#1210): cutoff is baseTime, so the two older
+      // claude:weekly rows and both unreasoned claude:five_hour rows go, while
+      // the latest reasoned row per (provider, kind) is kept as controller
+      // memory. The older codex row is still that row for codex:weekly when
+      // the prune runs, because the new reading lands after it.
+      const evalTime = baseTime + 30 * dayMs;
       recordObservation(
         store,
         "codex",
-        new Date(baseTime + 30 * dayMs).toISOString(),
+        new Date(evalTime).toISOString(),
         60,
         new Date(baseTime + 37 * dayMs).toISOString(),
         "weekly"
       );
+      expect(countObservations()).toBe(3);
 
-      // Verify initial observation counts
-      const beforeObservations = store.db
-        .prepare("SELECT count(*) AS n FROM quota_observations")
-        .get() as { n: number };
-      expect(beforeObservations.n).toBe(7);
-
-      // Prune observations at evaluation time (baseTime + 30 days) -> cutoff is baseTime
-      const evalTime = baseTime + 30 * dayMs;
+      // An explicit prune at the same time now releases the older codex row,
+      // which the fresh reading has superseded as controller memory.
       const deleted = store.pruneObservations(evalTime);
-      expect(deleted).toBe(5); // 2 claude:weekly older + 2 claude:five_hour unreasoned + 1 codex:weekly older = 5 deleted
+      expect(deleted).toBe(1);
 
       const surviving = store.db
         .prepare(

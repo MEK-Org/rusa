@@ -286,12 +286,12 @@ export interface GlassGoalsConfig {
 }
 
 /**
- * An independently running host HTTP JSON service exposed only through a grantable,
- * per-actor loopback endpoint. The configured user is a trusted request
- * binding, never a tool argument supplied by an actor.
+ * An independently running host MCP service on a Unix socket, exposed only
+ * through a grantable, per-actor loopback endpoint. The configured user is a
+ * trusted request binding, never a tool argument supplied by an actor.
  */
 export interface CustomMcpServerConfig {
-  /** Absolute Unix socket path for the independently running HTTP service. */
+  /** Absolute Unix socket path for the independently running MCP service. */
   socketPath: string;
   /** Plain filename under RUSA_HOME/secrets containing the host bearer token. */
   tokenFile: string;

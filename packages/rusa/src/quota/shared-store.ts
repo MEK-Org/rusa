@@ -717,7 +717,7 @@ export class SharedQuotaStore {
    * a retry arriving after its `quota_scrapes` row has been pruned is rejected
    * by ordering (`stale_observation`) rather than replayed anyway.
    */
-  pruneRawScrapes(nowMs = Date.now()): number {
+  pruneRawScrapes(nowMs: number): number {
     if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
     const cutoff = new Date(nowMs - QUOTA_RAW_RETENTION_MS).toISOString();
     return (
@@ -728,7 +728,7 @@ export class SharedQuotaStore {
     );
   }
 
-  pruneObservations(nowMs = Date.now()): number {
+  pruneObservations(nowMs: number): number {
     if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
     const cutoff = new Date(nowMs - QUOTA_OBSERVATION_RETENTION_MS).toISOString();
     return this.db
@@ -754,13 +754,18 @@ export class SharedQuotaStore {
 
   recordRaw(opts: { provider: string; scrapedAt: string; rawOutput: string }): string {
     const id = randomUUID();
+    const scrapedMs = Date.parse(opts.scrapedAt);
+    if (!Number.isFinite(scrapedMs)) throw new Error("scrape scrapedAt is invalid");
     // A fenced result is a durable no-op: the id has no row, and the caller's
     // follow-up `recordParsed` / `recordParseError` runs under the same stale
     // permit (generations only grow), so it is discarded there too.
     if (this.fencedByScrapePermit(opts.provider)) return id;
     this.db.transaction(() => {
-      this.pruneRawScrapes();
-      this.pruneObservations();
+      // Retention is measured from the evidence being written, as the manual
+      // path measures it from `acceptedAt`, so what the store keeps depends on
+      // the readings it holds rather than on the day a reading is replayed.
+      this.pruneRawScrapes(scrapedMs);
+      this.pruneObservations(scrapedMs);
       this.db
         .prepare(
           `INSERT INTO quota_scrapes
