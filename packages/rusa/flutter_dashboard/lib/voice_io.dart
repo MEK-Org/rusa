@@ -104,8 +104,13 @@ class IoVoiceRecorder implements VoiceRecorder {
         throw StateError('recording superseded before it started');
       }
       final headset = _headset;
-      if (headset != null && await headset.acquire()) {
+      if (headset != null) {
+        // Held from the request, so a cancel while the route is still
+        // pending releases it at once rather than when it settles.
         _routeGeneration = generation;
+        if (!await headset.acquire() && _routeGeneration == generation) {
+          _routeGeneration = null;
+        }
       }
       if (generation != _generation) {
         throw StateError('recording superseded before it started');

@@ -38,6 +38,10 @@ class _AssistantPageState extends State<AssistantPage> {
   late final DashboardApi _api;
   WalkieDeps? _deps;
   WalkieController? _controller;
+
+  /// The controller triggers reach: set once its start has begun recording,
+  /// so a trigger while voice starts is dropped rather than racing it.
+  WalkieController? _live;
   late Future<WalkieController> _ready;
   final _subs = <StreamSubscription<Object?>>[];
   StreamSubscription<bool>? _enabledSub;
@@ -84,16 +88,16 @@ class _AssistantPageState extends State<AssistantPage> {
       sessionRepliesOnly: true,
     );
     _controller = controller;
-    Future<Never> discard() async {
+    Future<Never> discard([String reason = 'Assist screen closed']) async {
       if (_controller == controller) _controller = null;
       await controller.dispose();
-      throw StateError('Assist screen closed');
+      throw StateError(reason);
     }
 
     await controller.init();
     if (stale()) return discard();
     if (controller.available.valueOrNull == false) {
-      throw StateError('Voice is not configured on this instance');
+      return discard('Voice is not configured on this instance');
     }
     await controller.enable();
     if (stale()) return discard();
@@ -101,14 +105,15 @@ class _AssistantPageState extends State<AssistantPage> {
     _enabledSub = controller.enabled.skip(1).listen((enabled) {
       if (!enabled) _close();
     });
+    _live = controller;
     unawaited(controller.toggleRecord());
     return controller;
   }
 
   Future<void> _onTrigger() async {
-    final controller = _controller;
-    if (controller == null) return;
-    if (!controller.enabled.value) await controller.enable();
+    final controller = _live;
+    // Walkie off is closing the screen; a trigger does not reopen it.
+    if (controller == null || !controller.enabled.value) return;
     await controller.toggleRecord();
   }
 
@@ -133,6 +138,7 @@ class _AssistantPageState extends State<AssistantPage> {
     _enabledSub = null;
     final controller = _controller;
     _controller = null;
+    _live = null;
     final pending = _ready;
     await controller?.dispose();
     try {

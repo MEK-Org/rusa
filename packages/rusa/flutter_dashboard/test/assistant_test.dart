@@ -377,6 +377,43 @@ void main() {
       await unmount(tester);
     });
 
+    testWidgets('a trigger while voice starts is dropped', (tester) async {
+      final probe = Completer<List<VoiceAnnouncement>>();
+      final backlog = Completer<List<VoiceAnnouncement>>();
+      api.backlogGates.addAll([probe, backlog]);
+      await pumpPage(tester);
+      probe.complete(const []);
+      await tester.pump();
+
+      assistant.triggerCtrl.add(null);
+      await tester.pump();
+      await tester.pump();
+      backlog.complete(const []);
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.stopCalls, 0);
+      expect(api.memoSends, isEmpty);
+      await unmount(tester);
+    });
+
+    testWidgets('a trigger after walkie off starts nothing', (tester) async {
+      await pumpPage(tester);
+      await tester.tap(find.byKey(const ValueKey('walkie-off')));
+      await tester.pump();
+      await tester.pump();
+      expect(closed, 1);
+
+      assistant.triggerCtrl.add(null);
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.streams, hasLength(1));
+      expect(walkie.recorder.startCalls, 1);
+      await unmount(tester);
+    });
+
     testWidgets('closing while voice starts releases it unrecorded', (
       tester,
     ) async {

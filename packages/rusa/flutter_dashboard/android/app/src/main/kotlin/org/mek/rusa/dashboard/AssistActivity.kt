@@ -88,15 +88,6 @@ class AssistActivity : FlutterActivity() {
         super.cleanUpFlutterEngine(flutterEngine)
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        if (assistant?.onRequestPermissionsResult(requestCode) == true) return
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-    }
-
     companion object {
         private const val END_DEADLINE_MS = 3_000L
     }

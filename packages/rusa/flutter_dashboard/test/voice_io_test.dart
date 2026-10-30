@@ -288,13 +288,13 @@ void main() {
         expect(headset.releases, 1);
       });
 
-      test('cancel while routing releases the late route', () async {
+      test('cancel while routing releases the route at once', () async {
         headset.gate = Completer<void>();
         final start = recorder.start();
         await pumpEventQueue();
 
         await recorder.cancel();
-        expect(headset.releases, 0);
+        expect(headset.releases, 1);
         headset.gate!.complete();
 
         await expectLater(start, throwsStateError);
