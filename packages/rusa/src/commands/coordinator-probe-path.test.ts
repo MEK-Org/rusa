@@ -178,10 +178,12 @@ describe("the quota coordinator's probe PATH reaches the tmux-launched CLI (#525
         claude: { cliCommand: "claude" },
         // No cliCommand: the key is the command, which is what the scrapers assume.
         kimi: {},
+        // The provider name is not the executable: OpenRouter runs Pi.
+        openrouter: { cliCommand: "pi" },
       },
     } as unknown as RusaConfig;
 
-    expect(configuredProviderCommands(config)).toEqual(["codex", "claude", "kimi"]);
+    expect(configuredProviderCommands(config)).toEqual(["codex", "claude", "kimi", "pi"]);
   });
 
   describe("describeProbePathSource", () => {

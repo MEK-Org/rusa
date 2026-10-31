@@ -1056,6 +1056,30 @@ describe("loadConfig providers.codex.authBroker", () => {
   });
 });
 
+describe("loadConfig providers.<name>.openrouterPoc is rejected", () => {
+  it("accepts OpenRouter as an ordinary pi provider", () => {
+    const providers = { codex: { cliCommand: "codex" }, openrouter: { cliCommand: "pi" } };
+    expect(loadConfig(writeConfig({ providers })).providers).toEqual(providers);
+  });
+
+  it("fails load naming the removed block, including its nested piCommand", () => {
+    for (const openrouterPoc of [{}, { piCommand: "/opt/pi/bin/pi" }]) {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            providers: {
+              codex: { cliCommand: "codex" },
+              openrouter: { cliCommand: "openrouter", openrouterPoc },
+            },
+          })
+        )
+      ).toThrow(
+        /providers\.openrouter\.openrouterPoc has been removed.*Delete the key and set cliCommand: pi/
+      );
+    }
+  });
+});
+
 describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   it("throws naming the ruling and issue when a provider carries fallbackModel", () => {
     expect(() =>

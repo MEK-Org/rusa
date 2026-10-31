@@ -10,7 +10,9 @@ import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { routeRunFailure } from "../../actor/failure-sink.js";
+import type { RusaConfig } from "../../config/types.js";
 import type { Logger } from "../../observability/logger.js";
+import { resolveProvider } from "../registry.js";
 import type { McpServerSpec } from "../types.js";
 import { OpenRouterProvider, setOpenRouterLogger } from "./provider.js";
 
@@ -55,17 +57,15 @@ async function fixture(options: { peerMode?: "failure" | "stream" | "wait" } = {
     `#!/bin/sh\nRUSA_TEST_PEER_MODE='${options.peerMode ?? "settle"}' RUSA_TEST_PEER_MARKER='${peerMarkerPath}' exec '${process.execPath}' '${fileURLToPath(new URL("./fixtures/rpc-child.mjs", import.meta.url))}' "$@"\n`,
     { mode: 0o700 }
   );
-  const config = {
-    openrouterPoc: {
-      piCommand,
-    },
-  };
+  // Constructed directly, so cliCommand can name the fake executable's path.
+  const config = { cliCommand: piCommand };
   return {
     root,
     artifactDir: join(rusaHome, "artifacts", "openrouter"),
     peerMarkerPath,
     apiKeyPath,
     config,
+    executableRoot,
     provider: new OpenRouterProvider("test", config, "vendor/fixed-model"),
   };
 }
@@ -122,11 +122,37 @@ function createOpenRouterActor(
   });
 }
 
-it("requires opt-in and refuses native sessions before inference", async () => {
-  const { root, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "");
-  await expect(provider.run({ cwd: root, prompt: "ping" })).rejects.toThrow(/requires/);
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
+it("dispatches the openrouter provider name to Pi through cliCommand", async () => {
+  const { root, executableRoot } = await fixture();
+  // Configured providers resolve their executable from PATH, like every other adapter.
+  vi.stubEnv("PATH", `${executableRoot}:${process.env.PATH ?? ""}`);
+  const config = {
+    github: { account: "test" },
+    providers: { openrouter: { cliCommand: "pi" }, legacy: { cliCommand: "openrouter" } },
+  } as unknown as RusaConfig;
+  const provider = resolveProvider(config, "openrouter", "vendor/fixed-model");
+  expect(provider).toBeInstanceOf(OpenRouterProvider);
+  expect(provider).toMatchObject({
+    providerName: "openrouter",
+    model: "vendor/fixed-model",
+    name: "vendor/fixed-model (openrouter)",
+  });
+  expect(await provider.run({ cwd: root, prompt: "ping-resolved" })).toEqual({
+    success: true,
+    output: "ping-resolved",
+    exitCode: 0,
+  });
+  // The former adapter key no longer names an implementation.
+  expect(() => resolveProvider(config, "legacy", "vendor/fixed-model")).toThrow(
+    /No implementation for CLI command "openrouter"/
+  );
+}, 10000);
+
+it("requires a model and refuses native sessions before inference", async () => {
+  const { root, config, provider } = await fixture();
+  await expect(
+    new OpenRouterProvider("test", config).run({ cwd: root, prompt: "ping" })
+  ).rejects.toThrow(/requires a model/);
   await expect(
     provider.run({
       cwd: root,
@@ -138,7 +164,6 @@ it("requires opt-in and refuses native sessions before inference", async () => {
 
 it("returns full shared interruption attribution when the synthetic peer is cancelled", async () => {
   const { root, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const controller = new AbortController();
   controller.abort("interrupt:responsive-notification");
 
@@ -156,7 +181,6 @@ it("returns full shared interruption attribution when the synthetic peer is canc
 
 it("honors a supplied in-flight deadline after peer protocol progress", async () => {
   const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const controller = new AbortController();
   let settled = false;
   let run: ReturnType<OpenRouterProvider["run"]> | undefined;
@@ -198,7 +222,6 @@ it("honors a supplied in-flight deadline after peer protocol progress", async ()
 
 it("keeps the Pi cancellation diagnosis on an adapter-local deadline", async () => {
   const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   let run: ReturnType<OpenRouterProvider["run"]> | undefined;
   try {
     run = provider.run({
@@ -226,7 +249,6 @@ it.each([
   "suppresses a %s after real peer progress",
   async (_label, source) => {
     const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
-    vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     const notices: string[] = [];
     let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
     let terminalSeen = false;
@@ -315,7 +337,6 @@ it.each([
   "attributes the %s after real peer progress goes quiet",
   async (_label, timeoutMs, reason) => {
     const { root, peerMarkerPath, provider } = await fixture({ peerMode: "wait" });
-    vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
     let terminalSeen = false;
     let resolveTerminal!: () => void;
@@ -378,7 +399,6 @@ it.each([
 
 it("reports an ordinary peer failure after protocol progress", async () => {
   const { root, peerMarkerPath, provider } = await fixture({ peerMode: "failure" });
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const notices: string[] = [];
   let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
   const lifecycle = createActorLifecycle([
@@ -415,13 +435,11 @@ it("reports an ordinary peer failure after protocol progress", async () => {
 }, 15_000);
 it("requires the independently managed Pi login", async () => {
   const { root, apiKeyPath, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   await rm(apiKeyPath);
   await expect(provider.run({ cwd: root, prompt: "ping" })).rejects.toThrow(/launch pi/);
 });
 it("uses a static Pi login without changing the source profile", async () => {
   const { root, apiKeyPath, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const source = JSON.stringify({
     openrouter: { type: "api_key", key: "synthetic-not-a-real-key" },
   });
@@ -437,7 +455,6 @@ it("uses a static Pi login without changing the source profile", async () => {
 
 it("keeps a nonempty actor repository and its marker across two fresh Actor runs", async () => {
   const { root, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const ended: Array<Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined> = [];
   let prompt = "repository-write";
   let settle = () => {};
@@ -480,7 +497,6 @@ it("keeps a nonempty actor repository and its marker across two fresh Actor runs
 
 it("renders Pi text and tool events through Actor while liveness remains invisible", async () => {
   const { root, provider } = await fixture({ peerMode: "stream" });
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const live: string[] = [];
   let ended: Awaited<ReturnType<OpenRouterProvider["run"]>> | undefined;
   let settle = () => {};
@@ -523,7 +539,6 @@ it("renders Pi text and tool events through Actor while liveness remains invisib
 
 it("settles through real pipes, reaps the peer and retains usage in its internal artifact directory", async () => {
   const { root, artifactDir, peerMarkerPath, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const result = await provider.run({
     cwd: root,
     prompt: "ping-unique",
@@ -545,7 +560,6 @@ it("settles through real pipes, reaps the peer and retains usage in its internal
 
 it("keeps the run result when its diagnostic receipt cannot be written", async () => {
   const { root, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const warnings: string[] = [];
   setOpenRouterLogger({ warn: (event: string) => warnings.push(event) } as unknown as Logger);
   onTestFinished(() => setOpenRouterLogger(undefined));
@@ -562,7 +576,6 @@ it("keeps the run result when its diagnostic receipt cannot be written", async (
 
 it("retains distinct artifacts for concurrent invocations", async () => {
   const { root, artifactDir, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   const results = await Promise.all([
     provider.run({ cwd: root, prompt: "one" }),
     provider.run({ cwd: root, prompt: "two" }),
@@ -580,7 +593,6 @@ it.skipIf(!bwrapCapable)(
   "launches a worker without a provider grant and accepts a mixed Pi login profile",
   async () => {
     const { root, provider } = await fixture();
-    vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     const actor = join(root, "workers", "actor");
     const sibling = join(root, "workers", "sibling");
     const secrets = join(root, "secrets");
@@ -616,7 +628,6 @@ it.skipIf(!bwrapCapable)(
 
 it("resolves the selected saved Pi login directory against the host cwd", async () => {
   const { root, provider } = await fixture();
-  vi.stubEnv("RUSA_OPENROUTER_POC", "1");
   vi.stubEnv("PI_CODING_AGENT_DIR", relative(process.cwd(), root));
   expect((await provider.run({ cwd: root, prompt: "ping" })).success).toBe(true);
 });
@@ -625,7 +636,6 @@ it.skipIf(!bwrapCapable)(
   "releases the supplied understanding snapshot after success and missing-login failure",
   async () => {
     const { root, apiKeyPath, provider } = await fixture();
-    vi.stubEnv("RUSA_OPENROUTER_POC", "1");
     const actor = join(root, "workers", "actor");
     await mkdir(actor, { recursive: true });
     for (const missingLogin of [false, true]) {

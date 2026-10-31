@@ -8,7 +8,7 @@ export function mcpAdmissionExtension(names: string[], waitMs = 12_000): string 
     new Set(namespaces).size !== names.length ||
     namespaces.some((name) => name.length > 40 || !name)
   ) {
-    throw new Error("OpenRouter prototype requires distinct short MCP namespaces");
+    throw new Error("OpenRouter requires distinct short MCP namespaces");
   }
   return `export default function(pi) {
     pi.on("before_agent_start", async () => {
