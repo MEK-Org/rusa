@@ -49,19 +49,19 @@ class NotGrantedError extends Error {}
 class RequestTooLargeError extends Error {}
 
 interface DriftRecord {
-  upstreamKey: string;
-  scope: Access;
+  lastUpstreamKeyByScope: Map<Access, string>;
+  lastWarned?: {
+    scope: Access;
+    missing: string[];
+    unclassified: string[];
+  };
 }
 
 /**
  * Deduplication state for classification drift warnings: memoized per server
- * configuration, keyed on sorted upstream tool names.
+ * configuration, tracking observed upstream tool listings by discovery scope.
  */
 const warnedDriftsByServer = new Map<string, DriftRecord>();
-
-export function resetCustomMcpDriftWarningsForTest(): void {
-  warnedDriftsByServer.clear();
-}
 
 function serverConfigKey(configured: ConfiguredCustomMcpServer): string {
   const read = [...configured.config.readTools].sort().join(",");
@@ -311,13 +311,16 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     const upstreamNames = upstreamTools.map((t) => t.name).sort();
     const upstreamKey = upstreamNames.join(",");
     const key = serverConfigKey(configured);
-    const previous = warnedDriftsByServer.get(key);
-
-    if (previous && previous.upstreamKey === upstreamKey) {
-      if (previous.scope === "write" || discoveryScope === "read") {
-        return;
-      }
+    let record = warnedDriftsByServer.get(key);
+    if (!record) {
+      record = { lastUpstreamKeyByScope: new Map() };
+      warnedDriftsByServer.set(key, record);
     }
+
+    if (record.lastUpstreamKeyByScope.get(discoveryScope) === upstreamKey) {
+      return;
+    }
+    record.lastUpstreamKeyByScope.set(discoveryScope, upstreamKey);
 
     const observedSet = new Set(upstreamNames);
     const unclassified = upstreamNames.filter((name) => !classifications.has(name));
@@ -331,15 +334,38 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       .sort();
 
     if (unclassified.length > 0 || missing.length > 0) {
+      if (record.lastWarned) {
+        if (record.lastWarned.scope === "write" && discoveryScope === "read") {
+          const hasNewMissing = missing.some((m) => !record.lastWarned?.missing.includes(m));
+          const hasNewUnclassified = unclassified.some(
+            (u) => !record.lastWarned?.unclassified.includes(u)
+          );
+          if (!hasNewMissing && !hasNewUnclassified) {
+            return;
+          }
+        }
+        if (
+          record.lastWarned.missing.join(",") === missing.join(",") &&
+          record.lastWarned.unclassified.join(",") === unclassified.join(",")
+        ) {
+          return;
+        }
+      }
+
       logger?.warn("custom_mcp_classification_drift", {
         capability: configured.capability,
         scope: discoveryScope,
         missing,
         unclassified,
       });
+      record.lastWarned = {
+        scope: discoveryScope,
+        missing,
+        unclassified,
+      };
+    } else if (discoveryScope === "write" || configured.config.writeTools.length === 0) {
+      record.lastWarned = undefined;
     }
-
-    warnedDriftsByServer.set(key, { upstreamKey, scope: discoveryScope });
   };
   const proxy = new McpServer(
     { name: configured.capability, version: "0.1.0" },

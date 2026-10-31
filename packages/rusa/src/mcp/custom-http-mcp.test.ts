@@ -24,11 +24,7 @@ import type { Logger } from "../observability/logger.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import {
-  CUSTOM_MCP_PROTOCOL_VERSION,
-  createCustomHttpMcpServer,
-  resetCustomMcpDriftWarningsForTest,
-} from "./custom-http-mcp.js";
+import { CUSTOM_MCP_PROTOCOL_VERSION, createCustomHttpMcpServer } from "./custom-http-mcp.js";
 import {
   buildGrantableServers,
   type GrantableServerDeps,
@@ -308,7 +304,6 @@ afterEach(async () => {
     new Set(calls.length === 0 ? [] : [CUSTOM_MCP_PROTOCOL_VERSION])
   );
   grants.clear();
-  resetCustomMcpDriftWarningsForTest();
   vi.restoreAllMocks();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -627,10 +622,11 @@ describe("configured host MCP service", () => {
     );
   });
 
-  it("warns once on write-scoped listing for unserved and unclassified tools, and deduplicates across actors", async () => {
-    upstreamToolsByScope = () => ["a", "b"];
+  it("warns once on write-scoped listing for unserved and unclassified tools, and deduplicates across actors and interleaved read discovery", async () => {
+    upstreamToolsByScope = (write) => (write ? ["a", "b"] : ["a"]);
     grants.set("writer1", ["glass_goals:configured-user:write"]);
     grants.set("writer2", ["glass_goals:configured-user:write"]);
+    grants.set("reader", ["glass_goals:configured-user:read"]);
     const warn = vi.fn();
     const writer1 = await connect("writer1", { readTools: ["a"], writeTools: ["c"] }, {
       warn,
@@ -647,6 +643,14 @@ describe("configured host MCP service", () => {
       })
     );
 
+    // Interleaved read discovery sees only ["a"] (which matches configured readTools ["a"]),
+    // so it neither warns nor resets write-scoped deduplication.
+    const reader = await connect("reader", { readTools: ["a"], writeTools: ["c"] }, {
+      warn,
+    } as unknown as Logger);
+    await reader.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+
     const writer2 = await connect("writer2", { readTools: ["a"], writeTools: ["c"] }, {
       warn,
     } as unknown as Logger);
@@ -655,7 +659,7 @@ describe("configured host MCP service", () => {
   });
 
   it("warns on read-scoped listing about unclassified tools without reporting missing write tools", async () => {
-    upstreamToolsByScope = () => ["a", "b"];
+    upstreamToolsByScope = (write) => (write ? ["a", "b", "c"] : ["a", "b"]);
     grants.set("reader", ["glass_goals:configured-user:read"]);
     const warn = vi.fn();
     const reader = await connect("reader", { readTools: ["a"], writeTools: ["c"] }, {
@@ -674,9 +678,42 @@ describe("configured host MCP service", () => {
     );
   });
 
+  it("does not re-warn on write-scoped listing when observed drift was already reported by a read-scoped listing", async () => {
+    upstreamToolsByScope = (write) => (write ? ["unclassified", "write_goal"] : ["unclassified"]);
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    const reader = await connect(
+      "reader",
+      { readTools: ["missing_read"], writeTools: ["write_goal"] },
+      { warn } as unknown as Logger
+    );
+    await reader.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({
+        capability: "glass_goals",
+        scope: "read",
+        missing: ["missing_read"],
+        unclassified: ["unclassified"],
+      })
+    );
+
+    const writer = await connect(
+      "writer",
+      { readTools: ["missing_read"], writeTools: ["write_goal"] },
+      { warn } as unknown as Logger
+    );
+    await writer.listTools();
+    // Write discovery sees write_goal present, so only missing_read is absent and
+    // unclassified is unclassified: identical to what was already warned.
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it("emits a fresh warning when the upstream tool listing changes between calls", async () => {
-    let currentTools = ["a", "b"];
-    upstreamToolsByScope = () => currentTools;
+    let currentTools = (write: boolean) => (write ? ["a", "b"] : ["a"]);
+    upstreamToolsByScope = (write) => currentTools(write);
     grants.set("writer", ["glass_goals:configured-user:write"]);
     const warn = vi.fn();
     const writer = await connect("writer", { readTools: ["a"], writeTools: ["c"] }, {
@@ -694,7 +731,7 @@ describe("configured host MCP service", () => {
       })
     );
 
-    currentTools = ["a", "d"];
+    currentTools = (write: boolean) => (write ? ["a", "d"] : ["a"]);
     await writer.listTools();
     expect(warn).toHaveBeenCalledTimes(2);
     expect(warn).toHaveBeenLastCalledWith(
@@ -709,7 +746,7 @@ describe("configured host MCP service", () => {
   });
 
   it("logs nothing when configuration fully matches the upstream listing", async () => {
-    upstreamToolsByScope = () => ["read_goal", "write_goal"];
+    upstreamToolsByScope = (write) => (write ? ["read_goal", "write_goal"] : ["read_goal"]);
     grants.set("writer", ["glass_goals:configured-user:write"]);
     const warn = vi.fn();
     const writer = await connect(
