@@ -62,7 +62,8 @@ current effective scope; each tool call carries only the scope its configured
 classification requires. The service lists only the tools the request's scope
 allows (`write` includes `read`) and knows no other tool at that scope; Rusa's
 `readTools` / `writeTools` classification then decides what an actor sees and
-calls. A tool called at a scope that does not list it is therefore unknown to
+calls. Classification drift between the upstream listing and configured tools is
+reported in the service log at first discovery. A tool called at a scope that does not list it is therefore unknown to
 the service, which answers the ordinary JSON-RPC tool-not-found error; Rusa
 reports that as unavailable, like any other failed call.
 
