@@ -81,6 +81,15 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
     hasSubIssues: async () => false,
     addSubIssue: async () => {},
     removeSubIssue: async () => {},
+    createStack: async (_repo, pullRequests) => ({
+      number: 1,
+      pull_requests: pullRequests.map((n) => ({ number: n })),
+    }),
+    addToStack: async (_repo, stackNumber, pullRequests) => ({
+      number: stackNumber,
+      pull_requests: pullRequests.map((n) => ({ number: n })),
+    }),
+    unstack: async () => undefined,
   };
   return { client, labels };
 }
