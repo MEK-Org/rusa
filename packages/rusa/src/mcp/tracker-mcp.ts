@@ -247,7 +247,9 @@ export function createTrackerMcpServer(
     },
     async ({ repo, prNumber }) => {
       try {
-        return toolOk(await issueClient.getPullRequestDetails(repo, prNumber));
+        return toolOk(
+          await issueClient.getPullRequestDetails(repo, prNumber, { includeStack: true })
+        );
       } catch (err) {
         return toolError(err);
       }

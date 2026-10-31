@@ -20,7 +20,6 @@ import {
   type PullRequestDetails,
   type PullRequestReviewDetails,
   type ReactionContent,
-  type StackDetails,
 } from "../gitops/issue-client.js";
 import type { LocalTracker, ReviewState } from "./local-tracker.js";
 
@@ -317,7 +316,7 @@ export class FakeIssueClient implements IssueClient {
     throw new Error("sub-issue parenting is not modelled by the e2e tracker");
   }
 
-  async createStack(_repo: string, _pullRequests: number[]): Promise<StackDetails> {
+  async createStack(_repo: string, _pullRequests: number[]): Promise<Record<string, unknown>> {
     throw new Error("stack management is not modelled by the e2e tracker");
   }
 
@@ -325,11 +324,11 @@ export class FakeIssueClient implements IssueClient {
     _repo: string,
     _stackNumber: number,
     _pullRequests: number[]
-  ): Promise<StackDetails> {
+  ): Promise<Record<string, unknown>> {
     throw new Error("stack management is not modelled by the e2e tracker");
   }
 
-  async unstack(_repo: string, _stackNumber: number): Promise<StackDetails | undefined> {
+  async unstack(_repo: string, _stackNumber: number): Promise<Record<string, unknown> | undefined> {
     throw new Error("stack management is not modelled by the e2e tracker");
   }
   private toOpenPullRequest(pr: {

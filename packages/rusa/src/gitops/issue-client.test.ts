@@ -1044,6 +1044,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 3,
                     nodes: [
@@ -1114,6 +1115,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 1,
                     nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
@@ -1160,6 +1162,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 1,
                     nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
@@ -1206,6 +1209,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 2,
                     nodes: [
@@ -1243,6 +1247,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 2,
                     nodes: [
@@ -1281,6 +1286,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 1,
                     nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
@@ -1329,6 +1335,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 1,
                     nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
@@ -1386,6 +1393,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 1,
                     nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
@@ -1474,6 +1482,7 @@ describe("GitHubIssueClient", () => {
             repository: {
               pullRequest: {
                 stack: {
+                  number: 100,
                   entries: {
                     totalCount: 1,
                     nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
@@ -1922,7 +1931,9 @@ describe("GitHubIssueClient", () => {
       },
     });
 
-    const details = await new GitHubIssueClient().getPullRequestDetails(REPO, 5);
+    const details = await new GitHubIssueClient().getPullRequestDetails(REPO, 5, {
+      includeStack: true,
+    });
     expect(details).toEqual({
       number: 5,
       title: "Stacked Title",
@@ -1937,6 +1948,11 @@ describe("GitHubIssueClient", () => {
       position: 2,
       total: 3,
     });
+
+    const detailsDefault = await new GitHubIssueClient().getPullRequestDetails(REPO, 5);
+    expect(detailsDefault.stackNumber).toBeUndefined();
+    expect(detailsDefault.position).toBeUndefined();
+    expect(detailsDefault.total).toBeUndefined();
   });
 
   it("rolls up combined statuses and check-runs for the PR head sha", async () => {

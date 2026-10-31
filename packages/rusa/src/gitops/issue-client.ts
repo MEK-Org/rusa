@@ -183,26 +183,6 @@ export interface PullRequestDetails {
   total?: number;
 }
 
-export interface StackDetails {
-  id?: number;
-  number: number;
-  node_id?: string;
-  url?: string;
-  base?: { ref?: string };
-  open?: boolean;
-  created_at?: string;
-  pull_requests?: Array<{
-    id?: number;
-    number: number;
-    state?: string;
-    draft?: boolean;
-    merged_at?: string | null;
-    head?: { ref?: string; sha?: string };
-    [key: string]: unknown;
-  }>;
-  [key: string]: unknown;
-}
-
 export interface PullRequestChecksStatus {
   state: "success" | "failure" | "pending";
   headSha: string;
@@ -321,8 +301,12 @@ export interface IssueClient {
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]>;
   /** Query issues with optional state and label filters. */
   listIssues(repo: string, opts?: ListIssuesOptions): Promise<OpenIssue[]>;
-  /** Fetch pull request details. */
-  getPullRequestDetails(repo: string, prNumber: number): Promise<PullRequestDetails>;
+  /** Fetch pull request details. Optionally queries GraphQL for stack membership when requested. */
+  getPullRequestDetails(
+    repo: string,
+    prNumber: number,
+    opts?: { includeStack?: boolean }
+  ): Promise<PullRequestDetails>;
   /** Fetch and roll up status checks for a pull request's current head commit. */
   getPullRequestChecksStatus(repo: string, prNumber: number): Promise<PullRequestChecksStatus>;
   /**
@@ -401,11 +385,15 @@ export interface IssueClient {
   /** Detach a child issue from its parent. */
   removeSubIssue(repo: string, parentIssueNumber: number, childIssueNumber: number): Promise<void>;
   /** Create a pull request stack from an ordered list of PR numbers. */
-  createStack(repo: string, pullRequests: number[]): Promise<StackDetails>;
+  createStack(repo: string, pullRequests: number[]): Promise<Record<string, unknown>>;
   /** Append pull requests to the top of an existing stack. */
-  addToStack(repo: string, stackNumber: number, pullRequests: number[]): Promise<StackDetails>;
+  addToStack(
+    repo: string,
+    stackNumber: number,
+    pullRequests: number[]
+  ): Promise<Record<string, unknown>>;
   /** Remove unmerged pull requests from a stack, dissolving it if none remain. */
-  unstack(repo: string, stackNumber: number): Promise<StackDetails | undefined>;
+  unstack(repo: string, stackNumber: number): Promise<Record<string, unknown> | undefined>;
 }
 
 /** A non-2xx GitHub API response, with the status code callers branch on. */
@@ -775,8 +763,8 @@ export class GitHubIssueClient implements IssueClient {
     );
   }
 
-  async createStack(repo: string, pullRequests: number[]): Promise<StackDetails> {
-    return this.api<StackDetails>(
+  async createStack(repo: string, pullRequests: number[]): Promise<Record<string, unknown>> {
+    return this.api<Record<string, unknown>>(
       "POST",
       `/repos/${repo}/stacks`,
       { pull_requests: pullRequests },
@@ -788,8 +776,8 @@ export class GitHubIssueClient implements IssueClient {
     repo: string,
     stackNumber: number,
     pullRequests: number[]
-  ): Promise<StackDetails> {
-    return this.api<StackDetails>(
+  ): Promise<Record<string, unknown>> {
+    return this.api<Record<string, unknown>>(
       "POST",
       `/repos/${repo}/stacks/${stackNumber}/add`,
       { pull_requests: pullRequests },
@@ -797,8 +785,8 @@ export class GitHubIssueClient implements IssueClient {
     );
   }
 
-  async unstack(repo: string, stackNumber: number): Promise<StackDetails | undefined> {
-    return this.api<StackDetails | undefined>(
+  async unstack(repo: string, stackNumber: number): Promise<Record<string, unknown> | undefined> {
+    return this.api<Record<string, unknown> | undefined>(
       "POST",
       `/repos/${repo}/stacks/${stackNumber}/unstack`,
       undefined,
@@ -934,12 +922,7 @@ export class GitHubIssueClient implements IssueClient {
   async mergePullRequest(opts: MergePullRequestOptions): Promise<string> {
     // Learn the head ref before merging (merging doesn't remove the branch itself).
     const headRef = opts.deleteBranch
-      ? (
-          await this.api<{ head: { ref: string } }>(
-            "GET",
-            `/repos/${opts.repo}/pulls/${opts.prNumber}`
-          )
-        ).head.ref
+      ? (await this.getPullRequestDetails(opts.repo, opts.prNumber)).headRef
       : undefined;
     // GitHub exposes stack membership through PullRequest.stack/stackEntry in
     // GraphQL. Preflighting keeps the position guard authoritative and avoids
@@ -978,7 +961,7 @@ export class GitHubIssueClient implements IssueClient {
     repo: string,
     prNumber: number
   ): Promise<{
-    stackNumber?: number;
+    stackNumber: number;
     position: number;
     total: number;
     entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>;
@@ -990,7 +973,7 @@ export class GitHubIssueClient implements IssueClient {
       repository?: {
         pullRequest?: {
           stack?: {
-            number?: number;
+            number: number;
             entries: {
               totalCount: number;
               nodes: Array<{
@@ -1296,7 +1279,11 @@ export class GitHubIssueClient implements IssueClient {
     await this.api("POST", path, { content });
   }
 
-  async getPullRequestDetails(repo: string, prNumber: number): Promise<PullRequestDetails> {
+  async getPullRequestDetails(
+    repo: string,
+    prNumber: number,
+    opts?: { includeStack?: boolean }
+  ): Promise<PullRequestDetails> {
     const pr = await this.api<{
       number: number;
       title: string;
@@ -1308,7 +1295,7 @@ export class GitHubIssueClient implements IssueClient {
       merged: boolean;
     }>("GET", `/repos/${repo}/pulls/${prNumber}`);
 
-    const stack = await this.getPullRequestStack(repo, prNumber);
+    const stack = opts?.includeStack ? await this.getPullRequestStack(repo, prNumber) : null;
 
     return {
       number: pr.number,
@@ -1322,7 +1309,7 @@ export class GitHubIssueClient implements IssueClient {
       merged: pr.merged,
       ...(stack
         ? {
-            ...(stack.stackNumber !== undefined ? { stackNumber: stack.stackNumber } : {}),
+            stackNumber: stack.stackNumber,
             position: stack.position,
             total: stack.total,
           }
@@ -1658,8 +1645,12 @@ export class GitBridgeIssueClient implements IssueClient {
     return this.delegate.listIssues(repo, opts);
   }
 
-  getPullRequestDetails(repo: string, prNumber: number): Promise<PullRequestDetails> {
-    return this.delegate.getPullRequestDetails(repo, prNumber);
+  getPullRequestDetails(
+    repo: string,
+    prNumber: number,
+    opts?: { includeStack?: boolean }
+  ): Promise<PullRequestDetails> {
+    return this.delegate.getPullRequestDetails(repo, prNumber, opts);
   }
 
   getPullRequestChecksStatus(repo: string, prNumber: number): Promise<PullRequestChecksStatus> {
@@ -1759,15 +1750,19 @@ export class GitBridgeIssueClient implements IssueClient {
     return this.delegate.removeSubIssue(repo, parentIssueNumber, childIssueNumber);
   }
 
-  createStack(repo: string, pullRequests: number[]): Promise<StackDetails> {
+  createStack(repo: string, pullRequests: number[]): Promise<Record<string, unknown>> {
     return this.delegate.createStack(repo, pullRequests);
   }
 
-  addToStack(repo: string, stackNumber: number, pullRequests: number[]): Promise<StackDetails> {
+  addToStack(
+    repo: string,
+    stackNumber: number,
+    pullRequests: number[]
+  ): Promise<Record<string, unknown>> {
     return this.delegate.addToStack(repo, stackNumber, pullRequests);
   }
 
-  unstack(repo: string, stackNumber: number): Promise<StackDetails | undefined> {
+  unstack(repo: string, stackNumber: number): Promise<Record<string, unknown> | undefined> {
     return this.delegate.unstack(repo, stackNumber);
   }
 }
