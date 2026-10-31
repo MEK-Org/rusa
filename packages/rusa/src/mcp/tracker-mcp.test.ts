@@ -158,6 +158,18 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
     removeSubIssue: async (repo, parentIssueNumber, childIssueNumber) => {
       calls.push({ method: "removeSubIssue", args: [repo, parentIssueNumber, childIssueNumber] });
     },
+    createStack: async (repo, pullRequests) => {
+      calls.push({ method: "createStack", args: [repo, pullRequests] });
+      return { number: 42, pull_requests: pullRequests.map((n) => ({ number: n })) };
+    },
+    addToStack: async (repo, stackNumber, pullRequests) => {
+      calls.push({ method: "addToStack", args: [repo, stackNumber, pullRequests] });
+      return { number: stackNumber, pull_requests: pullRequests.map((n) => ({ number: n })) };
+    },
+    unstack: async (repo, stackNumber) => {
+      calls.push({ method: "unstack", args: [repo, stackNumber] });
+      return undefined;
+    },
   };
   return { client, calls };
 }
@@ -185,10 +197,12 @@ describe("tracker MCP server", () => {
         "add_label",
         "add_reaction",
         "add_sub_issue",
+        "add_to_stack",
         "close_issue",
         "create_issue",
         "create_pr_review_comment",
         "create_pull_request",
+        "create_stack",
         "get_issue",
         "get_parent_issue",
         "get_pr_details",
@@ -204,6 +218,7 @@ describe("tracker MCP server", () => {
         "remove_parent",
         "reopen_issue",
         "set_parent",
+        "unstack",
         "update_body",
       ].sort()
     );
@@ -1234,6 +1249,149 @@ describe("tracker MCP server", () => {
     expect(calls).toContainEqual({
       method: "getPrReviewComments",
       args: ["o/r", 5, 42],
+    });
+  });
+
+  describe("pull request stack management tools (#1212)", () => {
+    it("create_stack creates a stack from an ordered list of PR numbers and fires onWrite", async () => {
+      let wrote = false;
+      const { client: backend, calls } = recordingIssueClient();
+      const client = await connect(
+        createTrackerMcpServer("test-actor-1", backend, {
+          onWrite: () => {
+            wrote = true;
+          },
+        })
+      );
+      const res = (await client.callTool({
+        name: "create_stack",
+        arguments: { repo: "owner/repo", pullRequests: [10, 11, 12] },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(JSON.parse(textOf(res))).toEqual({
+        number: 42,
+        pull_requests: [{ number: 10 }, { number: 11 }, { number: 12 }],
+      });
+      expect(calls).toContainEqual({
+        method: "createStack",
+        args: ["owner/repo", [10, 11, 12]],
+      });
+      expect(wrote).toBe(true);
+    });
+
+    it("add_to_stack appends PRs to an existing stack and fires onWrite", async () => {
+      let wrote = false;
+      const { client: backend, calls } = recordingIssueClient();
+      const client = await connect(
+        createTrackerMcpServer("test-actor-1", backend, {
+          onWrite: () => {
+            wrote = true;
+          },
+        })
+      );
+      const res = (await client.callTool({
+        name: "add_to_stack",
+        arguments: { repo: "owner/repo", stackNumber: 42, pullRequests: [13, 14] },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(JSON.parse(textOf(res))).toEqual({
+        number: 42,
+        pull_requests: [{ number: 13 }, { number: 14 }],
+      });
+      expect(calls).toContainEqual({
+        method: "addToStack",
+        args: ["owner/repo", 42, [13, 14]],
+      });
+      expect(wrote).toBe(true);
+    });
+
+    it("unstack returns 'Stack dissolved' when backend returns undefined (204) and fires onWrite", async () => {
+      let wrote = false;
+      const { client: backend, calls } = recordingIssueClient();
+      const client = await connect(
+        createTrackerMcpServer("test-actor-1", backend, {
+          onWrite: () => {
+            wrote = true;
+          },
+        })
+      );
+      const res = (await client.callTool({
+        name: "unstack",
+        arguments: { repo: "owner/repo", stackNumber: 42 },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(textOf(res)).toBe("Stack dissolved");
+      expect(calls).toContainEqual({
+        method: "unstack",
+        args: ["owner/repo", 42],
+      });
+      expect(wrote).toBe(true);
+    });
+
+    it("unstack returns updated stack object when remaining PRs exist (200) and fires onWrite", async () => {
+      let wrote = false;
+      const backend: IssueClient = {
+        ...recordingIssueClient().client,
+        unstack: async () => ({ number: 42, pull_requests: [{ number: 10 }] }),
+      };
+      const client = await connect(
+        createTrackerMcpServer("test-actor-1", backend, {
+          onWrite: () => {
+            wrote = true;
+          },
+        })
+      );
+      const res = (await client.callTool({
+        name: "unstack",
+        arguments: { repo: "owner/repo", stackNumber: 42 },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(JSON.parse(textOf(res))).toEqual({
+        number: 42,
+        pull_requests: [{ number: 10 }],
+      });
+      expect(wrote).toBe(true);
+    });
+
+    it("surfaces stack tool errors gracefully", async () => {
+      const failing: IssueClient = {
+        ...recordingIssueClient().client,
+        createStack: async () => {
+          throw new Error("Validation Failed: pull request base must match head");
+        },
+        addToStack: async () => {
+          throw new Error("Stack not found");
+        },
+        unstack: async () => {
+          throw new Error("Cannot unstack merged pull requests");
+        },
+      };
+      const client = await connect(createTrackerMcpServer("test-actor-1", failing));
+
+      const resCreate = (await client.callTool({
+        name: "create_stack",
+        arguments: { repo: "o/r", pullRequests: [1, 2] },
+      })) as CallToolResult;
+      expect(resCreate.isError).toBe(true);
+      expect(textOf(resCreate)).toContain("Validation Failed");
+
+      const resAdd = (await client.callTool({
+        name: "add_to_stack",
+        arguments: { repo: "o/r", stackNumber: 99, pullRequests: [3] },
+      })) as CallToolResult;
+      expect(resAdd.isError).toBe(true);
+      expect(textOf(resAdd)).toContain("Stack not found");
+
+      const resUnstack = (await client.callTool({
+        name: "unstack",
+        arguments: { repo: "o/r", stackNumber: 99 },
+      })) as CallToolResult;
+      expect(resUnstack.isError).toBe(true);
+      expect(textOf(resUnstack)).toContain("Cannot unstack merged pull requests");
     });
   });
 

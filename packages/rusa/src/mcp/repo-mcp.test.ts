@@ -85,6 +85,9 @@ function recordingIssueClient(
     hasSubIssues: async () => false,
     addSubIssue: async () => {},
     removeSubIssue: async () => {},
+    createStack: async () => ({ number: 1 }),
+    addToStack: async () => ({ number: 1 }),
+    unstack: async () => undefined,
   };
   return { client, calls };
 }

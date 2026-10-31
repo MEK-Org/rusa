@@ -241,7 +241,8 @@ export function createTrackerMcpServer(
     "get_pr_details",
     {
       title: "Get pull request details",
-      description: "Fetch metadata (title, body, head ref, state, URL) for a pull request.",
+      description:
+        "Fetch metadata (title, body, head ref, state, URL, stack membership) for a pull request.",
       inputSchema: { repo: z.string(), prNumber: z.number().int() },
     },
     async ({ repo, prNumber }) => {
@@ -822,6 +823,76 @@ export function createTrackerMcpServer(
         await issueClient.updateIssueBody(repo, issueNumber, stampedBody);
         options.onWrite?.();
         return toolOk("ok");
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "create_stack",
+    {
+      title: "Create a pull request stack",
+      description:
+        "Create a pull request stack from an ordered list of pull request numbers (bottom to top).",
+      inputSchema: {
+        repo: z.string().describe("Repository in owner/name format"),
+        pullRequests: z
+          .array(z.number().int())
+          .describe("Ordered list of pull request numbers from bottom to top"),
+      },
+    },
+    async ({ repo, pullRequests }) => {
+      try {
+        const stack = await issueClient.createStack(repo, pullRequests);
+        options.onWrite?.();
+        return toolOk(stack);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "add_to_stack",
+    {
+      title: "Add pull requests to a stack",
+      description: "Append pull requests to the top of an existing pull request stack.",
+      inputSchema: {
+        repo: z.string().describe("Repository in owner/name format"),
+        stackNumber: z.number().int().describe("The stack number"),
+        pullRequests: z
+          .array(z.number().int())
+          .describe("Ordered list of pull request numbers to append to the stack"),
+      },
+    },
+    async ({ repo, stackNumber, pullRequests }) => {
+      try {
+        const stack = await issueClient.addToStack(repo, stackNumber, pullRequests);
+        options.onWrite?.();
+        return toolOk(stack);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "unstack",
+    {
+      title: "Unstack pull requests",
+      description:
+        "Remove unmerged pull requests from a pull request stack, dissolving the stack if none remain.",
+      inputSchema: {
+        repo: z.string().describe("Repository in owner/name format"),
+        stackNumber: z.number().int().describe("The stack number"),
+      },
+    },
+    async ({ repo, stackNumber }) => {
+      try {
+        const result = await issueClient.unstack(repo, stackNumber);
+        options.onWrite?.();
+        return toolOk(result ?? "Stack dissolved");
       } catch (err) {
         return toolError(err);
       }

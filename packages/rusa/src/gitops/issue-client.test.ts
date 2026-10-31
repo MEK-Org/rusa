@@ -53,7 +53,13 @@ function installFetch(routes: Record<string, MockResponse & { responses?: MockRe
         return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
       }
       const response = route.responses?.shift() ?? route;
-      return new Response(response.json !== undefined ? JSON.stringify(response.json) : "", {
+      const body =
+        response.status === 204 || response.status === 205 || response.status === 304
+          ? null
+          : response.json !== undefined
+            ? JSON.stringify(response.json)
+            : "";
+      return new Response(body, {
         status: response.status ?? 200,
       });
     })
@@ -1878,6 +1884,61 @@ describe("GitHubIssueClient", () => {
     });
   });
 
+  it("includes stack membership (stackNumber, position, total) when PR is stacked (#1212)", async () => {
+    installFetch({
+      [`GET /repos/${REPO}/pulls/5`]: {
+        json: {
+          number: 5,
+          title: "Stacked Title",
+          body: "Stacked Body",
+          html_url: "https://github.com/test-org/test-repo/pull/5",
+          head: { ref: "mc/stacked-2", sha: "stacked-head-sha" },
+          base: { ref: "mc/stacked-1" },
+          state: "open",
+          merged: false,
+        },
+      },
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: {
+                stack: {
+                  number: 42,
+                  entries: {
+                    totalCount: 3,
+                    nodes: [
+                      { position: 1, pullRequest: { number: 4, state: "MERGED" } },
+                      { position: 2, pullRequest: { number: 5, state: "OPEN" } },
+                      { position: 3, pullRequest: { number: 6, state: "OPEN" } },
+                    ],
+                  },
+                },
+                stackEntry: { position: 2 },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const details = await new GitHubIssueClient().getPullRequestDetails(REPO, 5);
+    expect(details).toEqual({
+      number: 5,
+      title: "Stacked Title",
+      body: "Stacked Body",
+      htmlUrl: "https://github.com/test-org/test-repo/pull/5",
+      headRef: "mc/stacked-2",
+      baseRef: "mc/stacked-1",
+      headSha: "stacked-head-sha",
+      state: "open",
+      merged: false,
+      stackNumber: 42,
+      position: 2,
+      total: 3,
+    });
+  });
+
   it("rolls up combined statuses and check-runs for the PR head sha", async () => {
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls/5`]: {
@@ -2755,5 +2816,108 @@ describe("GitHubIssueClient", () => {
     });
 
     await expect(new GitHubIssueClient().addSubIssue(REPO, 1, 2)).rejects.toThrow("GraphQL error");
+  });
+
+  describe("pull request stacks REST client (#1212)", () => {
+    it("createStack calls POST /repos/:repo/stacks with X-GitHub-Api-Version 2026-03-10", async () => {
+      const requests = installFetch({
+        [`POST /repos/${REPO}/stacks`]: {
+          status: 201,
+          json: {
+            id: 987,
+            number: 42,
+            pull_requests: [{ number: 10 }, { number: 11 }],
+          },
+        },
+      });
+
+      const client = new GitHubIssueClient();
+      const result = await client.createStack(REPO, [10, 11]);
+
+      expect(result).toEqual({
+        id: 987,
+        number: 42,
+        pull_requests: [{ number: 10 }, { number: 11 }],
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.headers["X-GitHub-Api-Version"]).toBe("2026-03-10");
+      expect(requests[0]?.body).toEqual({ pull_requests: [10, 11] });
+    });
+
+    it("addToStack calls POST /repos/:repo/stacks/:number/add with X-GitHub-Api-Version 2026-03-10", async () => {
+      const requests = installFetch({
+        [`POST /repos/${REPO}/stacks/42/add`]: {
+          status: 200,
+          json: {
+            id: 987,
+            number: 42,
+            pull_requests: [{ number: 10 }, { number: 11 }, { number: 12 }],
+          },
+        },
+      });
+
+      const client = new GitHubIssueClient();
+      const result = await client.addToStack(REPO, 42, [12]);
+
+      expect(result).toEqual({
+        id: 987,
+        number: 42,
+        pull_requests: [{ number: 10 }, { number: 11 }, { number: 12 }],
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.headers["X-GitHub-Api-Version"]).toBe("2026-03-10");
+      expect(requests[0]?.body).toEqual({ pull_requests: [12] });
+    });
+
+    it("unstack handles 204 stack dissolution returning undefined", async () => {
+      const requests = installFetch({
+        [`POST /repos/${REPO}/stacks/42/unstack`]: {
+          status: 204,
+        },
+      });
+
+      const client = new GitHubIssueClient();
+      const result = await client.unstack(REPO, 42);
+
+      expect(result).toBeUndefined();
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.headers["X-GitHub-Api-Version"]).toBe("2026-03-10");
+    });
+
+    it("unstack handles 200 partial unstack returning remaining stack object", async () => {
+      const requests = installFetch({
+        [`POST /repos/${REPO}/stacks/42/unstack`]: {
+          status: 200,
+          json: {
+            id: 987,
+            number: 42,
+            pull_requests: [{ number: 10 }],
+          },
+        },
+      });
+
+      const client = new GitHubIssueClient();
+      const result = await client.unstack(REPO, 42);
+
+      expect(result).toEqual({
+        id: 987,
+        number: 42,
+        pull_requests: [{ number: 10 }],
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.headers["X-GitHub-Api-Version"]).toBe("2026-03-10");
+    });
+
+    it("surfaces GitHub API errors on stack REST calls", async () => {
+      installFetch({
+        [`POST /repos/${REPO}/stacks`]: {
+          status: 422,
+          json: { message: "Validation Failed" },
+        },
+      });
+
+      const client = new GitHubIssueClient();
+      await expect(client.createStack(REPO, [1, 2])).rejects.toThrow("Validation Failed");
+    });
   });
 });
