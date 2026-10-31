@@ -309,7 +309,9 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     upstreamTools: Array<{ name: string }>
   ): void => {
     const upstreamNames = upstreamTools.map((t) => t.name).sort();
-    const upstreamKey = upstreamNames.join(",");
+    // JSON keeps names apart: upstream names need not follow the configured
+    // grammar, so a comma-joined key could make two listings collide.
+    const upstreamKey = JSON.stringify(upstreamNames);
     const key = serverConfigKey(configured);
     let record = warnedDriftsByServer.get(key);
     if (!record) {
@@ -345,8 +347,8 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
           }
         }
         if (
-          record.lastWarned.missing.join(",") === missing.join(",") &&
-          record.lastWarned.unclassified.join(",") === unclassified.join(",")
+          JSON.stringify(record.lastWarned.missing) === JSON.stringify(missing) &&
+          JSON.stringify(record.lastWarned.unclassified) === JSON.stringify(unclassified)
         ) {
           return;
         }

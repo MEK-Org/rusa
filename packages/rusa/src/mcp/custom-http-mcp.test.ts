@@ -745,6 +745,32 @@ describe("configured host MCP service", () => {
     );
   });
 
+  it("distinguishes upstream listings whose names would collide when comma-joined", async () => {
+    // Upstream names are not held to the configured-name grammar, so a comma
+    // inside one name must not make two different listings look identical.
+    let currentTools = (write: boolean) => (write ? ["a", "b,c"] : ["a"]);
+    upstreamToolsByScope = (write) => currentTools(write);
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    const writer = await connect("writer", { readTools: ["a"], writeTools: ["x"] }, {
+      warn,
+    } as unknown as Logger);
+    await writer.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenLastCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({ scope: "write", missing: ["x"], unclassified: ["b,c"] })
+    );
+
+    currentTools = (write: boolean) => (write ? ["a", "b", "c"] : ["a"]);
+    await writer.listTools();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({ scope: "write", missing: ["x"], unclassified: ["b", "c"] })
+    );
+  });
+
   it("logs nothing when configuration fully matches the upstream listing", async () => {
     upstreamToolsByScope = (write) => (write ? ["read_goal", "write_goal"] : ["read_goal"]);
     grants.set("writer", ["glass_goals:configured-user:write"]);
