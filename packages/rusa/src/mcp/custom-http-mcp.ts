@@ -48,6 +48,27 @@ export interface CustomHttpMcpOptions {
 class NotGrantedError extends Error {}
 class RequestTooLargeError extends Error {}
 
+interface DriftRecord {
+  upstreamKey: string;
+  scope: Access;
+}
+
+/**
+ * Deduplication state for classification drift warnings: memoized per server
+ * configuration, keyed on sorted upstream tool names.
+ */
+const warnedDriftsByServer = new Map<string, DriftRecord>();
+
+export function resetCustomMcpDriftWarningsForTest(): void {
+  warnedDriftsByServer.clear();
+}
+
+function serverConfigKey(configured: ConfiguredCustomMcpServer): string {
+  const read = [...configured.config.readTools].sort().join(",");
+  const write = [...configured.config.writeTools].sort().join(",");
+  return `${configured.capability}:${configured.config.socketPath}:${read}:${write}`;
+}
+
 /**
  * The access one grant confers on a configured server: `read` or `write` for
  * exactly `<capability>:<configured-user-id>:read|write`, otherwise nothing.
@@ -283,6 +304,43 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     if (error instanceof RequestTooLargeError) return "request too large";
     return refused(error) ? "refused" : "unavailable";
   };
+  const checkClassificationDrift = (
+    discoveryScope: Access,
+    upstreamTools: Array<{ name: string }>
+  ): void => {
+    const upstreamNames = upstreamTools.map((t) => t.name).sort();
+    const upstreamKey = upstreamNames.join(",");
+    const key = serverConfigKey(configured);
+    const previous = warnedDriftsByServer.get(key);
+
+    if (previous && previous.upstreamKey === upstreamKey) {
+      if (previous.scope === "write" || discoveryScope === "read") {
+        return;
+      }
+    }
+
+    const observedSet = new Set(upstreamNames);
+    const unclassified = upstreamNames.filter((name) => !classifications.has(name));
+
+    const toCheck =
+      discoveryScope === "write"
+        ? [...configured.config.readTools, ...configured.config.writeTools]
+        : [...configured.config.readTools];
+    const missing = Array.from(new Set(toCheck))
+      .filter((name) => !observedSet.has(name))
+      .sort();
+
+    if (unclassified.length > 0 || missing.length > 0) {
+      logger?.warn("custom_mcp_classification_drift", {
+        capability: configured.capability,
+        scope: discoveryScope,
+        missing,
+        unclassified,
+      });
+    }
+
+    warnedDriftsByServer.set(key, { upstreamKey, scope: discoveryScope });
+  };
   const proxy = new McpServer(
     { name: configured.capability, version: "0.1.0" },
     { capabilities: { tools: {} } }
@@ -298,13 +356,13 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       // Discovery carries the actor's effective scope, so the service lists
       // what that scope allows; rusa's own classification then decides what
       // this actor may see and call.
+      const discoveryScope: Access = access.has("write") ? "write" : "read";
       const result = ListToolsResultSchema.parse(
-        await withUpstream(
-          access.has("write") ? "write" : "read",
-          extra.signal,
-          (upstream, cancellation) => upstream.listTools(undefined, { signal: cancellation })
+        await withUpstream(discoveryScope, extra.signal, (upstream, cancellation) =>
+          upstream.listTools(undefined, { signal: cancellation })
         )
       );
+      checkClassificationDrift(discoveryScope, result.tools);
       const currentAccess = activeAccess(actorId, configured, activeCapabilities);
       return {
         tools: result.tools.filter((tool) => {
