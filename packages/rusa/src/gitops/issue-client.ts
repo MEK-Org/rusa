@@ -446,6 +446,12 @@ const ASYNC_MERGE_POLL_INTERVAL_MS = 1_000;
 const ASYNC_MERGE_MAX_POLLS = 60;
 const ASYNC_MERGE_TIMEOUT_SECONDS = (ASYNC_MERGE_MAX_POLLS * ASYNC_MERGE_POLL_INTERVAL_MS) / 1_000;
 
+/** One PullRequestStack entry as GraphQL returns it; position 1 sits on the base branch. */
+interface StackEntry {
+  position: number;
+  pullRequest: { number: number; state: string } | null;
+}
+
 interface AsyncMergeResponse {
   status: string;
   details?: {
@@ -929,7 +935,11 @@ export class GitHubIssueClient implements IssueClient {
     // inferring stack membership from a REST error message.
     const stack = await this.getPullRequestStack(opts.repo, opts.prNumber);
     if (stack !== null) {
-      this.requireLowerStackEntriesMerged(opts, stack.position, stack.entries);
+      this.requireLowerStackEntriesMerged(
+        opts,
+        stack.position,
+        this.requireCompleteStackEntries(opts, stack)
+      );
       const sha = await this.mergePullRequestAsync(opts);
       if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
       return sha;
@@ -964,7 +974,7 @@ export class GitHubIssueClient implements IssueClient {
     stackNumber: number;
     position: number;
     total: number;
-    entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>;
+    entries: Array<StackEntry | null>;
   } | null> {
     const [owner, name] = repo.split("/");
     if (!owner || !name) throw new Error(`Invalid repository name: ${repo}`);
@@ -976,10 +986,7 @@ export class GitHubIssueClient implements IssueClient {
             number: number;
             entries: {
               totalCount: number;
-              nodes: Array<{
-                position: number;
-                pullRequest: { number: number; state: string } | null;
-              } | null>;
+              nodes: Array<StackEntry | null>;
             };
           } | null;
           stackEntry?: { position: number } | null;
@@ -1011,29 +1018,36 @@ export class GitHubIssueClient implements IssueClient {
     if (!pr.stack || !pr.stackEntry) {
       throw new Error(`GitHub returned incomplete stack metadata for ${repo}#${prNumber}`);
     }
-    if (pr.stack.entries.totalCount !== pr.stack.entries.nodes.length) {
-      throw new Error(
-        `GitHub returned more than 100 stack entries for ${repo}#${prNumber}; refusing an incomplete stack validation.`
-      );
-    }
-    if (pr.stack.entries.nodes.some((entry) => entry === null)) {
-      throw new Error(`GitHub returned an incomplete stack entry for ${repo}#${prNumber}`);
-    }
     return {
       stackNumber: pr.stack.number,
       position: pr.stackEntry.position,
       total: pr.stack.entries.totalCount,
-      entries: pr.stack.entries.nodes as Array<{
-        position: number;
-        pullRequest: { number: number; state: string } | null;
-      }>,
+      entries: pr.stack.entries.nodes,
     };
+  }
+
+  // Membership reads only need number, position and totalCount; the merge
+  // guard alone must see every entry before it can vouch for lower positions.
+  private requireCompleteStackEntries(
+    opts: MergePullRequestOptions,
+    stack: { total: number; entries: Array<StackEntry | null> }
+  ): StackEntry[] {
+    const where = `${opts.repo}#${opts.prNumber}`;
+    if (stack.total !== stack.entries.length) {
+      throw new Error(
+        `GitHub returned more than 100 stack entries for ${where}; refusing an incomplete stack validation.`
+      );
+    }
+    if (stack.entries.some((entry) => entry === null)) {
+      throw new Error(`GitHub returned an incomplete stack entry for ${where}`);
+    }
+    return stack.entries as StackEntry[];
   }
 
   private requireLowerStackEntriesMerged(
     opts: MergePullRequestOptions,
     position: number,
-    entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>
+    entries: StackEntry[]
   ): void {
     // PullRequestStackEntry.position is documented as 1 closest to the base
     // branch, with larger positions stacked above it.

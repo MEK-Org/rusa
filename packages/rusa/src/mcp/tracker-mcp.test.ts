@@ -81,8 +81,8 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
         },
       ];
     },
-    getPullRequestDetails: async (repo, prNumber) => {
-      calls.push({ method: "getPullRequestDetails", args: [repo, prNumber] });
+    getPullRequestDetails: async (repo, prNumber, opts) => {
+      calls.push({ method: "getPullRequestDetails", args: [repo, prNumber, opts] });
       return {
         number: prNumber,
         title: "t",
@@ -92,6 +92,7 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
         baseRef: "staging",
         headSha: "head-sha",
         state: "open",
+        ...(opts?.includeStack ? { stackNumber: 42, position: 2, total: 3 } : {}),
       };
     },
     getPullRequestChecksStatus: async (repo, prNumber) => {
@@ -1110,14 +1111,24 @@ describe("tracker MCP server", () => {
     expect(onWrite).not.toHaveBeenCalled();
   });
 
-  it("returns read results as JSON content", async () => {
-    const { client: backend } = recordingIssueClient();
+  it("returns read results as JSON content, including stack membership", async () => {
+    const { client: backend, calls } = recordingIssueClient();
     const client = await connect(createTrackerMcpServer("test-actor-1", backend));
     const res = (await client.callTool({
       name: "get_pr_details",
       arguments: { repo: "o/r", prNumber: 5 },
     })) as CallToolResult;
-    expect(JSON.parse(textOf(res))).toMatchObject({ number: 5, state: "open" });
+    expect(JSON.parse(textOf(res))).toMatchObject({
+      number: 5,
+      state: "open",
+      stackNumber: 42,
+      position: 2,
+      total: 3,
+    });
+    expect(calls).toContainEqual({
+      method: "getPullRequestDetails",
+      args: ["o/r", 5, { includeStack: true }],
+    });
   });
 
   it("lists open PRs by author via the legacy backend path", async () => {

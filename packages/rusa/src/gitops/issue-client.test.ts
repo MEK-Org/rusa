@@ -1955,6 +1955,78 @@ describe("GitHubIssueClient", () => {
     expect(detailsDefault.total).toBeUndefined();
   });
 
+  it("reads stack membership without requiring every stack entry (#1212)", async () => {
+    installFetch({
+      [`GET /repos/${REPO}/pulls/5`]: {
+        json: {
+          number: 5,
+          title: "Tall stack",
+          body: "",
+          html_url: "https://github.com/test-org/test-repo/pull/5",
+          head: { ref: "mc/stacked-2", sha: "stacked-head-sha" },
+          base: { ref: "mc/stacked-1" },
+          state: "open",
+          merged: false,
+        },
+      },
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: {
+                stack: {
+                  number: 42,
+                  entries: {
+                    totalCount: 150,
+                    nodes: [null, { position: 2, pullRequest: { number: 5, state: "OPEN" } }],
+                  },
+                },
+                stackEntry: { position: 2 },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const details = await new GitHubIssueClient().getPullRequestDetails(REPO, 5, {
+      includeStack: true,
+    });
+    expect(details).toMatchObject({ stackNumber: 42, position: 2, total: 150 });
+  });
+
+  it("refuses a stack merge when GitHub returns an incomplete entry list (#1212)", async () => {
+    installFetch({
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: {
+                stack: {
+                  number: 42,
+                  entries: {
+                    totalCount: 150,
+                    nodes: [{ position: 1, pullRequest: { number: 4, state: "MERGED" } }],
+                  },
+                },
+                stackEntry: { position: 2 },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().mergePullRequest({
+        repo: REPO,
+        prNumber: 5,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).rejects.toThrow("refusing an incomplete stack validation");
+  });
+
   it("rolls up combined statuses and check-runs for the PR head sha", async () => {
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls/5`]: {
