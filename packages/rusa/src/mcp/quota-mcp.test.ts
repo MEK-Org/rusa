@@ -32,7 +32,7 @@ import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import { runSubprocess } from "../providers/subprocess-execution.js";
-import type { CodingProvider } from "../providers/types.js";
+import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
@@ -2821,6 +2821,13 @@ describe("quota MCP server", () => {
         expect(missed.every((m) => m.scrapeFailed)).toBe(true);
       });
 
+      const cancelledCapture = {
+        success: false,
+        output: "\n[Task terminated by SIGTERM (source unattributed)]",
+        exitCode: 143,
+        cancelled: true,
+      };
+
       it("keeps capture failure distinct from a clean read, an absent window, and an extraction failure", async () => {
         const cases: Array<{
           name: string;
@@ -2868,12 +2875,7 @@ describe("quota MCP server", () => {
           },
           {
             name: "cancelled capture",
-            run: {
-              success: false,
-              output: "\n[Task terminated by SIGTERM (source unattributed)]",
-              exitCode: 143,
-              cancelled: true,
-            },
+            run: cancelledCapture,
             llm: () => mockGenerateContent.mockResolvedValue(noPanel),
             parseError: "claude /usage capture failed",
             extracted: false,
@@ -2905,6 +2907,7 @@ describe("quota MCP server", () => {
             failed: row.parse_error !== null,
             capture: row.parse_error?.includes("claude /usage capture failed") ?? false,
             extracted: mockGenerateContent.mock.calls.length > 0,
+            runs: vi.mocked(mockClaudeProvider.run).mock.calls.length,
           });
         }
         expect(observed).toEqual(
@@ -2913,12 +2916,114 @@ describe("quota MCP server", () => {
             failed: c.parseError !== null,
             capture: c.parseError !== null,
             extracted: c.extracted,
+            // Only a cancelled capture is retried (#1195).
+            runs: c.run.cancelled ? 2 : 1,
           }))
         );
         expect(store.listScrapeOutcomesSince("claude", baselineAt).map((s) => s.outcome)).toEqual([
           "parsed",
           ...cases.map((c) => (c.parseError ? "failed" : "parsed")),
         ]);
+      });
+
+      // Two cancelled captures are the table's "cancelled capture" case above.
+      describe("retrying a cancelled capture once (#1195)", () => {
+        const panel = "Current week (all models): 39% used";
+        const retriedAt = "2026-09-30T16:30:31.000Z";
+        const scrapesSinceBaseline = () =>
+          store.db
+            .prepare(
+              `SELECT scraped_at, raw_output, parse_error FROM quota_scrapes
+               WHERE provider = 'claude' AND scraped_at > ? ORDER BY rowid`
+            )
+            .all(baselineAt) as Array<{
+            scraped_at: string;
+            raw_output: string;
+            parse_error: string | null;
+          }>;
+
+        // Each capture takes the clock forward to its own completion, so the
+        // scrape stamp shows which attempt it came from.
+        function serviceWithClock(runs: RunResult[], completions: string[]): QuotaService {
+          let now = Date.parse(probeAt);
+          mockClaudeProvider.run = vi.fn(async () => {
+            const i = vi.mocked(mockClaudeProvider.run).mock.calls.length - 1;
+            now = Date.parse(completions[i] ?? probeAt);
+            return runs[i] ?? cancelledCapture;
+          });
+          return new QuotaService({
+            config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
+            workersDir: root,
+            resolveProvider: mockResolveProvider,
+            scrapeStore: store,
+            now: () => now,
+            ttlMs: 0,
+          });
+        }
+
+        it("records the retry's panel and completion time as the one scrape", async () => {
+          mockGenerateContent.mockResolvedValue({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  {
+                    label: "Current week (all models)",
+                    kind: "weekly",
+                    placeholder: false,
+                    scope: "provider",
+                    usedPercent: "39",
+                    resetAtIso: "2026-10-05T02:59:00+00:00",
+                  },
+                ],
+              }),
+          });
+          const service = serviceWithClock(
+            [cancelledCapture, { success: true, output: panel, exitCode: 0 }],
+            ["2026-09-30T16:30:30.000Z", retriedAt]
+          );
+
+          const outcome = await service.getQuotaProbeOutcome("claude");
+
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
+          expect(outcome.readFailed).toBeFalsy();
+          expect(outcome.state?.status).toBe("available");
+          expect(scrapesSinceBaseline()).toEqual([
+            { scraped_at: retriedAt, raw_output: panel, parse_error: null },
+          ]);
+          expect(store.listScrapeOutcomesSince("claude", baselineAt)).toEqual([
+            { observedAt: baselineAt, outcome: "parsed" },
+            { observedAt: retriedAt, outcome: "parsed" },
+          ]);
+        });
+
+        it("records the first cancellation when the retry cannot run", async () => {
+          mockGenerateContent.mockResolvedValue(noPanel);
+          const service = serviceWithClock(
+            [cancelledCapture],
+            ["2026-09-30T16:30:30.000Z", retriedAt]
+          );
+          const run = vi.mocked(mockClaudeProvider.run);
+          const first = run.getMockImplementation();
+          run.mockImplementation(async (opts) => {
+            const result = await first?.(opts);
+            if (run.mock.calls.length > 1) throw new Error("sandbox setup failed");
+            return result as RunResult;
+          });
+
+          const outcome = await service.getQuotaProbeOutcome("claude");
+
+          expect(run).toHaveBeenCalledTimes(2);
+          expect(mockGenerateContent).not.toHaveBeenCalled();
+          expect(String(outcome.error)).toContain("claude /usage capture failed");
+          expect(scrapesSinceBaseline()).toEqual([
+            {
+              scraped_at: retriedAt,
+              raw_output: cancelledCapture.output,
+              parse_error: expect.stringContaining("claude /usage capture failed"),
+            },
+          ]);
+        });
       });
 
       it("publishes failed for a scrape whose stored parsed state cannot be decoded", () => {
