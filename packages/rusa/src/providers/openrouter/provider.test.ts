@@ -334,6 +334,8 @@ it.each([
         },
       },
     ]);
+    // Not pinClock: this test drives vi.advanceTimersByTimeAsync, so it needs
+    // fake setTimeout/clearTimeout alongside Date.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     let actor: Actor | undefined;
     let parentProgressAt: number | undefined;

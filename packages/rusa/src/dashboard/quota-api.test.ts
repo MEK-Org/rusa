@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { inferQuotaState, type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
+import { pinClock } from "../providers/test-support/pinned-clock.js";
 import type { CodingProvider } from "../providers/types.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
 import {
@@ -2143,11 +2144,9 @@ describe("dead-reckoned lane estimates (#759)", () => {
   });
 
   it("writes no estimate to the quota database", async () => {
-    // SharedQuotaStore prunes against Date.now() on every raw write; pin the
-    // clock to this fixture's timeline so retention cannot drop its first
-    // pacing point as the real date advances (#1184).
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(at("13:30"));
+    // Pin the clock to this fixture's timeline so it cannot age out as the
+    // real date advances (#1184, #1218).
+    const clock = pinClock(at("13:30"));
     const root = mkdtempSync(join(tmpdir(), "rusa-quota-estimate-"));
     const store = new SharedQuotaStore(join(root, "quota.db"));
     try {
@@ -2215,7 +2214,7 @@ describe("dead-reckoned lane estimates (#759)", () => {
     } finally {
       store.close();
       rmSync(root, { recursive: true, force: true });
-      vi.useRealTimers();
+      clock.restore();
     }
   });
 });

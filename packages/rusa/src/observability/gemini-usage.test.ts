@@ -37,6 +37,8 @@ function capture() {
     },
   });
   configureGeminiUsage(logger, "/synthetic/instance-a");
+  // Full fake timers, not pinClock: a retry test below drains backoff with
+  // vi.runAllTimersAsync, and capture() is shared by every test in the file.
   vi.useFakeTimers();
   vi.setSystemTime("2026-10-14T12:30:00Z");
   return { lines, logger };

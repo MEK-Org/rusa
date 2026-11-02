@@ -30,6 +30,7 @@
     "eval:quota": "pnpm --reporter=silent run build:maintenance --silent && node scripts/eval-quota-extraction.mjs",
     "replay:codex-observations": "pnpm --reporter=silent run build:maintenance --silent && node scripts/replay-codex-quota-observations.mjs",
     "test": "vitest run",
+    "test:shifted": "vitest run --config vitest.shifted.config.ts",
     "test:full": "pnpm run build:dashboard-ui && vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
