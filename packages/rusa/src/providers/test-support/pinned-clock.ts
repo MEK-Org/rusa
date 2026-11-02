@@ -36,19 +36,3 @@ export function pinClock(at: string | number | Date = new Date()): PinnedClock {
     restore: () => vi.useRealTimers(),
   };
 }
-
-/**
- * Run `run` with the clock pinned to `at`, restoring the real clock on
- * success and on throw.
- */
-export async function withPinnedClock<T>(
-  at: string | number | Date,
-  run: () => T | Promise<T>
-): Promise<T> {
-  const clock = pinClock(at);
-  try {
-    return await run();
-  } finally {
-    clock.restore();
-  }
-}

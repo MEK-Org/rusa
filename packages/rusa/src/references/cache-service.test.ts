@@ -4,7 +4,7 @@ import type {
   ReferenceCacheRow,
 } from "../db/repositories/reference-cache-repository.js";
 import type { IssueDetails } from "../gitops/issue-client.js";
-import { withPinnedClock } from "../providers/test-support/pinned-clock.js";
+import { pinClock } from "../providers/test-support/pinned-clock.js";
 import { ReferenceCacheService } from "./cache-service.js";
 
 /** A production-shaped `IssueDetails`, as `GitHubIssueClient.getIssue` really returns. */
@@ -716,11 +716,14 @@ describe("ReferenceCacheService", () => {
       expect((await svc.get(ref, deps)).cacheState).toBe("unavailable");
       expect(getMessage).toHaveBeenCalledTimes(1);
 
-      await withPinnedClock(Date.now() + 1001, async () => {
+      const clock = pinClock(Date.now() + 1001);
+      try {
         const res = await svc.get(ref, deps);
         expect(res.cacheState).toBe("fresh");
         expect(getMessage).toHaveBeenCalledTimes(2);
-      });
+      } finally {
+        clock.restore();
+      }
     });
 
     it("remembers no failure that was answered inside the deadline", async () => {

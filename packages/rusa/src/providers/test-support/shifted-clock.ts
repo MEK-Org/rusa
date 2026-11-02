@@ -14,12 +14,29 @@
  * this. 45 days clears the largest window (30 days).
  */
 
-import { vi } from "vitest";
+import { afterAll, beforeEach, vi } from "vitest";
 
 const SHIFT_MS = 45 * 24 * 60 * 60 * 1000;
 
-vi.useFakeTimers({
-  toFake: ["Date"],
-  now: Date.now() + SHIFT_MS,
-  shouldAdvanceTime: true,
+function installShiftedClock() {
+  vi.useRealTimers();
+  vi.useFakeTimers({
+    toFake: ["Date"],
+    now: Date.now() + SHIFT_MS,
+    shouldAdvanceTime: true,
+  });
+}
+
+// Install once at module load for any module-level evaluation or beforeAll.
+installShiftedClock();
+
+// Re-install before each test so a test running after an in-file
+// `pinClock().restore()` or `afterEach(() => vi.useRealTimers())` still
+// starts with the shifted clock (#1218 / PR #1219 review).
+beforeEach(() => {
+  installShiftedClock();
+});
+
+afterAll(() => {
+  vi.useRealTimers();
 });
