@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type PinnedClock, pinClock } from "../providers/test-support/pinned-clock.js";
 import {
   authorStampBodyForWebhookPayload,
   isSystemActor,
@@ -17,8 +18,10 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
   const actorId = "peppy-harbor-seal";
   const instanceId = "ember-familiar";
 
+  let clock: PinnedClock;
+
   beforeEach(() => {
-    vi.useFakeTimers();
+    clock = pinClock();
   });
 
   afterEach(() => {
@@ -69,12 +72,12 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
 
   it("should return status 'expired' on a stale timestamp (older than 15 minutes)", () => {
     const nowTime = 1717171717000;
-    vi.setSystemTime(new Date(nowTime));
+    clock.set(nowTime);
 
     const stamp = stampAuthor(actorId, repo, issueNumber);
 
     // Fast-forward time by 16 minutes (960,000 ms)
-    vi.setSystemTime(new Date(nowTime + 16 * 60 * 1000));
+    clock.set(nowTime + 16 * 60 * 1000);
 
     const res = verifyAuthorStamp(stamp, repo, issueNumber);
     expect(res.status).toBe("expired");
@@ -517,11 +520,10 @@ describe("resolveStampedAuthor ", () => {
     });
 
     it("classifies an expired same-instance stamp as 'expired', quietly and distinctly from 'unverifiable'", () => {
-      vi.useFakeTimers();
       const nowTime = 1717171717000;
-      vi.setSystemTime(new Date(nowTime));
+      const pinned = pinClock(nowTime);
       const stamp = stampAuthor(actorId, repo, number, localInstanceId);
-      vi.setSystemTime(new Date(nowTime + 16 * 60 * 1000));
+      pinned.set(nowTime + 16 * 60 * 1000);
 
       const body = `hi\n\n${stamp}`;
       const anomalies: StampAnomaly[] = [];
@@ -529,7 +531,7 @@ describe("resolveStampedAuthor ", () => {
 
       expect(anomalies).toHaveLength(1);
       expect(anomalies[0].detail).toBe("expired");
-      vi.useRealTimers();
+      pinned.restore();
     });
 
     it("classifies a same-instance HMAC mismatch as 'unverifiable', distinct from 'foreign_instance' and 'expired'", () => {

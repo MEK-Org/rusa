@@ -714,6 +714,7 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("prunes an expired subscription and creates a fresh one instead of renewing it", async () => {
+    // Full fake timers, not pinClock: this suite drives vi.advanceTimersByTimeAsync.
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
     const api = new FakeWeApi([
@@ -802,6 +803,7 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("alerts when an adopted subscription's own expireTime passes, not a TTL after boot", async () => {
+    // Full fake timers, not pinClock: this suite drives vi.advanceTimersByTimeAsync.
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
     const alerts: SystemChatSubscriptionLapseEvent[] = [];
@@ -830,6 +832,7 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("times the lapse from the kept subscription, not from a suspended leftover that expires later", async () => {
+    // Full fake timers, not pinClock: this suite drives vi.advanceTimersByTimeAsync.
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
     const alerts: SystemChatSubscriptionLapseEvent[] = [];
@@ -867,6 +870,7 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("times the lapse from the expired subscription when reactivating the leftover fails", async () => {
+    // Full fake timers, not pinClock: this suite drives vi.advanceTimersByTimeAsync.
     vi.useFakeTimers();
     // Restart at 12:40 onto nothing that delivers: the ACTIVE subscription
     // expired at 12:30 and the SUSPENDED leftover listed to 15:00 delivers
@@ -897,6 +901,7 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("restarts the lapse clock when reactivation succeeds, up to the unchanged expiry", async () => {
+    // Full fake timers, not pinClock: this suite drives vi.advanceTimersByTimeAsync.
     vi.useFakeTimers();
     // Same restart, but reactivation succeeds: the leftover delivers again from
     // 12:40, so no alert is due until its own 15:00 expiry passes with every
@@ -930,6 +935,7 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("extends the lapse horizon by an ACTIVE duplicate that could not be pruned", async () => {
+    // Full fake timers, not pinClock: this suite drives vi.advanceTimersByTimeAsync.
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
     const alerts: SystemChatSubscriptionLapseEvent[] = [];

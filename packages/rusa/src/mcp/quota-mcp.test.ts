@@ -32,6 +32,7 @@ import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import { runSubprocess } from "../providers/subprocess-execution.js";
+import { pinClock } from "../providers/test-support/pinned-clock.js";
 import type { CodingProvider } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import {
@@ -1235,8 +1236,7 @@ describe("quota MCP server", () => {
 
     it("resolves LLM-extracted ISO durations for relative reset dialects", async () => {
       const generatedAt = new Date("2026-07-12T10:00:00.000Z");
-      vi.useFakeTimers();
-      vi.setSystemTime(generatedAt);
+      const clock = pinClock(generatedAt);
       try {
         const cases = [
           {
@@ -1281,14 +1281,13 @@ describe("quota MCP server", () => {
           ]);
         }
       } finally {
-        vi.useRealTimers();
+        clock.restore();
       }
     });
 
     it("parses agy quota using provider-scoped top-level windows", async () => {
       const generatedAt = new Date("2026-07-12T10:00:00.000Z");
-      vi.useFakeTimers();
-      vi.setSystemTime(generatedAt);
+      const clock = pinClock(generatedAt);
       try {
         mockGenerateContent.mockResolvedValue({
           text: () =>
@@ -1328,7 +1327,7 @@ describe("quota MCP server", () => {
         expect(lastCallArgs.config.responseSchema.properties.groups).toBeUndefined();
         expect(lastCallArgs.config.responseSchema.properties.windows).toBeDefined();
       } finally {
-        vi.useRealTimers();
+        clock.restore();
       }
     });
 
@@ -1456,8 +1455,7 @@ describe("quota MCP server", () => {
 
     it("maps Kimi remaining percentages into used-percent limits using the LLM kind enum", async () => {
       const generatedAt = new Date("2026-07-12T10:00:00.000Z");
-      vi.useFakeTimers();
-      vi.setSystemTime(generatedAt);
+      const clock = pinClock(generatedAt);
       try {
         const fixture = readFileSync(
           join(__dirname, "fixtures", "kimi-usage-expected.txt"),
@@ -1503,7 +1501,7 @@ describe("quota MCP server", () => {
           },
         ]);
       } finally {
-        vi.useRealTimers();
+        clock.restore();
       }
     });
 
@@ -3240,9 +3238,8 @@ describe("quota MCP server", () => {
     });
 
     it("stamps scrapedAt once per probe and preserves it unchanged across a within-TTL cache hit ", async () => {
-      vi.useFakeTimers();
+      const clock = pinClock("2026-07-14T09:15:00.000Z");
       try {
-        vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
         const service = new QuotaService({
           config: mockConfig,
           workersDir: "/tmp/workers",
@@ -3255,18 +3252,18 @@ describe("quota MCP server", () => {
 
         // Still within the 30-minute TTL — cache hit, scrapedAt rides
         // through unchanged rather than reflecting this later read time.
-        vi.setSystemTime(new Date("2026-07-14T09:16:00.000Z"));
+        clock.set("2026-07-14T09:16:00.000Z");
         const second = await service.getQuota("claude");
         expect(second.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
         expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
 
         // Past the TTL — a fresh probe runs and stamps a new scrapedAt.
-        vi.setSystemTime(new Date("2026-07-14T09:46:00.000Z"));
+        clock.set("2026-07-14T09:46:00.000Z");
         const third = await service.getQuota("claude");
         expect(third.scrapedAt).toBe("2026-07-14T09:46:00.000Z");
         expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
       } finally {
-        vi.useRealTimers();
+        clock.restore();
       }
     });
 
@@ -3345,6 +3342,8 @@ describe("quota MCP server", () => {
       });
 
       it("serves a stale cached reading immediately and refreshes in the background", async () => {
+        // Not pinClock: this test drains the background probe with
+        // vi.runAllTimersAsync, so it needs fake timers as well as Date.
         vi.useFakeTimers();
         try {
           vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
@@ -3378,6 +3377,8 @@ describe("quota MCP server", () => {
       });
 
       it("preserves stale valid reading when a background refresh fails (status: unknown)", async () => {
+        // Not pinClock: this test drains the background probe with
+        // vi.runAllTimersAsync, so it needs fake timers as well as Date.
         vi.useFakeTimers();
         try {
           vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
@@ -3435,9 +3436,8 @@ describe("quota MCP server", () => {
       });
 
       it("serves a fresh cached reading without probing", async () => {
-        vi.useFakeTimers();
+        const clock = pinClock("2026-07-14T09:15:00.000Z");
         try {
-          vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
           const service = new QuotaService({
             config: mockConfig,
             workersDir: "/tmp/workers",
@@ -3448,12 +3448,12 @@ describe("quota MCP server", () => {
           expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
 
           // Still within the 30-minute TTL — no background probe.
-          vi.setSystemTime(new Date("2026-07-14T09:16:00.000Z"));
+          clock.set("2026-07-14T09:16:00.000Z");
           const fresh = service.getQuotaCached("claude");
           expect(fresh.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
           expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
         } finally {
-          vi.useRealTimers();
+          clock.restore();
         }
       });
 

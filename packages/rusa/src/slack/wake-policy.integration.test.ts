@@ -8,6 +8,7 @@ import {
 import { chatWakeModeFromConfig } from "../chat/wake-mode.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import { pinClock } from "../providers/test-support/pinned-clock.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { SlackClient } from "./slack-client.js";
@@ -475,7 +476,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
   });
 
   it("detects plain-text bot mentions only once the bot's identity is known", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    const clock = pinClock();
     const h = await harness({
       firstIdentify: async () => {
         throw Object.assign(new Error("invalid_auth"), { data: { error: "invalid_auth" } });
@@ -500,7 +501,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
     expect(h.identify).toHaveBeenCalledOnce();
 
     // After the cooldown this event starts the retry.
-    vi.setSystemTime(Date.now() + 30_000);
+    clock.set(Date.now() + 30_000);
     await h.send(mention("7002.000001"));
     expect(h.items("owner-group-dm")).toEqual([]);
 

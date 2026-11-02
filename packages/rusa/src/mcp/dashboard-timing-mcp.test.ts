@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import { pinClock } from "../providers/test-support/pinned-clock.js";
 import { createDashboardTimingMcpServer } from "./dashboard-timing-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -70,7 +71,7 @@ describe("dashboard timing MCP", () => {
     afterEach(() => vi.useRealTimers());
 
     const retentionLimited = async (hours: number, readLagMs: number) => {
-      vi.useFakeTimers({ now: new Date("2026-10-10T12:00:00.000Z"), toFake: ["Date"] });
+      pinClock("2026-10-10T12:00:00.000Z");
       const db = new Database(":memory:");
       runMigrations(db);
       // The recorder reads its clock a moment after the tool computes `since`.

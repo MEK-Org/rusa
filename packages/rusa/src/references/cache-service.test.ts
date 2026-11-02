@@ -4,6 +4,7 @@ import type {
   ReferenceCacheRow,
 } from "../db/repositories/reference-cache-repository.js";
 import type { IssueDetails } from "../gitops/issue-client.js";
+import { withPinnedClock } from "../providers/test-support/pinned-clock.js";
 import { ReferenceCacheService } from "./cache-service.js";
 
 /** A production-shaped `IssueDetails`, as `GitHubIssueClient.getIssue` really returns. */
@@ -715,15 +716,11 @@ describe("ReferenceCacheService", () => {
       expect((await svc.get(ref, deps)).cacheState).toBe("unavailable");
       expect(getMessage).toHaveBeenCalledTimes(1);
 
-      vi.useFakeTimers({ toFake: ["Date"] });
-      try {
-        vi.setSystemTime(Date.now() + 1001);
+      await withPinnedClock(Date.now() + 1001, async () => {
         const res = await svc.get(ref, deps);
         expect(res.cacheState).toBe("fresh");
         expect(getMessage).toHaveBeenCalledTimes(2);
-      } finally {
-        vi.useRealTimers();
-      }
+      });
     });
 
     it("remembers no failure that was answered inside the deadline", async () => {
@@ -751,6 +748,8 @@ describe("ReferenceCacheService", () => {
         const getIssue = vi.fn(() => new Promise<IssueDetails>(() => {}));
         const deps = { issueClient: { getIssue } };
         const svc = new ReferenceCacheService({ repo, deadlineMs: 60_000 });
+        // Not pinClock: this test also drives vi.advanceTimersByTimeAsync, so
+        // it fakes setTimeout alongside Date.
         vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
         try {
           const budget = svc.startBudget();
