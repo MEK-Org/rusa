@@ -196,7 +196,7 @@ void main() {
       expect(assistant.onEnd, isNull);
     });
 
-    testWidgets('leaving the screen during the root lookup starts nothing', (
+    testWidgets('leaving the screen during the root lookup cancels capture', (
       tester,
     ) async {
       final gate = Completer<ThreadsSnapshot>();
@@ -221,7 +221,10 @@ void main() {
 
       expect(ended, isTrue);
       expect(walkie.streams, isEmpty);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(walkie.recorder.stopCalls, 0);
+      expect(api.memoSends, isEmpty);
       await unmount(tester);
     });
 
@@ -233,13 +236,14 @@ void main() {
 
       expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
       expect(find.text('No active root actor'), findsOneWidget);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
 
       api.threadsResult = [makeThread('root')];
       await tester.tap(find.text('Retry'));
       await tester.pump();
       await tester.pump();
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.startCalls, 2);
       await unmount(tester);
     });
 
@@ -255,7 +259,8 @@ void main() {
       await pumpPage(tester);
 
       expect(find.text('No active root actor'), findsOneWidget);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
       expect(walkie.streams, isEmpty);
       assistant.triggerCtrl.add(null);
       await tester.pump();
@@ -274,7 +279,8 @@ void main() {
       expect(find.text("Couldn't reach Rusa"), findsOneWidget);
       expect(find.textContaining('dash.example'), findsNothing);
       expect(find.textContaining('internal detail'), findsNothing);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
       await unmount(tester);
     });
 
@@ -287,11 +293,12 @@ void main() {
       await pumpPage(tester);
 
       expect(find.text('Voice is not configured on this instance'), findsOne);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
       await unmount(tester);
     });
 
-    testWidgets('closing during the root lookup starts nothing', (
+    testWidgets('closing during the root lookup cancels capture', (
       tester,
     ) async {
       final gate = Completer<ThreadsSnapshot>();
@@ -311,10 +318,11 @@ void main() {
 
       expect(walkie.streams, isEmpty);
       expect(walkie.wakeLock.acquireCalls, 0);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
     });
 
-    testWidgets('closing during a Retry start starts nothing', (tester) async {
+    testWidgets('closing during a Retry start cancels capture', (tester) async {
       api.threadsResult = [makeThread('child', parent: 'gone')];
       await pumpPage(tester);
       expect(find.text('No active root actor'), findsOneWidget);
@@ -337,7 +345,8 @@ void main() {
       await tester.pump();
 
       expect(walkie.streams, isEmpty);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 2);
+      expect(walkie.recorder.cancelCalls, 2);
     });
 
     testWidgets('a superseded Retry leaves the current start\'s walkie off', (
@@ -364,7 +373,7 @@ void main() {
       second.complete(snapshot());
       await tester.pump();
       await tester.pump();
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.startCalls, 3);
       first.complete(snapshot());
       await tester.pump();
       await tester.pump();
@@ -373,7 +382,7 @@ void main() {
       await tester.pump();
       await tester.pump();
       expect(closed, 1);
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.startCalls, 3);
       await unmount(tester);
     });
 
@@ -414,7 +423,7 @@ void main() {
       await unmount(tester);
     });
 
-    testWidgets('closing while voice starts releases it unrecorded', (
+    testWidgets('closing while voice starts cancels capture', (
       tester,
     ) async {
       final probe = Completer<List<VoiceAnnouncement>>();
@@ -428,7 +437,8 @@ void main() {
 
       expect(walkie.streams, isEmpty);
       expect(walkie.wakeLock.acquireCalls, 0);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
     });
 
     testWidgets('plays only replies to this assist session', (tester) async {
@@ -464,6 +474,52 @@ void main() {
 
       expect(find.text('Voice is not available on this device'), findsOne);
       expect(api.threadsCallCount, 0);
+      await unmount(tester);
+    });
+
+    testWidgets(
+      'plays ready cue only once capture is live, and only on assist entry',
+      (tester) async {
+        final micGate = Completer<void>();
+        walkie.recorder.startGates.add(micGate);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              onClose: () {},
+            ),
+          ),
+        );
+        await tester.pump();
+
+        // While mic is still acquiring, no ready cue has fired yet
+        expect(walkie.recorder.startCalls, 1);
+        expect(assistant.readyCueCalls, 0);
+
+        // Mic finishes acquiring -> capture is now live
+        micGate.complete();
+        await tester.pump();
+        await tester.pump();
+
+        // Ready cue fires after capture is live
+        expect(assistant.readyCueCalls, 1);
+        expect(walkie.recorder.startCalls, 1);
+
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('does not play ready cue if mic acquisition fails', (
+      tester,
+    ) async {
+      walkie.recorder.startError = StateError('mic permission denied');
+      await pumpPage(tester);
+
+      expect(assistant.readyCueCalls, 0);
+      expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
       await unmount(tester);
     });
   });

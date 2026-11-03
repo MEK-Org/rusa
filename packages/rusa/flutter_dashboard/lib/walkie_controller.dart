@@ -568,6 +568,32 @@ class WalkieController {
     });
   }
 
+  /// Adopts an active recording that was already started on the shared recorder
+  /// (e.g. immediate capture on assist entry).
+  void adoptRecording({required DateTime startedAt}) {
+    if (_disposed) return;
+    _deliveredReset?.cancel();
+    _stopRecordTimers();
+    _recordGeneration++;
+    _recordStartedAt = startedAt;
+    _record.add(
+      RecordStatus(
+        phase: RecordPhase.recording,
+        elapsed: DateTime.now().difference(startedAt),
+      ),
+    );
+    _recordTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      final started = _recordStartedAt;
+      if (started == null) return;
+      _record.add(
+        RecordStatus(
+          phase: RecordPhase.recording,
+          elapsed: DateTime.now().difference(started),
+        ),
+      );
+    });
+  }
+
   Future<void> _stopAndSend() async {
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));

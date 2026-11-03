@@ -1560,6 +1560,7 @@ class FakeVoiceRecorder implements VoiceRecorder {
   int startCalls = 0;
   int stopCalls = 0;
   int cancelCalls = 0;
+  final List<String> recorderEvents = [];
   Object? startError;
   Completer<void>? startCompleter;
 
@@ -1580,6 +1581,7 @@ class FakeVoiceRecorder implements VoiceRecorder {
   @override
   Future<void> start() async {
     startCalls++;
+    recorderEvents.add('start');
     final generation = _generation;
     final err = startError;
     if (err != null) throw err;
@@ -1599,6 +1601,7 @@ class FakeVoiceRecorder implements VoiceRecorder {
   @override
   Future<RecordedAudio> stop() async {
     stopCalls++;
+    recorderEvents.add('stop');
     _generation++;
     return result;
   }
@@ -1606,6 +1609,7 @@ class FakeVoiceRecorder implements VoiceRecorder {
   @override
   Future<void> cancel() async {
     cancelCalls++;
+    recorderEvents.add('cancel');
     _generation++;
   }
 }
@@ -1760,6 +1764,8 @@ class FakeAssistant implements AssistantPlatform {
 
   AssistantRoleStatus? roleStatus;
   int settingsOpened = 0;
+  int readyCueCalls = 0;
+  final List<String> signalEvents = [];
   final triggerCtrl = StreamController<void>.broadcast();
   final routeLostCtrl = StreamController<void>.broadcast();
 
@@ -1767,6 +1773,12 @@ class FakeAssistant implements AssistantPlatform {
   Stream<void> get triggers => triggerCtrl.stream;
   @override
   Stream<void> get routeLost => routeLostCtrl.stream;
+
+  @override
+  Future<void> playReadyCue() async {
+    readyCueCalls++;
+    signalEvents.add('readyCue');
+  }
   @override
   Future<void> Function()? onEnd;
 
