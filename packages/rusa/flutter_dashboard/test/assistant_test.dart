@@ -413,6 +413,72 @@ void main() {
       },
     );
 
+    testWidgets(
+      'multiple triggers while voice starts keep stop buffered and do not toggle',
+      (tester) async {
+        final probe = Completer<List<VoiceAnnouncement>>();
+        final backlog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([probe, backlog]);
+        await pumpPage(tester);
+        probe.complete(const []);
+        await tester.pump();
+
+        // Trigger twice while voice network setup is still in flight:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+
+        // Network finishes and adoptRecording runs:
+        backlog.complete(const []);
+        await tester.pump();
+        await tester.pump();
+
+        // It should stop and send (not toggled back to recording):
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.stopCalls, 1);
+        expect(api.memoSends, hasLength(1));
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'stop trigger while lookup is in flight does not carry over to Retry after failure',
+      (tester) async {
+        final gate = Completer<ThreadsSnapshot>();
+        api.threadSnapshotGates.add(gate);
+        await pumpPage(tester);
+        expect(walkie.recorder.startCalls, 1);
+
+        // Stop triggered while lookup is in flight:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+
+        // Lookup fails:
+        gate.completeError(Exception('network dropped'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
+        expect(walkie.recorder.cancelCalls, 1);
+
+        // Pressing trigger while error screen is showing is ignored:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+
+        // User taps Retry:
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
+        await tester.pump();
+
+        // Fresh capture started; not immediately stopped/sent:
+        expect(walkie.recorder.startCalls, 2);
+        expect(walkie.recorder.stopCalls, 0);
+        expect(api.memoSends, isEmpty);
+        await unmount(tester);
+      },
+    );
+
     testWidgets('a trigger after walkie off starts nothing', (tester) async {
       await pumpPage(tester);
       await tester.tap(find.byKey(const ValueKey('walkie-off')));

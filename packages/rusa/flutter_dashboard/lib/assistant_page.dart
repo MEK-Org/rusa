@@ -78,6 +78,8 @@ class _AssistantPageState extends State<AssistantPage> {
       throw StateError('Voice is not available on this device');
     }
 
+    _pendingStop = false;
+
     // Capture starts immediately on assist entry (#1223): local microphone
     // recording begins at once without waiting on network readiness, with the
     // session and root actor resolution catching up in parallel.
@@ -120,12 +122,14 @@ class _AssistantPageState extends State<AssistantPage> {
     try {
       snapshot = await _api.fetchThreads();
     } catch (e) {
+      _cancelCurrentCapture = null;
       await cancelCapture();
       rethrow;
     }
 
     // Only the current start may drop the previous walkie-off listener.
     if (stale()) {
+      _cancelCurrentCapture = null;
       await cancelCapture();
       throw StateError('Assist screen closed');
     }
@@ -133,12 +137,14 @@ class _AssistantPageState extends State<AssistantPage> {
     _enabledSub = null;
     await previousEnabled?.cancel();
     if (stale()) {
+      _cancelCurrentCapture = null;
       await cancelCapture();
       throw StateError('Assist screen closed');
     }
 
     final root = resolveRootActorId(snapshot);
     if (root == null) {
+      _cancelCurrentCapture = null;
       await cancelCapture();
       throw StateError('No active root actor');
     }
@@ -151,6 +157,7 @@ class _AssistantPageState extends State<AssistantPage> {
     );
     _controller = controller;
     Future<Never> discard([String reason = 'Assist screen closed']) async {
+      _cancelCurrentCapture = null;
       if (_controller == controller) _controller = null;
       await controller.dispose();
       await cancelCapture();
@@ -167,7 +174,9 @@ class _AssistantPageState extends State<AssistantPage> {
 
     await captureFuture;
     if (captureError != null) {
+      _cancelCurrentCapture = null;
       if (stale()) return discard();
+      if (_controller == controller) _controller = null;
       await controller.dispose();
       if (captureError is StateError) throw captureError!;
       throw StateError('Mic unavailable: $captureError');
@@ -201,7 +210,7 @@ class _AssistantPageState extends State<AssistantPage> {
     // If the user triggers stop/send before network resolution completes,
     // buffer the stop request so adoption immediately stops and uploads.
     if (_cancelCurrentCapture != null) {
-      _pendingStop = !_pendingStop;
+      _pendingStop = true;
     }
   }
 
