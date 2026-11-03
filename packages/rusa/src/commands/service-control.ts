@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { dashboardBaseUrl } from "./chat.js";
 import { resolveServiceInstance, type ServiceEnvironment } from "./service-instance.js";
 
 function hasCommand(command: string): boolean {
@@ -59,4 +60,46 @@ export async function runServiceStop(opts?: { environment?: ServiceEnvironment }
   });
 
   console.log(`✓ ${instance.serviceUnit} stopped`);
+}
+
+export async function runServiceShutdown(opts?: {
+  environment?: ServiceEnvironment;
+  timeout?: number;
+  behavior?: "cancel" | "terminate";
+  reason?: string;
+  cancel?: boolean;
+  url?: string;
+}): Promise<void> {
+  const instance = resolveServiceInstance(opts?.environment ?? "production");
+  const baseUrl = opts?.url ?? dashboardBaseUrl({ home: instance.mcHome });
+  const endpoint = opts?.cancel
+    ? `${baseUrl}/api/mesh/shutdown/cancel`
+    : `${baseUrl}/api/mesh/shutdown`;
+  const body = opts?.cancel
+    ? JSON.stringify({ reason: opts?.reason })
+    : JSON.stringify({
+        timeoutSeconds: opts?.timeout,
+        timeoutBehavior: opts?.behavior,
+        reason: opts?.reason,
+      });
+
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    const data = (await res.json()) as { ok?: boolean; message?: string; error?: string };
+    if (!res.ok || !data.ok) {
+      console.error(`Failed to request shutdown: ${data.error ?? res.statusText}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(data.message);
+  } catch (err) {
+    console.error(
+      `Failed to connect to Rusa service at ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`
+    );
+    process.exitCode = 1;
+  }
 }

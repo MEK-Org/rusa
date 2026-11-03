@@ -1,4 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import {
+  MaintenanceShutdownCoordinator,
+  type MaintenanceShutdownOptions,
+  type MaintenanceShutdownOutcome,
+} from "../update/maintenance-shutdown.js";
 import {
   executeUpdate,
   shortSha,
@@ -20,12 +26,20 @@ export interface UpdateToolDeps {
    * server ({@link UPDATE_MCP_NAME}); no actor id or topology stands in for it.
    */
   hasCapability: (actorId: string, capability: string) => boolean;
+  /** Optional shared maintenance shutdown coordinator. */
+  maintenanceShutdown?: MaintenanceShutdownCoordinator;
 }
 
 export interface UpdateToolOutcome {
   ok: boolean;
   message: string;
   result?: UpdateResult;
+}
+
+export interface ShutdownToolOutcome {
+  ok: boolean;
+  message: string;
+  completion?: Promise<MaintenanceShutdownOutcome>;
 }
 
 /**
@@ -68,8 +82,78 @@ export async function runUpdateTool(
   };
 }
 
+function resolveMaintenanceShutdown(toolDeps: UpdateToolDeps): MaintenanceShutdownCoordinator {
+  if (!toolDeps.maintenanceShutdown) {
+    toolDeps.maintenanceShutdown = new MaintenanceShutdownCoordinator({
+      drain: toolDeps.deps.drain,
+      notify: toolDeps.deps.notify,
+      recordAction: toolDeps.deps.recordAction,
+      exit: toolDeps.deps.exit,
+      log: toolDeps.deps.log,
+    });
+  }
+  return toolDeps.maintenanceShutdown;
+}
+
 /**
- * In-process MCP server exposing the self-update as a single `update` tool.
+ * Standalone graceful drain and shutdown maintenance request without pulling or
+ * building code (#1225).
+ *
+ * Grant-gated identically to `update`: only holders of the `update` capability
+ * may trigger maintenance shutdown.
+ */
+export async function runShutdownTool(
+  toolDeps: UpdateToolDeps,
+  selfId: string,
+  opts?: MaintenanceShutdownOptions
+): Promise<ShutdownToolOutcome> {
+  if (!toolDeps.hasCapability(selfId, UPDATE_MCP_NAME)) {
+    return {
+      ok: false,
+      message: `'shutdown' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
+    };
+  }
+  const coordinator = resolveMaintenanceShutdown(toolDeps);
+  const outcome = await coordinator.request({
+    ...opts,
+    selfId,
+  });
+  return {
+    ok: outcome.ok,
+    message: outcome.message,
+    completion: outcome.completion,
+  };
+}
+
+/**
+ * Cancel a pending graceful shutdown request, lifting the admission brake and
+ * resuming normal execution.
+ */
+export function runCancelShutdownTool(
+  toolDeps: UpdateToolDeps,
+  selfId: string,
+  reason?: string
+): ShutdownToolOutcome {
+  if (!toolDeps.hasCapability(selfId, UPDATE_MCP_NAME)) {
+    return {
+      ok: false,
+      message: `'cancel_shutdown' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
+    };
+  }
+  const coordinator = resolveMaintenanceShutdown(toolDeps);
+  const outcome = coordinator.cancel(reason);
+  return {
+    ok: outcome.ok,
+    message: outcome.message,
+  };
+}
+
+/**
+ * In-process MCP server exposing host maintenance operations:
+ * - `update`: pull, build, drain, and restart (existing)
+ * - `shutdown`: graceful drain and shutdown for maintenance without pulling/rebuilding (#1225)
+ * - `cancel_shutdown`: cancel a pending graceful shutdown request (#1225)
+ *
  * **One instance per granted actor**, with `selfId` baked into the endpoint
  * (like every mesh endpoint), so "who is acting" is unspoofable.
  */
@@ -86,6 +170,77 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     async () => {
       try {
         const outcome = await runUpdateTool(toolDeps, selfId);
+        return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "shutdown",
+    {
+      title: "Graceful drain and shutdown",
+      description:
+        "Gracefully quiesce and shut down the mesh for maintenance (e.g. config-only restart). Stops admitting new runs, emits a notification to the configured error chat, allows active in-flight runs to finish, and shuts down the process once drained. Does not pull git or rebuild code. Preserves operator HALT state. Requires the 'update' capability.",
+      inputSchema: {
+        timeout_seconds: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Maximum seconds to wait for active runs to finish before applying timeout_behavior (default: 60)"
+          ),
+        timeout_behavior: z
+          .enum(["cancel", "terminate"])
+          .optional()
+          .describe(
+            "What to do if active runs do not finish within timeout: 'cancel' aborts shutdown and resumes normal operation; 'terminate' proceeds with shutdown (default: 'cancel')"
+          ),
+        reason: z
+          .string()
+          .optional()
+          .describe(
+            "Maintenance reason for the shutdown, included in error-chat notification and audit logs"
+          ),
+      },
+    },
+    async (args) => {
+      try {
+        const timeoutSeconds =
+          typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined;
+        const timeoutBehavior = args.timeout_behavior === "terminate" ? "terminate" : "cancel";
+        const reason = typeof args.reason === "string" ? args.reason : undefined;
+        const outcome = await runShutdownTool(toolDeps, selfId, {
+          timeoutSeconds,
+          timeoutBehavior,
+          reason,
+        });
+        return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "cancel_shutdown",
+    {
+      title: "Cancel pending graceful shutdown",
+      description:
+        "Cancel a pending graceful shutdown request, lifting the admission brake and resuming normal execution. Requires the 'update' capability.",
+      inputSchema: {
+        reason: z
+          .string()
+          .optional()
+          .describe("Reason for cancellation, included in error-chat notification and audit logs"),
+      },
+    },
+    async (args) => {
+      try {
+        const reason = typeof args.reason === "string" ? args.reason : undefined;
+        const outcome = runCancelShutdownTool(toolDeps, selfId, reason);
         return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
       } catch (err) {
         return toolError(err);

@@ -70,16 +70,40 @@ export class MeshDrainer implements DrainSeam {
   }
 
   /** Count of actors OTHER than self currently executing a run. */
-  private othersRunning(): number {
+  othersRunning(): number {
     const ids = this.runningThreadIds(); // a fresh snapshot Set each call
-    ids.delete(this.selfId);
+    if (this.selfId) {
+      ids.delete(this.selfId);
+    }
     return ids.size;
+  }
+
+  /** Count of ALL actors currently executing a run. */
+  activeCount(): number {
+    return this.runningThreadIds().size;
+  }
+
+  /** True once graceful shutdown has been engaged and not cancelled. */
+  isShuttingDown(): boolean {
+    return this.graceful.isShuttingDown();
   }
 
   waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }> {
     return waitForQuiescence(() => this.othersRunning() === 0, {
       timeoutMs,
       intervalMs: this.intervalMs,
+    });
+  }
+
+  waitForAllQuiescence(
+    timeoutMs: number,
+    opts?: { intervalMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number }
+  ): Promise<{ quiesced: boolean; waitedMs: number }> {
+    return waitForQuiescence(() => this.activeCount() === 0, {
+      timeoutMs,
+      intervalMs: opts?.intervalMs ?? this.intervalMs,
+      sleep: opts?.sleep,
+      now: opts?.now,
     });
   }
 }

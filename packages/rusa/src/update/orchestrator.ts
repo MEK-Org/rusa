@@ -174,6 +174,16 @@ export interface DrainSeam {
    * `timeoutMs`. Always resolves by the deadline.
    */
   waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }>;
+  /**
+   * Wait until ALL actors have completed executing runs (including self if running),
+   * or until `timeoutMs`. Always resolves by the deadline.
+   */
+  waitForAllQuiescence?(
+    timeoutMs: number,
+    opts?: { intervalMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number }
+  ): Promise<{ quiesced: boolean; waitedMs: number }>;
+  activeCount?(): number;
+  isShuttingDown?(): boolean;
 }
 
 /** Outbound failure notice sink (best-effort; never sinks the result). */

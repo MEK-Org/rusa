@@ -398,6 +398,7 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
+import { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
 import {
   BuildRunner,
   GitRunner,
@@ -789,6 +790,8 @@ export interface RunStartE2EHandles {
    * host-maintenance wiring, not through the runner handles.
    */
   updateToolDepsFor?: (selfId: string) => UpdateToolDeps;
+  /** Standalone graceful shutdown coordinator (#1225). */
+  maintenanceShutdown?: MaintenanceShutdownCoordinator;
 }
 
 /**
@@ -2761,6 +2764,7 @@ async function composeStart(
   );
   let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
+  let maintenanceShutdown: MaintenanceShutdownCoordinator | undefined;
   try {
     const repoRoot = resolveRepoRoot();
     const packageDir = join(repoRoot, "packages", "rusa");
@@ -2770,9 +2774,40 @@ async function composeStart(
     } else if (!sendErrorSink) {
       console.warn("[update] error sink writer unavailable — lifecycle pings disabled");
     }
+    const maintenanceDrainer = new MeshDrainer(
+      gracefulShutdown,
+      () => mesh.activeRunThreadIds(),
+      ""
+    );
+    maintenanceShutdown = new MaintenanceShutdownCoordinator({
+      drain: maintenanceDrainer,
+      notify: sendErrorSink ? { notify: sendErrorSink } : undefined,
+      recordAction: (text: string) => {
+        try {
+          mkdirSync(join(mcHome, "audit"), { recursive: true });
+          appendFileSync(
+            join(mcHome, "audit", "shutdown.log"),
+            `[${new Date().toISOString()}] ${text}\n`,
+            "utf8"
+          );
+        } catch {}
+      },
+      exit: (code) => {
+        shutdown(null, code).catch((err) =>
+          log.error("shutdown_not_committed", {
+            err,
+            reason: "maintenance",
+            action: "maintenance shutdown aborted before commit; the service is still running",
+          })
+        );
+      },
+      log: (m) => log.info("maintenance_shutdown", { detail: m }),
+    });
+
     updateToolDepsFor = (selfId) => ({
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
       hasCapability: (actorId, capability) => mesh.hasActiveCapability(actorId, capability),
+      maintenanceShutdown,
       deps: {
         git: new GitRunner(repoRoot),
         build: new BuildRunner(
@@ -4848,6 +4883,7 @@ async function composeStart(
           },
           rootControl,
           operatorActors: new OperatorActorControl(mesh, capabilityGrants, rootId),
+          maintenanceShutdown,
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the
@@ -5723,6 +5759,7 @@ async function composeStart(
     emitSystemDiskCheck: () => diskAlert?.check() ?? Promise.resolve(),
     shutdown,
     updateToolDepsFor,
+    maintenanceShutdown,
   });
 
   // Keep the process alive until a signal triggers shutdown().

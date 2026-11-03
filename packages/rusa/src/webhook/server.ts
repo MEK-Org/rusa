@@ -166,6 +166,8 @@ export interface DashboardMeshRefs {
   rootControl?: RootControlService;
   /** The authenticated operator's actor-forest boundary (#1003). */
   operatorActors?: OperatorActorControl;
+  /** Standalone graceful shutdown coordinator (#1225). */
+  maintenanceShutdown?: DashboardDataDeps["maintenanceShutdown"];
   /** Read-only emergency-brake state (HALT sentinel) → top-level `halted` flag. */
   isHalted?: () => boolean;
   /** Same sentinel's structured scope/expiry → top-level `halt`; see `DashboardDataDeps`. */
@@ -683,6 +685,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,
           operatorActors: options.mesh.operatorActors,
+          maintenanceShutdown: options.mesh.maintenanceShutdown,
           isHalted: options.mesh.isHalted,
           haltSnapshot: options.mesh.haltSnapshot,
           haltBrake: options.mesh.haltBrake,

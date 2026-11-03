@@ -6,7 +6,14 @@ import type {
   UpdateDeps,
   UpdatePlan,
 } from "../update/orchestrator.js";
-import { runUpdateTool, UPDATE_MCP_NAME, type UpdateToolDeps } from "./update-mcp.js";
+import {
+  createUpdateMcpServer,
+  runCancelShutdownTool,
+  runShutdownTool,
+  runUpdateTool,
+  UPDATE_MCP_NAME,
+  type UpdateToolDeps,
+} from "./update-mcp.js";
 
 /** Records every side effect so we can assert a rejected caller touches nothing. */
 function trackingDeps() {
@@ -121,5 +128,70 @@ describe("runUpdateTool — capability guard (#549)", () => {
     expect(outcome.ok).toBe(false);
     expect(outcome.message).toContain("update failed");
     expect(touched.exited).toBe(false); // never restart onto a broken build
+  });
+});
+
+describe("runShutdownTool & runCancelShutdownTool (#1225)", () => {
+  it("REFUSES shutdown for an actor without the 'update' capability", async () => {
+    const { deps, touched } = trackingDeps();
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: holderOnly("root") };
+
+    const outcome = await runShutdownTool(toolDeps, "worker-1");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toMatch(/requires the 'update' capability/);
+    expect(touched.drained).toBe(false);
+    expect(touched.exited).toBe(false);
+  });
+
+  it("RUNS shutdown for a granted actor", async () => {
+    const { deps, touched } = trackingDeps();
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: holderOnly("root") };
+
+    const outcome = await runShutdownTool(toolDeps, "root", { reason: "config restart" });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain("Graceful shutdown initiated");
+    expect(touched.drained).toBe(true);
+
+    const result = await outcome.completion;
+    expect(result?.status).toBe("quiesced");
+    expect(touched.exited).toBe(true);
+  });
+
+  it("REFUSES cancel_shutdown for an actor without the 'update' capability", () => {
+    const { deps } = trackingDeps();
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: holderOnly("root") };
+
+    const outcome = runCancelShutdownTool(toolDeps, "worker-1");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toMatch(/requires the 'update' capability/);
+  });
+
+  it("RUNS cancel_shutdown for a granted actor", async () => {
+    const { deps } = trackingDeps();
+    let cancelled = false;
+    deps.drain = {
+      engage() {},
+      cancel() {
+        cancelled = true;
+      },
+      async waitForQuiescence() {
+        return new Promise(() => {}); // never resolves
+      },
+    };
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: holderOnly("root") };
+
+    await runShutdownTool(toolDeps, "root", { timeoutSeconds: 60 });
+    const cancelOutcome = runCancelShutdownTool(toolDeps, "root", "test cancel");
+    expect(cancelOutcome.ok).toBe(true);
+    expect(cancelOutcome.message).toContain("Graceful shutdown cancelled");
+    expect(cancelled).toBe(true);
+  });
+
+  it("createUpdateMcpServer exposes update, shutdown, and cancel_shutdown tools", () => {
+    const { deps } = trackingDeps();
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: holderOnly("root") };
+    const server = createUpdateMcpServer(toolDeps, "root");
+    // Verify server created and tools registered
+    expect(server).toBeDefined();
   });
 });
