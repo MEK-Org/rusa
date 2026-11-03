@@ -226,8 +226,18 @@ class MeshHeader extends StatelessWidget {
             final detailActions = detail == null
                 ? const <_ActorHeaderAction>[]
                 : _actorHeaderActions(store: store, actor: detail);
+            // #1221: on phones the header draws behind the Android status bar.
+            // Inset the contents by the top view padding while keeping the
+            // background color and border behind the status bar. Desktop/web
+            // leaves top padding at 0.
+            final topPadding =
+                drawerNav ? MediaQuery.viewPaddingOf(context).top : 0.0;
             return Container(
-              padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 20),
+              padding: EdgeInsets.only(
+                left: compact ? 8 : 20,
+                right: compact ? 8 : 20,
+                top: topPadding,
+              ),
               decoration: const BoxDecoration(
                 color: MeshColors.bgSecondary,
                 border: Border(bottom: BorderSide(color: MeshColors.border)),

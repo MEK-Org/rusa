@@ -251,6 +251,12 @@ class _DashboardBodyState extends State<DashboardBody> {
             // keeps the drawer (and this file) VM-safe. An exceptionally short
             // narrow Room uses this scaffold: without its header, the left-edge
             // drawer gesture is its navigation entry point.
+            // #1221: on Android the body starts behind system overlays.
+            // When the header is present, MeshHeader insets its own contents
+            // by the top view padding while keeping its color behind the
+            // status bar (top: false). A headerless short room insets the top
+            // directly. The bottom edge is insets-protected against the
+            // Android 3-button navigation bar (bottom: true).
             return Scaffold(
               key: _scaffoldKey,
               backgroundColor: MeshColors.bgPrimary,
@@ -266,11 +272,15 @@ class _DashboardBodyState extends State<DashboardBody> {
                 profileDisplayName: widget.store.operatorDisplayName,
                 assistantRole: widget.assistantRole,
               ),
-              body: _chrome(
-                onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
-                onBack: inActorDetail ? widget.store.clearSelection : null,
-                detailActorId: inActorDetail ? snap.data : null,
-                hideRoomHeader: headerlessRoom,
+              body: SafeArea(
+                top: headerlessRoom,
+                bottom: true,
+                child: _chrome(
+                  onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
+                  onBack: inActorDetail ? widget.store.clearSelection : null,
+                  detailActorId: inActorDetail ? snap.data : null,
+                  hideRoomHeader: headerlessRoom,
+                ),
               ),
             );
           },
