@@ -230,6 +230,73 @@ void main() {
       });
     });
 
+    testWidgets('short-viewport walkie transition preserves body element and state under stable wrapper ancestry', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = await _createStore();
+        addTearDown(store.dispose);
+
+        const shortSize = Size(390, 450);
+        const topPadding = 40.0;
+        const bottomPadding = 48.0;
+
+        await tester.binding.setSurfaceSize(shortSize);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        await tester.pumpWidget(
+          _app(
+            store,
+            size: shortSize,
+            viewPadding: const EdgeInsets.only(
+              top: topPadding,
+              bottom: bottomPadding,
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+
+        // On short viewport without walkie: landing view selects actors (ActorTree), header is visible.
+        expect(find.byType(MeshHeader), findsOneWidget);
+        final treeFinder = find.byType(ActorTree);
+        expect(treeFinder, findsOneWidget);
+
+        // Capture the element of the mounted body widget before the transition
+        final elementBefore = tester.element(treeFinder);
+
+        // Activate walkie: on short viewport (height 450 < 500), hideHeader becomes true.
+        store.setWalkieActive(true);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+
+        // Header is now hidden
+        expect(find.byType(MeshHeader), findsNothing);
+
+        // Body content remains mounted with the EXACT SAME Element instance (no reparenting / state loss)
+        expect(find.byType(ActorTree), findsOneWidget);
+        final elementDuring = tester.element(find.byType(ActorTree));
+        expect(
+          identical(elementBefore, elementDuring),
+          isTrue,
+          reason: 'Body element must be preserved across walkie toggle under stable Builder/MediaQuery wrapper',
+        );
+
+        // Deactivate walkie: header returns, element identity remains preserved
+        store.setWalkieActive(false);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.byType(MeshHeader), findsOneWidget);
+        expect(find.byType(ActorTree), findsOneWidget);
+        final elementAfter = tester.element(find.byType(ActorTree));
+        expect(
+          identical(elementBefore, elementAfter),
+          isTrue,
+          reason: 'Body element must remain preserved when returning from walkie mode',
+        );
+      });
+    });
+
     testWidgets('desktop header keeps 71px height (70px content + 1px border) without top padding', (
       tester,
     ) async {

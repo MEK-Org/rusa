@@ -376,15 +376,13 @@ class _DashboardBodyState extends State<DashboardBody> {
         children: [
           if (!hideRoomHeader) phoneHeader,
           Expanded(
-            child: hideRoomHeader
-                ? bodyContent
-                : Builder(
-                    builder: (context) => MediaQuery.removePadding(
-                      context: context,
-                      removeTop: true,
-                      child: bodyContent,
-                    ),
-                  ),
+            child: Builder(
+              builder: (context) => MediaQuery.removePadding(
+                context: context,
+                removeTop: !hideRoomHeader,
+                child: bodyContent,
+              ),
+            ),
           ),
         ],
       ),
