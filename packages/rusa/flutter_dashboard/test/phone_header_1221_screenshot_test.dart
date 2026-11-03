@@ -16,6 +16,7 @@ import 'screenshot_support.dart';
 
 final String _outDir = '${Directory.current.path}/screenshots';
 const _phoneSize = Size(390, 844);
+const _landscapeSize = Size(844, 390);
 const _statusBarHeight = 40.0;
 const _navBarHeight = 48.0;
 
@@ -85,6 +86,7 @@ class _SimulatedNavigationBar extends StatelessWidget {
 Widget _deviceFrame({
   required GlobalKey key,
   required Widget child,
+  Size size = _phoneSize,
 }) {
   return MaterialApp(
     debugShowCheckedModeBanner: false,
@@ -92,8 +94,8 @@ Widget _deviceFrame({
     home: RepaintBoundary(
       key: key,
       child: SizedBox(
-        width: _phoneSize.width,
-        height: _phoneSize.height,
+        width: size.width,
+        height: size.height,
         child: Stack(
           children: [
             Positioned.fill(child: child),
@@ -258,6 +260,52 @@ void main() {
         await captureBoundary(
           drawerKey,
           '$_outDir/1221_phone_drawer_after.png',
+        );
+      }
+
+      // ── 4. LANDSCAPE CAPTURE ─────────────────────────────────────────────
+      // Demonstrates wide phone layout (844×390) with header inset below status
+      // bar and body protected above bottom navigation bar.
+      {
+        await tester.binding.setSurfaceSize(_landscapeSize);
+        final store = DashboardStore(
+          api: FakeApi()..threadsResult = [makeThread('root', created: 't0')],
+          stream: FakeStream(),
+        );
+        addTearDown(store.dispose);
+        await store.init();
+
+        final landscapeKey = GlobalKey();
+        await tester.pumpWidget(
+          _deviceFrame(
+            key: landscapeKey,
+            size: _landscapeSize,
+            child: MediaQuery(
+              data: const MediaQueryData(
+                size: _landscapeSize,
+                padding: EdgeInsets.only(
+                  top: _statusBarHeight,
+                  bottom: _navBarHeight,
+                ),
+                viewPadding: EdgeInsets.only(
+                  top: _statusBarHeight,
+                  bottom: _navBarHeight,
+                ),
+              ),
+              child: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: DashboardBody(store: store),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await tester.pump();
+
+        await captureBoundary(
+          landscapeKey,
+          '$_outDir/1221_landscape_header_after.png',
         );
       }
     });
