@@ -41,8 +41,9 @@ class _AssistantPageState extends State<AssistantPage> {
   WalkieDeps? _deps;
   WalkieController? _controller;
 
-  /// The controller triggers reach: set once its start has begun recording,
-  /// so a trigger while voice starts is dropped rather than racing it.
+  /// The controller triggers reach once network and session readiness resolve.
+  /// Triggers arriving before adoption buffer into [_pendingStop] and complete
+  /// on adopt rather than being dropped.
   WalkieController? _live;
   late Future<WalkieController> _ready;
   final _subs = <StreamSubscription<Object?>>[];
@@ -50,15 +51,8 @@ class _AssistantPageState extends State<AssistantPage> {
   int _attempt = 0;
   bool _ended = false;
   bool _disposed = false;
-  bool _recordingActive = false;
-
-  Future<void> _cancelCapture() async {
-    if (!_recordingActive) return;
-    _recordingActive = false;
-    try {
-      await _deps?.recorder.cancel();
-    } catch (_) {}
-  }
+  bool _pendingStop = false;
+  Future<void> Function()? _cancelCurrentCapture;
 
   @override
   void initState() {
@@ -87,21 +81,38 @@ class _AssistantPageState extends State<AssistantPage> {
     // Capture starts immediately on assist entry (#1223): local microphone
     // recording begins at once without waiting on network readiness, with the
     // session and root actor resolution catching up in parallel.
-    _recordingActive = true;
+    //
+    // Scoped per attempt: cancellation only affects the active attempt, and
+    // stale recorder.start() completions cancel their take directly rather
+    // than leaving an orphaned recording open.
+    var captureActive = true;
+    Future<void> cancelCapture() async {
+      if (!captureActive) return;
+      captureActive = false;
+      try {
+        await deps.recorder.cancel();
+      } catch (_) {}
+    }
+    _cancelCurrentCapture = cancelCapture;
+
     final captureStartedAt = DateTime.now();
     Object? captureError;
     final captureFuture = () async {
       try {
         await deps.recorder.start();
-        if (stale() || !_recordingActive) {
-          await _cancelCapture();
+        if (stale() || !captureActive) {
+          try {
+            await deps.recorder.cancel();
+          } catch (_) {}
           return;
         }
         // Play audible ready cue at observed capture readiness for assist entry only.
         await widget.signals?.playReadyCue();
       } catch (e) {
-        _recordingActive = false;
-        captureError = e;
+        if (!stale()) {
+          captureActive = false;
+          captureError = e;
+        }
       }
     }();
 
@@ -109,26 +120,26 @@ class _AssistantPageState extends State<AssistantPage> {
     try {
       snapshot = await _api.fetchThreads();
     } catch (e) {
-      await _cancelCapture();
+      await cancelCapture();
       rethrow;
     }
 
     // Only the current start may drop the previous walkie-off listener.
     if (stale()) {
-      await _cancelCapture();
+      await cancelCapture();
       throw StateError('Assist screen closed');
     }
     final previousEnabled = _enabledSub;
     _enabledSub = null;
     await previousEnabled?.cancel();
     if (stale()) {
-      await _cancelCapture();
+      await cancelCapture();
       throw StateError('Assist screen closed');
     }
 
     final root = resolveRootActorId(snapshot);
     if (root == null) {
-      await _cancelCapture();
+      await cancelCapture();
       throw StateError('No active root actor');
     }
 
@@ -142,7 +153,7 @@ class _AssistantPageState extends State<AssistantPage> {
     Future<Never> discard([String reason = 'Assist screen closed']) async {
       if (_controller == controller) _controller = null;
       await controller.dispose();
-      await _cancelCapture();
+      await cancelCapture();
       throw StateError(reason);
     }
 
@@ -163,7 +174,8 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     if (stale()) return discard();
 
-    _recordingActive = false;
+    captureActive = false;
+    _cancelCurrentCapture = null;
     controller.adoptRecording(startedAt: captureStartedAt);
 
     // Walkie off (the panel's power button) ends the assist session.
@@ -171,20 +183,36 @@ class _AssistantPageState extends State<AssistantPage> {
       if (!enabled) _close();
     });
     _live = controller;
+    if (_pendingStop) {
+      _pendingStop = false;
+      await controller.toggleRecord();
+    }
     return controller;
   }
 
   Future<void> _onTrigger() async {
     final controller = _live;
-    // Walkie off is closing the screen; a trigger does not reopen it.
-    if (controller == null || !controller.enabled.value) return;
-    await controller.toggleRecord();
+    if (controller != null) {
+      // Walkie off is closing the screen; a trigger does not reopen it.
+      if (!controller.enabled.value) return;
+      await controller.toggleRecord();
+      return;
+    }
+    // If the user triggers stop/send before network resolution completes,
+    // buffer the stop request so adoption immediately stops and uploads.
+    if (_cancelCurrentCapture != null) {
+      _pendingStop = !_pendingStop;
+    }
   }
 
   Future<void> _onRouteLost() async {
     final controller = _controller;
     if (controller?.record.value.phase == RecordPhase.recording) {
       await controller!.toggleRecord();
+      return;
+    }
+    if (_cancelCurrentCapture != null) {
+      _pendingStop = true;
     }
   }
 
@@ -203,11 +231,14 @@ class _AssistantPageState extends State<AssistantPage> {
     final controller = _controller;
     _controller = null;
     _live = null;
+    final cancelCapture = _cancelCurrentCapture;
+    _cancelCurrentCapture = null;
     final pending = _ready;
     if (controller != null) {
       await controller.dispose();
-    } else {
-      await _cancelCapture();
+    }
+    if (cancelCapture != null) {
+      await cancelCapture();
     }
     try {
       await pending;
@@ -236,8 +267,9 @@ class _AssistantPageState extends State<AssistantPage> {
     unawaited(_enabledSub?.cancel());
     if (_controller != null) {
       unawaited(_controller?.dispose());
-    } else {
-      unawaited(_cancelCapture());
+    }
+    if (_cancelCurrentCapture != null) {
+      unawaited(_cancelCurrentCapture?.call());
     }
     super.dispose();
   }

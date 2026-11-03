@@ -386,26 +386,32 @@ void main() {
       await unmount(tester);
     });
 
-    testWidgets('a trigger while voice starts is dropped', (tester) async {
-      final probe = Completer<List<VoiceAnnouncement>>();
-      final backlog = Completer<List<VoiceAnnouncement>>();
-      api.backlogGates.addAll([probe, backlog]);
-      await pumpPage(tester);
-      probe.complete(const []);
-      await tester.pump();
+    testWidgets(
+      'a trigger while voice starts buffers stop and sends once adopted',
+      (tester) async {
+        final probe = Completer<List<VoiceAnnouncement>>();
+        final backlog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([probe, backlog]);
+        await pumpPage(tester);
+        probe.complete(const []);
+        await tester.pump();
 
-      assistant.triggerCtrl.add(null);
-      await tester.pump();
-      await tester.pump();
-      backlog.complete(const []);
-      await tester.pump();
-      await tester.pump();
+        // Trigger arrives while voice network setup is still in flight:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        await tester.pump();
 
-      expect(walkie.recorder.startCalls, 1);
-      expect(walkie.recorder.stopCalls, 0);
-      expect(api.memoSends, isEmpty);
-      await unmount(tester);
-    });
+        // Network finishes and adoptRecording runs:
+        backlog.complete(const []);
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.stopCalls, 1);
+        expect(api.memoSends, hasLength(1));
+        await unmount(tester);
+      },
+    );
 
     testWidgets('a trigger after walkie off starts nothing', (tester) async {
       await pumpPage(tester);
@@ -522,6 +528,126 @@ void main() {
       expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
       await unmount(tester);
     });
+
+    testWidgets(
+      'capture starts immediately and ready cue fires before network resolves',
+      (tester) async {
+        final threadsGate = Completer<ThreadsSnapshot>();
+        api.threadSnapshotGates.add(threadsGate);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              onClose: () {},
+            ),
+          ),
+        );
+
+        // Before any network responds:
+        // Recorder start has already completed locally and ready cue fired.
+        expect(walkie.recorder.startCalls, 1);
+        expect(assistant.readyCueCalls, 1);
+
+        // Verify network is still blocked
+        expect(threadsGate.isCompleted, isFalse);
+        expect(walkie.streams, isEmpty);
+
+        // Unblock network
+        threadsGate.complete(
+          ThreadsSnapshot(
+            halted: false,
+            threads: api.threadsResult,
+            rootActorId: 'root',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.streams, hasLength(1));
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'ready cue is specific to assist entry and does not fire on manual record toggle',
+      (tester) async {
+        await pumpPage(tester);
+
+        // Initial assist entry fired cue once
+        expect(assistant.readyCueCalls, 1);
+
+        // User stops recording via trigger
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        await tester.pump();
+
+        // User resumes recording manually via trigger
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        await tester.pump();
+
+        // Ready cue must NOT fire again on subsequent manual toggles
+        expect(assistant.readyCueCalls, 1);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'locked-phone assist screen provides restricted UI only (dashboard unreachable)',
+      (tester) async {
+        await pumpPage(tester);
+
+        // The assist page only renders WalkiePanel to root actor
+        expect(find.byType(WalkiePanel), findsOneWidget);
+
+        // Dashboard views, navigation drawers, and app bars are absent
+        expect(find.byType(AppBar), findsNothing);
+        expect(find.byType(Drawer), findsNothing);
+        expect(find.text('Overview'), findsNothing);
+        expect(find.text('Chat'), findsNothing);
+        expect(find.text('Settings'), findsNothing);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'stale recorder start settles cancelled directly without leaking',
+      (tester) async {
+        final gate = Completer<void>();
+        walkie.recorder.startGates.add(gate);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              onClose: () {},
+            ),
+          ),
+        );
+        await tester.pump();
+
+        // Start 1 is in flight waiting on gate
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.cancelCalls, 0);
+
+        // Screen is closed before start completes -> triggers cancellation
+        await unmount(tester);
+        expect(walkie.recorder.cancelCalls, 1);
+
+        // Start completes asynchronously after unmount
+        gate.complete();
+        await tester.pump();
+
+        // Cancelled cleanly, did not fire ready cue
+        expect(assistant.readyCueCalls, 0);
+      },
+    );
   });
 
   group('drawer assistant entry', () {
@@ -678,6 +804,12 @@ void main() {
 
       expect(triggers, hasLength(2));
       expect(losses, hasLength(1));
+    });
+
+    test('plays ready cue via platform channel', () async {
+      final assistant = IoAssistantChannel(channel: channel);
+      await assistant.playReadyCue();
+      expect(calls, ['playReadyCue']);
     });
   });
 }
