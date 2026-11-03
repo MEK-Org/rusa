@@ -665,7 +665,7 @@ void main() {
       final startedAt = DateTime.now().subtract(const Duration(seconds: 2));
       controller.adoptRecording(startedAt: startedAt);
       expect(controller.record.value.phase, RecordPhase.recording);
-      expect(controller.record.value.elapsed?.inSeconds, greaterThanOrEqualTo(2));
+      expect(controller.record.value.elapsed.inSeconds, greaterThanOrEqualTo(2));
 
       // Stopping adopted recording sends the memo
       await controller.toggleRecord();
