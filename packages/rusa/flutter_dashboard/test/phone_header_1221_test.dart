@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
+import 'package:rusa_dashboard/widgets/overview_tab.dart';
 
 import 'fakes.dart';
 
@@ -35,7 +37,7 @@ Widget _app(
 
 void main() {
   group('MEK-Org/rusa#1221: Phone header status bar & nav bar insets', () {
-    testWidgets('phone header insets below status bar when viewPadding.top is present', (
+    testWidgets('phone layout insets header below status bar, consumes insets for body, and opens drawer', (
       tester,
     ) async {
       await tester.runAsync(() async {
@@ -61,7 +63,7 @@ void main() {
         );
         await tester.pump(const Duration(milliseconds: 50));
 
-        // Header widget itself must extend behind status bar (70 + 1px border + topPadding)
+        // 1. Header widget container extends behind status bar (70 + 1px border + topPadding)
         final headerSize = tester.getSize(find.byType(MeshHeader));
         expect(
           headerSize.height,
@@ -69,7 +71,7 @@ void main() {
           reason: 'Header container height must include top view padding',
         );
 
-        // Hamburger icon must be positioned below the status bar
+        // 2. Hamburger icon & title positioned below the status bar
         final menuIcon = find.byIcon(Icons.menu);
         expect(menuIcon, findsOneWidget);
         final menuTop = tester.getTopLeft(menuIcon).dy;
@@ -79,7 +81,6 @@ void main() {
           reason: 'Hamburger must be below status bar top padding of $topPadding, but was at $menuTop',
         );
 
-        // Page title ("Overview") must also be positioned below the status bar
         final title = find.descendant(
           of: find.byType(MeshHeader),
           matching: find.text('Overview'),
@@ -91,62 +92,57 @@ void main() {
           greaterThanOrEqualTo(topPadding),
           reason: 'Page title must be below status bar top padding of $topPadding, but was at $titleTop',
         );
-      });
-    });
 
-    testWidgets('tapping hamburger opens drawer on phone with status bar', (
-      tester,
-    ) async {
-      await tester.runAsync(() async {
-        final store = await _createStore();
-        addTearDown(store.dispose);
-
-        const phoneSize = Size(390, 844);
-        const topPadding = 40.0;
-        const bottomPadding = 48.0;
-
-        await tester.binding.setSurfaceSize(phoneSize);
-        addTearDown(() => tester.binding.setSurfaceSize(null));
-
-        await tester.pumpWidget(
-          _app(
-            store,
-            size: phoneSize,
-            viewPadding: const EdgeInsets.only(
-              top: topPadding,
-              bottom: bottomPadding,
-            ),
-          ),
+        // 3. Body content layout bounds: rendered bottom bound must stop above the navigation bar
+        final overviewFinder = find.byType(OverviewTab);
+        expect(overviewFinder, findsOneWidget);
+        final overviewBounds = tester.getRect(overviewFinder);
+        expect(
+          overviewBounds.bottom,
+          lessThanOrEqualTo(phoneSize.height - bottomPadding),
+          reason: 'Body content must stop above bottom navigation bar of $bottomPadding',
         );
-        await tester.pump(const Duration(milliseconds: 50));
 
-        final menuIcon = find.byIcon(Icons.menu);
+        // 4. MediaQuery.padding inside body below MeshHeader must have consumed top and bottom insets
+        final innerContext = tester.element(overviewFinder);
+        final innerPadding = MediaQuery.paddingOf(innerContext);
+        expect(
+          innerPadding.top,
+          0.0,
+          reason: 'Top padding must be consumed for child scroll views below MeshHeader',
+        );
+        expect(
+          innerPadding.bottom,
+          0.0,
+          reason: 'Bottom padding must be consumed by SafeArea for child scroll views',
+        );
+
+        // 5. Tapping hamburger opens MobileNavDrawer
         await tester.tap(menuIcon);
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 400));
-
         expect(find.byType(MobileNavDrawer), findsOneWidget);
       });
     });
 
-    testWidgets('bottom safe area insets content above 3-button navigation bar', (
+    testWidgets('wide/landscape Android viewport insets header and protects bottom nav bar', (
       tester,
     ) async {
       await tester.runAsync(() async {
         final store = await _createStore();
         addTearDown(store.dispose);
 
-        const phoneSize = Size(390, 844);
-        const topPadding = 40.0;
+        const landscapeSize = Size(844, 390);
+        const topPadding = 24.0;
         const bottomPadding = 48.0;
 
-        await tester.binding.setSurfaceSize(phoneSize);
+        await tester.binding.setSurfaceSize(landscapeSize);
         addTearDown(() => tester.binding.setSurfaceSize(null));
 
         await tester.pumpWidget(
           _app(
             store,
-            size: phoneSize,
+            size: landscapeSize,
             viewPadding: const EdgeInsets.only(
               top: topPadding,
               bottom: bottomPadding,
@@ -155,16 +151,82 @@ void main() {
         );
         await tester.pump(const Duration(milliseconds: 50));
 
-        // The nested Scaffold's body inside DashboardBody must be wrapped in SafeArea
-        // so bottomPadding (48.0) is not overlapped by body content.
-        final safeArea = find.descendant(
-          of: find.byType(DashboardBody),
-          matching: find.byType(SafeArea),
+        // At 844 width (< 850), twoTier is active (70px brand + 12px quota tier + 1px border = 83px base).
+        // Header height includes topPadding even though drawerNav is false.
+        final headerSize = tester.getSize(find.byType(MeshHeader));
+        expect(
+          headerSize.height,
+          83.0 + topPadding,
+          reason: 'Landscape/wide header must include top view padding',
         );
-        expect(safeArea, findsAtLeastNWidgets(1));
 
-        final safeAreaWidget = tester.widget<SafeArea>(safeArea.first);
-        expect(safeAreaWidget.bottom, isTrue);
+        // Header content (e.g. RUSA wordmark) must be below the top status bar padding
+        final wordmark = find.text('RUSA');
+        expect(wordmark, findsOneWidget);
+        final wordmarkTop = tester.getTopLeft(wordmark).dy;
+        expect(
+          wordmarkTop,
+          greaterThanOrEqualTo(topPadding),
+          reason: 'RUSA wordmark must be below top padding of $topPadding, but was at $wordmarkTop',
+        );
+
+        // On a short landscape viewport (height 390 < kShortViewportHeight 500),
+        // landingViewFor selects DashboardView.actors, rendering ActorTree.
+        // Body content stops above bottom nav bar.
+        final treeFinder = find.byType(ActorTree);
+        expect(treeFinder, findsOneWidget);
+        final treeBounds = tester.getRect(treeFinder);
+        expect(
+          treeBounds.bottom,
+          lessThanOrEqualTo(landscapeSize.height - bottomPadding),
+        );
+
+        // Inner body has consumed top and bottom padding
+        final innerContext = tester.element(treeFinder);
+        final innerPadding = MediaQuery.paddingOf(innerContext);
+        expect(innerPadding.top, 0.0);
+        expect(innerPadding.bottom, 0.0);
+      });
+    });
+
+    testWidgets('short-viewport walkie mode hides header and insets top via SafeArea', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = await _createStore();
+        addTearDown(store.dispose);
+        store.setWalkieActive(true);
+
+        const shortSize = Size(390, 450);
+        const topPadding = 40.0;
+        const bottomPadding = 48.0;
+
+        await tester.binding.setSurfaceSize(shortSize);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        await tester.pumpWidget(
+          _app(
+            store,
+            size: shortSize,
+            viewPadding: const EdgeInsets.only(
+              top: topPadding,
+              bottom: bottomPadding,
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+
+        // MeshHeader must not be rendered
+        expect(find.byType(MeshHeader), findsNothing);
+
+        // Body content must be inset below status bar (top >= topPadding)
+        final chromeFinder = find.descendant(
+          of: find.byType(SafeArea),
+          matching: find.byType(ColoredBox),
+        );
+        expect(chromeFinder, findsWidgets);
+        final chromeTop = tester.getTopLeft(chromeFinder.first).dy;
+        expect(chromeTop, greaterThanOrEqualTo(topPadding));
       });
     });
 

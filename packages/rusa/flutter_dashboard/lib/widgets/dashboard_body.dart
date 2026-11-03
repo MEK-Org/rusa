@@ -233,55 +233,75 @@ class _DashboardBodyState extends State<DashboardBody> {
             _view == DashboardView.chatRoom &&
             constraints.maxWidth < kNarrowBreakpoint &&
             constraints.maxHeight <= _shortRoomMaxHeight;
-        if (constraints.maxWidth >= kNarrowBreakpoint && !headerlessRoom) {
-          return _chrome();
-        }
-        // On a phone the header's leading slot carries the navigation: the
-        // hamburger that opens the drawer, or — once an actor's detail is open
-        // — the back arrow out of it.
-        return StreamBuilder<String?>(
-          stream: widget.store.primary,
-          initialData: widget.store.primary.valueOrNull,
-          builder: (context, snap) {
-            final inActorDetail =
-                _view == DashboardView.actors && snap.data != null;
-            // A nested Scaffold of our own: the drawer has to hang off a
-            // Scaffold, and this body is rendered directly — without main.dart's
-            // — by the screenshot harness and the widget tests, so owning one
-            // keeps the drawer (and this file) VM-safe. An exceptionally short
-            // narrow Room uses this scaffold: without its header, the left-edge
-            // drawer gesture is its navigation entry point.
-            // #1221: on Android the body starts behind system overlays.
-            // When the header is present, MeshHeader insets its own contents
-            // by the top view padding while keeping its color behind the
-            // status bar (top: false). A headerless short room insets the top
-            // directly. The bottom edge is insets-protected against the
-            // Android 3-button navigation bar (bottom: true).
-            return Scaffold(
-              key: _scaffoldKey,
-              backgroundColor: MeshColors.bgPrimary,
-              drawer: MobileNavDrawer(
-                store: widget.store,
-                selected: _view,
-                onSelect: _selectView,
-                quotaProviders: _quotaProviders(
-                  widget.store.dashboardConfig.valueOrNull,
-                ),
-                onLogout: widget.onLogout,
-                profilePhotoUrl: widget.profilePhotoUrl,
-                profileDisplayName: widget.store.operatorDisplayName,
-                assistantRole: widget.assistantRole,
-              ),
-              body: SafeArea(
-                top: headerlessRoom,
+        return StreamBuilder<bool>(
+          stream: widget.store.walkieActive,
+          initialData: widget.store.walkieActive.valueOrNull ?? false,
+          builder: (context, walkieSnap) {
+            final walkieActive = walkieSnap.data ?? false;
+            final hideHeader = headerlessRoom ||
+                (walkieActive && constraints.maxHeight < kShortViewportHeight);
+
+            // Desktop / wide layout (constraints.maxWidth >= kNarrowBreakpoint):
+            // Navigation lives in the header, so no drawer Scaffold is needed.
+            // On desktop/web viewPadding is 0.0 (SafeArea is a no-op), while on
+            // Android landscape / tablets SafeArea(bottom: true) protects against
+            // navigation bars and top is protected if the header is hidden.
+            if (constraints.maxWidth >= kNarrowBreakpoint) {
+              return SafeArea(
+                top: hideHeader,
                 bottom: true,
-                child: _chrome(
-                  onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
-                  onBack: inActorDetail ? widget.store.clearSelection : null,
-                  detailActorId: inActorDetail ? snap.data : null,
-                  hideRoomHeader: headerlessRoom,
-                ),
-              ),
+                child: _chrome(hideRoomHeader: hideHeader),
+              );
+            }
+
+            // On a phone the header's leading slot carries the navigation: the
+            // hamburger that opens the drawer, or — once an actor's detail is open
+            // — the back arrow out of it.
+            return StreamBuilder<String?>(
+              stream: widget.store.primary,
+              initialData: widget.store.primary.valueOrNull,
+              builder: (context, snap) {
+                final inActorDetail =
+                    _view == DashboardView.actors && snap.data != null;
+                // A nested Scaffold of our own: the drawer has to hang off a
+                // Scaffold, and this body is rendered directly — without main.dart's
+                // — by the screenshot harness and the widget tests, so owning one
+                // keeps the drawer (and this file) VM-safe. An exceptionally short
+                // narrow Room uses this scaffold: without its header, the left-edge
+                // drawer gesture is its navigation entry point.
+                // #1221: on Android the body starts behind system overlays.
+                // When the header is present, MeshHeader insets its own contents
+                // by the top view padding while keeping its color behind the
+                // status bar (top: false). A headerless short room or short walkie
+                // insets the top directly (top: true). The bottom edge is
+                // insets-protected against the Android 3-button navigation bar (bottom: true).
+                return Scaffold(
+                  key: _scaffoldKey,
+                  backgroundColor: MeshColors.bgPrimary,
+                  drawer: MobileNavDrawer(
+                    store: widget.store,
+                    selected: _view,
+                    onSelect: _selectView,
+                    quotaProviders: _quotaProviders(
+                      widget.store.dashboardConfig.valueOrNull,
+                    ),
+                    onLogout: widget.onLogout,
+                    profilePhotoUrl: widget.profilePhotoUrl,
+                    profileDisplayName: widget.store.operatorDisplayName,
+                    assistantRole: widget.assistantRole,
+                  ),
+                  body: SafeArea(
+                    top: hideHeader,
+                    bottom: true,
+                    child: _chrome(
+                      onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
+                      onBack: inActorDetail ? widget.store.clearSelection : null,
+                      detailActorId: inActorDetail ? snap.data : null,
+                      hideRoomHeader: hideHeader,
+                    ),
+                  ),
+                );
+              },
             );
           },
         );
@@ -330,31 +350,41 @@ class _DashboardBodyState extends State<DashboardBody> {
                 header(snap.data?.actors[detailActorId]?.thread),
           );
 
+    final bodyContent = _view == DashboardView.overview
+        ? OverviewTab(
+            store: widget.store,
+            onSelectView: _selectView,
+            trackNavigation: _hasNavigated,
+          )
+        : (_view == DashboardView.understanding ||
+              _view == DashboardView.reports)
+        ? _IuBody(
+            view: _view,
+            onSelect: _selectView,
+            understandingBuilder: widget.understandingBuilder,
+            reportsBuilder: widget.reportsBuilder,
+          )
+        : _view == DashboardView.work
+        ? WorkTab(store: widget.store, onSelectView: _selectView)
+        : _view == DashboardView.chatRoom
+        ? ChatRoomTab(store: widget.store)
+        : _ActorsBody(store: widget.store, onSelectView: _selectView);
+
     return ColoredBox(
       color: MeshColors.bgPrimary,
       child: Column(
         children: [
           if (!hideRoomHeader) phoneHeader,
           Expanded(
-            child: _view == DashboardView.overview
-                ? OverviewTab(
-                    store: widget.store,
-                    onSelectView: _selectView,
-                    trackNavigation: _hasNavigated,
-                  )
-                : (_view == DashboardView.understanding ||
-                      _view == DashboardView.reports)
-                ? _IuBody(
-                    view: _view,
-                    onSelect: _selectView,
-                    understandingBuilder: widget.understandingBuilder,
-                    reportsBuilder: widget.reportsBuilder,
-                  )
-                : _view == DashboardView.work
-                ? WorkTab(store: widget.store, onSelectView: _selectView)
-                : _view == DashboardView.chatRoom
-                ? ChatRoomTab(store: widget.store)
-                : _ActorsBody(store: widget.store, onSelectView: _selectView),
+            child: hideRoomHeader
+                ? bodyContent
+                : Builder(
+                    builder: (context) => MediaQuery.removePadding(
+                      context: context,
+                      removeTop: true,
+                      child: bodyContent,
+                    ),
+                  ),
           ),
         ],
       ),
