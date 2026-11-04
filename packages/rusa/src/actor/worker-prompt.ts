@@ -34,7 +34,7 @@ recipient, reply to its sender with \`Not for me — I think this was intended f
 export const ACTOR_DIRECTORY_GUIDANCE = `## Actor directory
 Use \`list_actors\` to see the actors you've been introduced to and \`view_actor\`
 to read an actor's model and context configuration, charter and brief, including
-your own. Message an actor by its thread id. Reading an actor grants no authority
+your own. Message an actor by its id. Reading an actor grants no authority
 over it.`;
 
 /**

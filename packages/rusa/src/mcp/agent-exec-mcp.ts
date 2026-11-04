@@ -347,7 +347,7 @@ export function createAgentExecMcpServer(
     {
       title: "List your actor directory",
       description:
-        "List the actors you have been introduced to: your parent, the handles you hold and your direct children, each with its thread id, handle, status and a brief description from its own title or charter. Retired (archived) actors are left out unless you ask for them. Use `view_actor` for one actor's full metadata. Reading grants no authority.",
+        "List the actors you have been introduced to: your parent and the actors you hold handles to, including your children, each with its actor id, handle, status and a brief description from its own title or charter. Retired (archived) actors are left out unless you ask for them. Use `view_actor` for one actor's full metadata. Reading grants no authority.",
       inputSchema: {
         include_archived: z
           .boolean()
@@ -362,7 +362,7 @@ export function createAgentExecMcpServer(
             .listDirectory(selfId)
             .filter((record) => include_archived === true || record.status !== "retired")
             .map((record) => ({
-              thread_id: record.id,
+              actor_id: record.id,
               handle: mesh.getActorHandle(record.id),
               description: describeActor(record),
               status: record.status,
@@ -379,21 +379,19 @@ export function createAgentExecMcpServer(
     {
       title: "View an actor's metadata",
       description:
-        "Read one actor's thread id, handle, status, title, model and context configuration, charter and brief. Omit `actor_id` to view yourself, including the provider, model and effort your current run launched on (`current_run`). `model_config` and `context` are what is effective now; `pending` holds any staged replacement that applies at the actor's next run boundary. Any actor can be read by thread id; a handle resolves only to you or an actor in your directory. Reading grants no authority.",
+        "Read one actor's id, handle, status, title, model and context configuration, charter and brief. Omit `actor_id` to view yourself, including the provider, model and effort your current run launched on (`current_run`). `model_config` and `context` are the actor's current configuration; a run already in flight keeps what it launched on, which only your own view reports. `pending` holds any staged replacement that applies at the actor's next run boundary. Any actor can be read by id. Reading grants no authority.",
       inputSchema: {
         actor_id: z
           .string()
           .optional()
-          .describe(
-            "A thread id, or the handle of yourself or an actor in your directory. Omit to view yourself."
-          ),
+          .describe("The actor's id, as `list_actors` reports it. Omit to view yourself."),
       },
     },
     async ({ actor_id }) => {
       try {
-        const self = mesh.resolveActorId(selfId);
-        const record = mesh.resolveDirectoryActor(selfId, actor_id ?? self);
-        const run = record.id === self ? options?.currentRun?.() : undefined;
+        const record = mesh.actors.get(actor_id ?? selfId);
+        if (!record) return toolError(new Error(`unknown actor id: ${actor_id ?? selfId}`));
+        const run = record.id === selfId ? options?.currentRun?.() : undefined;
         const brief = options?.readBrief?.(record.id) ?? null;
         const pending = {
           ...(record.desiredModelConfig !== undefined
@@ -407,7 +405,7 @@ export function createAgentExecMcpServer(
             : {}),
         };
         return toolOk({
-          thread_id: record.id,
+          actor_id: record.id,
           handle: mesh.getActorHandle(record.id),
           ...(record.title !== undefined ? { title: record.title } : {}),
           status: record.status,
@@ -614,7 +612,7 @@ export function createAgentExecMcpServer(
     {
       title: "Introduce one thread to another",
       description:
-        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). You must already hold handles to both; your parent and root addresses are not handles. The holder sees the target described by its own title, or its charter's first line when it has none.",
+        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). You must already hold handles to both; your parent and root addresses are not handles. The holder is not notified: `list_actors` shows it the target, described by its own title or its charter's first line, so message the holder if it needs to act on the introduction.",
       inputSchema: {
         holder_thread_id: z.string().describe("The actor that should gain the new handle."),
         target_thread_id: z.string().describe("The actor the handle points at."),

@@ -5749,10 +5749,7 @@ describe("actor directory (#1231)", () => {
   const handleOf = (id: string) => `handle-${id.slice(1)}`;
 
   function directory(options: Parameters<typeof createAgentExecMcpServer>[4] = {}) {
-    const fixture = setup({
-      // Colliding display handles for the two actors named "shared-*".
-      handleForId: (id) => (id === "t5" || id === "t6" ? "shared-handle" : handleOf(id)),
-    });
+    const fixture = setup({ handleForId: handleOf });
     const { mesh } = fixture;
     const parent = mesh.spawn({
       charter: "parent charter",
@@ -5772,16 +5769,6 @@ describe("actor directory (#1231)", () => {
       title: "Old",
       modelConfig: CLAUDE,
     });
-    const sharedHeld = mesh.spawn({
-      charter: "shared held",
-      parentId: "root",
-      modelConfig: CLAUDE,
-    });
-    const sharedOther = mesh.spawn({
-      charter: "shared other",
-      parentId: "root",
-      modelConfig: CLAUDE,
-    });
     const stranger = mesh.spawn({
       charter: "stranger charter",
       parentId: "root",
@@ -5790,7 +5777,6 @@ describe("actor directory (#1231)", () => {
     });
     mesh.grantHandle(viewer, { id: peer });
     mesh.grantHandle(viewer, { id: archived });
-    mesh.grantHandle(viewer, { id: sharedHeld });
     mesh.retire(archived);
     const connectViewer = () =>
       connect(createAgentExecMcpServer(mesh, viewer, "root", undefined, options));
@@ -5800,8 +5786,6 @@ describe("actor directory (#1231)", () => {
       viewer,
       peer,
       archived,
-      sharedHeld,
-      sharedOther,
       stranger,
       connectViewer,
     };
@@ -5811,55 +5795,49 @@ describe("actor directory (#1231)", () => {
     (await client.callTool({ name, arguments: args })) as CallToolResult;
 
   it("lists introduced actors with their own descriptions and hides archived ones by default", async () => {
-    const { parent, peer, archived, sharedHeld, stranger, connectViewer } = directory();
+    const { parent, peer, archived, stranger, connectViewer } = directory();
     const client = await connectViewer();
 
     const listed = dataOf(await call(client, "list_actors")) as Array<{
-      thread_id: string;
+      actor_id: string;
       handle: string;
       description: string;
       status: string;
     }>;
     expect(listed).toEqual([
-      { thread_id: parent, handle: handleOf(parent), description: "Parent", status: "active" },
+      { actor_id: parent, handle: handleOf(parent), description: "Parent", status: "active" },
       {
-        thread_id: peer,
+        actor_id: peer,
         handle: handleOf(peer),
         description: "peer first line",
         status: "active",
       },
-      {
-        thread_id: sharedHeld,
-        handle: "shared-handle",
-        description: "shared held",
-        status: "active",
-      },
     ]);
-    expect(listed.map((actor) => actor.thread_id)).not.toContain(archived);
-    expect(listed.map((actor) => actor.thread_id)).not.toContain(stranger);
+    expect(listed.map((actor) => actor.actor_id)).not.toContain(archived);
+    expect(listed.map((actor) => actor.actor_id)).not.toContain(stranger);
 
     const withArchived = dataOf(
       await call(client, "list_actors", { include_archived: true })
-    ) as Array<{ thread_id: string; description: string; status: string }>;
-    expect(withArchived.find((actor) => actor.thread_id === archived)).toMatchObject({
+    ) as Array<{ actor_id: string; description: string; status: string }>;
+    expect(withArchived.find((actor) => actor.actor_id === archived)).toMatchObject({
       description: "Old",
       status: "retired",
     });
-    expect(withArchived.map((actor) => actor.thread_id)).not.toContain(stranger);
+    expect(withArchived.map((actor) => actor.actor_id)).not.toContain(stranger);
   });
 
-  it("lists a parent's direct children and a delivered sender as introductions", async () => {
+  it("lists a child through the handle spawning grants, and a delivered sender", async () => {
     const { mesh, viewer, parent, stranger } = directory();
     const parentClient = await connect(createAgentExecMcpServer(mesh, parent, "root"));
     const children = dataOf(await call(parentClient, "list_actors")) as Array<{
-      thread_id: string;
+      actor_id: string;
     }>;
-    expect(children.map((actor) => actor.thread_id)).toContain(viewer);
+    expect(children.map((actor) => actor.actor_id)).toContain(viewer);
 
     mesh.grantHandle(viewer, { id: stranger, origin: "message" });
     const client = await connect(createAgentExecMcpServer(mesh, viewer, "root"));
-    const listed = dataOf(await call(client, "list_actors")) as Array<{ thread_id: string }>;
-    expect(listed.map((actor) => actor.thread_id)).toContain(stranger);
+    const listed = dataOf(await call(client, "list_actors")) as Array<{ actor_id: string }>;
+    expect(listed.map((actor) => actor.actor_id)).toContain(stranger);
   });
 
   it("shows an actor its own effective model and its in-flight launch without an argument", async () => {
@@ -5874,7 +5852,7 @@ describe("actor directory (#1231)", () => {
 
     const view = dataOf(await call(client, "view_actor")) as Record<string, unknown>;
     expect(view).toEqual({
-      thread_id: viewer,
+      actor_id: viewer,
       handle: handleOf(viewer),
       status: "active",
       model_config: [CLAUDE],
@@ -5926,7 +5904,7 @@ describe("actor directory (#1231)", () => {
     });
   });
 
-  it("reads any actor's metadata by thread id, retired ones included, without its relationships", async () => {
+  it("reads any actor's metadata by id, retired ones included, without its relationships", async () => {
     const { stranger, archived, connectViewer } = directory({
       currentRun: () => ({ provider: "claude", model: "the-caller-not-the-target" }),
       readBrief: (actorId) =>
@@ -5937,7 +5915,7 @@ describe("actor directory (#1231)", () => {
     const client = await connectViewer();
 
     expect(dataOf(await call(client, "view_actor", { actor_id: stranger }))).toEqual({
-      thread_id: stranger,
+      actor_id: stranger,
       handle: handleOf(stranger),
       title: "Stranger",
       status: "active",
@@ -5953,43 +5931,34 @@ describe("actor directory (#1231)", () => {
     });
   });
 
-  it("resolves a display handle only inside the caller's directory, so reading mints no id", async () => {
-    const { mesh, viewer, peer, sharedHeld, sharedOther, stranger, connectViewer } = directory();
+  it("addresses an actor by exact id, so a display handle or the legacy root address mints none", async () => {
+    const { peer, stranger, connectViewer } = directory();
     const client = await connectViewer();
 
-    expect(
-      dataOf(await call(client, "view_actor", { actor_id: `  HANDLE-${peer.slice(1)} ` }))
-    ).toMatchObject({ thread_id: peer });
-    expect(dataOf(await call(client, "view_actor", { actor_id: handleOf(viewer) }))).toMatchObject({
-      thread_id: viewer,
+    for (const reference of [handleOf(peer), handleOf(stranger), "   ", "no-such-actor"]) {
+      const refused = await call(client, "view_actor", { actor_id: reference });
+      expect(refused.isError).toBe(true);
+      expect(JSON.stringify(refused.content)).toContain("unknown actor id");
+      expect(JSON.stringify(refused.content)).not.toContain(peer);
+      expect(JSON.stringify(refused.content)).not.toContain(stranger);
+    }
+
+    const rootId = "opaque-root-id";
+    const opaque = setup({ rootId });
+    const middle = opaque.mesh.spawn({ charter: "m", parentId: rootId, modelConfig: CLAUDE });
+    const leaf = opaque.mesh.spawn({ charter: "l", parentId: middle, modelConfig: CLAUDE });
+    const leafClient = await connect(createAgentExecMcpServer(opaque.mesh, leaf, rootId));
+    const alias = await call(leafClient, "view_actor", { actor_id: "root" });
+    expect(alias.isError).toBe(true);
+    expect(JSON.stringify(alias.content)).not.toContain(rootId);
+    expect(dataOf(await call(leafClient, "view_actor", { actor_id: rootId }))).toMatchObject({
+      actor_id: rootId,
     });
-
-    // A display handle is public; the id is the capability. Only the holder's
-    // own introduction may turn one into the other.
-    const refused = await call(client, "view_actor", { actor_id: handleOf(stranger) });
-    expect(refused.isError).toBe(true);
-    expect(JSON.stringify(refused.content)).not.toContain(stranger);
-
-    // A colliding handle outside the directory neither ambiguates nor leaks.
-    const shared = await call(client, "view_actor", { actor_id: "shared-handle" });
-    expect(dataOf(shared)).toMatchObject({ thread_id: sharedHeld });
-    expect(JSON.stringify(shared.content)).not.toContain(sharedOther);
-
-    mesh.grantHandle(viewer, { id: sharedOther });
-    const ambiguous = await call(client, "view_actor", { actor_id: "shared-handle" });
-    expect(ambiguous.isError).toBe(true);
-    expect(JSON.stringify(ambiguous.content)).toContain("ambiguous");
-
-    expect((await call(client, "view_actor", { actor_id: "   " })).isError).toBe(true);
-    expect((await call(client, "view_actor", { actor_id: "no-such-actor" })).isError).toBe(true);
   });
 
   it("leaves write authority and durable state unchanged after every read", async () => {
     const onWrite = vi.fn();
-    const { registry, viewer, peer, stranger, connectViewer } = directory({
-      onWrite,
-      modelClasses: { list: () => [], upsert: vi.fn(), delete: vi.fn() },
-    });
+    const { registry, viewer, peer, stranger, connectViewer } = directory({ onWrite });
     const client = await connectViewer();
     const handlesBefore = registry.get(viewer)?.handles;
     const strangerBefore = registry.get(stranger);
@@ -6000,32 +5969,15 @@ describe("actor directory (#1231)", () => {
     expect(onWrite).not.toHaveBeenCalled();
     expect(registry.get(viewer)?.handles).toEqual(handlesBefore);
     expect(registry.get(stranger)).toEqual(strangerBefore);
-    expect(
-      (
-        await call(client, "introduce", {
-          holder_thread_id: peer,
-          target_thread_id: stranger,
-        })
-      ).isError
-    ).toBe(true);
-    expect(
-      (
-        await call(client, "set_actor_model", {
-          actor_id: stranger,
-          model_config: CLAUDE,
-        })
-      ).isError
-    ).toBe(true);
-    expect(
-      (
-        await call(client, "set_actor_context", {
-          actor_id: stranger,
-          context_mode: "ledger",
-        })
-      ).isError
-    ).toBe(true);
-    expect((await call(client, "retire_thread", { thread_id: stranger })).isError).toBe(true);
-    expect((await call(client, "transfer_voice_session", { target: stranger })).isError).toBe(true);
+
+    // Having read a stranger neither makes it introducible nor retirable.
+    const introduce = await call(client, "introduce", {
+      holder_thread_id: peer,
+      target_thread_id: stranger,
+    });
+    expect(JSON.stringify(introduce.content)).toContain(`you do not hold a handle to ${stranger}`);
+    const retire = await call(client, "retire_thread", { thread_id: stranger });
+    expect(JSON.stringify(retire.content)).toContain("only retire your own descendant");
     expect(registry.get(stranger)).toEqual(strangerBefore);
   });
 

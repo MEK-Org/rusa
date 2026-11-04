@@ -6336,19 +6336,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
     };
 
     const self = await read("view_actor", {});
-    expect(self).toMatchObject({ thread_id: workerId, current_run: modelConfig, brief: null });
+    expect(self).toMatchObject({ actor_id: workerId, current_run: modelConfig, brief: null });
     // Viewing an actor without a brief reads it and never seeds one.
     expect(store.load(workerId).brief).toBeNull();
 
     const peer = await read("view_actor", { actor_id: peerId });
     expect(peer).toMatchObject({
-      thread_id: peerId,
+      actor_id: peerId,
       brief: { text: "peer brief", generation: 3, updated_at: brief.updatedAt },
     });
     expect(peer).not.toHaveProperty("current_run");
 
     expect(await read("list_actors", {})).toContainEqual(
-      expect.objectContaining({ thread_id: peerId, description: "Peer", status: "active" })
+      expect.objectContaining({ actor_id: peerId, description: "Peer", status: "active" })
     );
   });
 
