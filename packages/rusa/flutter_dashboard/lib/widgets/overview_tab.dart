@@ -155,9 +155,9 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Wide screens span Running Mesh Workers above, and Recent Activity below, My
-  /// Queue and Queued Actors beside the charts (#1018, #1234); phone-sized
-  /// displays stack the work first, then the charts.
+  /// Wide screens keep My Queue and Queued Actors beside the charts (#1018),
+  /// then span Running Mesh Workers and Recent Activity below them (#1234);
+  /// phone-sized displays stack the work first, then the charts.
   Widget _buildWorkAndCharts() {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -180,7 +180,6 @@ class _OverviewTabState extends State<OverviewTab> {
           return column([myQueue, running, queued, recentActivity, ...charts]);
         }
         return column([
-          running,
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -189,6 +188,7 @@ class _OverviewTabState extends State<OverviewTab> {
               Expanded(child: column(charts)),
             ],
           ),
+          running,
           recentActivity,
         ]);
       },
@@ -600,12 +600,7 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(
-                        ready,
-                        blockerMap,
-                        ancestorMap,
-                        isReadyList: true,
-                      ),
+                      _buildQueueList(ready, blockerMap, ancestorMap, isReadyList: true),
                       if (waiting.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (waiting.isNotEmpty) ...[
@@ -646,12 +641,7 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(
-                        waiting,
-                        blockerMap,
-                        ancestorMap,
-                        isReadyList: false,
-                      ),
+                      _buildQueueList(waiting, blockerMap, ancestorMap, isReadyList: false),
                       if (scheduled.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (scheduled.isNotEmpty) ...[

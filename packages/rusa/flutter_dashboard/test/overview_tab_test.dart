@@ -264,7 +264,7 @@ void main() {
 
     // The narrowest wide layout, where the row columns leave the least room.
     testWidgets(
-      'wide: both sections span the content width around the columns',
+      'wide: both sections span the content width below the columns',
       (tester) async {
         await tester.runAsync(() async {
           final store = await pumpOverview(tester, const Size(740, 2400));
@@ -285,10 +285,14 @@ void main() {
           expect(queued.left, closeTo(myQueue.left, 1));
           expect(queued.right, closeTo(myQueue.right, 1));
 
-          expect(running.bottom, lessThan(myQueue.top));
-          expect(running.bottom, lessThan(quota.top));
-          expect(recent.top, greaterThan(queued.bottom));
-          expect(recent.top, greaterThan(quota.bottom));
+          // The columns stay on top, then Running, then Recent Activity.
+          final charts = tester.getRect(
+            find.byKey(const Key('overview-inbox-metrics')),
+          );
+          expect(myQueue.top, lessThan(queued.top));
+          expect(running.top, greaterThan(queued.bottom));
+          expect(running.top, greaterThan(charts.bottom));
+          expect(recent.top, greaterThan(running.bottom));
 
           // Rows keep their when and who columns beside a readable card.
           final row = rowParts(tester, store);
