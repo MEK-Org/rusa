@@ -37,6 +37,7 @@ let dir: string;
 let secretsDir: string;
 let config: CustomMcpServerConfig;
 let service: http.Server;
+let upstreamToolsByScope: ((write: boolean) => string[]) | undefined;
 // Failure modes other than `hang-discover` and `legacy` apply to `tools/call`
 // after a successful `server/discover`, so they exercise the connected path.
 let mode:
@@ -109,7 +110,12 @@ async function startService(): Promise<void> {
       const upstream = new UpstreamMcpServer({ name: "synthetic-graph", version: "0.0.0" });
       // Like the host service, list write tools only to a write-scoped caller.
       const write = authInfo?.scopes.includes("write") === true;
-      for (const name of write ? ["read_goal", "write_goal", "unclassified"] : ["read_goal"]) {
+      const toolNames = upstreamToolsByScope
+        ? upstreamToolsByScope(write)
+        : write
+          ? ["read_goal", "write_goal", "unclassified"]
+          : ["read_goal"];
+      for (const name of toolNames) {
         upstream.registerTool(
           name,
           {
@@ -283,6 +289,7 @@ beforeEach(async () => {
   aborted = 0;
   mutations = 0;
   heldResponses = [];
+  upstreamToolsByScope = undefined;
   await startService();
 });
 
@@ -613,6 +620,168 @@ describe("configured host MCP service", () => {
       "custom_mcp_upstream_failed",
       expect.objectContaining({ reason: "request too large", tool: "write_goal" })
     );
+  });
+
+  it("warns once on write-scoped listing for unserved and unclassified tools, and deduplicates across actors and interleaved read discovery", async () => {
+    upstreamToolsByScope = (write) => (write ? ["a", "b"] : ["a"]);
+    grants.set("writer1", ["glass_goals:configured-user:write"]);
+    grants.set("writer2", ["glass_goals:configured-user:write"]);
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const warn = vi.fn();
+    const writer1 = await connect("writer1", { readTools: ["a"], writeTools: ["c"] }, {
+      warn,
+    } as unknown as Logger);
+    await writer1.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({
+        capability: "glass_goals",
+        scope: "write",
+        missing: ["c"],
+        unclassified: ["b"],
+      })
+    );
+
+    // Interleaved read discovery sees only ["a"] (which matches configured readTools ["a"]),
+    // so it neither warns nor resets write-scoped deduplication.
+    const reader = await connect("reader", { readTools: ["a"], writeTools: ["c"] }, {
+      warn,
+    } as unknown as Logger);
+    await reader.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    const writer2 = await connect("writer2", { readTools: ["a"], writeTools: ["c"] }, {
+      warn,
+    } as unknown as Logger);
+    await writer2.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("warns on read-scoped listing about unclassified tools without reporting missing write tools", async () => {
+    upstreamToolsByScope = (write) => (write ? ["a", "b", "c"] : ["a", "b"]);
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    const warn = vi.fn();
+    const reader = await connect("reader", { readTools: ["a"], writeTools: ["c"] }, {
+      warn,
+    } as unknown as Logger);
+    await reader.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({
+        capability: "glass_goals",
+        scope: "read",
+        missing: [],
+        unclassified: ["b"],
+      })
+    );
+  });
+
+  it("does not re-warn on write-scoped listing when observed drift was already reported by a read-scoped listing", async () => {
+    upstreamToolsByScope = (write) => (write ? ["unclassified", "write_goal"] : ["unclassified"]);
+    grants.set("reader", ["glass_goals:configured-user:read"]);
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    const reader = await connect(
+      "reader",
+      { readTools: ["missing_read"], writeTools: ["write_goal"] },
+      { warn } as unknown as Logger
+    );
+    await reader.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({
+        capability: "glass_goals",
+        scope: "read",
+        missing: ["missing_read"],
+        unclassified: ["unclassified"],
+      })
+    );
+
+    const writer = await connect(
+      "writer",
+      { readTools: ["missing_read"], writeTools: ["write_goal"] },
+      { warn } as unknown as Logger
+    );
+    await writer.listTools();
+    // Write discovery sees write_goal present, so only missing_read is absent and
+    // unclassified is unclassified: identical to what was already warned.
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits a fresh warning when the upstream tool listing changes between calls", async () => {
+    let currentTools = (write: boolean) => (write ? ["a", "b"] : ["a"]);
+    upstreamToolsByScope = (write) => currentTools(write);
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    const writer = await connect("writer", { readTools: ["a"], writeTools: ["c"] }, {
+      warn,
+    } as unknown as Logger);
+    await writer.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenLastCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({
+        capability: "glass_goals",
+        scope: "write",
+        missing: ["c"],
+        unclassified: ["b"],
+      })
+    );
+
+    currentTools = (write: boolean) => (write ? ["a", "d"] : ["a"]);
+    await writer.listTools();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({
+        capability: "glass_goals",
+        scope: "write",
+        missing: ["c"],
+        unclassified: ["d"],
+      })
+    );
+  });
+
+  it("distinguishes upstream listings whose names would collide when comma-joined", async () => {
+    // Upstream names are not held to the configured-name grammar, so a comma
+    // inside one name must not make two different listings look identical.
+    let currentTools = (write: boolean) => (write ? ["a", "b,c"] : ["a"]);
+    upstreamToolsByScope = (write) => currentTools(write);
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    const writer = await connect("writer", { readTools: ["a"], writeTools: ["x"] }, {
+      warn,
+    } as unknown as Logger);
+    await writer.listTools();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenLastCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({ scope: "write", missing: ["x"], unclassified: ["b,c"] })
+    );
+
+    currentTools = (write: boolean) => (write ? ["a", "b", "c"] : ["a"]);
+    await writer.listTools();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(
+      "custom_mcp_classification_drift",
+      expect.objectContaining({ scope: "write", missing: ["x"], unclassified: ["b", "c"] })
+    );
+  });
+
+  it("logs nothing when configuration fully matches the upstream listing", async () => {
+    upstreamToolsByScope = (write) => (write ? ["read_goal", "write_goal"] : ["read_goal"]);
+    grants.set("writer", ["glass_goals:configured-user:write"]);
+    const warn = vi.fn();
+    const writer = await connect(
+      "writer",
+      { readTools: ["read_goal"], writeTools: ["write_goal"] },
+      { warn } as unknown as Logger
+    );
+    await writer.listTools();
+    expect(warn).not.toHaveBeenCalledWith("custom_mcp_classification_drift", expect.anything());
   });
 });
 

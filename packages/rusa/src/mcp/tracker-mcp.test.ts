@@ -81,8 +81,8 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
         },
       ];
     },
-    getPullRequestDetails: async (repo, prNumber) => {
-      calls.push({ method: "getPullRequestDetails", args: [repo, prNumber] });
+    getPullRequestDetails: async (repo, prNumber, opts) => {
+      calls.push({ method: "getPullRequestDetails", args: [repo, prNumber, opts] });
       return {
         number: prNumber,
         title: "t",
@@ -92,6 +92,7 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
         baseRef: "staging",
         headSha: "head-sha",
         state: "open",
+        ...(opts?.includeStack ? { stackNumber: 42, position: 2, total: 3 } : {}),
       };
     },
     getPullRequestChecksStatus: async (repo, prNumber) => {
@@ -158,6 +159,18 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
     removeSubIssue: async (repo, parentIssueNumber, childIssueNumber) => {
       calls.push({ method: "removeSubIssue", args: [repo, parentIssueNumber, childIssueNumber] });
     },
+    createStack: async (repo, pullRequests) => {
+      calls.push({ method: "createStack", args: [repo, pullRequests] });
+      return { number: 42, pull_requests: pullRequests.map((n) => ({ number: n })) };
+    },
+    addToStack: async (repo, stackNumber, pullRequests) => {
+      calls.push({ method: "addToStack", args: [repo, stackNumber, pullRequests] });
+      return { number: stackNumber, pull_requests: pullRequests.map((n) => ({ number: n })) };
+    },
+    unstack: async (repo, stackNumber) => {
+      calls.push({ method: "unstack", args: [repo, stackNumber] });
+      return undefined;
+    },
   };
   return { client, calls };
 }
@@ -185,10 +198,12 @@ describe("tracker MCP server", () => {
         "add_label",
         "add_reaction",
         "add_sub_issue",
+        "add_to_stack",
         "close_issue",
         "create_issue",
         "create_pr_review_comment",
         "create_pull_request",
+        "create_stack",
         "get_issue",
         "get_parent_issue",
         "get_pr_details",
@@ -204,6 +219,7 @@ describe("tracker MCP server", () => {
         "remove_parent",
         "reopen_issue",
         "set_parent",
+        "unstack",
         "update_body",
       ].sort()
     );
@@ -1095,14 +1111,24 @@ describe("tracker MCP server", () => {
     expect(onWrite).not.toHaveBeenCalled();
   });
 
-  it("returns read results as JSON content", async () => {
-    const { client: backend } = recordingIssueClient();
+  it("returns read results as JSON content, including stack membership", async () => {
+    const { client: backend, calls } = recordingIssueClient();
     const client = await connect(createTrackerMcpServer("test-actor-1", backend));
     const res = (await client.callTool({
       name: "get_pr_details",
       arguments: { repo: "o/r", prNumber: 5 },
     })) as CallToolResult;
-    expect(JSON.parse(textOf(res))).toMatchObject({ number: 5, state: "open" });
+    expect(JSON.parse(textOf(res))).toMatchObject({
+      number: 5,
+      state: "open",
+      stackNumber: 42,
+      position: 2,
+      total: 3,
+    });
+    expect(calls).toContainEqual({
+      method: "getPullRequestDetails",
+      args: ["o/r", 5, { includeStack: true }],
+    });
   });
 
   it("lists open PRs by author via the legacy backend path", async () => {
@@ -1234,6 +1260,66 @@ describe("tracker MCP server", () => {
     expect(calls).toContainEqual({
       method: "getPrReviewComments",
       args: ["o/r", 5, 42],
+    });
+  });
+
+  describe("pull request stack management tools (#1212)", () => {
+    it("dispatches create_stack, add_to_stack, and unstack with onWrite, formatting 204 dissolution", async () => {
+      let writes = 0;
+      let unstackResponse: Record<string, unknown> | undefined;
+      const backend: IssueClient = {
+        ...recordingIssueClient().client,
+        unstack: async () => unstackResponse,
+      };
+      const client = await connect(
+        createTrackerMcpServer("test-actor-1", backend, {
+          onWrite: () => {
+            writes++;
+          },
+        })
+      );
+
+      const resCreate = (await client.callTool({
+        name: "create_stack",
+        arguments: { repo: "owner/repo", pullRequests: [10, 11, 12] },
+      })) as CallToolResult;
+      expect(resCreate.isError).toBeFalsy();
+      expect(JSON.parse(textOf(resCreate))).toEqual({
+        number: 42,
+        pull_requests: [{ number: 10 }, { number: 11 }, { number: 12 }],
+      });
+
+      const resAdd = (await client.callTool({
+        name: "add_to_stack",
+        arguments: { repo: "owner/repo", stackNumber: 42, pullRequests: [13, 14] },
+      })) as CallToolResult;
+      expect(resAdd.isError).toBeFalsy();
+      expect(JSON.parse(textOf(resAdd))).toEqual({
+        number: 42,
+        pull_requests: [{ number: 13 }, { number: 14 }],
+      });
+
+      // 204 No Content dissolution
+      const resUnstack204 = (await client.callTool({
+        name: "unstack",
+        arguments: { repo: "owner/repo", stackNumber: 42 },
+      })) as CallToolResult;
+      expect(resUnstack204.isError).toBeFalsy();
+      expect(textOf(resUnstack204)).toBe("Stack dissolved");
+
+      // 200 OK with remaining stack representation
+      unstackResponse = { number: 42, pull_requests: [{ number: 10 }] };
+      const resUnstack200 = (await client.callTool({
+        name: "unstack",
+        arguments: { repo: "owner/repo", stackNumber: 42 },
+      })) as CallToolResult;
+      expect(resUnstack200.isError).toBeFalsy();
+      expect(JSON.parse(textOf(resUnstack200))).toEqual({
+        number: 42,
+        pull_requests: [{ number: 10 }],
+      });
+
+      expect(writes).toBe(4);
     });
   });
 

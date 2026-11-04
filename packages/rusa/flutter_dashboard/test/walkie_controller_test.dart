@@ -659,6 +659,31 @@ void main() {
         expect(controller.record.value.phase, RecordPhase.delivered);
       },
     );
+
+    test('adoptRecording enters recording phase with given startedAt', () async {
+      await controller.enable();
+      final startedAt = DateTime.now().subtract(const Duration(seconds: 2));
+      controller.adoptRecording(startedAt: startedAt);
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.record.value.elapsed.inSeconds, greaterThanOrEqualTo(2));
+
+      // Stopping adopted recording sends the memo
+      await controller.toggleRecord();
+      await pumpEventQueue();
+      expect(walkie.recorder.stopCalls, 1);
+      expect(controller.record.value.phase, RecordPhase.delivered);
+    });
+
+    test('adoptRecording ignored when disabled or disposed', () async {
+      await controller.disable();
+      final startedAt = DateTime.now();
+      controller.adoptRecording(startedAt: startedAt);
+      expect(controller.record.value.phase, RecordPhase.idle);
+
+      await controller.dispose();
+      controller.adoptRecording(startedAt: startedAt);
+      expect(controller.record.value.phase, RecordPhase.idle);
+    });
   });
 
   group('voice unavailable (503)', () {

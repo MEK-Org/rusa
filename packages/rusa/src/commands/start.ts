@@ -398,6 +398,8 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
+import { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
+import { isUpdateInProgress } from "../update/orchestrator.js";
 import {
   BuildRunner,
   GitRunner,
@@ -2761,6 +2763,43 @@ async function composeStart(
   );
   let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
+
+  const maintenanceDrainer = new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), "");
+  const maintenanceShutdown = new MaintenanceShutdownCoordinator({
+    drain: maintenanceDrainer,
+    notify: sendErrorSink ? { notify: sendErrorSink } : undefined,
+    recordAction: (text: string) => {
+      try {
+        mkdirSync(join(mcHome, "audit"), { recursive: true });
+        appendFileSync(
+          join(mcHome, "audit", "update.log"),
+          `[${new Date().toISOString()}] ${text}\n`,
+          "utf8"
+        );
+      } catch {}
+    },
+    exit: async (code) => {
+      // Record requested restart intent right before exit commit so the next boot
+      // computes `requested_clean` rather than `clean_without_requested_restart`.
+      try {
+        const intent = serviceLifecycleStore.recordRequestedRestart({
+          targetSha: deployedSha || "unknown",
+          branch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
+          subject: "graceful maintenance shutdown",
+        });
+        requestedRestartTransitionId = intent.id;
+      } catch (err) {
+        log.warn("service_restart_intent_persist_failed", { err });
+      }
+      await shutdown("deploy", code);
+    },
+    log: (m) => log.info("maintenance_shutdown", { detail: m }),
+    isBusy: () => isUpdateInProgress(),
+    onResumeWork: () => {
+      resumeAfterHalt();
+    },
+  });
+
   try {
     const repoRoot = resolveRepoRoot();
     const packageDir = join(repoRoot, "packages", "rusa");
@@ -2770,9 +2809,11 @@ async function composeStart(
     } else if (!sendErrorSink) {
       console.warn("[update] error sink writer unavailable — lifecycle pings disabled");
     }
+
     updateToolDepsFor = (selfId) => ({
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
       hasCapability: (actorId, capability) => mesh.hasActiveCapability(actorId, capability),
+      maintenanceShutdown,
       deps: {
         git: new GitRunner(repoRoot),
         build: new BuildRunner(

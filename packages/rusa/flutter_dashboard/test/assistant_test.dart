@@ -9,6 +9,7 @@ import 'package:rusa_dashboard/assistant_page.dart';
 import 'package:rusa_dashboard/assistant_platform.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/walkie_controller.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/walkie_panel.dart';
@@ -196,7 +197,7 @@ void main() {
       expect(assistant.onEnd, isNull);
     });
 
-    testWidgets('leaving the screen during the root lookup starts nothing', (
+    testWidgets('leaving the screen during the root lookup cancels capture', (
       tester,
     ) async {
       final gate = Completer<ThreadsSnapshot>();
@@ -221,7 +222,10 @@ void main() {
 
       expect(ended, isTrue);
       expect(walkie.streams, isEmpty);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(walkie.recorder.stopCalls, 0);
+      expect(api.memoSends, isEmpty);
       await unmount(tester);
     });
 
@@ -233,13 +237,14 @@ void main() {
 
       expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
       expect(find.text('No active root actor'), findsOneWidget);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
 
       api.threadsResult = [makeThread('root')];
       await tester.tap(find.text('Retry'));
       await tester.pump();
       await tester.pump();
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.startCalls, 2);
       await unmount(tester);
     });
 
@@ -255,7 +260,8 @@ void main() {
       await pumpPage(tester);
 
       expect(find.text('No active root actor'), findsOneWidget);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
       expect(walkie.streams, isEmpty);
       assistant.triggerCtrl.add(null);
       await tester.pump();
@@ -274,7 +280,8 @@ void main() {
       expect(find.text("Couldn't reach Rusa"), findsOneWidget);
       expect(find.textContaining('dash.example'), findsNothing);
       expect(find.textContaining('internal detail'), findsNothing);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
       await unmount(tester);
     });
 
@@ -287,11 +294,12 @@ void main() {
       await pumpPage(tester);
 
       expect(find.text('Voice is not configured on this instance'), findsOne);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
       await unmount(tester);
     });
 
-    testWidgets('closing during the root lookup starts nothing', (
+    testWidgets('closing during the root lookup cancels capture', (
       tester,
     ) async {
       final gate = Completer<ThreadsSnapshot>();
@@ -311,10 +319,11 @@ void main() {
 
       expect(walkie.streams, isEmpty);
       expect(walkie.wakeLock.acquireCalls, 0);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
     });
 
-    testWidgets('closing during a Retry start starts nothing', (tester) async {
+    testWidgets('closing during a Retry start cancels capture', (tester) async {
       api.threadsResult = [makeThread('child', parent: 'gone')];
       await pumpPage(tester);
       expect(find.text('No active root actor'), findsOneWidget);
@@ -337,7 +346,8 @@ void main() {
       await tester.pump();
 
       expect(walkie.streams, isEmpty);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 2);
+      expect(walkie.recorder.cancelCalls, 2);
     });
 
     testWidgets('a superseded Retry leaves the current start\'s walkie off', (
@@ -364,39 +374,186 @@ void main() {
       second.complete(snapshot());
       await tester.pump();
       await tester.pump();
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.startCalls, 3);
+      final cancelCallsBeforeFirst = walkie.recorder.cancelCalls;
       first.complete(snapshot());
       await tester.pump();
       await tester.pump();
+      expect(walkie.recorder.cancelCalls, cancelCallsBeforeFirst);
+      expect(find.byKey(const ValueKey('walkie-panel')), findsOneWidget);
+      final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
+      expect(panel.controller.record.value.phase, RecordPhase.recording);
 
       await tester.tap(find.byKey(const ValueKey('walkie-off')));
       await tester.pump();
       await tester.pump();
       expect(closed, 1);
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.startCalls, 3);
+      expect(walkie.recorder.cancelCalls, cancelCallsBeforeFirst + 1);
       await unmount(tester);
     });
 
-    testWidgets('a trigger while voice starts is dropped', (tester) async {
-      final probe = Completer<List<VoiceAnnouncement>>();
-      final backlog = Completer<List<VoiceAnnouncement>>();
-      api.backlogGates.addAll([probe, backlog]);
-      await pumpPage(tester);
-      probe.complete(const []);
-      await tester.pump();
+    testWidgets(
+      'closing screen while a newer retry is in lookup cancels capture after superseded retry completes',
+      (tester) async {
+        api.threadsResult = [makeThread('child', parent: 'gone')];
+        await pumpPage(tester);
+        expect(find.text('No active root actor'), findsOneWidget);
 
-      assistant.triggerCtrl.add(null);
-      await tester.pump();
-      await tester.pump();
-      backlog.complete(const []);
-      await tester.pump();
-      await tester.pump();
+        api.threadsResult = [makeThread('root')];
+        final first = Completer<ThreadsSnapshot>();
+        final second = Completer<ThreadsSnapshot>();
+        api.threadSnapshotGates.addAll([first, second]);
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
 
-      expect(walkie.recorder.startCalls, 1);
-      expect(walkie.recorder.stopCalls, 0);
-      expect(api.memoSends, isEmpty);
-      await unmount(tester);
-    });
+        ThreadsSnapshot snapshot() => ThreadsSnapshot(
+              halted: false,
+              threads: api.threadsResult,
+              rootActorId: 'root',
+            );
+
+        // First (superseded) attempt completes while second is still awaiting threads lookup:
+        first.complete(snapshot());
+        await tester.pump();
+        await tester.pump();
+
+        // Screen is unmounted while second attempt is still in flight:
+        await unmount(tester);
+
+        expect(walkie.recorder.startCalls, 3);
+        // Initial failed attempt cancelled (1), then unmount cancels the active retry handle (2):
+        expect(walkie.recorder.cancelCalls, 2);
+      },
+    );
+
+    testWidgets(
+      'a 503 during enable cancels capture and displays voice not configured',
+      (tester) async {
+        final probe = Completer<List<VoiceAnnouncement>>();
+        final backlog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([probe, backlog]);
+        await pumpPage(tester);
+
+        // First backlog fetch (init probe) succeeds:
+        probe.complete(const []);
+        await tester.pump();
+
+        // Second backlog fetch (enable backlog) fails with 503:
+        backlog.completeError(
+          DashboardApiException(
+            Uri.parse('https://dash.example/api/mesh/voice/backlog'),
+            503,
+            'service unavailable',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('Voice is not configured on this instance'),
+          findsOneWidget,
+        );
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.cancelCalls, 1);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a trigger while voice starts buffers stop and sends once adopted',
+      (tester) async {
+        final probe = Completer<List<VoiceAnnouncement>>();
+        final backlog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([probe, backlog]);
+        await pumpPage(tester);
+        probe.complete(const []);
+        await tester.pump();
+
+        // Trigger arrives while voice network setup is still in flight:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        await tester.pump();
+
+        // Network finishes and adoptRecording runs:
+        backlog.complete(const []);
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.stopCalls, 1);
+        expect(api.memoSends, hasLength(1));
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'multiple triggers while voice starts keep stop buffered and do not toggle',
+      (tester) async {
+        final probe = Completer<List<VoiceAnnouncement>>();
+        final backlog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([probe, backlog]);
+        await pumpPage(tester);
+        probe.complete(const []);
+        await tester.pump();
+
+        // Trigger twice while voice network setup is still in flight:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+
+        // Network finishes and adoptRecording runs:
+        backlog.complete(const []);
+        await tester.pump();
+        await tester.pump();
+
+        // It should stop and send (not toggled back to recording):
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.stopCalls, 1);
+        expect(api.memoSends, hasLength(1));
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'stop trigger while lookup is in flight does not carry over to Retry after failure',
+      (tester) async {
+        final gate = Completer<ThreadsSnapshot>();
+        api.threadSnapshotGates.add(gate);
+        await pumpPage(tester);
+        expect(walkie.recorder.startCalls, 1);
+
+        // Stop triggered while lookup is in flight:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+
+        // Lookup fails:
+        gate.completeError(Exception('network dropped'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
+        expect(walkie.recorder.cancelCalls, 1);
+
+        // Pressing trigger while error screen is showing is ignored:
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+
+        // User taps Retry:
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
+        await tester.pump();
+
+        // Fresh capture started; not immediately stopped/sent:
+        expect(walkie.recorder.startCalls, 2);
+        expect(walkie.recorder.stopCalls, 0);
+        expect(api.memoSends, isEmpty);
+        await unmount(tester);
+      },
+    );
 
     testWidgets('a trigger after walkie off starts nothing', (tester) async {
       await pumpPage(tester);
@@ -414,7 +571,7 @@ void main() {
       await unmount(tester);
     });
 
-    testWidgets('closing while voice starts releases it unrecorded', (
+    testWidgets('closing while voice starts cancels capture', (
       tester,
     ) async {
       final probe = Completer<List<VoiceAnnouncement>>();
@@ -428,7 +585,8 @@ void main() {
 
       expect(walkie.streams, isEmpty);
       expect(walkie.wakeLock.acquireCalls, 0);
-      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 1);
     });
 
     testWidgets('plays only replies to this assist session', (tester) async {
@@ -466,6 +624,172 @@ void main() {
       expect(api.threadsCallCount, 0);
       await unmount(tester);
     });
+
+    testWidgets(
+      'plays ready cue only once capture is live, and only on assist entry',
+      (tester) async {
+        final micGate = Completer<void>();
+        walkie.recorder.startGates.add(micGate);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              onClose: () {},
+            ),
+          ),
+        );
+        await tester.pump();
+
+        // While mic is still acquiring, no ready cue has fired yet
+        expect(walkie.recorder.startCalls, 1);
+        expect(assistant.readyCueCalls, 0);
+
+        // Mic finishes acquiring -> capture is now live
+        micGate.complete();
+        await tester.pump();
+        await tester.pump();
+
+        // Ready cue fires after capture is live
+        expect(assistant.readyCueCalls, 1);
+        expect(walkie.recorder.startCalls, 1);
+
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('does not play ready cue if mic acquisition fails', (
+      tester,
+    ) async {
+      walkie.recorder.startError = StateError('mic permission denied');
+      await pumpPage(tester);
+
+      expect(assistant.readyCueCalls, 0);
+      expect(find.byKey(const ValueKey('assistant-error')), findsOneWidget);
+      await unmount(tester);
+    });
+
+    testWidgets(
+      'capture starts immediately and ready cue fires before network resolves',
+      (tester) async {
+        final threadsGate = Completer<ThreadsSnapshot>();
+        api.threadSnapshotGates.add(threadsGate);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              onClose: () {},
+            ),
+          ),
+        );
+
+        // Before any network responds:
+        // Recorder start has already completed locally and ready cue fired.
+        expect(walkie.recorder.startCalls, 1);
+        expect(assistant.readyCueCalls, 1);
+
+        // Verify network is still blocked
+        expect(threadsGate.isCompleted, isFalse);
+        expect(walkie.streams, isEmpty);
+
+        // Unblock network
+        threadsGate.complete(
+          ThreadsSnapshot(
+            halted: false,
+            threads: api.threadsResult,
+            rootActorId: 'root',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.streams, hasLength(1));
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'ready cue is specific to assist entry and does not fire on manual record toggle',
+      (tester) async {
+        await pumpPage(tester);
+
+        // Initial assist entry fired cue once
+        expect(assistant.readyCueCalls, 1);
+
+        // User stops recording via trigger
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        await tester.pump();
+
+        // User resumes recording manually via trigger
+        assistant.triggerCtrl.add(null);
+        await tester.pump();
+        await tester.pump();
+
+        // Ready cue must NOT fire again on subsequent manual toggles
+        expect(assistant.readyCueCalls, 1);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'locked-phone assist screen provides restricted UI only (dashboard unreachable)',
+      (tester) async {
+        await pumpPage(tester);
+
+        // The assist page only renders WalkiePanel to root actor
+        expect(find.byType(WalkiePanel), findsOneWidget);
+
+        // Dashboard views, navigation drawers, and app bars are absent
+        expect(find.byType(AppBar), findsNothing);
+        expect(find.byType(Drawer), findsNothing);
+        expect(find.text('Overview'), findsNothing);
+        expect(find.text('Chat'), findsNothing);
+        expect(find.text('Settings'), findsNothing);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'stale recorder start settles cancelled directly without leaking',
+      (tester) async {
+        final gate = Completer<void>();
+        walkie.recorder.startGates.add(gate);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              onClose: () {},
+            ),
+          ),
+        );
+        await tester.pump();
+
+        // Start 1 is in flight waiting on gate
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.cancelCalls, 0);
+
+        // Screen is closed before start completes -> triggers cancellation
+        await unmount(tester);
+        expect(walkie.recorder.cancelCalls, 1);
+
+        // Start completes asynchronously after unmount
+        gate.complete();
+        await tester.pump();
+
+        // Cancelled cleanly, did not fire ready cue
+        expect(assistant.readyCueCalls, 0);
+      },
+    );
   });
 
   group('drawer assistant entry', () {
@@ -622,6 +946,12 @@ void main() {
 
       expect(triggers, hasLength(2));
       expect(losses, hasLength(1));
+    });
+
+    test('plays ready cue via platform channel', () async {
+      final assistant = IoAssistantChannel(channel: channel);
+      await assistant.playReadyCue();
+      expect(calls, ['playReadyCue']);
     });
   });
 }

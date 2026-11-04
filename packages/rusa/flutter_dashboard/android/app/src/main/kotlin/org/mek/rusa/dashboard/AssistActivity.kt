@@ -7,12 +7,12 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 
 /**
- * The assist screen. [AssistGateActivity] starts it on an unlocked phone with
- * the trigger's action: ACTION_ASSIST for the assist gesture, and
- * ACTION_VOICE_COMMAND for a headset's assistant button (HFP AT+BVRA). It runs
- * the `assistMain` Dart entrypoint, which opens walkie recording to root. A
- * trigger while it is open reaches Dart as `trigger` and stops and sends. It
- * never shows over the keyguard, and the session ends once it leaves the screen.
+ * The assist screen. Handles the trigger's action: ACTION_ASSIST for the assist
+ * gesture, and ACTION_VOICE_COMMAND for a headset's assistant button (HFP
+ * AT+BVRA). It runs the `assistMain` Dart entrypoint, which opens walkie
+ * recording to root over the lock screen without requiring an unlock. A trigger
+ * while it is open reaches Dart as `trigger` and stops and sends. The session
+ * ends once it leaves the screen.
  */
 class AssistActivity : FlutterActivity() {
     private var assistant: AssistantChannel? = null
@@ -73,8 +73,6 @@ class AssistActivity : FlutterActivity() {
      * The Bluetooth stack gives the app 5 s to answer a headset's voice-command
      * request with startVoiceRecognition before it reports failure to the
      * headset, which is less than a cold Flutter start. Answer it natively.
-     * On a locked phone the unlock prompt comes first and can outlast that
-     * window, so the headset may report failure before this answer arrives.
      */
     private fun answerHeadset(intent: Intent?, channel: AssistantChannel) {
         if (intent?.action == Intent.ACTION_VOICE_COMMAND) {

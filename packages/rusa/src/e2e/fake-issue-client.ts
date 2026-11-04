@@ -315,6 +315,22 @@ export class FakeIssueClient implements IssueClient {
   ): Promise<void> {
     throw new Error("sub-issue parenting is not modelled by the e2e tracker");
   }
+
+  async createStack(_repo: string, _pullRequests: number[]): Promise<Record<string, unknown>> {
+    throw new Error("stack management is not modelled by the e2e tracker");
+  }
+
+  async addToStack(
+    _repo: string,
+    _stackNumber: number,
+    _pullRequests: number[]
+  ): Promise<Record<string, unknown>> {
+    throw new Error("stack management is not modelled by the e2e tracker");
+  }
+
+  async unstack(_repo: string, _stackNumber: number): Promise<Record<string, unknown> | undefined> {
+    throw new Error("stack management is not modelled by the e2e tracker");
+  }
   private toOpenPullRequest(pr: {
     number: number;
     title: string;

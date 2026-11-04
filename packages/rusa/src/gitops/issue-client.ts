@@ -175,6 +175,12 @@ export interface PullRequestDetails {
   state: string;
   /** GitHub's authoritative merge state; closed alone is not sufficient. */
   merged?: boolean;
+  /** GitHub stack number if this PR is part of a stack. */
+  stackNumber?: number;
+  /** 1-based position in the stack (1 is closest to base branch). */
+  position?: number;
+  /** Total number of PRs in the stack. */
+  total?: number;
 }
 
 export interface PullRequestChecksStatus {
@@ -295,8 +301,12 @@ export interface IssueClient {
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]>;
   /** Query issues with optional state and label filters. */
   listIssues(repo: string, opts?: ListIssuesOptions): Promise<OpenIssue[]>;
-  /** Fetch pull request details. */
-  getPullRequestDetails(repo: string, prNumber: number): Promise<PullRequestDetails>;
+  /** Fetch pull request details. Optionally queries GraphQL for stack membership when requested. */
+  getPullRequestDetails(
+    repo: string,
+    prNumber: number,
+    opts?: { includeStack?: boolean }
+  ): Promise<PullRequestDetails>;
   /** Fetch and roll up status checks for a pull request's current head commit. */
   getPullRequestChecksStatus(repo: string, prNumber: number): Promise<PullRequestChecksStatus>;
   /**
@@ -374,6 +384,16 @@ export interface IssueClient {
   addSubIssue(repo: string, parentIssueNumber: number, childIssueNumber: number): Promise<void>;
   /** Detach a child issue from its parent. */
   removeSubIssue(repo: string, parentIssueNumber: number, childIssueNumber: number): Promise<void>;
+  /** Create a pull request stack from an ordered list of PR numbers. */
+  createStack(repo: string, pullRequests: number[]): Promise<Record<string, unknown>>;
+  /** Append pull requests to the top of an existing stack. */
+  addToStack(
+    repo: string,
+    stackNumber: number,
+    pullRequests: number[]
+  ): Promise<Record<string, unknown>>;
+  /** Remove unmerged pull requests from a stack, dissolving it if none remain. */
+  unstack(repo: string, stackNumber: number): Promise<Record<string, unknown> | undefined>;
 }
 
 /** A non-2xx GitHub API response, with the status code callers branch on. */
@@ -426,6 +446,12 @@ const ASYNC_MERGE_POLL_INTERVAL_MS = 1_000;
 const ASYNC_MERGE_MAX_POLLS = 60;
 const ASYNC_MERGE_TIMEOUT_SECONDS = (ASYNC_MERGE_MAX_POLLS * ASYNC_MERGE_POLL_INTERVAL_MS) / 1_000;
 
+/** One PullRequestStack entry as GraphQL returns it; position 1 sits on the base branch. */
+interface StackEntry {
+  position: number;
+  pullRequest: { number: number; state: string } | null;
+}
+
 interface AsyncMergeResponse {
   status: string;
   details?: {
@@ -474,7 +500,12 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   /** One REST call. Returns the parsed JSON body (undefined for 204s). */
-  private async api<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async api<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    headers?: Record<string, string>
+  ): Promise<T> {
     const token = await this.resolveToken();
     const res = await fetch(`${API_BASE}${path}`, {
       method,
@@ -484,6 +515,7 @@ export class GitHubIssueClient implements IssueClient {
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "rusa",
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...headers,
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
@@ -737,6 +769,37 @@ export class GitHubIssueClient implements IssueClient {
     );
   }
 
+  async createStack(repo: string, pullRequests: number[]): Promise<Record<string, unknown>> {
+    return this.api<Record<string, unknown>>(
+      "POST",
+      `/repos/${repo}/stacks`,
+      { pull_requests: pullRequests },
+      { "X-GitHub-Api-Version": "2026-03-10" }
+    );
+  }
+
+  async addToStack(
+    repo: string,
+    stackNumber: number,
+    pullRequests: number[]
+  ): Promise<Record<string, unknown>> {
+    return this.api<Record<string, unknown>>(
+      "POST",
+      `/repos/${repo}/stacks/${stackNumber}/add`,
+      { pull_requests: pullRequests },
+      { "X-GitHub-Api-Version": "2026-03-10" }
+    );
+  }
+
+  async unstack(repo: string, stackNumber: number): Promise<Record<string, unknown> | undefined> {
+    return this.api<Record<string, unknown> | undefined>(
+      "POST",
+      `/repos/${repo}/stacks/${stackNumber}/unstack`,
+      undefined,
+      { "X-GitHub-Api-Version": "2026-03-10" }
+    );
+  }
+
   async getPrReviewComments(
     repo: string,
     prNumber: number,
@@ -872,7 +935,11 @@ export class GitHubIssueClient implements IssueClient {
     // inferring stack membership from a REST error message.
     const stack = await this.getPullRequestStack(opts.repo, opts.prNumber);
     if (stack !== null) {
-      this.requireLowerStackEntriesMerged(opts, stack.position, stack.entries);
+      this.requireLowerStackEntriesMerged(
+        opts,
+        stack.position,
+        this.requireCompleteStackEntries(opts, stack)
+      );
       const sha = await this.mergePullRequestAsync(opts);
       if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
       return sha;
@@ -904,8 +971,10 @@ export class GitHubIssueClient implements IssueClient {
     repo: string,
     prNumber: number
   ): Promise<{
+    stackNumber: number;
     position: number;
-    entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>;
+    total: number;
+    entries: Array<StackEntry | null>;
   } | null> {
     const [owner, name] = repo.split("/");
     if (!owner || !name) throw new Error(`Invalid repository name: ${repo}`);
@@ -914,12 +983,10 @@ export class GitHubIssueClient implements IssueClient {
       repository?: {
         pullRequest?: {
           stack?: {
+            number: number;
             entries: {
               totalCount: number;
-              nodes: Array<{
-                position: number;
-                pullRequest: { number: number; state: string } | null;
-              } | null>;
+              nodes: Array<StackEntry | null>;
             };
           } | null;
           stackEntry?: { position: number } | null;
@@ -930,6 +997,7 @@ export class GitHubIssueClient implements IssueClient {
         repository(owner: $owner, name: $name) {
           pullRequest(number: $number) {
             stack {
+              number
               entries(first: 100) {
                 totalCount
                 nodes {
@@ -950,27 +1018,36 @@ export class GitHubIssueClient implements IssueClient {
     if (!pr.stack || !pr.stackEntry) {
       throw new Error(`GitHub returned incomplete stack metadata for ${repo}#${prNumber}`);
     }
-    if (pr.stack.entries.totalCount !== pr.stack.entries.nodes.length) {
+    return {
+      stackNumber: pr.stack.number,
+      position: pr.stackEntry.position,
+      total: pr.stack.entries.totalCount,
+      entries: pr.stack.entries.nodes,
+    };
+  }
+
+  // Membership reads only need number, position and totalCount; the merge
+  // guard alone must see every entry before it can vouch for lower positions.
+  private requireCompleteStackEntries(
+    opts: MergePullRequestOptions,
+    stack: { total: number; entries: Array<StackEntry | null> }
+  ): StackEntry[] {
+    const where = `${opts.repo}#${opts.prNumber}`;
+    if (stack.total !== stack.entries.length) {
       throw new Error(
-        `GitHub returned more than 100 stack entries for ${repo}#${prNumber}; refusing an incomplete stack validation.`
+        `GitHub returned more than 100 stack entries for ${where}; refusing an incomplete stack validation.`
       );
     }
-    if (pr.stack.entries.nodes.some((entry) => entry === null)) {
-      throw new Error(`GitHub returned an incomplete stack entry for ${repo}#${prNumber}`);
+    if (stack.entries.some((entry) => entry === null)) {
+      throw new Error(`GitHub returned an incomplete stack entry for ${where}`);
     }
-    return {
-      position: pr.stackEntry.position,
-      entries: pr.stack.entries.nodes as Array<{
-        position: number;
-        pullRequest: { number: number; state: string } | null;
-      }>,
-    };
+    return stack.entries as StackEntry[];
   }
 
   private requireLowerStackEntriesMerged(
     opts: MergePullRequestOptions,
     position: number,
-    entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>
+    entries: StackEntry[]
   ): void {
     // PullRequestStackEntry.position is documented as 1 closest to the base
     // branch, with larger positions stacked above it.
@@ -1216,7 +1293,11 @@ export class GitHubIssueClient implements IssueClient {
     await this.api("POST", path, { content });
   }
 
-  async getPullRequestDetails(repo: string, prNumber: number): Promise<PullRequestDetails> {
+  async getPullRequestDetails(
+    repo: string,
+    prNumber: number,
+    opts?: { includeStack?: boolean }
+  ): Promise<PullRequestDetails> {
     const pr = await this.api<{
       number: number;
       title: string;
@@ -1228,6 +1309,8 @@ export class GitHubIssueClient implements IssueClient {
       merged: boolean;
     }>("GET", `/repos/${repo}/pulls/${prNumber}`);
 
+    const stack = opts?.includeStack ? await this.getPullRequestStack(repo, prNumber) : null;
+
     return {
       number: pr.number,
       title: pr.title,
@@ -1238,6 +1321,13 @@ export class GitHubIssueClient implements IssueClient {
       headSha: pr.head.sha,
       state: pr.state,
       merged: pr.merged,
+      ...(stack
+        ? {
+            stackNumber: stack.stackNumber,
+            position: stack.position,
+            total: stack.total,
+          }
+        : {}),
     };
   }
 
@@ -1569,8 +1659,12 @@ export class GitBridgeIssueClient implements IssueClient {
     return this.delegate.listIssues(repo, opts);
   }
 
-  getPullRequestDetails(repo: string, prNumber: number): Promise<PullRequestDetails> {
-    return this.delegate.getPullRequestDetails(repo, prNumber);
+  getPullRequestDetails(
+    repo: string,
+    prNumber: number,
+    opts?: { includeStack?: boolean }
+  ): Promise<PullRequestDetails> {
+    return this.delegate.getPullRequestDetails(repo, prNumber, opts);
   }
 
   getPullRequestChecksStatus(repo: string, prNumber: number): Promise<PullRequestChecksStatus> {
@@ -1668,6 +1762,22 @@ export class GitBridgeIssueClient implements IssueClient {
 
   removeSubIssue(repo: string, parentIssueNumber: number, childIssueNumber: number): Promise<void> {
     return this.delegate.removeSubIssue(repo, parentIssueNumber, childIssueNumber);
+  }
+
+  createStack(repo: string, pullRequests: number[]): Promise<Record<string, unknown>> {
+    return this.delegate.createStack(repo, pullRequests);
+  }
+
+  addToStack(
+    repo: string,
+    stackNumber: number,
+    pullRequests: number[]
+  ): Promise<Record<string, unknown>> {
+    return this.delegate.addToStack(repo, stackNumber, pullRequests);
+  }
+
+  unstack(repo: string, stackNumber: number): Promise<Record<string, unknown> | undefined> {
+    return this.delegate.unstack(repo, stackNumber);
   }
 }
 

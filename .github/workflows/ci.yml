@@ -95,3 +95,33 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - run: pnpm -r --if-present test
+
+      # Shifted-clock run (#1218): the retention/expiry-owning test surface,
+      # run again with Date faked 45 days ahead of the real clock (still
+      # advancing), so a dated fixture that only passes at today's real date
+      # fails the day it is written instead of weeks later (#1184, #1210).
+      # Tests that pin their own clock override the shift by design. The
+      # scope keeps the run bounded instead of doubling suite time, and
+      # excludes suites whose assertions sit on OS-level clocks or mtimes,
+      # which any fake Date breaks independent of the shift (verified with a
+      # one-minute probe). The shift exceeds every retention and expiry
+      # window the code measures against Date.now(), audited at bd8a1122:
+      #   30d  quota raw + observation retention (quota/shared-store.ts)
+      #   30d  run material retention (remote-instances/run-material.ts)
+      #   30d  run prompt retention (db/repositories/run-prompt-repository.ts)
+      #   30d  invocation artifact retentionDays default (commands/config-docs.ts)
+      #   7d   weekly quota bucket + provider pacer weekly window
+      #   7d   dashboard timing retention (dashboard/timing.ts)
+      #   7d   hard runtime cap (actor/host-job-runner.ts)
+      #   5d   dashboard auth session (dashboard/auth.ts)
+      #   3d   quota history window (quota/coordinator-protocol.ts)
+      #   1d   codex models cache max age, quota backup interval
+      #   ≤30m quota probe TTL, weekly quota max age, 15m stamp expiry
+      # Scoped packages (mirrored in vitest.shifted.config.ts): quota, the
+      # quota/stamp/timing MCP tests, dashboard quota-api/auth/timing, actor
+      # pacer + availability holds, run-prompt repository, run material +
+      # event transfer, model catalog, references, slack, observability,
+      # quota commands, and the pinned-clock helper. Typecheck already ran
+      # with the ordinary suite; this pass is behavioral only.
+      - name: Shifted-clock vitest run
+        run: pnpm --filter rusa run test:shifted

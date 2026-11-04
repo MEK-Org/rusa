@@ -1760,6 +1760,7 @@ class FakeAssistant implements AssistantPlatform {
 
   AssistantRoleStatus? roleStatus;
   int settingsOpened = 0;
+  int readyCueCalls = 0;
   final triggerCtrl = StreamController<void>.broadcast();
   final routeLostCtrl = StreamController<void>.broadcast();
 
@@ -1767,6 +1768,11 @@ class FakeAssistant implements AssistantPlatform {
   Stream<void> get triggers => triggerCtrl.stream;
   @override
   Stream<void> get routeLost => routeLostCtrl.stream;
+
+  @override
+  Future<void> playReadyCue() async {
+    readyCueCalls++;
+  }
   @override
   Future<void> Function()? onEnd;
 

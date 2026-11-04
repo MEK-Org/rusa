@@ -22,6 +22,7 @@ export async function waitForQuiescence(
     intervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
     now?: () => number;
+    signal?: AbortSignal;
   }
 ): Promise<{ quiesced: boolean; waitedMs: number }> {
   const intervalMs = Math.max(1, opts.intervalMs ?? 500);
@@ -32,9 +33,12 @@ export async function waitForQuiescence(
 
   // Drain the microtask queue before the first conclusive read (see above).
   await sleep(0);
+  if (opts.signal?.aborted) return { quiesced: false, waitedMs: now() - start };
   if (isQuiescent()) return { quiesced: true, waitedMs: now() - start };
   while (now() < deadline) {
+    if (opts.signal?.aborted) return { quiesced: false, waitedMs: now() - start };
     await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
+    if (opts.signal?.aborted) return { quiesced: false, waitedMs: now() - start };
     if (isQuiescent()) return { quiesced: true, waitedMs: now() - start };
   }
   return { quiesced: false, waitedMs: now() - start };
@@ -76,10 +80,14 @@ export class MeshDrainer implements DrainSeam {
     return ids.size;
   }
 
-  waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }> {
+  waitForQuiescence(
+    timeoutMs: number,
+    opts?: { signal?: AbortSignal }
+  ): Promise<{ quiesced: boolean; waitedMs: number }> {
     return waitForQuiescence(() => this.othersRunning() === 0, {
       timeoutMs,
       intervalMs: this.intervalMs,
+      signal: opts?.signal,
     });
   }
 }

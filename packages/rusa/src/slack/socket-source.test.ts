@@ -1,5 +1,6 @@
 import { ErrorCode } from "@slack/web-api";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { pinClock } from "../providers/test-support/pinned-clock.js";
 import { parseSlackEvent, rememberSlackSelf } from "./socket-source.js";
 import { slackMessageWakes } from "./wake-mode.js";
 
@@ -104,7 +105,7 @@ describe("Slack bot identity lookup", () => {
   const settle = () => new Promise((resolve) => setImmediate(resolve));
 
   it("waits out Slack's retry-after, else 30 seconds, before looking up again", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    pinClock();
     const rateLimited = Object.assign(new Error("rate limited"), {
       code: ErrorCode.RateLimitedError,
       retryAfter: 45,

@@ -48,6 +48,27 @@ export interface CustomHttpMcpOptions {
 class NotGrantedError extends Error {}
 class RequestTooLargeError extends Error {}
 
+interface DriftRecord {
+  lastUpstreamKeyByScope: Map<Access, string>;
+  lastWarned?: {
+    scope: Access;
+    missing: string[];
+    unclassified: string[];
+  };
+}
+
+/**
+ * Deduplication state for classification drift warnings: memoized per server
+ * configuration, tracking observed upstream tool listings by discovery scope.
+ */
+const warnedDriftsByServer = new Map<string, DriftRecord>();
+
+function serverConfigKey(configured: ConfiguredCustomMcpServer): string {
+  const read = [...configured.config.readTools].sort().join(",");
+  const write = [...configured.config.writeTools].sort().join(",");
+  return `${configured.capability}:${configured.config.socketPath}:${read}:${write}`;
+}
+
 /**
  * The access one grant confers on a configured server: `read` or `write` for
  * exactly `<capability>:<configured-user-id>:read|write`, otherwise nothing.
@@ -283,6 +304,71 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
     if (error instanceof RequestTooLargeError) return "request too large";
     return refused(error) ? "refused" : "unavailable";
   };
+  const checkClassificationDrift = (
+    discoveryScope: Access,
+    upstreamTools: Array<{ name: string }>
+  ): void => {
+    const upstreamNames = upstreamTools.map((t) => t.name).sort();
+    // JSON keeps names apart: upstream names need not follow the configured
+    // grammar, so a comma-joined key could make two listings collide.
+    const upstreamKey = JSON.stringify(upstreamNames);
+    const key = serverConfigKey(configured);
+    let record = warnedDriftsByServer.get(key);
+    if (!record) {
+      record = { lastUpstreamKeyByScope: new Map() };
+      warnedDriftsByServer.set(key, record);
+    }
+
+    if (record.lastUpstreamKeyByScope.get(discoveryScope) === upstreamKey) {
+      return;
+    }
+    record.lastUpstreamKeyByScope.set(discoveryScope, upstreamKey);
+
+    const observedSet = new Set(upstreamNames);
+    const unclassified = upstreamNames.filter((name) => !classifications.has(name));
+
+    const toCheck =
+      discoveryScope === "write"
+        ? [...configured.config.readTools, ...configured.config.writeTools]
+        : [...configured.config.readTools];
+    const missing = Array.from(new Set(toCheck))
+      .filter((name) => !observedSet.has(name))
+      .sort();
+
+    if (unclassified.length > 0 || missing.length > 0) {
+      if (record.lastWarned) {
+        if (record.lastWarned.scope === "write" && discoveryScope === "read") {
+          const hasNewMissing = missing.some((m) => !record.lastWarned?.missing.includes(m));
+          const hasNewUnclassified = unclassified.some(
+            (u) => !record.lastWarned?.unclassified.includes(u)
+          );
+          if (!hasNewMissing && !hasNewUnclassified) {
+            return;
+          }
+        }
+        if (
+          JSON.stringify(record.lastWarned.missing) === JSON.stringify(missing) &&
+          JSON.stringify(record.lastWarned.unclassified) === JSON.stringify(unclassified)
+        ) {
+          return;
+        }
+      }
+
+      logger?.warn("custom_mcp_classification_drift", {
+        capability: configured.capability,
+        scope: discoveryScope,
+        missing,
+        unclassified,
+      });
+      record.lastWarned = {
+        scope: discoveryScope,
+        missing,
+        unclassified,
+      };
+    } else if (discoveryScope === "write" || configured.config.writeTools.length === 0) {
+      record.lastWarned = undefined;
+    }
+  };
   const proxy = new McpServer(
     { name: configured.capability, version: "0.1.0" },
     { capabilities: { tools: {} } }
@@ -298,13 +384,13 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       // Discovery carries the actor's effective scope, so the service lists
       // what that scope allows; rusa's own classification then decides what
       // this actor may see and call.
+      const discoveryScope: Access = access.has("write") ? "write" : "read";
       const result = ListToolsResultSchema.parse(
-        await withUpstream(
-          access.has("write") ? "write" : "read",
-          extra.signal,
-          (upstream, cancellation) => upstream.listTools(undefined, { signal: cancellation })
+        await withUpstream(discoveryScope, extra.signal, (upstream, cancellation) =>
+          upstream.listTools(undefined, { signal: cancellation })
         )
       );
+      checkClassificationDrift(discoveryScope, result.tools);
       const currentAccess = activeAccess(actorId, configured, activeCapabilities);
       return {
         tools: result.tools.filter((tool) => {
