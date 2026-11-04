@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:developer' as developer;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -85,9 +84,9 @@ class _AssistantPageState extends State<AssistantPage> {
     // recording begins at once without waiting on network readiness, with the
     // session and root actor resolution catching up in parallel.
     //
-    // Scoped per attempt: cancellation only affects the active attempt, and
-    // stale recorder.start() completions cancel their take directly rather
-    // than leaving an orphaned recording open.
+    // Scoped per attempt: cancellation only affects the active attempt;
+    // a stale attempt never touches the shared recorder so it cannot cancel a
+    // newer take, leaving _end(), dispose() and a newer start() to release it.
     var captureActive = true;
     Future<void> cancelCapture() async {
       if (!captureActive) return;
@@ -98,7 +97,6 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     _cancelCurrentCapture = cancelCapture;
 
-    final pageStart = DateTime.now();
     final captureStartedAt = DateTime.now();
     Object? captureError;
     final captureFuture = () async {
@@ -112,8 +110,9 @@ class _AssistantPageState extends State<AssistantPage> {
           }
           return;
         }
-        final elapsed = DateTime.now().difference(pageStart).inMilliseconds;
-        developer.log('Capture live in ${elapsed}ms', name: 'assistant_page');
+        final elapsed =
+            DateTime.now().difference(captureStartedAt).inMilliseconds;
+        debugPrint('assistant_page: Capture live in ${elapsed}ms');
         // Play audible ready cue at observed capture readiness for assist entry only.
         await widget.signals?.playReadyCue();
       } catch (e) {
@@ -191,9 +190,6 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
-    if (!controller.enabled.value) {
-      return discard('Voice is not configured on this instance');
-    }
 
     await captureFuture;
     if (captureError != null) {
@@ -207,6 +203,9 @@ class _AssistantPageState extends State<AssistantPage> {
       throw StateError('Mic unavailable: $captureError');
     }
     if (stale()) return discard();
+    if (!controller.enabled.value) {
+      return discard('Voice is not configured on this instance');
+    }
 
     captureActive = false;
     if (_cancelCurrentCapture == cancelCapture) {

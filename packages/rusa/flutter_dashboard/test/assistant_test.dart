@@ -394,6 +394,42 @@ void main() {
     });
 
     testWidgets(
+      'closing screen while a newer retry is in lookup cancels capture after superseded retry completes',
+      (tester) async {
+        api.threadsResult = [makeThread('child', parent: 'gone')];
+        await pumpPage(tester);
+        expect(find.text('No active root actor'), findsOneWidget);
+
+        api.threadsResult = [makeThread('root')];
+        final first = Completer<ThreadsSnapshot>();
+        final second = Completer<ThreadsSnapshot>();
+        api.threadSnapshotGates.addAll([first, second]);
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
+        await tester.tap(find.text('Retry'));
+        await tester.pump();
+
+        ThreadsSnapshot snapshot() => ThreadsSnapshot(
+              halted: false,
+              threads: api.threadsResult,
+              rootActorId: 'root',
+            );
+
+        // First (superseded) attempt completes while second is still awaiting threads lookup:
+        first.complete(snapshot());
+        await tester.pump();
+        await tester.pump();
+
+        // Screen is unmounted while second attempt is still in flight:
+        await unmount(tester);
+
+        expect(walkie.recorder.startCalls, 3);
+        // Initial failed attempt cancelled (1), then unmount cancels the active retry handle (2):
+        expect(walkie.recorder.cancelCalls, 2);
+      },
+    );
+
+    testWidgets(
       'a 503 during enable cancels capture and displays voice not configured',
       (tester) async {
         final probe = Completer<List<VoiceAnnouncement>>();
