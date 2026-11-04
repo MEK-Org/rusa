@@ -46,6 +46,20 @@ export type DashboardServerPhaseDurations = Partial<Record<DashboardServerPhase,
  * - `finishMs`: local handoff of the last body chunk until `finish`. It is not
  *   client receipt or network transit.
  *
+ * - `actorRuntimeMs`: actor-list runtime, running/queued and provider queue
+ *   snapshots plus viewer scope setup.
+ * - `actorReadMs`: reading the actor records.
+ * - `actorActivityMs`: the batched last-activity lookup for those actors.
+ * - `actorSummariesMs`: building all actor DTOs, including selected-work reads
+ *   and awaited inbox enrichment. This is one wall interval around Promise.all,
+ *   not a sum of per-actor times; it overlaps the enrichment phase.
+ * - `actorMetadataMs`: scheduler health, viewer identity and response metadata.
+ *
+ * Actor substages occur only on the actor-list route and sit inside `route`.
+ * Like phases they measure elapsed time, including scheduling delays, not CPU
+ * cost; do not add them to their enclosing phases. Existing loopBusyPct is
+ * request-wide context, not attribution to a particular actor operation.
+ *
  * Only the request's own authorization reports auth substages; stream
  * rechecks and session refresh never do. A substage a request never reached
  * is absent, not zero; one still open at the terminal is clipped there.
@@ -56,6 +70,11 @@ export const DASHBOARD_SERVER_SUBSTAGE_INTERVALS = [
   "identityMs",
   "codecMs",
   "finishMs",
+  "actorRuntimeMs",
+  "actorReadMs",
+  "actorActivityMs",
+  "actorSummariesMs",
+  "actorMetadataMs",
 ] as const;
 
 export type DashboardServerSubstageInterval = (typeof DASHBOARD_SERVER_SUBSTAGE_INTERVALS)[number];

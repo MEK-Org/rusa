@@ -2426,6 +2426,7 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
+    const endRuntime = startDashboardSubstage("actorRuntimeMs");
     const runtime =
       typeof deps.mesh?.runtimeStateSnapshot === "function"
         ? deps.mesh.runtimeStateSnapshot()
@@ -2439,11 +2440,18 @@ export async function handleMeshApiRequest(
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
     const chatScope = viewerScope();
+    endRuntime();
     // Aggregate last activity once for all displayed actors; bounded indexed
     // seeks on idx_mesh_events_actor_ts scale with actor count rather than event history (#934).
+    const endRead = startDashboardSubstage("actorReadMs");
     const actorList = actors.list();
+    endRead();
+    const endActivity = startDashboardSubstage("actorActivityMs");
     const lastActiveByActor = meshEvents.latestActivityByActor(actorList.map((a) => a.id));
 
+    endActivity();
+
+    const endSummaries = startDashboardSubstage("actorSummariesMs");
     const threads: ThreadDto[] = await Promise.all(
       actorList.map(async (r) => {
         let runState: "running" | "queued" | "idle" = "idle";
@@ -2567,9 +2575,11 @@ export async function handleMeshApiRequest(
         };
       })
     );
+    endSummaries();
+    const endMetadata = startDashboardSubstage("actorMetadataMs");
     const schedulerHealth = deps.schedulerHealth?.();
     const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
-    sendJson(res, 200, {
+    const response = {
       halted: deps.isHalted?.() ?? false,
       halt: haltSnapshotJson(deps.haltSnapshot?.()),
       haltBrake: haltSnapshotJson(deps.haltBrake?.()),
@@ -2583,7 +2593,9 @@ export async function handleMeshApiRequest(
       rootActorId: deps.resolveActorId?.("root") ?? null,
       userPrincipalId,
       supportedVoices: deps.supportedVoices ?? buildSupportedVoiceCatalog(),
-    });
+    };
+    endMetadata();
+    sendJson(res, 200, response);
     return true;
   }
 
