@@ -7,6 +7,10 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
@@ -44,6 +48,10 @@ class AssistantChannel(
                 headset?.release()
                 result.success(null)
             }
+            "playReadyCue" -> {
+                playReadyCue()
+                result.success(null)
+            }
             else -> result.notImplemented()
         }
     }
@@ -60,6 +68,26 @@ class AssistantChannel(
             override fun notImplemented() = done()
         },
     )
+
+    /** Plays a short audible prompt cue once capture is actively listening. */
+    private fun playReadyCue() {
+        try {
+            val streamType = if (headset?.isRouted == true) {
+                AudioManager.STREAM_VOICE_CALL
+            } else {
+                AudioManager.STREAM_NOTIFICATION
+            }
+            val tone = ToneGenerator(streamType, 80)
+            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 100)
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    tone.release()
+                } catch (_: Exception) {}
+            }, 250)
+        } catch (_: Exception) {
+            // Audio hardware unavailable or muted; don't disrupt recording.
+        }
+    }
 
     private fun roleStatus(): Map<String, Boolean> {
         val roles = activity.getSystemService(RoleManager::class.java)

@@ -5,15 +5,17 @@ import 'package:flutter/services.dart';
 
 import 'api.dart';
 import 'assistant_platform.dart';
+import 'models.dart';
 import 'theme.dart';
 import 'voice_platform.dart';
 import 'walkie_controller.dart';
 import 'widgets/walkie_panel.dart';
 
-/// The screen Android's assist trigger opens once the phone is unlocked
-/// (`AssistGateActivity.kt`): walkie mode to the root actor, already
-/// recording. It reaches nothing else of the dashboard. Another trigger, or the headset ending its voice
-/// recognition, stops and sends; turning walkie off closes the screen.
+/// The screen Android's assist trigger opens (`AssistActivity.kt`): walkie mode
+/// to the root actor, recording immediately on entry over the lock screen. It
+/// reaches nothing else of the dashboard. Another trigger, or the headset
+/// ending its voice recognition, stops and sends; turning walkie off closes the
+/// screen.
 class AssistantPage extends StatefulWidget {
   const AssistantPage({
     super.key,
@@ -39,8 +41,9 @@ class _AssistantPageState extends State<AssistantPage> {
   WalkieDeps? _deps;
   WalkieController? _controller;
 
-  /// The controller triggers reach: set once its start has begun recording,
-  /// so a trigger while voice starts is dropped rather than racing it.
+  /// The controller triggers reach once network and session readiness resolve.
+  /// Triggers arriving before adoption buffer into [_pendingStop] and complete
+  /// on adopt rather than being dropped.
   WalkieController? _live;
   late Future<WalkieController> _ready;
   final _subs = <StreamSubscription<Object?>>[];
@@ -48,6 +51,8 @@ class _AssistantPageState extends State<AssistantPage> {
   int _attempt = 0;
   bool _ended = false;
   bool _disposed = false;
+  bool _pendingStop = false;
+  Future<void> Function()? _cancelCurrentCapture;
 
   @override
   void initState() {
@@ -72,15 +77,93 @@ class _AssistantPageState extends State<AssistantPage> {
     if (deps == null) {
       throw StateError('Voice is not available on this device');
     }
-    final snapshot = await _api.fetchThreads();
+
+    _pendingStop = false;
+
+    // Capture starts immediately on assist entry (#1223): local microphone
+    // recording begins at once without waiting on network readiness, with the
+    // session and root actor resolution catching up in parallel.
+    //
+    // Scoped per attempt: cancellation only affects the active attempt;
+    // a stale attempt never touches the shared recorder so it cannot cancel a
+    // newer take, leaving _end(), dispose() and a newer start() to release it.
+    var captureActive = true;
+    Future<void> cancelCapture() async {
+      if (!captureActive) return;
+      captureActive = false;
+      try {
+        await deps.recorder.cancel();
+      } catch (_) {}
+    }
+    _cancelCurrentCapture = cancelCapture;
+
+    final captureStartedAt = DateTime.now();
+    Object? captureError;
+    final captureFuture = () async {
+      try {
+        await deps.recorder.start();
+        if (stale() || !captureActive) {
+          if (!stale()) {
+            try {
+              await deps.recorder.cancel();
+            } catch (_) {}
+          }
+          return;
+        }
+        final elapsed =
+            DateTime.now().difference(captureStartedAt).inMilliseconds;
+        debugPrint('assistant_page: Capture live in ${elapsed}ms');
+        // Play audible ready cue at observed capture readiness for assist entry only.
+        await widget.signals?.playReadyCue();
+      } catch (e) {
+        if (!stale()) {
+          captureActive = false;
+          captureError = e;
+        }
+      }
+    }();
+
+    ThreadsSnapshot snapshot;
+    try {
+      snapshot = await _api.fetchThreads();
+    } catch (e) {
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      if (!stale()) {
+        await cancelCapture();
+      }
+      rethrow;
+    }
+
     // Only the current start may drop the previous walkie-off listener.
-    if (stale()) throw StateError('Assist screen closed');
+    if (stale()) {
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      throw StateError('Assist screen closed');
+    }
     final previousEnabled = _enabledSub;
     _enabledSub = null;
     await previousEnabled?.cancel();
-    if (stale()) throw StateError('Assist screen closed');
+    if (stale()) {
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      throw StateError('Assist screen closed');
+    }
+
     final root = resolveRootActorId(snapshot);
-    if (root == null) throw StateError('No active root actor');
+    if (root == null) {
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      if (!stale()) {
+        await cancelCapture();
+      }
+      throw StateError('No active root actor');
+    }
+
     unawaited(_controller?.dispose());
     final controller = WalkieController(
       actorId: root,
@@ -89,8 +172,14 @@ class _AssistantPageState extends State<AssistantPage> {
     );
     _controller = controller;
     Future<Never> discard([String reason = 'Assist screen closed']) async {
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
       if (_controller == controller) _controller = null;
       await controller.dispose();
+      if (!stale()) {
+        await cancelCapture();
+      }
       throw StateError(reason);
     }
 
@@ -101,26 +190,64 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
+
+    await captureFuture;
+    if (captureError != null) {
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      if (stale()) return discard();
+      if (_controller == controller) _controller = null;
+      await controller.dispose();
+      if (captureError is StateError) throw captureError!;
+      throw StateError('Mic unavailable: $captureError');
+    }
+    if (stale()) return discard();
+    if (!controller.enabled.value) {
+      return discard('Voice is not configured on this instance');
+    }
+
+    captureActive = false;
+    if (_cancelCurrentCapture == cancelCapture) {
+      _cancelCurrentCapture = null;
+    }
+    controller.adoptRecording(startedAt: captureStartedAt);
+
     // Walkie off (the panel's power button) ends the assist session.
     _enabledSub = controller.enabled.skip(1).listen((enabled) {
       if (!enabled) _close();
     });
     _live = controller;
-    unawaited(controller.toggleRecord());
+    if (_pendingStop) {
+      _pendingStop = false;
+      unawaited(controller.toggleRecord());
+    }
     return controller;
   }
 
   Future<void> _onTrigger() async {
     final controller = _live;
-    // Walkie off is closing the screen; a trigger does not reopen it.
-    if (controller == null || !controller.enabled.value) return;
-    await controller.toggleRecord();
+    if (controller != null) {
+      // Walkie off is closing the screen; a trigger does not reopen it.
+      if (!controller.enabled.value) return;
+      await controller.toggleRecord();
+      return;
+    }
+    // If the user triggers stop/send before network resolution completes,
+    // buffer the stop request so adoption immediately stops and uploads.
+    if (_cancelCurrentCapture != null) {
+      _pendingStop = true;
+    }
   }
 
   Future<void> _onRouteLost() async {
     final controller = _controller;
     if (controller?.record.value.phase == RecordPhase.recording) {
       await controller!.toggleRecord();
+      return;
+    }
+    if (_cancelCurrentCapture != null) {
+      _pendingStop = true;
     }
   }
 
@@ -139,8 +266,15 @@ class _AssistantPageState extends State<AssistantPage> {
     final controller = _controller;
     _controller = null;
     _live = null;
+    final cancelCapture = _cancelCurrentCapture;
+    _cancelCurrentCapture = null;
     final pending = _ready;
-    await controller?.dispose();
+    if (controller != null) {
+      await controller.dispose();
+    }
+    if (cancelCapture != null) {
+      await cancelCapture();
+    }
     try {
       await pending;
     } catch (_) {
@@ -166,7 +300,12 @@ class _AssistantPageState extends State<AssistantPage> {
       unawaited(sub.cancel());
     }
     unawaited(_enabledSub?.cancel());
-    unawaited(_controller?.dispose());
+    if (_controller != null) {
+      unawaited(_controller?.dispose());
+    }
+    if (_cancelCurrentCapture != null) {
+      unawaited(_cancelCurrentCapture?.call());
+    }
     super.dispose();
   }
 

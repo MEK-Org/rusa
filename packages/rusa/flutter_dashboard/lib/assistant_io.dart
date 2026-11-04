@@ -27,6 +27,17 @@ class IoAssistantChannel implements AssistantPlatform {
   Stream<void> get routeLost => _routeLost.stream;
 
   @override
+  Future<void> playReadyCue() async {
+    try {
+      await _channel.invokeMethod('playReadyCue');
+    } on PlatformException {
+      // Audio cue failure should not disrupt recording.
+    } on MissingPluginException {
+      // Non-Android or unhandled test environment.
+    }
+  }
+
+  @override
   Future<void> Function()? onEnd;
 
   Future<Object?> _handle(MethodCall call) async {

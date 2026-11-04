@@ -46,6 +46,9 @@ abstract interface class AssistantSignals {
   /// its voice recognition.
   Stream<void> get routeLost;
 
+  /// Plays a short audible ready cue once capture is actively listening.
+  Future<void> playReadyCue();
+
   /// Ends the session when the assist screen is closing because it left the
   /// screen. The screen closes once the returned future settles, or after a
   /// native deadline. Null when no page owns the screen.

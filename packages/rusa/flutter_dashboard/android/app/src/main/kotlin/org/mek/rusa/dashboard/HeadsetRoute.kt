@@ -42,6 +42,7 @@ class HeadsetRoute(private val context: Context, private val onLost: () -> Unit)
     private var communicationSet = false
     private var scoStarted = false
     private var routed = false
+    val isRouted: Boolean get() = routed
     private var pending: ((Boolean) -> Unit)? = null
     private val timeout = Runnable { settle(false) }
     private var communicationListener: Any? = null
