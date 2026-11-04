@@ -61,7 +61,6 @@ import type {
   InboxPayload,
   InboxRepository,
 } from "../repositories/inbox-repository.js";
-import type { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
 import type { RoomEntryService } from "../voice/room-entry.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
@@ -136,8 +135,6 @@ export interface DashboardDataDeps {
   rootControl?: RootControlService;
   /** The authenticated operator's actor-forest boundary (#1003). */
   operatorActors?: OperatorActorControl;
-  /** Standalone graceful shutdown coordinator (#1225). */
-  maintenanceShutdown?: MaintenanceShutdownCoordinator;
   /**
    * Read-only view of the mesh's emergency-brake state (the HALT sentinel),
    * surfaced as the top-level `halted` flag on `/api/mesh/threads`. Optional:
@@ -1115,77 +1112,6 @@ export async function handleMeshApiRequest(
           }
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));
-      return true;
-    }
-
-    // POST /api/mesh/shutdown — authenticated operator requests graceful shutdown (#1225)
-    if (pathname === "/api/mesh/shutdown" && req.method === "POST") {
-      const coordinator = deps?.maintenanceShutdown;
-      if (!coordinator) {
-        sendJson(res, 503, { error: "maintenance shutdown unavailable" });
-        return true;
-      }
-      const principal = requireOperatorPrincipal(req, res, deps);
-      if (!principal) return true;
-      readBody(req)
-        .then(async (bodyStr) => {
-          let body: Record<string, unknown> = {};
-          if (bodyStr.trim()) {
-            try {
-              body = JSON.parse(bodyStr);
-            } catch {
-              sendJson(res, 400, { error: "Invalid JSON body" });
-              return;
-            }
-          }
-          const timeoutSeconds =
-            typeof body.timeoutSeconds === "number" ? body.timeoutSeconds : undefined;
-          const timeoutBehavior = body.timeoutBehavior === "terminate" ? "terminate" : "cancel";
-          const reason = typeof body.reason === "string" ? body.reason : undefined;
-          const outcome = await coordinator.request({ timeoutSeconds, timeoutBehavior, reason });
-          if (outcome.ok) {
-            sendJson(res, 200, { ok: true, message: outcome.message });
-          } else {
-            sendJson(res, 409, { ok: false, error: outcome.message });
-          }
-        })
-        .catch((err) => {
-          sendJson(res, 500, { error: String(err) });
-        });
-      return true;
-    }
-
-    // POST /api/mesh/shutdown/cancel — authenticated operator cancels graceful shutdown (#1225)
-    if (pathname === "/api/mesh/shutdown/cancel" && req.method === "POST") {
-      const coordinator = deps?.maintenanceShutdown;
-      if (!coordinator) {
-        sendJson(res, 503, { error: "maintenance shutdown unavailable" });
-        return true;
-      }
-      const principal = requireOperatorPrincipal(req, res, deps);
-      if (!principal) return true;
-      readBody(req)
-        .then((bodyStr) => {
-          let reason: string | undefined;
-          if (bodyStr.trim()) {
-            try {
-              const body = JSON.parse(bodyStr);
-              if (typeof body.reason === "string") reason = body.reason;
-            } catch {
-              sendJson(res, 400, { error: "Invalid JSON body" });
-              return;
-            }
-          }
-          const outcome = coordinator.cancel(reason);
-          if (outcome.ok) {
-            sendJson(res, 200, { ok: true, message: outcome.message });
-          } else {
-            sendJson(res, 409, { ok: false, error: outcome.message });
-          }
-        })
-        .catch((err) => {
-          sendJson(res, 500, { error: String(err) });
-        });
       return true;
     }
 

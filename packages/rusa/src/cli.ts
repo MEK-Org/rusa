@@ -24,12 +24,7 @@ import {
   runQuotaSprintStatus,
 } from "./commands/quota-sprint.js";
 import { runReport } from "./commands/report.js";
-import {
-  runServiceRestart,
-  runServiceShutdown,
-  runServiceStatus,
-  runServiceStop,
-} from "./commands/service-control.js";
+import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
 import { runStart } from "./commands/start.js";
 import { runUnderstandingRecompute } from "./commands/understanding.js";
 import {
@@ -250,41 +245,6 @@ program
   .action(async (opts: { environment: ServiceEnvironment }) => {
     await runServiceStop({ environment: opts.environment });
   });
-
-program
-  .command("shutdown")
-  .description(
-    "Gracefully drain and shut down the orchestrator service for maintenance without rebuilding"
-  )
-  .option("--environment <environment>", "Service environment: production or staging", "production")
-  .option("--timeout <seconds>", "Drain timeout in seconds (default: 60)", (v) => parseInt(v, 10))
-  .option(
-    "--behavior <behavior>",
-    "Timeout behavior: cancel or terminate (default: cancel)",
-    "cancel"
-  )
-  .option("--reason <reason>", "Maintenance reason for shutdown")
-  .option("--cancel", "Cancel a pending graceful shutdown request")
-  .option("--url <url>", "Direct dashboard base URL")
-  .action(
-    async (opts: {
-      environment: ServiceEnvironment;
-      timeout?: number;
-      behavior?: "cancel" | "terminate";
-      reason?: string;
-      cancel?: boolean;
-      url?: string;
-    }) => {
-      await runServiceShutdown({
-        environment: opts.environment,
-        timeout: opts.timeout,
-        behavior: opts.behavior,
-        reason: opts.reason,
-        cancel: opts.cancel,
-        url: opts.url,
-      });
-    }
-  );
 
 program
   .command("status")

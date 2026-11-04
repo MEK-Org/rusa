@@ -96,31 +96,4 @@ describe("MeshDrainer — self-excluding barrier (deadlock regression)", () => {
     drainer.cancel();
     expect(g.isShuttingDown()).toBe(false);
   });
-
-  it("waitForAllQuiescence waits for ALL runs including self to complete", async () => {
-    const running = new Set([ROOT, "worker-1"]);
-    const drainer = new MeshDrainer(new GracefulShutdown(), () => new Set(running), ROOT, 5);
-    expect(drainer.activeCount()).toBe(2);
-    expect(drainer.othersRunning()).toBe(1);
-
-    const p = drainer.waitForAllQuiescence(5000);
-    // Root finishes first
-    running.delete(ROOT);
-    expect(drainer.activeCount()).toBe(1);
-
-    // worker-1 finishes
-    running.delete("worker-1");
-    expect(drainer.activeCount()).toBe(0);
-
-    const res = await p;
-    expect(res.quiesced).toBe(true);
-  });
-
-  it("waitForAllQuiescence times out when a run remains active", async () => {
-    const running = new Set(["worker-stuck"]);
-    const drainer = new MeshDrainer(new GracefulShutdown(), () => new Set(running), ROOT, 5);
-    const res = await drainer.waitForAllQuiescence(20);
-    expect(res.quiesced).toBe(false);
-    expect(res.waitedMs).toBeGreaterThanOrEqual(20);
-  });
 });

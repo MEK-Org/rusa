@@ -1,191 +1,157 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
+import { HaltSwitch } from "../actor/halt-switch.js";
 import { MeshDrainer } from "./drain.js";
 import { MaintenanceShutdownCoordinator } from "./maintenance-shutdown.js";
 
-function fakeClock() {
-  let t = 1000;
+function setupCoordinator(opts?: {
+  defaultTimeoutSeconds?: number;
+  isBusy?: () => boolean;
+  onExit?: (code: number) => void;
+  notifyFails?: boolean;
+}) {
+  const graceful = new GracefulShutdown();
+  const running = new Set<string>();
+  const drainer = new MeshDrainer(graceful, () => new Set(running), "", 10);
+  const notifications: string[] = [];
+  const actions: string[] = [];
+  let exitCode: number | null = null;
+  let workResumedCount = 0;
+
+  const coordinator = new MaintenanceShutdownCoordinator({
+    drain: drainer,
+    notify: {
+      notify: async (text) => {
+        if (opts?.notifyFails) {
+          throw new Error("Chat network unavailable");
+        }
+        notifications.push(text);
+      },
+    },
+    recordAction: (text) => {
+      actions.push(text);
+    },
+    exit: (code) => {
+      exitCode = code;
+      opts?.onExit?.(code);
+    },
+    defaultTimeoutSeconds: opts?.defaultTimeoutSeconds ?? 60,
+    isBusy: opts?.isBusy,
+    onResumeWork: () => {
+      workResumedCount++;
+    },
+  });
+
   return {
-    now: () => t,
-    sleep: async (ms: number) => {
-      t += ms;
-    },
-    advance: (ms: number) => {
-      t += ms;
-    },
+    graceful,
+    running,
+    drainer,
+    notifications,
+    actions,
+    getExitCode: () => exitCode,
+    getWorkResumedCount: () => workResumedCount,
+    coordinator,
   };
 }
 
 describe("MaintenanceShutdownCoordinator (#1225)", () => {
-  it("emits mechanical notification to configured error chat at request time", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    const running = new Set<string>();
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "root", 5);
-
-    const notifications: string[] = [];
-    const actions: string[] = [];
-    let exitCode: number | null = null;
-
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      notify: {
-        notify: async (text) => {
-          notifications.push(text);
-        },
-      },
-      recordAction: (text) => {
-        actions.push(text);
-      },
-      exit: (code) => {
-        exitCode = code;
-      },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 5,
-    });
+  it("engages admission brake synchronously and emits notification at request time", async () => {
+    const { graceful, notifications, actions, coordinator, getExitCode } = setupCoordinator();
 
     const outcome = await coordinator.request({
       reason: "custom MCP registration config update",
       timeoutSeconds: 30,
-      timeoutBehavior: "cancel",
     });
 
     expect(outcome.ok).toBe(true);
     expect(outcome.message).toContain("Graceful shutdown initiated");
     expect(outcome.message).toContain("custom MCP registration config update");
 
-    // Notification posted to error chat AT REQUEST TIME
+    // Admission brake engaged immediately (synchronously)
+    expect(graceful.isShuttingDown()).toBe(true);
+    expect(actions[0]).toContain("shutdown requested: custom MCP registration config update");
+
+    // Notification posted to error chat at request time
     expect(notifications).toHaveLength(1);
     expect(notifications[0]).toContain(
       "🛑 Graceful shutdown requested: custom MCP registration config update"
     );
     expect(notifications[0]).toContain("timeout: 30s");
-    expect(notifications[0]).toContain("on timeout: cancel");
 
-    // Admission brake engaged immediately
-    expect(graceful.isShuttingDown()).toBe(true);
-    expect(actions[0]).toContain("shutdown requested: custom MCP registration config update");
-
-    // Let drain watcher resolve (running is empty)
+    // Quiesced immediately (running is empty) -> clean exit(0)
     const result = await outcome.completion;
     expect(result?.status).toBe("quiesced");
-    expect(exitCode).toBe(0);
+    expect(getExitCode()).toBe(0);
     expect(actions[1]).toContain("shutdown committed: drained in");
   });
 
-  it("allows active runs to finish while pending work stays blocked, then exits", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    const running = new Set<string>(["worker-active"]);
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "", 5);
+  it("self-request return: requesting actor returns immediately without deadlock while active run finishes before clean exit", async () => {
+    const { running, coordinator, getExitCode } = setupCoordinator();
 
-    let exitCode: number | null = null;
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      exit: (code) => {
-        exitCode = code;
-      },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 5,
-    });
+    // Calling actor (root) and worker-1 are actively running
+    running.add("root");
+    running.add("worker-1");
 
+    // Root calls request (simulating MCP tool invocation)
     const outcome = await coordinator.request({
-      timeoutSeconds: 10,
-    });
-    expect(outcome.ok).toBe(true);
-    expect(graceful.isShuttingDown()).toBe(true);
-
-    // Simulated pending run check: while shutting down, new work must NOT start
-    expect(graceful.isShuttingDown()).toBe(true);
-
-    // Active run is still executing, so exit has not been called
-    expect(exitCode).toBeNull();
-    expect(drainer.activeCount()).toBe(1);
-
-    // Now active run finishes
-    running.delete("worker-active");
-
-    const result = await outcome.completion;
-    expect(result?.status).toBe("quiesced");
-    expect(exitCode).toBe(0);
-  });
-
-  it("self-request return: requesting actor returns cleanly from tool call without deadlocking", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    // Root (requesting actor) and worker-1 are both running
-    const running = new Set<string>(["root", "worker-1"]);
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "root", 5);
-
-    let exitCode: number | null = null;
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      exit: (code) => {
-        exitCode = code;
-      },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 5,
+      reason: "maintenance bounce",
+      timeoutSeconds: 5,
     });
 
-    // Root calls request (simulating the MCP tool invocation)
-    const outcome = await coordinator.request({
-      selfId: "root",
-      timeoutSeconds: 15,
-      reason: "test self-request return",
-    });
-
-    // Request returns immediately to root! (No deadlock!)
+    // Request returns immediately to root so its turn finishes cleanly
     expect(outcome.ok).toBe(true);
     expect(outcome.message).toContain("Active runs will finish before shutdown");
-    expect(exitCode).toBeNull();
+    expect(getExitCode()).toBeNull();
 
     // Root finishes its turn and returns cleanly
     running.delete("root");
-    expect(exitCode).toBeNull(); // worker-1 still running
+    expect(getExitCode()).toBeNull(); // worker-1 still running
 
-    // worker-1 finishes its run
+    // Worker-1 finishes its run
     running.delete("worker-1");
 
     const result = await outcome.completion;
     expect(result?.status).toBe("quiesced");
-    expect(exitCode).toBe(0);
+    expect(getExitCode()).toBe(0);
   });
 
-  it("timeout behavior 'cancel' (default): aborts shutdown, lifts brake, notifies chat, does NOT exit", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    // Stuck worker that will not finish
-    const running = new Set<string>(["worker-stuck"]);
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "", 100);
+  it("pending run gating: pending work stays blocked while active runs finish", async () => {
+    const { graceful, running, coordinator, getExitCode } = setupCoordinator();
 
-    const notifications: string[] = [];
-    const actions: string[] = [];
-    let exitCode: number | null = null;
-
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      notify: {
-        notify: async (text) => {
-          notifications.push(text);
-        },
-      },
-      recordAction: (text) => {
-        actions.push(text);
-      },
-      exit: (code) => {
-        exitCode = code;
-      },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 100,
-    });
+    running.add("worker-active");
 
     const outcome = await coordinator.request({
-      timeoutSeconds: 1, // 1000ms
-      timeoutBehavior: "cancel",
+      timeoutSeconds: 5,
+    });
+    expect(outcome.ok).toBe(true);
+
+    // Admission brake is engaged
+    expect(graceful.isShuttingDown()).toBe(true);
+
+    // Simulated run admission gate (mirrors actor-mesh.prepareRun / actor.runOnce)
+    const canAdmitPendingRun = () => !graceful.isShuttingDown();
+    expect(canAdmitPendingRun()).toBe(false);
+
+    // Active run completes
+    running.delete("worker-active");
+
+    const result = await outcome.completion;
+    expect(result?.status).toBe("quiesced");
+    expect(getExitCode()).toBe(0);
+  });
+
+  it("timeout behavior: aborts shutdown, lifts brake, notifies chat, invokes onResumeWork, does NOT exit", async () => {
+    const { graceful, running, notifications, coordinator, getExitCode, getWorkResumedCount } =
+      setupCoordinator();
+
+    // Worker remains running past timeout
+    running.add("worker-long");
+
+    const outcome = await coordinator.request({
+      timeoutSeconds: 1,
       reason: "timeout test",
     });
     expect(outcome.ok).toBe(true);
@@ -195,175 +161,172 @@ describe("MaintenanceShutdownCoordinator (#1225)", () => {
     expect(result?.status).toBe("cancelled");
     expect(result?.reason).toBe("timeout");
 
-    // Exit must NOT have been called
-    expect(exitCode).toBeNull();
+    // Exit must NOT have been called (never silently terminates)
+    expect(getExitCode()).toBeNull();
 
-    // Admission brake must have been lifted!
+    // Admission brake lifted and queued work resumed
     expect(graceful.isShuttingDown()).toBe(false);
+    expect(getWorkResumedCount()).toBe(1);
 
-    // Error chat must have received the cancellation notice
+    // Error chat notified
     expect(notifications).toHaveLength(2);
     expect(notifications[1]).toContain("⚠️ Graceful shutdown cancelled: drain timed out after 1s");
     expect(notifications[1]).toContain("Admission resumed");
 
-    // Action log records cancellation
-    expect(actions.some((a) => a.includes("shutdown cancelled: drain timed out"))).toBe(true);
-
-    // Coordinator is now free for future requests
+    // Coordinator is ready for future requests
     expect(coordinator.isPending()).toBe(false);
   });
 
-  it("timeout behavior 'terminate': terminates remaining active runs and calls exit", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    const running = new Set<string>(["worker-stuck"]);
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "", 100);
+  it("explicit cancellation: cancels pending shutdown, lifts brake, notifies chat, invokes onResumeWork", async () => {
+    const { graceful, running, notifications, coordinator, getExitCode, getWorkResumedCount } =
+      setupCoordinator();
 
-    const notifications: string[] = [];
-    let exitCode: number | null = null;
-
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      notify: {
-        notify: async (text) => {
-          notifications.push(text);
-        },
-      },
-      exit: (code) => {
-        exitCode = code;
-      },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 100,
-    });
-
-    const outcome = await coordinator.request({
-      timeoutSeconds: 1,
-      timeoutBehavior: "terminate",
-      reason: "terminate test",
-    });
-
-    const result = await outcome.completion;
-    expect(result?.status).toBe("terminated");
-    expect(result?.reason).toBe("timeout");
-    expect(exitCode).toBe(0);
-
-    expect(notifications).toHaveLength(2);
-    expect(notifications[1]).toContain(
-      "⚠️ Graceful shutdown drain timed out after 1s. Terminating remaining active runs"
-    );
-  });
-
-  it("explicit cancellation: cancels pending shutdown, lifts brake, notifies error chat", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    const running = new Set<string>(["worker-long"]);
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "", 50);
-
-    const notifications: string[] = [];
-    const actions: string[] = [];
-    let exitCode: number | null = null;
-
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      notify: {
-        notify: async (text) => {
-          notifications.push(text);
-        },
-      },
-      recordAction: (text) => {
-        actions.push(text);
-      },
-      exit: (code) => {
-        exitCode = code;
-      },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 50,
-    });
+    running.add("worker-long");
 
     const outcome = await coordinator.request({
       timeoutSeconds: 60,
-      reason: "cancel me",
+      reason: "operator cancel test",
     });
     expect(coordinator.isPending()).toBe(true);
     expect(graceful.isShuttingDown()).toBe(true);
 
-    // Operator cancels the pending request
     const cancelResult = coordinator.cancel("operator changed mind");
     expect(cancelResult.ok).toBe(true);
-    expect(cancelResult.message).toContain("Graceful shutdown cancelled");
+    expect(cancelResult.message).toContain("Graceful shutdown cancelled by operator");
     expect(coordinator.isPending()).toBe(false);
 
-    // Admission brake lifted
+    // Brake lifted, work resumed, no exit
     expect(graceful.isShuttingDown()).toBe(false);
-    expect(exitCode).toBeNull();
-
-    // Notification emitted
-    expect(notifications).toHaveLength(2);
-    expect(notifications[1]).toContain(
-      "⚠️ Graceful shutdown cancelled by operator: operator changed mind. Admission resumed."
-    );
+    expect(getExitCode()).toBeNull();
+    expect(getWorkResumedCount()).toBe(1);
 
     const completion = await outcome.completion;
     expect(completion?.status).toBe("cancelled");
     expect(completion?.reason).toBe("explicit");
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications[1]).toContain(
+      "⚠️ Graceful shutdown cancelled by operator: operator changed mind. Admission resumed."
+    );
   });
 
-  it("rejects duplicate request when already pending and rejects cancel when not pending", async () => {
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    const running = new Set<string>(["worker-long"]);
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "", 50);
+  it("stale background watcher does not clobber a subsequent request after cancel", async () => {
+    const { running, coordinator } = setupCoordinator();
 
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      exit: () => {},
-      now: clock.now,
-      sleep: clock.sleep,
-    });
+    running.add("worker-stuck");
 
-    // Cancel when not pending
-    expect(coordinator.cancel().ok).toBe(false);
+    // 1. First request
+    const _firstOutcome = await coordinator.request({ timeoutSeconds: 1, reason: "first" });
+    expect(coordinator.isPending()).toBe(true);
 
-    // First request succeeds
-    const first = await coordinator.request({ timeoutSeconds: 60, reason: "initial" });
+    // 2. Cancel immediately
+    const cancelRes = coordinator.cancel("abort first");
+    expect(cancelRes.ok).toBe(true);
+    expect(coordinator.isPending()).toBe(false);
+
+    // 3. Second request starts right away
+    const secondOutcome = await coordinator.request({ timeoutSeconds: 60, reason: "second" });
+    expect(coordinator.isPending()).toBe(true);
+
+    // 4. Wait for first watcher's timeout to pass
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // Second request must STILL be active and not clobbered by the first watcher
+    expect(coordinator.isPending()).toBe(true);
+
+    // Now let worker finish so second request can quiesce
+    running.delete("worker-stuck");
+    const secondResult = await secondOutcome.completion;
+    expect(secondResult?.status).toBe("quiesced");
+    expect(coordinator.isPending()).toBe(false);
+  });
+
+  it("preserves operator HALT state independently without file collision or state conflation", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "rusa-halt-test-"));
+    try {
+      const haltFile = join(tmp, "HALT");
+      const haltSwitch = new HaltSwitch(haltFile);
+
+      // Pre-condition: no halt active
+      expect(haltSwitch.isHalted()).toBe(false);
+
+      const { coordinator } = setupCoordinator();
+      const outcome = await coordinator.request({ reason: "mcp reload" });
+      expect(outcome.ok).toBe(true);
+
+      // Halt state remains completely untouched
+      expect(haltSwitch.isHalted()).toBe(false);
+
+      // Now create an explicit operator halt sentinel
+      writeFileSync(haltFile, JSON.stringify({ reason: "operator emergency" }));
+      expect(haltSwitch.isHalted()).toBe(true);
+
+      // Cancelling maintenance shutdown does NOT clear the operator halt
+      coordinator.cancel("cancel test");
+      expect(haltSwitch.isHalted()).toBe(true);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("chat notification failure does not crash the coordinator or strand the brake", async () => {
+    const { graceful, coordinator, getExitCode } = setupCoordinator({ notifyFails: true });
+
+    // Request succeeds even if error-chat send rejects
+    const outcome = await coordinator.request({ reason: "chat-broken test" });
+    expect(outcome.ok).toBe(true);
+    expect(graceful.isShuttingDown()).toBe(true);
+
+    const result = await outcome.completion;
+    expect(result?.status).toBe("quiesced");
+    expect(getExitCode()).toBe(0);
+  });
+
+  it("rejects duplicate requests and prevents collision when update is in progress", async () => {
+    let updating = false;
+    const { coordinator } = setupCoordinator({ isBusy: () => updating });
+
+    // Refused when update is running
+    updating = true;
+    const refused = await coordinator.request({ reason: "while update running" });
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain("An update is currently in progress");
+
+    updating = false;
+    const first = await coordinator.request({ reason: "first" });
     expect(first.ok).toBe(true);
 
-    // Second request is rejected
-    const second = await coordinator.request({ timeoutSeconds: 60, reason: "duplicate" });
+    // Duplicate rejected
+    const second = await coordinator.request({ reason: "duplicate" });
     expect(second.ok).toBe(false);
     expect(second.message).toContain("already in progress");
 
     coordinator.cancel();
   });
 
-  it("preserves operator HALT state independently without file collision or state conflation", async () => {
-    // HALT is separate: graceful shutdown exists only in-memory and does not create or touch HALT.
-    const clock = fakeClock();
-    const graceful = new GracefulShutdown();
-    const running = new Set<string>();
-    const drainer = new MeshDrainer(graceful, () => new Set(running), "", 5);
-
-    let exitCode: number | null = null;
-    const coordinator = new MaintenanceShutdownCoordinator({
-      drain: drainer,
-      exit: (code) => {
-        exitCode = code;
+  it("failed shutdown commit does not strand the brake", async () => {
+    const { graceful, notifications, coordinator, getWorkResumedCount } = setupCoordinator({
+      onExit: () => {
+        throw new Error("simulated e2e stop error");
       },
-      now: clock.now,
-      sleep: clock.sleep,
-      intervalMs: 5,
     });
 
-    // Request shutdown
-    const outcome = await coordinator.request({ reason: "config restart" });
-    expect(graceful.isShuttingDown()).toBe(true);
+    const outcome = await coordinator.request({ reason: "failing commit test" });
+    expect(outcome.ok).toBe(true);
 
-    await outcome.completion;
-    expect(exitCode).toBe(0);
+    const result = await outcome.completion;
+    expect(result?.status).toBe("cancelled");
+    expect(result?.reason).toBe("error");
 
-    // In a freshly rebooted process, gracefulShutdown starts false by design.
-    // Operator HALT is never touched or conflated.
+    // Brake must be lifted, work resumed, coordinator freed
+    expect(graceful.isShuttingDown()).toBe(false);
+    expect(getWorkResumedCount()).toBe(1);
+    expect(coordinator.isPending()).toBe(false);
+
+    // Error chat notified that commit aborted and admission resumed
+    expect(notifications).toHaveLength(2);
+    expect(notifications[1]).toContain(
+      "⚠️ Graceful shutdown aborted before commit: exit failed (simulated e2e stop error). Admission resumed."
+    );
   });
 });

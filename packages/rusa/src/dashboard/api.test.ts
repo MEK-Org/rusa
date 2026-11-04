@@ -38,7 +38,6 @@ import { assertConcreteModelConfig } from "../providers/model-config.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
-import type { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
@@ -5937,120 +5936,6 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(unknownOwner.res.statusCode).toBe(400);
         expect(obligations.get("task-owner")?.ownerId).toBe("actor-1");
-      });
-    });
-
-    describe("POST /api/mesh/shutdown and POST /api/mesh/shutdown/cancel (#1225)", () => {
-      it("returns 503 when maintenanceShutdown dependency is not configured", async () => {
-        const { res } = await call(deps, "POST", "/api/mesh/shutdown", JSON.stringify({}));
-        await settled(res);
-        expect(res.statusCode).toBe(503);
-        expect(JSON.parse(res.body).error).toMatch(/unavailable/);
-      });
-
-      it("returns 403 when principal is disabled", async () => {
-        principals.setDisabled(LOCAL_USER, "2026-06-22T00:00:00.000Z");
-        const mockShutdown = {
-          request: vi.fn(),
-          cancel: vi.fn(),
-        } as unknown as MaintenanceShutdownCoordinator;
-        const depsWithShutdown = { ...deps, maintenanceShutdown: mockShutdown };
-        const { res } = await call(
-          depsWithShutdown,
-          "POST",
-          "/api/mesh/shutdown",
-          JSON.stringify({})
-        );
-        await settled(res);
-        expect(res.statusCode).toBe(403);
-      });
-
-      it("handles successful shutdown request", async () => {
-        const requestFn = vi.fn().mockResolvedValue({ ok: true, message: "Drain started" });
-        const mockShutdown = {
-          request: requestFn,
-          cancel: vi.fn(),
-        } as unknown as MaintenanceShutdownCoordinator;
-        const depsWithShutdown = { ...deps, maintenanceShutdown: mockShutdown };
-        const { res } = await call(
-          depsWithShutdown,
-          "POST",
-          "/api/mesh/shutdown",
-          JSON.stringify({ timeoutSeconds: 300, timeoutBehavior: "cancel", reason: "maintenance" })
-        );
-        await settled(res);
-        expect(res.statusCode).toBe(200);
-        expect(JSON.parse(res.body)).toEqual({ ok: true, message: "Drain started" });
-        expect(requestFn).toHaveBeenCalledWith({
-          timeoutSeconds: 300,
-          timeoutBehavior: "cancel",
-          reason: "maintenance",
-        });
-      });
-
-      it("returns 409 when shutdown request is rejected", async () => {
-        const requestFn = vi
-          .fn()
-          .mockResolvedValue({ ok: false, message: "Graceful shutdown already in progress" });
-        const mockShutdown = {
-          request: requestFn,
-          cancel: vi.fn(),
-        } as unknown as MaintenanceShutdownCoordinator;
-        const depsWithShutdown = { ...deps, maintenanceShutdown: mockShutdown };
-        const { res } = await call(
-          depsWithShutdown,
-          "POST",
-          "/api/mesh/shutdown",
-          JSON.stringify({})
-        );
-        await settled(res);
-        expect(res.statusCode).toBe(409);
-        expect(JSON.parse(res.body)).toEqual({
-          ok: false,
-          error: "Graceful shutdown already in progress",
-        });
-      });
-
-      it("handles shutdown cancellation", async () => {
-        const cancelFn = vi.fn().mockReturnValue({ ok: true, message: "Shutdown cancelled" });
-        const mockShutdown = {
-          request: vi.fn(),
-          cancel: cancelFn,
-        } as unknown as MaintenanceShutdownCoordinator;
-        const depsWithShutdown = { ...deps, maintenanceShutdown: mockShutdown };
-        const { res } = await call(
-          depsWithShutdown,
-          "POST",
-          "/api/mesh/shutdown/cancel",
-          JSON.stringify({ reason: "operator aborted" })
-        );
-        await settled(res);
-        expect(res.statusCode).toBe(200);
-        expect(JSON.parse(res.body)).toEqual({ ok: true, message: "Shutdown cancelled" });
-        expect(cancelFn).toHaveBeenCalledWith("operator aborted");
-      });
-
-      it("returns 409 when cancellation is rejected", async () => {
-        const cancelFn = vi
-          .fn()
-          .mockReturnValue({ ok: false, message: "No graceful shutdown is currently in progress" });
-        const mockShutdown = {
-          request: vi.fn(),
-          cancel: cancelFn,
-        } as unknown as MaintenanceShutdownCoordinator;
-        const depsWithShutdown = { ...deps, maintenanceShutdown: mockShutdown };
-        const { res } = await call(
-          depsWithShutdown,
-          "POST",
-          "/api/mesh/shutdown/cancel",
-          JSON.stringify({})
-        );
-        await settled(res);
-        expect(res.statusCode).toBe(409);
-        expect(JSON.parse(res.body)).toEqual({
-          ok: false,
-          error: "No graceful shutdown is currently in progress",
-        });
       });
     });
   });

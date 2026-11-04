@@ -1,9 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import {
+import type {
   MaintenanceShutdownCoordinator,
-  type MaintenanceShutdownOptions,
-  type MaintenanceShutdownOutcome,
+  MaintenanceShutdownOutcome,
 } from "../update/maintenance-shutdown.js";
 import {
   executeUpdate,
@@ -26,8 +25,8 @@ export interface UpdateToolDeps {
    * server ({@link UPDATE_MCP_NAME}); no actor id or topology stands in for it.
    */
   hasCapability: (actorId: string, capability: string) => boolean;
-  /** Optional shared maintenance shutdown coordinator. */
-  maintenanceShutdown?: MaintenanceShutdownCoordinator;
+  /** Shared maintenance shutdown coordinator (#1225). */
+  maintenanceShutdown: MaintenanceShutdownCoordinator;
 }
 
 export interface UpdateToolOutcome {
@@ -65,6 +64,12 @@ export async function runUpdateTool(
       message: `'update' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
     };
   }
+  if (toolDeps.maintenanceShutdown.isPending()) {
+    return {
+      ok: false,
+      message: "A maintenance shutdown is currently in progress — refusing update.",
+    };
+  }
   const result = await executeUpdate(toolDeps.plan, toolDeps.deps);
   if (result.restarting) {
     // The process is exiting; this response may never reach root (the daemon dies
@@ -82,19 +87,6 @@ export async function runUpdateTool(
   };
 }
 
-function resolveMaintenanceShutdown(toolDeps: UpdateToolDeps): MaintenanceShutdownCoordinator {
-  if (!toolDeps.maintenanceShutdown) {
-    toolDeps.maintenanceShutdown = new MaintenanceShutdownCoordinator({
-      drain: toolDeps.deps.drain,
-      notify: toolDeps.deps.notify,
-      recordAction: toolDeps.deps.recordAction,
-      exit: toolDeps.deps.exit,
-      log: toolDeps.deps.log,
-    });
-  }
-  return toolDeps.maintenanceShutdown;
-}
-
 /**
  * Standalone graceful drain and shutdown maintenance request without pulling or
  * building code (#1225).
@@ -105,7 +97,7 @@ function resolveMaintenanceShutdown(toolDeps: UpdateToolDeps): MaintenanceShutdo
 export async function runShutdownTool(
   toolDeps: UpdateToolDeps,
   selfId: string,
-  opts?: MaintenanceShutdownOptions
+  opts?: { timeoutSeconds?: number; reason?: string }
 ): Promise<ShutdownToolOutcome> {
   if (!toolDeps.hasCapability(selfId, UPDATE_MCP_NAME)) {
     return {
@@ -113,10 +105,9 @@ export async function runShutdownTool(
       message: `'shutdown' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
     };
   }
-  const coordinator = resolveMaintenanceShutdown(toolDeps);
-  const outcome = await coordinator.request({
-    ...opts,
-    selfId,
+  const outcome = await toolDeps.maintenanceShutdown.request({
+    timeoutSeconds: opts?.timeoutSeconds,
+    reason: opts?.reason,
   });
   return {
     ok: outcome.ok,
@@ -127,7 +118,7 @@ export async function runShutdownTool(
 
 /**
  * Cancel a pending graceful shutdown request, lifting the admission brake and
- * resuming normal execution.
+ * resuming normal execution (#1225).
  */
 export function runCancelShutdownTool(
   toolDeps: UpdateToolDeps,
@@ -140,8 +131,7 @@ export function runCancelShutdownTool(
       message: `'cancel_shutdown' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
     };
   }
-  const coordinator = resolveMaintenanceShutdown(toolDeps);
-  const outcome = coordinator.cancel(reason);
+  const outcome = toolDeps.maintenanceShutdown.cancel(reason);
   return {
     ok: outcome.ok,
     message: outcome.message,
@@ -182,7 +172,7 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     {
       title: "Graceful drain and shutdown",
       description:
-        "Gracefully quiesce and shut down the mesh for maintenance (e.g. config-only restart). Stops admitting new runs, emits a notification to the configured error chat, allows active in-flight runs to finish, and shuts down the process once drained. Does not pull git or rebuild code. Preserves operator HALT state. Requires the 'update' capability.",
+        "Gracefully quiesce and shut down the mesh for maintenance (e.g. config-only restart). Stops admitting new runs, emits a notification to the configured error chat, allows active in-flight runs to finish, and shuts down the process once drained. Does not pull git or rebuild code. Preserves operator HALT state. Requires the 'update' capability. Note: under the production systemd unit (Restart=always), a clean exit (code 0) triggers an immediate service restart.",
       inputSchema: {
         timeout_seconds: z
           .number()
@@ -190,13 +180,7 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
           .positive()
           .optional()
           .describe(
-            "Maximum seconds to wait for active runs to finish before applying timeout_behavior (default: 60)"
-          ),
-        timeout_behavior: z
-          .enum(["cancel", "terminate"])
-          .optional()
-          .describe(
-            "What to do if active runs do not finish within timeout: 'cancel' aborts shutdown and resumes normal operation; 'terminate' proceeds with shutdown (default: 'cancel')"
+            "Maximum seconds to wait for active runs to finish before cancelling shutdown (default: 300)"
           ),
         reason: z
           .string()
@@ -208,14 +192,9 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     },
     async (args) => {
       try {
-        const timeoutSeconds =
-          typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined;
-        const timeoutBehavior = args.timeout_behavior === "terminate" ? "terminate" : "cancel";
-        const reason = typeof args.reason === "string" ? args.reason : undefined;
         const outcome = await runShutdownTool(toolDeps, selfId, {
-          timeoutSeconds,
-          timeoutBehavior,
-          reason,
+          timeoutSeconds: args.timeout_seconds,
+          reason: args.reason,
         });
         return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
       } catch (err) {
@@ -239,8 +218,7 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     },
     async (args) => {
       try {
-        const reason = typeof args.reason === "string" ? args.reason : undefined;
-        const outcome = runCancelShutdownTool(toolDeps, selfId, reason);
+        const outcome = runCancelShutdownTool(toolDeps, selfId, args.reason);
         return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
       } catch (err) {
         return toolError(err);

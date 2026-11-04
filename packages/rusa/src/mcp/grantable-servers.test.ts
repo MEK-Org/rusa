@@ -121,6 +121,7 @@ describe("grantable capabilities allow-list ", () => {
       plan: { branch: "master", drainTimeoutMs: 1 },
       deps: {} as UpdateToolDeps["deps"],
       hasCapability: () => true,
+      maintenanceShutdown: {} as UpdateToolDeps["maintenanceShutdown"],
     }));
     const servers = buildGrantableServers({
       ...STUB_DEPS,

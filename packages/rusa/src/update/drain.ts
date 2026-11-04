@@ -22,6 +22,7 @@ export async function waitForQuiescence(
     intervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
     now?: () => number;
+    signal?: AbortSignal;
   }
 ): Promise<{ quiesced: boolean; waitedMs: number }> {
   const intervalMs = Math.max(1, opts.intervalMs ?? 500);
@@ -32,9 +33,12 @@ export async function waitForQuiescence(
 
   // Drain the microtask queue before the first conclusive read (see above).
   await sleep(0);
+  if (opts.signal?.aborted) return { quiesced: false, waitedMs: now() - start };
   if (isQuiescent()) return { quiesced: true, waitedMs: now() - start };
   while (now() < deadline) {
+    if (opts.signal?.aborted) return { quiesced: false, waitedMs: now() - start };
     await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
+    if (opts.signal?.aborted) return { quiesced: false, waitedMs: now() - start };
     if (isQuiescent()) return { quiesced: true, waitedMs: now() - start };
   }
   return { quiesced: false, waitedMs: now() - start };
@@ -70,40 +74,20 @@ export class MeshDrainer implements DrainSeam {
   }
 
   /** Count of actors OTHER than self currently executing a run. */
-  othersRunning(): number {
+  private othersRunning(): number {
     const ids = this.runningThreadIds(); // a fresh snapshot Set each call
-    if (this.selfId) {
-      ids.delete(this.selfId);
-    }
+    ids.delete(this.selfId);
     return ids.size;
   }
 
-  /** Count of ALL actors currently executing a run. */
-  activeCount(): number {
-    return this.runningThreadIds().size;
-  }
-
-  /** True once graceful shutdown has been engaged and not cancelled. */
-  isShuttingDown(): boolean {
-    return this.graceful.isShuttingDown();
-  }
-
-  waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }> {
+  waitForQuiescence(
+    timeoutMs: number,
+    opts?: { signal?: AbortSignal }
+  ): Promise<{ quiesced: boolean; waitedMs: number }> {
     return waitForQuiescence(() => this.othersRunning() === 0, {
       timeoutMs,
       intervalMs: this.intervalMs,
-    });
-  }
-
-  waitForAllQuiescence(
-    timeoutMs: number,
-    opts?: { intervalMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number }
-  ): Promise<{ quiesced: boolean; waitedMs: number }> {
-    return waitForQuiescence(() => this.activeCount() === 0, {
-      timeoutMs,
-      intervalMs: opts?.intervalMs ?? this.intervalMs,
-      sleep: opts?.sleep,
-      now: opts?.now,
+      signal: opts?.signal,
     });
   }
 }

@@ -1,32 +1,28 @@
 import type { DrainSeam, NotifySeam } from "./orchestrator.js";
 
-export type TimeoutBehavior = "cancel" | "terminate";
-
 export interface MaintenanceShutdownOptions {
-  /** Maximum seconds to wait for active runs to finish (default: 60). */
+  /** Maximum seconds to wait for active runs to finish before cancelling (default: 60). */
   timeoutSeconds?: number;
-  /** What to do if active runs do not finish within timeout (default: "cancel"). */
-  timeoutBehavior?: TimeoutBehavior;
   /** Reason for the maintenance shutdown. */
   reason?: string;
-  /** If called by an actor in a run, its thread ID. */
-  selfId?: string;
 }
 
 export interface MaintenanceShutdownDeps {
   drain: DrainSeam;
   notify?: NotifySeam;
   recordAction?: (text: string) => void;
-  exit: (code: number) => void;
+  exit: (code: number) => Promise<void> | void;
   log?: (msg: string) => void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   intervalMs?: number;
   defaultTimeoutSeconds?: number;
+  isBusy?: () => boolean;
+  onResumeWork?: () => void;
 }
 
 export interface MaintenanceShutdownOutcome {
-  status: "quiesced" | "cancelled" | "terminated";
+  status: "quiesced" | "cancelled";
   reason: "quiesced" | "timeout" | "explicit" | "error";
   waitedMs: number;
 }
@@ -46,16 +42,15 @@ interface ActiveShutdownRequest {
   reason: string;
   startedAt: number;
   timeoutSeconds: number;
-  timeoutBehavior: TimeoutBehavior;
-  cancelRequested?: boolean;
-  cancelReason?: string;
+  abortController: AbortController;
+  onCancel: () => void;
   resolve: (outcome: MaintenanceShutdownOutcome) => void;
   promise: Promise<MaintenanceShutdownOutcome>;
 }
 
 /**
  * Coordinates graceful drain and shutdown of the mesh for maintenance (e.g. config-only
- * restart) without pulling or rebuilding code.
+ * restart) without pulling or rebuilding code (#1225).
  *
  * Requirements:
  * 1. Process-local admission brake: engages `GracefulShutdown` so new runs stop starting,
@@ -67,11 +62,11 @@ interface ActiveShutdownRequest {
  * 4. Active runs finish: existing in-flight runs are allowed to finish.
  * 5. Pending work stays blocked: new runs are refused while draining.
  * 6. Explicit timeout/cancel: if active runs do not finish within `timeoutSeconds`,
- *    applies explicit `timeoutBehavior`:
- *    - "cancel" (default): aborts shutdown, lifts admission brake, notifies error chat,
- *      and resumes normal operation without killing active runs.
- *    - "terminate": notifies error chat and calls exit to terminate.
+ *    aborts shutdown, lifts admission brake, notifies error chat, and resumes normal
+ *    mesh operation (replaying/re-admitting gated work) without killing active runs.
  * 7. Operator cancel: explicit cancellation lifts the brake and resumes normal operations.
+ * 8. Clean exit behavior: under production systemd unit (Restart=always), exit(0) restarts
+ *    the service onto updated configurations.
  */
 export class MaintenanceShutdownCoordinator {
   private activeRequest: ActiveShutdownRequest | null = null;
@@ -82,10 +77,6 @@ export class MaintenanceShutdownCoordinator {
     return this.activeRequest !== null;
   }
 
-  currentReason(): string | undefined {
-    return this.activeRequest?.reason;
-  }
-
   async request(opts: MaintenanceShutdownOptions = {}): Promise<MaintenanceShutdownRequestResult> {
     if (this.activeRequest) {
       return {
@@ -94,72 +85,85 @@ export class MaintenanceShutdownCoordinator {
       };
     }
 
+    if (this.deps.isBusy?.()) {
+      return {
+        ok: false,
+        message: "An update is currently in progress — refusing graceful shutdown.",
+      };
+    }
+
     const timeoutSeconds = Math.max(
       1,
       opts.timeoutSeconds ?? this.deps.defaultTimeoutSeconds ?? 60
     );
-    const timeoutBehavior: TimeoutBehavior =
-      opts.timeoutBehavior === "terminate" ? "terminate" : "cancel";
     const reason = opts.reason?.trim() || "maintenance shutdown";
     const timeoutMs = timeoutSeconds * 1000;
     const now = this.deps.now ? this.deps.now() : Date.now();
 
-    // 1. Emit notification to configured error chat AT REQUEST TIME
-    const requestNotice = `🛑 Graceful shutdown requested: ${reason}. Admission stopped; draining active runs (timeout: ${timeoutSeconds}s, on timeout: ${timeoutBehavior}).`;
-    if (this.deps.notify) {
-      try {
-        await this.deps.notify.notify(requestNotice);
-      } catch (err) {
-        this.deps.log?.(
-          `[maintenance-shutdown] error-chat notification failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-    }
-
-    // 2. Engage admission brake (GracefulShutdown.request)
+    // 1. Engage admission brake and set activeRequest synchronously BEFORE notification await
+    // This prevents concurrent requests from both passing the guard and ensures admission
+    // is stopped before the error-chat notification is posted.
     this.deps.drain.engage(reason);
     try {
-      this.deps.recordAction?.(
-        `shutdown requested: ${reason} [timeout: ${timeoutSeconds}s, on timeout: ${timeoutBehavior}]`
-      );
+      this.deps.recordAction?.(`shutdown requested: ${reason} [timeout: ${timeoutSeconds}s]`);
     } catch {}
 
+    const abortController = new AbortController();
     let resolveCompletion!: (outcome: MaintenanceShutdownOutcome) => void;
     const completionPromise = new Promise<MaintenanceShutdownOutcome>((resolve) => {
       resolveCompletion = resolve;
+    });
+
+    let cancelResolve: (() => void) | undefined;
+    const cancelPromise = new Promise<void>((resolve) => {
+      cancelResolve = resolve;
     });
 
     const active: ActiveShutdownRequest = {
       reason,
       startedAt: now,
       timeoutSeconds,
-      timeoutBehavior,
+      abortController,
+      onCancel: () => cancelResolve?.(),
       resolve: resolveCompletion,
       promise: completionPromise,
     };
     this.activeRequest = active;
 
+    // 2. Emit notification to configured error chat AT REQUEST TIME
+    const requestNotice = `🛑 Graceful shutdown requested: ${reason}. Admission stopped; draining active runs (timeout: ${timeoutSeconds}s). Note: clean exit under systemd restarts service.`;
+    if (this.deps.notify) {
+      this.deps.notify.notify(requestNotice).catch((err) => {
+        this.deps.log?.(
+          `[maintenance-shutdown] error-chat notification failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
+    }
+
     // 3. Start drain watcher in the background
     void (async () => {
       const startDrainTime = this.deps.now ? this.deps.now() : Date.now();
       try {
-        // Wait for all active runs to complete
-        const drainResult = await (this.deps.drain.waitForAllQuiescence
-          ? this.deps.drain.waitForAllQuiescence(timeoutMs, {
-              intervalMs: this.deps.intervalMs,
-              sleep: this.deps.sleep,
-              now: this.deps.now,
-            })
-          : this.deps.drain.waitForQuiescence(timeoutMs));
+        const drainPromise = this.deps.drain.waitForQuiescence(timeoutMs, {
+          signal: active.abortController.signal,
+        });
+        const raced = await Promise.race([
+          drainPromise.then((res) => ({ cancelled: false as const, drainResult: res })),
+          cancelPromise.then(() => ({ cancelled: true as const, drainResult: null })),
+        ]);
 
-        const waitedMs = drainResult.waitedMs;
-
-        // Check if cancel was requested during the drain wait
-        if (active.cancelRequested) {
-          this.activeRequest = null;
-          active.resolve({ status: "cancelled", reason: "explicit", waitedMs });
+        if (
+          raced.cancelled ||
+          !raced.drainResult ||
+          active.abortController.signal.aborted ||
+          this.activeRequest !== active
+        ) {
+          // Cancel was handled synchronously by cancel(); exit watcher without touching state
           return;
         }
+
+        const drainResult = raced.drainResult;
+        const waitedMs = drainResult.waitedMs;
 
         if (drainResult.quiesced) {
           this.deps.log?.(`[maintenance-shutdown] drained after ${waitedMs}ms (quiesced)`);
@@ -168,51 +172,77 @@ export class MaintenanceShutdownCoordinator {
               `shutdown committed: drained in ${waitedMs}ms (${reason}) — exiting`
             );
           } catch {}
-          this.activeRequest = null;
-          active.resolve({ status: "quiesced", reason: "quiesced", waitedMs });
-          this.deps.exit(0);
-          return;
+
+          // Attempt shutdown commit / exit
+          try {
+            await this.deps.exit(0);
+            this.activeRequest = null;
+            active.resolve({ status: "quiesced", reason: "quiesced", waitedMs });
+            return;
+          } catch (exitErr) {
+            // A failed commit must NOT strand the brake!
+            this.deps.log?.(
+              `[maintenance-shutdown] shutdown commit failed: ${exitErr instanceof Error ? exitErr.message : String(exitErr)}`
+            );
+            this.deps.drain.cancel();
+            try {
+              this.deps.onResumeWork?.();
+            } catch {}
+            this.activeRequest = null;
+
+            const abortNotice = `⚠️ Graceful shutdown aborted before commit: exit failed (${exitErr instanceof Error ? exitErr.message : String(exitErr)}). Admission resumed.`;
+            if (this.deps.notify) {
+              this.deps.notify.notify(abortNotice).catch((notifyErr) => {
+                this.deps.log?.(
+                  `[maintenance-shutdown] error-chat notification failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`
+                );
+              });
+            }
+            try {
+              this.deps.recordAction?.(
+                `shutdown aborted before commit: exit failed (${exitErr instanceof Error ? exitErr.message : String(exitErr)})`
+              );
+            } catch {}
+
+            active.resolve({ status: "cancelled", reason: "error", waitedMs });
+            return;
+          }
         }
 
         // Timed out!
         this.deps.log?.(`[maintenance-shutdown] drain timed out after ${waitedMs}ms`);
-        if (timeoutBehavior === "cancel") {
-          this.deps.drain.cancel();
-          const cancelMsg = `⚠️ Graceful shutdown cancelled: drain timed out after ${timeoutSeconds}s with active runs remaining. Admission resumed.`;
-          if (this.deps.notify) {
-            try {
-              await this.deps.notify.notify(cancelMsg);
-            } catch {}
-          }
-          try {
-            this.deps.recordAction?.(
-              `shutdown cancelled: drain timed out after ${timeoutSeconds}s (${reason})`
+        this.deps.drain.cancel();
+        try {
+          this.deps.onResumeWork?.();
+        } catch {}
+        this.activeRequest = null;
+
+        const cancelMsg = `⚠️ Graceful shutdown cancelled: drain timed out after ${timeoutSeconds}s with active runs remaining. Admission resumed.`;
+        if (this.deps.notify) {
+          this.deps.notify.notify(cancelMsg).catch((notifyErr) => {
+            this.deps.log?.(
+              `[maintenance-shutdown] error-chat notification failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`
             );
-          } catch {}
-          this.activeRequest = null;
-          active.resolve({ status: "cancelled", reason: "timeout", waitedMs });
-        } else {
-          // terminate
-          const termMsg = `⚠️ Graceful shutdown drain timed out after ${timeoutSeconds}s. Terminating remaining active runs.`;
-          if (this.deps.notify) {
-            try {
-              await this.deps.notify.notify(termMsg);
-            } catch {}
-          }
-          try {
-            this.deps.recordAction?.(
-              `shutdown terminated after timeout: ${timeoutSeconds}s (${reason}) — exiting`
-            );
-          } catch {}
-          this.activeRequest = null;
-          active.resolve({ status: "terminated", reason: "timeout", waitedMs });
-          this.deps.exit(0);
+          });
         }
+        try {
+          this.deps.recordAction?.(
+            `shutdown cancelled: drain timed out after ${timeoutSeconds}s (${reason})`
+          );
+        } catch {}
+
+        active.resolve({ status: "cancelled", reason: "timeout", waitedMs });
       } catch (err) {
+        if (active.abortController.signal.aborted || this.activeRequest !== active) {
+          return;
+        }
         this.deps.log?.(
           `[maintenance-shutdown] drain error: ${err instanceof Error ? err.message : String(err)}`
         );
         this.deps.drain.cancel();
+        try {
+          this.deps.onResumeWork?.();
+        } catch {}
         this.activeRequest = null;
         active.resolve({
           status: "cancelled",
@@ -222,7 +252,7 @@ export class MaintenanceShutdownCoordinator {
       }
     })();
 
-    const message = `Graceful shutdown initiated (${reason}). Admission stopped; draining active runs with ${timeoutSeconds}s timeout (on timeout: ${timeoutBehavior}). Active runs will finish before shutdown.`;
+    const message = `Graceful shutdown initiated (${reason}). Admission stopped; draining active runs with ${timeoutSeconds}s timeout. Active runs will finish before shutdown. Note: clean exit under systemd restarts service.`;
     return {
       ok: true,
       message,
@@ -239,21 +269,28 @@ export class MaintenanceShutdownCoordinator {
     }
 
     const active = this.activeRequest;
-    active.cancelRequested = true;
-    active.cancelReason = cancelReason;
+    this.activeRequest = null;
+    active.abortController.abort();
+    active.onCancel();
 
     this.deps.drain.cancel();
+    try {
+      this.deps.onResumeWork?.();
+    } catch {}
+
     const reasonText = cancelReason ? `: ${cancelReason}` : "";
     const notice = `⚠️ Graceful shutdown cancelled by operator${reasonText}. Admission resumed.`;
     if (this.deps.notify) {
-      try {
-        void this.deps.notify.notify(notice);
-      } catch {}
+      this.deps.notify.notify(notice).catch((err) => {
+        this.deps.log?.(
+          `[maintenance-shutdown] error-chat notification failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
     }
     try {
       this.deps.recordAction?.(`shutdown cancelled by operator${reasonText}`);
     } catch {}
-    this.activeRequest = null;
+
     active.resolve({
       status: "cancelled",
       reason: "explicit",
@@ -262,7 +299,7 @@ export class MaintenanceShutdownCoordinator {
 
     return {
       ok: true,
-      message: `Graceful shutdown cancelled${reasonText}. Admission resumed.`,
+      message: `Graceful shutdown cancelled by operator${reasonText}. Admission resumed.`,
     };
   }
 }
