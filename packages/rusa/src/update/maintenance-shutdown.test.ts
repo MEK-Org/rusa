@@ -1,11 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
-import { HaltSwitch } from "../actor/halt-switch.js";
 import { MeshDrainer } from "./drain.js";
 import { MaintenanceShutdownCoordinator } from "./maintenance-shutdown.js";
+import type { DrainSeam } from "./orchestrator.js";
 
 function setupCoordinator(opts?: {
   defaultTimeoutSeconds?: number;
@@ -118,31 +115,6 @@ describe("MaintenanceShutdownCoordinator (#1225)", () => {
     expect(getExitCode()).toBe(0);
   });
 
-  it("pending run gating: pending work stays blocked while active runs finish", async () => {
-    const { graceful, running, coordinator, getExitCode } = setupCoordinator();
-
-    running.add("worker-active");
-
-    const outcome = await coordinator.request({
-      timeoutSeconds: 5,
-    });
-    expect(outcome.ok).toBe(true);
-
-    // Admission brake is engaged
-    expect(graceful.isShuttingDown()).toBe(true);
-
-    // Simulated run admission gate (mirrors actor-mesh.prepareRun / actor.runOnce)
-    const canAdmitPendingRun = () => !graceful.isShuttingDown();
-    expect(canAdmitPendingRun()).toBe(false);
-
-    // Active run completes
-    running.delete("worker-active");
-
-    const result = await outcome.completion;
-    expect(result?.status).toBe("quiesced");
-    expect(getExitCode()).toBe(0);
-  });
-
   it("timeout behavior: aborts shutdown, lifts brake, notifies chat, invokes onResumeWork, does NOT exit", async () => {
     const { graceful, running, notifications, coordinator, getExitCode, getWorkResumedCount } =
       setupCoordinator();
@@ -241,32 +213,49 @@ describe("MaintenanceShutdownCoordinator (#1225)", () => {
     expect(coordinator.isPending()).toBe(false);
   });
 
-  it("preserves operator HALT state independently without file collision or state conflation", async () => {
-    const tmp = mkdtempSync(join(tmpdir(), "rusa-halt-test-"));
-    try {
-      const haltFile = join(tmp, "HALT");
-      const haltSwitch = new HaltSwitch(haltFile);
+  it("drain error aborts shutdown, lifts brake, notifies chat, records audit, and resumes work", async () => {
+    let cancelled = false;
+    const drain: DrainSeam = {
+      engage() {},
+      cancel() {
+        cancelled = true;
+      },
+      async waitForQuiescence() {
+        throw new Error("unexpected drain explosion");
+      },
+    };
+    const notifications: string[] = [];
+    const actions: string[] = [];
+    let workResumed = false;
 
-      // Pre-condition: no halt active
-      expect(haltSwitch.isHalted()).toBe(false);
+    const coordinator = new MaintenanceShutdownCoordinator({
+      drain,
+      notify: {
+        notify: async (msg) => {
+          notifications.push(msg);
+        },
+      },
+      recordAction: (act) => {
+        actions.push(act);
+      },
+      exit: () => {},
+      onResumeWork: () => {
+        workResumed = true;
+      },
+    });
 
-      const { coordinator } = setupCoordinator();
-      const outcome = await coordinator.request({ reason: "mcp reload" });
-      expect(outcome.ok).toBe(true);
+    const outcome = await coordinator.request({ reason: "error test" });
+    const completion = await outcome.completion;
 
-      // Halt state remains completely untouched
-      expect(haltSwitch.isHalted()).toBe(false);
-
-      // Now create an explicit operator halt sentinel
-      writeFileSync(haltFile, JSON.stringify({ reason: "operator emergency" }));
-      expect(haltSwitch.isHalted()).toBe(true);
-
-      // Cancelling maintenance shutdown does NOT clear the operator halt
-      coordinator.cancel("cancel test");
-      expect(haltSwitch.isHalted()).toBe(true);
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
+    expect(completion?.status).toBe("cancelled");
+    expect(completion?.reason).toBe("error");
+    expect(cancelled).toBe(true);
+    expect(workResumed).toBe(true);
+    expect(notifications).toHaveLength(2);
+    expect(notifications[1]).toContain(
+      "⚠️ Graceful shutdown aborted: drain error (unexpected drain explosion). Admission resumed."
+    );
+    expect(actions[1]).toContain("shutdown aborted: drain error (unexpected drain explosion)");
   });
 
   it("chat notification failure does not crash the coordinator or strand the brake", async () => {

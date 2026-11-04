@@ -178,10 +178,11 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
           .number()
           .int()
           .positive()
+          .max(3600)
           .optional()
           .default(300)
           .describe(
-            "Maximum seconds to wait for active runs to finish before cancelling shutdown (default: 300)"
+            "Maximum seconds to wait for active runs to finish before cancelling shutdown (default: 300, max: 3600)"
           ),
         reason: z
           .string()
@@ -209,7 +210,7 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     {
       title: "Cancel pending graceful shutdown",
       description:
-        "Cancel a pending graceful shutdown request, lifting the admission brake and resuming normal execution. Requires the 'update' capability.",
+        "Cancel a pending graceful shutdown request, lifting the admission brake and resuming normal execution. Requires the 'update' capability. Note: callable by in-flight runs (such as the calling turn before completion or concurrent runs) while new runs are barred from starting.",
       inputSchema: {
         reason: z
           .string()

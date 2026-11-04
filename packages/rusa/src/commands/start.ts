@@ -791,8 +791,6 @@ export interface RunStartE2EHandles {
    * host-maintenance wiring, not through the runner handles.
    */
   updateToolDepsFor?: (selfId: string) => UpdateToolDeps;
-  /** Standalone graceful shutdown coordinator (#1225). */
-  maintenanceShutdown?: MaintenanceShutdownCoordinator;
 }
 
 /**
@@ -5757,7 +5755,6 @@ async function composeStart(
     emitSystemDiskCheck: () => diskAlert?.check() ?? Promise.resolve(),
     shutdown,
     updateToolDepsFor,
-    maintenanceShutdown,
   });
 
   // Keep the process alive until a signal triggers shutdown().

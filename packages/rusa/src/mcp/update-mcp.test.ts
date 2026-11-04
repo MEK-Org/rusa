@@ -19,6 +19,7 @@ import {
   type UpdateToolDeps,
 } from "./update-mcp.js";
 
+/** Records every side effect so we can assert a rejected caller touches nothing. */
 function trackingDeps() {
   const touched = { fetched: false, built: false, drained: false, exited: false, git: false };
   const git: GitSeam = {
@@ -101,6 +102,7 @@ describe("runUpdateTool — capability guard (#549)", () => {
 
     expect(outcome.ok).toBe(false);
     expect(outcome.message).toMatch(/requires the 'update' capability/);
+    // The security-critical assertion: nothing happened — no pull, build, drain, exit.
     expect(touched).toEqual({
       fetched: false,
       built: false,
