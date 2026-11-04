@@ -143,6 +143,125 @@ void main() {
     },
   );
 
+  group('#1234 full-width activity sections', () {
+    const actor = '11111111-1111-4111-8111-111111111111';
+
+    FakeApi activityApi() => FakeApi()
+      ..threadsResult = [
+        makeThread(actor, runState: RunState.running),
+        makeThread('queued', runState: RunState.queued, queuePosition: 0),
+      ]
+      ..recentActivityResult = [
+        const RecentActivityItem(
+          id: 'inbox_1',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:21:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB ISSUE',
+          sourceRef: 'github:example/project/issues/1',
+          summary: 'Handled summary',
+          handledTime: '2026-09-23T14:22:37.000Z',
+          addressedNote: 'Answered on the thread',
+        ),
+        const RecentActivityItem(
+          id: 'ob_1',
+          kind: 'terminal_obligation',
+          time: '2026-09-23T14:20:37.000Z',
+          actorId: actor,
+          sourceKind: 'OBLIGATION',
+          sourceRef: 'github:example/project/issues/2',
+          summary: 'Terminal summary',
+          obligationId: '0e655f00-0000-4000-8000-000000000001',
+          terminalStatus: 'done',
+          terminalNote: 'Landed',
+        ),
+      ];
+
+    // The section card a title sits in: its nearest Container.
+    Rect section(WidgetTester tester, String title) => tester.getRect(
+      find
+          .ancestor(of: find.text(title), matching: find.byType(Container))
+          .first,
+    );
+
+    testWidgets(
+      'wide: both sections span the content width around the columns',
+      (tester) async {
+        await tester.runAsync(() async {
+          final store = DashboardStore(
+            api: activityApi(),
+            stream: FakeStream(),
+          );
+          await store.init();
+          addTearDown(store.dispose);
+          await tester.binding.setSurfaceSize(const Size(1200, 2400));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          await tester.pumpWidget(_app(store));
+          await tester.pump();
+          await tester.pump();
+
+          // The 20px page padding is all that remains on either side.
+          final running = section(tester, 'Running Mesh Workers');
+          final recent = section(tester, 'Recent Activity');
+          for (final spanning in [running, recent]) {
+            expect(spanning.left, closeTo(20, 1));
+            expect(spanning.right, closeTo(1180, 1));
+          }
+
+          // My Queue and Queued Actors stay in their column beside the charts.
+          final myQueue = section(tester, 'My Queue');
+          final queued = section(tester, 'Queued Actors');
+          final quota = tester.getRect(find.textContaining('Quota Pacing'));
+          expect(myQueue.right, lessThan(quota.left));
+          expect(queued.left, closeTo(myQueue.left, 1));
+          expect(queued.right, closeTo(myQueue.right, 1));
+
+          expect(running.bottom, lessThan(myQueue.top));
+          expect(running.bottom, lessThan(quota.top));
+          expect(recent.top, greaterThan(queued.bottom));
+          expect(recent.top, greaterThan(quota.bottom));
+        });
+      },
+    );
+
+    testWidgets('phone: activity rows stack rather than overflow', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = DashboardStore(api: activityApi(), stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        await tester.binding.setSurfaceSize(const Size(390, 2400));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        for (final title in ['Running Mesh Workers', 'Recent Activity']) {
+          final spanning = section(tester, title);
+          expect(spanning.left, closeTo(20, 1));
+          expect(spanning.right, closeTo(370, 1));
+        }
+
+        // A RenderFlex overflow fails this test on its own; the card must
+        // also keep a readable width, and sit below who handled it.
+        final handle = tester.getRect(
+          find
+              .descendant(
+                of: find.byType(ListView),
+                matching: find.text(store.actorDisplay(actor)),
+              )
+              .first,
+        );
+        final note = tester.getRect(
+          find.textContaining('Answered on the thread', findRichText: true),
+        );
+        expect(note.width, greaterThan(200));
+        expect(note.top, greaterThan(handle.bottom));
+      });
+    });
+  });
+
   testWidgets('Recent Activity renders handled cards with addressed note', (
     tester,
   ) async {
