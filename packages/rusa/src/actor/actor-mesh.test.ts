@@ -22,6 +22,12 @@ import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
+import {
+  runCancelShutdownTool,
+  runShutdownTool,
+  UPDATE_MCP_NAME,
+  type UpdateToolDeps,
+} from "../mcp/update-mcp.js";
 import type { Obligation } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import type { Logger } from "../observability/logger.js";
@@ -51,6 +57,8 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { MeshDrainer } from "../update/drain.js";
+import { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
 import { RoomEntryService } from "../voice/room-entry.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
@@ -85,6 +93,7 @@ import {
 } from "./event-subscriptions.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
+import { GracefulShutdown } from "./graceful-shutdown.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import {
   AtEnqueueUnconfirmedError,
@@ -921,6 +930,147 @@ describe("ActorMesh", () => {
     mesh.sendMessage(id, "begin", "root");
     await tick();
     expect(fake(id).calls).toHaveLength(1); // both clear → runs
+  });
+
+  describe("maintenance shutdown composed through the tool entrypoint (#1225)", () => {
+    /**
+     * The real mesh, brake, drainer and coordinator behind `runShutdownTool`, wired
+     * as `start.ts` wires them. Only the provider, process exit and error-chat sink
+     * are doubles. `onResumeWork` mirrors `resumeAfterHalt` apart from its
+     * `admissionQueue.refresh()`, because this mesh has no admission queue.
+     */
+    function composedShutdown() {
+      const graceful = new GracefulShutdown();
+      let releaseFirstRun!: () => void;
+      const firstRunHeld = new Promise<void>((resolve) => {
+        releaseFirstRun = resolve;
+      });
+      const provider: FakeProvider = new FakeProvider(async () => {
+        if (provider.calls.length === 1) await firstRunHeld;
+        return {};
+      });
+      const { mesh, capabilityGrants, tick } = setup({
+        isShuttingDown: () => graceful.isShuttingDown(),
+        sharedProvider: provider,
+        inboxStore: createMemoryInboxStore(),
+      });
+      const active = mesh.spawn({ charter: "already running", parentId: "root" });
+      const idle = mesh.spawn({ charter: "has pending work", parentId: "root" });
+      capabilityGrants.grant({
+        actorId: active,
+        capability: UPDATE_MCP_NAME,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+
+      const notices: string[] = [];
+      const exits: Array<{ code: number; activeRuns: string[] }> = [];
+      const maintenanceShutdown = new MaintenanceShutdownCoordinator({
+        drain: new MeshDrainer(graceful, () => mesh.activeRunThreadIds(), ""),
+        notify: {
+          notify: async (text) => {
+            notices.push(text);
+          },
+        },
+        exit: (code) => {
+          exits.push({ code, activeRuns: [...mesh.activeRunThreadIds()] });
+        },
+        onResumeWork: () => {
+          mesh.resumeCancelledRuns();
+          mesh.reconcileUnseenInbox();
+        },
+      });
+      const toolDeps: UpdateToolDeps = {
+        plan: { branch: "master", drainTimeoutMs: 1000 },
+        deps: {} as UpdateToolDeps["deps"],
+        hasCapability: (actorId, capability) => mesh.hasActiveCapability(actorId, capability),
+        maintenanceShutdown,
+      };
+      const runsOf = (id: string) =>
+        provider.calls.filter((call) => call.cwd === `/tmp/${id}`).length;
+
+      return {
+        mesh,
+        tick,
+        graceful,
+        active,
+        idle,
+        notices,
+        exits,
+        toolDeps,
+        maintenanceShutdown,
+        releaseFirstRun,
+        runsOf,
+      };
+    }
+
+    /** Longer than the drainer's poll interval, shorter than the requested timeout. */
+    const pastDrainPoll = () => vi.advanceTimersByTimeAsync(2_000);
+    const TIMEOUT_SECONDS = 60;
+
+    it("finishes the active run with pending work gated, then exits", async () => {
+      const h = composedShutdown();
+      h.mesh.sendMessage(h.active, "begin", "root");
+      await h.tick();
+      expect(h.runsOf(h.active)).toBe(1);
+
+      // The caller is the actor whose run is in flight, as it is for a real tool call.
+      const outcome = await runShutdownTool(h.toolDeps, h.active, {
+        reason: "config restart",
+        timeoutSeconds: TIMEOUT_SECONDS,
+      });
+      expect(outcome.ok).toBe(true);
+      expect(h.graceful.isShuttingDown()).toBe(true);
+      expect(h.notices).toHaveLength(1);
+      expect(h.notices[0]).toContain("Graceful shutdown requested: config restart");
+
+      h.mesh.sendMessage(h.idle, "pending work", "root");
+      h.mesh.sendMessage(h.active, "follow-up", "root");
+      await h.tick();
+      await pastDrainPoll();
+      expect(h.runsOf(h.idle)).toBe(0);
+      expect(h.runsOf(h.active)).toBe(1);
+      expect(h.mesh.activeRunThreadIds().has(h.active)).toBe(true);
+      expect(h.exits).toEqual([]);
+
+      h.releaseFirstRun();
+      await pastDrainPoll();
+      expect(h.exits).toEqual([{ code: 0, activeRuns: [] }]);
+      expect(h.runsOf(h.idle)).toBe(0);
+      expect(h.runsOf(h.active)).toBe(1);
+      expect(h.maintenanceShutdown.isPending()).toBe(false);
+    });
+
+    it("replays gated work on cancel without a new message, and never exits", async () => {
+      const h = composedShutdown();
+      h.mesh.sendMessage(h.active, "begin", "root");
+      await h.tick();
+
+      const outcome = await runShutdownTool(h.toolDeps, h.active, {
+        reason: "config restart",
+        timeoutSeconds: TIMEOUT_SECONDS,
+      });
+      expect(outcome.ok).toBe(true);
+      h.mesh.sendMessage(h.idle, "pending work", "root");
+      await h.tick();
+      await pastDrainPoll();
+      expect(h.runsOf(h.idle)).toBe(0);
+
+      const cancelled = runCancelShutdownTool(h.toolDeps, h.active, "changed my mind");
+      expect(cancelled.ok).toBe(true);
+      expect(h.graceful.isShuttingDown()).toBe(false);
+      expect(h.notices.at(-1)).toContain("cancelled by operator: changed my mind");
+
+      await h.tick();
+      expect(h.runsOf(h.idle)).toBe(1);
+      expect(h.mesh.activeRunThreadIds().has(h.active)).toBe(true);
+
+      // The abandoned watcher must not commit once the mesh quiesces or the timeout passes.
+      h.releaseFirstRun();
+      await vi.advanceTimersByTimeAsync(TIMEOUT_SECONDS * 1000 + 1_000);
+      expect(h.exits).toEqual([]);
+      expect(h.maintenanceShutdown.isPending()).toBe(false);
+    });
   });
 
   it("spawns a worker and records it, but does NOT wake it (spawn ≠ message)", async () => {
