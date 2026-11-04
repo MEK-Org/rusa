@@ -41,6 +41,11 @@ import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
+import {
+  attachDashboardPhaseClock,
+  DashboardPhaseClock,
+  runDashboardRequestScope,
+} from "./timing-phases.js";
 
 class MockReq extends EventEmitter {
   method = "GET";
@@ -2055,6 +2060,56 @@ describe("handleMeshApiRequest", () => {
       expect(res.headers["Content-Encoding"]).toBeUndefined();
       expect(JSON.parse(res.body).threads).toHaveLength(61);
     });
+  });
+
+  it("attributes actor-list work to request-local server substages", async () => {
+    actors.upsert(rec(UUID_A, "root", "active"));
+    let now = 0;
+    const clock = new DashboardPhaseClock(() => now);
+    const list = actors.list.bind(actors);
+    vi.spyOn(actors, "list").mockImplementation(() => {
+      now += 11;
+      return list();
+    });
+    const activity = meshEvents.latestActivityByActor.bind(meshEvents);
+    vi.spyOn(meshEvents, "latestActivityByActor").mockImplementation((ids) => {
+      now += 17;
+      return activity(ids);
+    });
+    const measuredDeps = {
+      ...deps,
+      runningThreadIds: () => {
+        now += 7;
+        return new Set([UUID_A]);
+      },
+      selectedObligationForActor: () => {
+        now += 23;
+        return null;
+      },
+      schedulerHealth: () => {
+        now += 31;
+        return { ok: true, issues: [] };
+      },
+    };
+    await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(clock);
+      const { res } = await call(measuredDeps, "GET", "/api/mesh/threads");
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).threads[0].id).toBe(UUID_A);
+    });
+    expect(clock.substages()).toEqual({
+      actorRuntimeMs: 7,
+      actorReadMs: 11,
+      actorActivityMs: 17,
+      actorSummariesMs: 23,
+      actorMetadataMs: 31,
+    });
+    const unrelated = new DashboardPhaseClock(() => now);
+    await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(unrelated);
+      await call(deps, "GET", "/api/mesh/events");
+    });
+    expect(unrelated.substages()).toEqual({});
   });
 
   it("GET /api/mesh/threads lists threads with deterministic handles", async () => {
