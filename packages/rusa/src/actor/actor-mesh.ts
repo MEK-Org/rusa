@@ -3381,8 +3381,8 @@ export class ActorMesh {
   /**
    * Introduce `handle`'s actor to `toId`'s address book — the parent handing a
    * child a capability to message a peer (e.g. giving a coder the reviewer's
-   * handle). Idempotent per id; no-op if `toId` is unknown. Takes effect on the
-   * grantee's next wake (its prompt re-renders the address book).
+   * handle). Idempotent per id; no-op if `toId` is unknown. The grantee's next
+   * directory read shows it.
    */
   grantHandle(toId: string, handle: ActorHandle): void {
     toId = this.resolveThreadId(toId);
@@ -3426,7 +3426,7 @@ export class ActorMesh {
     const recipient = this.actors.get(toId);
     const sender = this.actors.get(fromId);
     if (!recipient || !sender || recipient.id === sender.id) return;
-    // A parent is already a stable, separately rendered address-book alias.
+    // A parent is already a stable address-book alias, listed from its edge.
     // Do not turn that topology edge into a duplicate explicit handle.
     if (recipient.parentId !== null && this.resolveThreadId(recipient.parentId) === sender.id) {
       return;
@@ -3439,8 +3439,7 @@ export class ActorMesh {
 
   /**
    * Remove `targetId` from `toId`'s address book. Idempotent; no-op if `toId` is
-   * unknown or does not hold a handle to `targetId`. Takes effect on the actor's
-   * next wake.
+   * unknown or does not hold a handle to `targetId`.
    */
   revokeHandle(toId: string, targetId: string): void {
     toId = this.resolveThreadId(toId);
@@ -5045,6 +5044,54 @@ export class ActorMesh {
     if (matches.length > 1) {
       throw new Error(
         `ambiguous child handle "${handle}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
+      );
+    }
+    return matches[0];
+  }
+
+  /**
+   * The actors `requesterId` has been introduced to, retired ones included (#1231):
+   * its parent, then the handles it holds, then direct children a reparent left
+   * without a handle. A topology read only: it grants nothing and mints no handle.
+   */
+  listDirectory(requesterId: string): ActorRecord[] {
+    const requester = this.actors.get(this.resolveThreadId(requesterId));
+    if (!requester) return [];
+    const ids = new Set<string>();
+    if (requester.parentId !== null) ids.add(this.resolveThreadId(requester.parentId));
+    for (const handle of requester.handles ?? []) ids.add(handle.id);
+    for (const child of this.actors.children(requester.id)) ids.add(child.id);
+    ids.delete(requester.id);
+    return [...ids]
+      .map((id) => this.actors.get(id))
+      .filter((record): record is ActorRecord => record !== undefined);
+  }
+
+  /**
+   * Resolve a `view_actor` reference (#1231). A thread id reads any actor: the
+   * caller already holds that id, so the read discloses no new capability. A
+   * display handle is public but the id it stands for is what authorizes
+   * messaging, so a handle resolves only to the requester or its directory.
+   * Throws if the reference is blank, unknown, or ambiguous.
+   */
+  resolveDirectoryActor(requesterId: string, reference: string): ActorRecord {
+    const requested = reference.trim();
+    if (!requested) throw new Error("actor reference must not be blank");
+    const byId = this.actors.get(this.resolveThreadId(requested));
+    if (byId) return byId;
+    const requester = this.actors.get(this.resolveThreadId(requesterId));
+    const normalized = requested.toLowerCase();
+    const matches = [...(requester ? [requester] : []), ...this.listDirectory(requesterId)].filter(
+      (record) => this.handleForId(record.id).toLowerCase() === normalized
+    );
+    if (matches.length === 0) {
+      throw new Error(
+        `"${reference}" is not a thread id, or the handle of yourself or an actor in your directory`
+      );
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `ambiguous actor handle "${reference}": matches ${matches.map((m) => m.id).join(", ")}`
       );
     }
     return matches[0];

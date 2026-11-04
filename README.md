@@ -82,10 +82,12 @@ The core primitives:
 
 | Primitive | What it does |
 | --- | --- |
-| `spawn_thread(charter, model_config, …)` | Create a child actor with its own charter and session. You become its parent. Non-blocking: the child runs asynchronously. `model_config` is required; there is no default model. |
+| `spawn_actor(charter, model_config, …)` | Create a child actor with its own charter and session. You become its parent. Non-blocking: the child runs asynchronously. `model_config` is required; there is no default model. |
 | `send_message(thread_id, body)` | Deliver a message to another actor's inbox (parent, child, or an introduced peer). The recipient wakes on its own schedule and replies later as a new message. |
 | `introduce(holder, target)` | Grant one actor a handle to another so they can message directly (for example, let a coder reach a reviewer). The caller must already hold handles to both (its parent and root addresses do not count), and the holder gets no more authority than the caller had. The id is the capability; the holder sees the target's own title, or its charter's first line when untitled. |
 | `list_threads()` | List the actors you have spawned, with charter summaries and status. |
+| `list_actors(include_archived?)` | List the actors you have been introduced to (your parent, the handles you hold, your direct children) with a brief description of each. Retired actors are left out unless you ask for them. Reading grants no authority. |
+| `view_actor(actor_id?)` | Read an actor's id, handle, status, model and context configuration, charter and brief; omit `actor_id` for yourself. Effective configuration and any `pending` replacement are reported separately, and your own view adds what your current run launched on. Any actor can be read by id; a handle resolves only to you or an actor in your directory. |
 | `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. Only a parent can retire its descendants. |
 | `set_actor_model(actor_id, model_config)` | Replace a child's provider/model pool in place (parent or root only). Provider changes and multi-entry pools are only allowed for portable-context actors. |
 | `set_actor_context(actor_id, context_mode, compaction_model?)` | Update an existing actor's context mode in place (`native`, `ledger`, `tail`, `brief`). Parent or subtree admin; the configured root can switch itself. Running actors switch at run end; idle or queued actors switch immediately. |

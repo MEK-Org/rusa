@@ -13,6 +13,7 @@ import {
   resolveMeshGitIdentity,
 } from "../gitops/mesh-git-identity.js";
 import {
+  ACTOR_DIRECTORY_GUIDANCE,
   DELEGATION_DISCIPLINE,
   EXTERNAL_CONDUCT_POLICY,
   GROUNDING_DISCIPLINE,
@@ -72,6 +73,8 @@ export function buildRootPrompt(
 ${charter}
 
 ${DELEGATION_DISCIPLINE}
+
+${ACTOR_DIRECTORY_GUIDANCE}
 
 ${GROUNDING_DISCIPLINE}
 

@@ -31,14 +31,14 @@ Ledger compaction continues, and the prompt still uses the selected mode;
 only an explicit switch to brief mode injects the prepared document.
 
 Brief is selected like the other portable modes. Any actor that may spawn can
-pass `context_mode: "brief"` to `spawn_thread` for its own child, and the
+pass `context_mode: "brief"` to `spawn_actor` for its own child, and the
 operator can select it through the dashboard spawn API or an actor's configured
 context. Spawning adds no new authority check and no root-only path: the
 existing spawn authorization, charter, actor isolation and the
 `conversation_id` incompatibility of portable modes apply unchanged, and the
 default when no mode is given stays `native`. The tool describes the mode as
 an actor-maintained WHAT/HOW/DOMAIN brief, every statement citing its source,
-injected with the actor's recent journal; `spawn_thread` writes no brief, so a
+injected with the actor's recent journal; `spawn_actor` writes no brief, so a
 new child starts from its charter and the brief grows only by its own cited
 writes. A multi-entry model pool needs a portable mode, and brief counts as
 one, as `ledger` and `tail` do. This follows the architecture owner's

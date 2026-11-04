@@ -17,8 +17,10 @@ import {
 } from "../actor/event-subscriptions.js";
 import type { MessageStamp } from "../actor/message-stamp.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
+import type { PortableBrief } from "../actor/portable-context-state.js";
 import type { RootControlService } from "../actor/root-control.js";
-import { summarizeCharter } from "../actor/worker-prompt.js";
+import type { ActiveRunContext } from "../actor/run-context.js";
+import { describeActor, summarizeCharter } from "../actor/worker-prompt.js";
 import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
@@ -108,7 +110,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 /**
  * The agent-execution MCP server — the actor mesh's primitive (design B.4)
  * exposed as tools: spawn children, message any thread you hold a handle to,
- * introduce peers, see your reports, and retire a child.
+ * introduce peers, read the actor directory, see your reports, and retire a child.
  *
  * **One server instance per actor**, with that actor's id (`selfId`) baked in, so
  * "who is acting" is the unspoofable endpoint identity, not a tool argument the
@@ -132,6 +134,10 @@ export function createAgentExecMcpServer(
     onWrite?: () => void;
     /** Host-created immutable stamp for this endpoint's exact active run. */
     messageStamp?: () => MessageStamp;
+    /** What this endpoint's exact active run launched on; `view_actor` shows it to its own actor. */
+    currentRun?: () => Pick<ActiveRunContext, "provider" | "model" | "effort"> | undefined;
+    /** Read an actor's stored brief without seeding one; a directory read never writes. */
+    readBrief?: (actorId: string) => PortableBrief | null;
     rootControl?: RootControlService;
     /**
      * Runtime model-class store. The model-class tools mount only when this and
@@ -264,9 +270,9 @@ export function createAgentExecMcpServer(
   };
 
   server.registerTool(
-    "spawn_thread",
+    "spawn_actor",
     {
-      title: "Spawn a worker thread",
+      title: "Spawn a worker actor",
       description:
         "Create a child actor that owns the given charter and runs in its own session and its own private working directory. Returns its thread_id. You become its parent and get a handle to it. Spawning does NOT start the actor — it is born idle and will not run until you `send_message` it; spawn and message are separate steps, so spawn now and message when there's work (e.g. spawn a reviewer up front, message it once a PR is ready). Use this to delegate focused or parallel work; the child reports back to you by message. Non-blocking — the child runs asynchronously. Put the FULL scope in the charter — which repo(s) to clone and work in, whether to cut one PR or several — the child clones whatever it needs into its working directory itself.",
       inputSchema: {
@@ -337,11 +343,101 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
+    "list_actors",
+    {
+      title: "List your actor directory",
+      description:
+        "List the actors you have been introduced to: your parent, the handles you hold and your direct children, each with its thread id, handle, status and a brief description from its own title or charter. Retired (archived) actors are left out unless you ask for them. Use `view_actor` for one actor's full metadata. Reading grants no authority.",
+      inputSchema: {
+        include_archived: z
+          .boolean()
+          .optional()
+          .describe("Also list retired actors. Defaults to false."),
+      },
+    },
+    async ({ include_archived }) => {
+      try {
+        return toolOk(
+          mesh
+            .listDirectory(selfId)
+            .filter((record) => include_archived === true || record.status !== "retired")
+            .map((record) => ({
+              thread_id: record.id,
+              handle: mesh.getActorHandle(record.id),
+              description: describeActor(record),
+              status: record.status,
+            }))
+        );
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "view_actor",
+    {
+      title: "View an actor's metadata",
+      description:
+        "Read one actor's thread id, handle, status, title, model and context configuration, charter and brief. Omit `actor_id` to view yourself, including the provider, model and effort your current run launched on (`current_run`). `model_config` and `context` are what is effective now; `pending` holds any staged replacement that applies at the actor's next run boundary. Any actor can be read by thread id; a handle resolves only to you or an actor in your directory. Reading grants no authority.",
+      inputSchema: {
+        actor_id: z
+          .string()
+          .optional()
+          .describe(
+            "A thread id, or the handle of yourself or an actor in your directory. Omit to view yourself."
+          ),
+      },
+    },
+    async ({ actor_id }) => {
+      try {
+        const self = mesh.resolveActorId(selfId);
+        const record = mesh.resolveDirectoryActor(selfId, actor_id ?? self);
+        const run = record.id === self ? options?.currentRun?.() : undefined;
+        const brief = options?.readBrief?.(record.id) ?? null;
+        const pending = {
+          ...(record.desiredModelConfig !== undefined
+            ? { model_config: record.desiredModelConfig }
+            : {}),
+          ...(record.desiredModelClass !== undefined
+            ? { model_class: record.desiredModelClass }
+            : {}),
+          ...(record.desiredContextConfig !== undefined
+            ? { context: record.desiredContextConfig }
+            : {}),
+        };
+        return toolOk({
+          thread_id: record.id,
+          handle: mesh.getActorHandle(record.id),
+          ...(record.title !== undefined ? { title: record.title } : {}),
+          status: record.status,
+          model_config: record.modelConfig ?? [],
+          ...(record.modelClass !== undefined ? { model_class: record.modelClass } : {}),
+          ...(record.modelClassError !== undefined
+            ? { model_class_error: record.modelClassError }
+            : {}),
+          ...(run?.provider !== undefined
+            ? { current_run: { provider: run.provider, model: run.model, effort: run.effort } }
+            : {}),
+          context: record.context ?? { type: "native" },
+          ...(Object.keys(pending).length > 0 ? { pending } : {}),
+          charter: record.charter,
+          brief: brief
+            ? { text: brief.text, generation: brief.generation, updated_at: brief.updatedAt }
+            : null,
+        });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
     "list_followers",
     {
       title: "List connected followers",
       description:
-        "List all connected follower instances available for remote actor placement via spawn_thread target.",
+        "List all connected follower instances available for remote actor placement via spawn_actor target.",
       inputSchema: {},
     },
     async () => {
@@ -1171,7 +1267,7 @@ export function createAgentExecMcpServer(
         {
           title: "List runtime model classes (model-admin)",
           description:
-            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model. Requires the model-admin capability.",
+            "List every model class currently committed in mesh.db. This is the live authority used by spawn_actor and set_actor_model. Requires the model-admin capability.",
           inputSchema: {},
         },
         async () => {
@@ -1197,7 +1293,7 @@ export function createAgentExecMcpServer(
         {
           title: "Create or replace a runtime model class (model-admin)",
           description:
-            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Actors bound to this class by reference follow the new definition: dashboard and API reads show it at once, and each actor picks it up on its next run, while an already-launched run keeps the tuple it started on. Actors holding an explicit concrete pool are unaffected. A class definition cannot reference another class. Requires the model-admin capability.",
+            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_actor or set_actor_model class reference immediately, without restart. Actors bound to this class by reference follow the new definition: dashboard and API reads show it at once, and each actor picks it up on its next run, while an already-launched run keeps the tuple it started on. Actors holding an explicit concrete pool are unaffected. A class definition cannot reference another class. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact stable class name, e.g. 'review'."),
             model_config: concreteModelConfigSchema.describe(
