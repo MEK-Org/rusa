@@ -10,6 +10,7 @@ import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/inbox_item_row.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
+import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
@@ -260,6 +261,158 @@ void main() {
         expect(note.top, greaterThan(handle.bottom));
       });
     });
+
+    // Resolved references render their own card inside the shared row, so they
+    // are the widest content that shell holds. Each kind of header is covered:
+    // an open-link button beside the longest chip, a mesh subtitle, and an
+    // unresolved reference that falls back to its generic title.
+    const issueRef = 'github:example/project/issues/9';
+    const commentRef = 'github:example/project/issues/9/comments/1';
+    const meshRef = 'mesh:messages/activity-reference';
+    const missingRef = 'github:example/project/issues/404';
+    const longTitle =
+        'A resolved issue title long enough that it has to ellipsize on any '
+        'width this row is rendered at, however wide that row turns out to be';
+
+    FakeApi referenceApi() => FakeApi()
+      ..threadsResult = [makeThread(actor)]
+      ..referencesResult = {
+        issueRef: const ReferenceDto(
+          ref: issueRef,
+          scheme: 'github',
+          title: 'unused',
+          url: 'https://example.com/issues/9',
+          entity: {'type': 'github_issue', 'title': longTitle},
+        ),
+        commentRef: const ReferenceDto(
+          ref: commentRef,
+          scheme: 'github',
+          title: commentRef,
+          author: 'an-author-with-a-long-enough-name-to-test-the-byline',
+          url: 'https://example.com/issues/9#comment-1',
+          entity: {'type': 'github_comment', 'body': 'Comment body'},
+        ),
+        meshRef: const ReferenceDto(
+          ref: meshRef,
+          scheme: 'mesh',
+          title: '$actor → root',
+          timestamp: '2026-09-23T14:21:37.000Z',
+          entity: {
+            'type': 'mesh_message',
+            'senderId': actor,
+            'recipientId': 'root',
+          },
+        ),
+        missingRef: const ReferenceDto(
+          ref: missingRef,
+          scheme: 'github',
+          title: missingRef,
+          unavailable: 'tracker not configured',
+        ),
+      }
+      ..recentActivityResult = const [
+        RecentActivityItem(
+          id: 'inbox_issue',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:21:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB ISSUE',
+          referenceKey: issueRef,
+          summary: 'Issue summary',
+          addressedNote: 'Issue note',
+        ),
+        RecentActivityItem(
+          id: 'inbox_comment',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:20:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB COMMENT',
+          referenceKey: commentRef,
+          addressedNote: 'Comment note',
+        ),
+        RecentActivityItem(
+          id: 'inbox_mesh',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:19:37.000Z',
+          actorId: actor,
+          sourceKind: 'MESH CHAT',
+          referenceKey: meshRef,
+          addressedNote: 'Mesh note',
+        ),
+        RecentActivityItem(
+          id: 'inbox_missing',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:18:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB ISSUE',
+          referenceKey: missingRef,
+          addressedNote: 'Missing note',
+        ),
+      ];
+
+    for (final (name, width, stacked) in const [
+      ('phone', 390.0, true),
+      // The row is 74px narrower than the viewport: page and section padding.
+      ('just below the column breakpoint', 620.0, true),
+      ('just above the column breakpoint', 640.0, false),
+      ('desktop', 1200.0, false),
+    ]) {
+      testWidgets('$name: resolved references fit the shared activity row', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final store = DashboardStore(
+            api: referenceApi(),
+            stream: FakeStream(),
+          );
+          await store.init();
+          addTearDown(store.dispose);
+          await store.refreshRecentActivity(deferUntilPostFrame: false);
+          await tester.binding.setSurfaceSize(Size(width, 3000));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          await tester.pumpWidget(_app(store));
+          await tester.pump();
+          await tester.pump();
+
+          final rows = find.descendant(
+            of: find.byType(ListView),
+            matching: find.byType(ReferencePreview),
+          );
+          expect(rows, findsNWidgets(4));
+
+          final activity = section(tester, 'Recent Activity');
+          for (var i = 0; i < 4; i++) {
+            final card = tester.getRect(rows.at(i));
+            expect(card.right, lessThanOrEqualTo(activity.right));
+            // A card narrowed to its fixed columns' leftovers would fail this
+            // even where nothing overflows.
+            expect(card.width, greaterThan(220));
+          }
+
+          // Stacked, the card starts left of who handled it, on the line below.
+          final firstCard = tester.getRect(rows.first);
+          final who = tester.getRect(
+            find
+                .descendant(
+                  of: find.byType(ListView),
+                  matching: find.text(store.actorDisplay(actor)),
+                )
+                .first,
+          );
+          expect(firstCard.left < who.left, stacked);
+          expect(firstCard.top > who.bottom, stacked);
+          expect(find.text(longTitle), findsOneWidget);
+
+          expect(find.text('GitHub comment'), findsOneWidget);
+          expect(find.text('GitHub reference'), findsOneWidget);
+          for (final raw in [issueRef, commentRef, meshRef, missingRef]) {
+            expect(find.textContaining(raw), findsNothing);
+          }
+          // A RenderFlex overflow surfaces here as well as failing the test.
+          expect(tester.takeException(), isNull);
+        });
+      });
+    }
   });
 
   testWidgets('Recent Activity renders handled cards with addressed note', (
