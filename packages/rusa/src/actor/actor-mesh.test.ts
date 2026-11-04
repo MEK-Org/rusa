@@ -871,18 +871,32 @@ describe("ActorMesh", () => {
     expect(fake(id).calls).toHaveLength(1); // resumed → runs normally
   });
 
-  it("skips worker runs while gracefully shutting down, and runs once cancelled", async () => {
+  it("skips worker runs while gracefully shutting down, and replays gated work once cancelled (#1225)", async () => {
     let shuttingDown = true;
-    const { mesh, fake, tick } = setup({ isShuttingDown: () => shuttingDown });
+    let halted = false;
+    const { mesh, fake, tick } = setup({
+      isShuttingDown: () => shuttingDown,
+      isHalted: () => halted,
+    });
     const id = mesh.spawn({ charter: "do work", parentId: "root" });
     mesh.sendMessage(id, "begin", "root");
     await tick();
     expect(fake(id).calls).toHaveLength(0); // draining → beforeRun gates the run off
 
+    // Lifting drain brake while HALT is active starts nothing
+    halted = true;
     shuttingDown = false;
-    mesh.sendMessage(id, "begin again", "root");
+    mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
     await tick();
-    expect(fake(id).calls).toHaveLength(1); // drain cancelled → runs normally
+    expect(fake(id).calls).toHaveLength(0); // halted → still gated off
+
+    // Once HALT also clears, resuming replays the gated work without a new message
+    halted = false;
+    mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    await tick();
+    expect(fake(id).calls).toHaveLength(1); // drain cancelled & unhalted → replayed cleanly
   });
 
   it("halt and graceful-shutdown gate independently (either one alone skips)", async () => {

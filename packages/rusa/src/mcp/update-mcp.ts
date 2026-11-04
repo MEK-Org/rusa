@@ -1,9 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type {
-  MaintenanceShutdownCoordinator,
-  MaintenanceShutdownOutcome,
-} from "../update/maintenance-shutdown.js";
+import type { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
 import {
   executeUpdate,
   shortSha,
@@ -38,7 +35,6 @@ export interface UpdateToolOutcome {
 export interface ShutdownToolOutcome {
   ok: boolean;
   message: string;
-  completion?: Promise<MaintenanceShutdownOutcome>;
 }
 
 /**
@@ -112,7 +108,6 @@ export async function runShutdownTool(
   return {
     ok: outcome.ok,
     message: outcome.message,
-    completion: outcome.completion,
   };
 }
 
@@ -180,7 +175,6 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
           .positive()
           .max(3600)
           .optional()
-          .default(300)
           .describe(
             "Maximum seconds to wait for active runs to finish before cancelling shutdown (default: 300, max: 3600)"
           ),

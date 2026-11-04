@@ -1,5 +1,8 @@
 import type { DrainSeam, NotifySeam } from "./orchestrator.js";
 
+/** Default timeout in seconds to wait for active runs to finish before cancelling shutdown (#1225). */
+export const DEFAULT_MAINTENANCE_SHUTDOWN_TIMEOUT_SECONDS = 300;
+
 export interface MaintenanceShutdownOptions {
   /** Maximum seconds to wait for active runs to finish before cancelling (default: 300). */
   timeoutSeconds?: number;
@@ -13,8 +16,6 @@ export interface MaintenanceShutdownDeps {
   recordAction?: (text: string) => void;
   exit: (code: number) => Promise<void> | void;
   log?: (msg: string) => void;
-  now?: () => number;
-  defaultTimeoutSeconds?: number;
   isBusy?: () => boolean;
   onResumeWork?: () => void;
 }
@@ -89,11 +90,11 @@ export class MaintenanceShutdownCoordinator {
 
     const timeoutSeconds = Math.max(
       1,
-      opts.timeoutSeconds ?? this.deps.defaultTimeoutSeconds ?? 300
+      opts.timeoutSeconds ?? DEFAULT_MAINTENANCE_SHUTDOWN_TIMEOUT_SECONDS
     );
     const reason = opts.reason?.trim() || "maintenance shutdown";
     const timeoutMs = timeoutSeconds * 1000;
-    const now = this.deps.now ? this.deps.now() : Date.now();
+    const now = Date.now();
 
     // 1. Engage admission brake and set activeRequest synchronously BEFORE notification await
     // This prevents concurrent requests from both passing the guard and ensures admission
@@ -129,7 +130,7 @@ export class MaintenanceShutdownCoordinator {
 
     // 3. Start drain watcher in the background
     void (async () => {
-      const startDrainTime = this.deps.now ? this.deps.now() : Date.now();
+      const startDrainTime = Date.now();
       try {
         const drainResult = await this.deps.drain.waitForQuiescence(timeoutMs, {
           signal: active.abortController.signal,
@@ -191,7 +192,7 @@ export class MaintenanceShutdownCoordinator {
           {
             status: "cancelled",
             reason: "error",
-            waitedMs: (this.deps.now ? this.deps.now() : Date.now()) - startDrainTime,
+            waitedMs: Date.now() - startDrainTime,
           }
         );
       }
@@ -219,7 +220,7 @@ export class MaintenanceShutdownCoordinator {
     const reasonText = cancelReason ? `: ${cancelReason}` : "";
     const notice = `⚠️ Graceful shutdown cancelled by operator${reasonText}. Admission resumed.`;
     const auditText = `shutdown cancelled by operator${reasonText}`;
-    const waitedMs = (this.deps.now ? this.deps.now() : Date.now()) - active.startedAt;
+    const waitedMs = Date.now() - active.startedAt;
 
     this.abandon(active, notice, auditText, {
       status: "cancelled",
@@ -242,7 +243,11 @@ export class MaintenanceShutdownCoordinator {
     this.deps.drain.cancel();
     try {
       this.deps.onResumeWork?.();
-    } catch {}
+    } catch (err) {
+      this.deps.log?.(
+        `[maintenance-shutdown] onResumeWork failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     this.activeRequest = null;
 
     if (this.deps.notify) {

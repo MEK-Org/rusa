@@ -2767,7 +2767,6 @@ async function composeStart(
   const maintenanceDrainer = new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), "");
   const maintenanceShutdown = new MaintenanceShutdownCoordinator({
     drain: maintenanceDrainer,
-    defaultTimeoutSeconds: 300,
     notify: sendErrorSink ? { notify: sendErrorSink } : undefined,
     recordAction: (text: string) => {
       try {
@@ -2780,14 +2779,24 @@ async function composeStart(
       } catch {}
     },
     exit: async (code) => {
-      await shutdown(null, code);
+      // Record requested restart intent right before exit commit so the next boot
+      // computes `requested_clean` rather than `clean_without_requested_restart`.
+      try {
+        const intent = serviceLifecycleStore.recordRequestedRestart({
+          targetSha: deployedSha || "unknown",
+          branch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
+          subject: "graceful maintenance shutdown",
+        });
+        requestedRestartTransitionId = intent.id;
+      } catch (err) {
+        log.warn("service_restart_intent_persist_failed", { err });
+      }
+      await shutdown("deploy", code);
     },
     log: (m) => log.info("maintenance_shutdown", { detail: m }),
     isBusy: () => isUpdateInProgress(),
     onResumeWork: () => {
-      mesh.resumeCancelledRuns();
-      mesh.reconcileUnseenInbox();
-      admissionQueue.refresh();
+      resumeAfterHalt();
     },
   });
 

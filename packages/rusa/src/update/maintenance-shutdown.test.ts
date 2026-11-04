@@ -5,7 +5,6 @@ import { MaintenanceShutdownCoordinator } from "./maintenance-shutdown.js";
 import type { DrainSeam } from "./orchestrator.js";
 
 function setupCoordinator(opts?: {
-  defaultTimeoutSeconds?: number;
   isBusy?: () => boolean;
   onExit?: (code: number) => void;
   notifyFails?: boolean;
@@ -35,7 +34,6 @@ function setupCoordinator(opts?: {
       exitCode = code;
       opts?.onExit?.(code);
     },
-    defaultTimeoutSeconds: opts?.defaultTimeoutSeconds ?? 300,
     isBusy: opts?.isBusy,
     onResumeWork: () => {
       workResumedCount++;
@@ -337,5 +335,26 @@ describe("MaintenanceShutdownCoordinator (#1225)", () => {
     expect(outcome.ok).toBe(true);
     expect(outcome.message).toContain("draining active runs with 300s timeout");
     expect(notifications[0]).toContain("timeout: 300s");
+  });
+
+  it("onResumeWork failure logs warning and does not crash abandon", async () => {
+    const logs: string[] = [];
+    const graceful = new GracefulShutdown();
+    const drainer = new MeshDrainer(graceful, () => new Set(), "");
+    const coordinator = new MaintenanceShutdownCoordinator({
+      drain: drainer,
+      exit: () => {},
+      onResumeWork: () => {
+        throw new Error("simulated resume failure");
+      },
+      log: (msg) => logs.push(msg),
+    });
+
+    await coordinator.request();
+    coordinator.cancel();
+
+    expect(logs.some((l) => l.includes("onResumeWork failed: simulated resume failure"))).toBe(
+      true
+    );
   });
 });

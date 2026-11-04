@@ -180,8 +180,8 @@ describe("runShutdownTool & runCancelShutdownTool (#1225)", () => {
     expect(outcome.message).toContain("Graceful shutdown initiated");
     expect(touched.drained).toBe(true);
 
-    const result = await outcome.completion;
-    expect(result?.status).toBe("quiesced");
+    // Wait for the background drain watcher to quiesce and trigger exit
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(touched.exited).toBe(true);
   });
 
