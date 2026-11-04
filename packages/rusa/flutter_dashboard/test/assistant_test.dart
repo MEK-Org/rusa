@@ -9,6 +9,7 @@ import 'package:rusa_dashboard/assistant_page.dart';
 import 'package:rusa_dashboard/assistant_platform.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/walkie_controller.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/walkie_panel.dart';
@@ -374,17 +375,56 @@ void main() {
       await tester.pump();
       await tester.pump();
       expect(walkie.recorder.startCalls, 3);
+      final cancelCallsBeforeFirst = walkie.recorder.cancelCalls;
       first.complete(snapshot());
       await tester.pump();
       await tester.pump();
+      expect(walkie.recorder.cancelCalls, cancelCallsBeforeFirst);
+      expect(find.byKey(const ValueKey('walkie-panel')), findsOneWidget);
+      final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
+      expect(panel.controller.record.value.phase, RecordPhase.recording);
 
       await tester.tap(find.byKey(const ValueKey('walkie-off')));
       await tester.pump();
       await tester.pump();
       expect(closed, 1);
       expect(walkie.recorder.startCalls, 3);
+      expect(walkie.recorder.cancelCalls, cancelCallsBeforeFirst + 1);
       await unmount(tester);
     });
+
+    testWidgets(
+      'a 503 during enable cancels capture and displays voice not configured',
+      (tester) async {
+        final probe = Completer<List<VoiceAnnouncement>>();
+        final backlog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([probe, backlog]);
+        await pumpPage(tester);
+
+        // First backlog fetch (init probe) succeeds:
+        probe.complete(const []);
+        await tester.pump();
+
+        // Second backlog fetch (enable backlog) fails with 503:
+        backlog.completeError(
+          DashboardApiException(
+            Uri.parse('https://dash.example/api/mesh/voice/backlog'),
+            503,
+            'service unavailable',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('Voice is not configured on this instance'),
+          findsOneWidget,
+        );
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.cancelCalls, 1);
+        await unmount(tester);
+      },
+    );
 
     testWidgets(
       'a trigger while voice starts buffers stop and sends once adopted',

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -97,17 +98,22 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     _cancelCurrentCapture = cancelCapture;
 
+    final pageStart = DateTime.now();
     final captureStartedAt = DateTime.now();
     Object? captureError;
     final captureFuture = () async {
       try {
         await deps.recorder.start();
         if (stale() || !captureActive) {
-          try {
-            await deps.recorder.cancel();
-          } catch (_) {}
+          if (!stale()) {
+            try {
+              await deps.recorder.cancel();
+            } catch (_) {}
+          }
           return;
         }
+        final elapsed = DateTime.now().difference(pageStart).inMilliseconds;
+        developer.log('Capture live in ${elapsed}ms', name: 'assistant_page');
         // Play audible ready cue at observed capture readiness for assist entry only.
         await widget.signals?.playReadyCue();
       } catch (e) {
@@ -122,30 +128,40 @@ class _AssistantPageState extends State<AssistantPage> {
     try {
       snapshot = await _api.fetchThreads();
     } catch (e) {
-      _cancelCurrentCapture = null;
-      await cancelCapture();
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      if (!stale()) {
+        await cancelCapture();
+      }
       rethrow;
     }
 
     // Only the current start may drop the previous walkie-off listener.
     if (stale()) {
-      _cancelCurrentCapture = null;
-      await cancelCapture();
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
       throw StateError('Assist screen closed');
     }
     final previousEnabled = _enabledSub;
     _enabledSub = null;
     await previousEnabled?.cancel();
     if (stale()) {
-      _cancelCurrentCapture = null;
-      await cancelCapture();
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
       throw StateError('Assist screen closed');
     }
 
     final root = resolveRootActorId(snapshot);
     if (root == null) {
-      _cancelCurrentCapture = null;
-      await cancelCapture();
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
+      if (!stale()) {
+        await cancelCapture();
+      }
       throw StateError('No active root actor');
     }
 
@@ -157,10 +173,14 @@ class _AssistantPageState extends State<AssistantPage> {
     );
     _controller = controller;
     Future<Never> discard([String reason = 'Assist screen closed']) async {
-      _cancelCurrentCapture = null;
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
       if (_controller == controller) _controller = null;
       await controller.dispose();
-      await cancelCapture();
+      if (!stale()) {
+        await cancelCapture();
+      }
       throw StateError(reason);
     }
 
@@ -171,10 +191,15 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
+    if (!controller.enabled.value) {
+      return discard('Voice is not configured on this instance');
+    }
 
     await captureFuture;
     if (captureError != null) {
-      _cancelCurrentCapture = null;
+      if (_cancelCurrentCapture == cancelCapture) {
+        _cancelCurrentCapture = null;
+      }
       if (stale()) return discard();
       if (_controller == controller) _controller = null;
       await controller.dispose();
@@ -184,7 +209,9 @@ class _AssistantPageState extends State<AssistantPage> {
     if (stale()) return discard();
 
     captureActive = false;
-    _cancelCurrentCapture = null;
+    if (_cancelCurrentCapture == cancelCapture) {
+      _cancelCurrentCapture = null;
+    }
     controller.adoptRecording(startedAt: captureStartedAt);
 
     // Walkie off (the panel's power button) ends the assist session.
@@ -194,7 +221,7 @@ class _AssistantPageState extends State<AssistantPage> {
     _live = controller;
     if (_pendingStop) {
       _pendingStop = false;
-      await controller.toggleRecord();
+      unawaited(controller.toggleRecord());
     }
     return controller;
   }
