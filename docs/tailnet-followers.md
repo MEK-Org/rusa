@@ -61,7 +61,7 @@ node scripts/follower-token.mjs /absolute/private/path/enrollment-token
 
 When `rusa start` runs with this configuration, it starts `FollowerHub`, binds to
 the configured address and port, and enables remote placement for `POST /api/mesh/actors`
-and `spawn_thread`.
+and `spawn_actor`.
 
 
 ## Mac setup
@@ -177,7 +177,7 @@ Remote placement is fully model-facing and API-accessible:
 
 1. **Model-facing MCP tools**:
    - `list_followers`: Returns the list of currently connected follower nodes and their platform/actor details.
-   - `spawn_thread`: Accepts an optional `target: "<follower-name>"` parameter.
+   - `spawn_actor`: Accepts an optional `target: "<follower-name>"` parameter.
 2. **Dashboard REST API**:
    - `GET /api/mesh/followers`: Returns `{ followers: [...] }`.
    - `POST /api/mesh/actors`: Accepts optional `target: "<follower-name>"`.

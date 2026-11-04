@@ -3381,8 +3381,8 @@ export class ActorMesh {
   /**
    * Introduce `handle`'s actor to `toId`'s address book — the parent handing a
    * child a capability to message a peer (e.g. giving a coder the reviewer's
-   * handle). Idempotent per id; no-op if `toId` is unknown. Takes effect on the
-   * grantee's next wake (its prompt re-renders the address book).
+   * handle). Idempotent per id; no-op if `toId` is unknown. The grantee's next
+   * directory read shows it.
    */
   grantHandle(toId: string, handle: ActorHandle): void {
     toId = this.resolveThreadId(toId);
@@ -3426,7 +3426,7 @@ export class ActorMesh {
     const recipient = this.actors.get(toId);
     const sender = this.actors.get(fromId);
     if (!recipient || !sender || recipient.id === sender.id) return;
-    // A parent is already a stable, separately rendered address-book alias.
+    // A parent is already a stable address-book alias, listed from its edge.
     // Do not turn that topology edge into a duplicate explicit handle.
     if (recipient.parentId !== null && this.resolveThreadId(recipient.parentId) === sender.id) {
       return;
@@ -3439,8 +3439,7 @@ export class ActorMesh {
 
   /**
    * Remove `targetId` from `toId`'s address book. Idempotent; no-op if `toId` is
-   * unknown or does not hold a handle to `targetId`. Takes effect on the actor's
-   * next wake.
+   * unknown or does not hold a handle to `targetId`.
    */
   revokeHandle(toId: string, targetId: string): void {
     toId = this.resolveThreadId(toId);
@@ -5048,6 +5047,23 @@ export class ActorMesh {
       );
     }
     return matches[0];
+  }
+
+  /**
+   * The actors `requesterId` has been introduced to, retired ones included (#1231):
+   * its parent, then the handles it holds, which include the children it spawned or
+   * was reparented. A topology read only: it grants nothing and mints no handle.
+   */
+  listDirectory(requesterId: string): ActorRecord[] {
+    const requester = this.actors.get(this.resolveActorId(requesterId));
+    if (!requester) return [];
+    const ids = new Set<string>();
+    if (requester.parentId !== null) ids.add(this.resolveActorId(requester.parentId));
+    for (const handle of requester.handles ?? []) ids.add(handle.id);
+    ids.delete(requester.id);
+    return [...ids]
+      .map((id) => this.actors.get(id))
+      .filter((record): record is ActorRecord => record !== undefined);
   }
 
   private retireInner(id: string): void {

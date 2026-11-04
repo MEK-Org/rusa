@@ -68,7 +68,6 @@ function assembledActorContext(): string {
   return buildWorkerPrompt(CHARTER_WITH_NUL, {
     threadId: "00000000-0000-4000-8000-00000000dead",
     parentId: "00000000-0000-4000-8000-00000000beef",
-    handles: [],
     understandingMountEnabled: false,
     gitIdentity: resolveMeshGitIdentity(undefined),
   });
