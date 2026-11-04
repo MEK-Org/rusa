@@ -173,7 +173,10 @@ export interface DrainSeam {
    * root's own run, so "wait until empty" would deadlock on self), or until
    * `timeoutMs`. Always resolves by the deadline.
    */
-  waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }>;
+  waitForQuiescence(
+    timeoutMs: number,
+    opts?: { signal?: AbortSignal }
+  ): Promise<{ quiesced: boolean; waitedMs: number }>;
 }
 
 /** Outbound failure notice sink (best-effort; never sinks the result). */
@@ -280,6 +283,11 @@ export function formatFailureOutcome(params: FormatFailureParams): string {
 }
 
 let isUpdating = false;
+
+/** True iff an orchestrated update is currently running. */
+export function isUpdateInProgress(): boolean {
+  return isUpdating;
+}
 
 /**
  * Run the update. Returns a structured result (never throws): a failed/hung build

@@ -1,4 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import type { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
 import {
   executeUpdate,
   shortSha,
@@ -20,12 +22,19 @@ export interface UpdateToolDeps {
    * server ({@link UPDATE_MCP_NAME}); no actor id or topology stands in for it.
    */
   hasCapability: (actorId: string, capability: string) => boolean;
+  /** Shared maintenance shutdown coordinator (#1225). */
+  maintenanceShutdown: MaintenanceShutdownCoordinator;
 }
 
 export interface UpdateToolOutcome {
   ok: boolean;
   message: string;
   result?: UpdateResult;
+}
+
+export interface ShutdownToolOutcome {
+  ok: boolean;
+  message: string;
 }
 
 /**
@@ -51,6 +60,12 @@ export async function runUpdateTool(
       message: `'update' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
     };
   }
+  if (toolDeps.maintenanceShutdown.isPending()) {
+    return {
+      ok: false,
+      message: "A maintenance shutdown is currently in progress — refusing update.",
+    };
+  }
   const result = await executeUpdate(toolDeps.plan, toolDeps.deps);
   if (result.restarting) {
     // The process is exiting; this response may never reach root (the daemon dies
@@ -69,7 +84,61 @@ export async function runUpdateTool(
 }
 
 /**
- * In-process MCP server exposing the self-update as a single `update` tool.
+ * Standalone graceful drain and shutdown maintenance request without pulling or
+ * building code (#1225).
+ *
+ * Grant-gated identically to `update`: only holders of the `update` capability
+ * may trigger maintenance shutdown.
+ */
+export async function runShutdownTool(
+  toolDeps: UpdateToolDeps,
+  selfId: string,
+  opts?: { timeoutSeconds?: number; reason?: string }
+): Promise<ShutdownToolOutcome> {
+  if (!toolDeps.hasCapability(selfId, UPDATE_MCP_NAME)) {
+    return {
+      ok: false,
+      message: `'shutdown' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
+    };
+  }
+  const outcome = await toolDeps.maintenanceShutdown.request({
+    timeoutSeconds: opts?.timeoutSeconds,
+    reason: opts?.reason,
+  });
+  return {
+    ok: outcome.ok,
+    message: outcome.message,
+  };
+}
+
+/**
+ * Cancel a pending graceful shutdown request, lifting the admission brake and
+ * resuming normal execution (#1225).
+ */
+export function runCancelShutdownTool(
+  toolDeps: UpdateToolDeps,
+  selfId: string,
+  reason?: string
+): ShutdownToolOutcome {
+  if (!toolDeps.hasCapability(selfId, UPDATE_MCP_NAME)) {
+    return {
+      ok: false,
+      message: `'cancel_shutdown' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
+    };
+  }
+  const outcome = toolDeps.maintenanceShutdown.cancel(reason);
+  return {
+    ok: outcome.ok,
+    message: outcome.message,
+  };
+}
+
+/**
+ * In-process MCP server exposing host maintenance operations:
+ * - `update`: pull, build, drain, and restart (existing)
+ * - `shutdown`: graceful drain and shutdown for maintenance without pulling/rebuilding (#1225)
+ * - `cancel_shutdown`: cancel a pending graceful shutdown request (#1225)
+ *
  * **One instance per granted actor**, with `selfId` baked into the endpoint
  * (like every mesh endpoint), so "who is acting" is unspoofable.
  */
@@ -86,6 +155,66 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     async () => {
       try {
         const outcome = await runUpdateTool(toolDeps, selfId);
+        return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "shutdown",
+    {
+      title: "Graceful drain and shutdown",
+      description:
+        "Gracefully quiesce and shut down the mesh for maintenance (e.g. config-only restart). Stops admitting new runs, emits a notification to the configured error chat, allows active in-flight runs to finish, and shuts down the process once drained. Does not pull git or rebuild code. Preserves operator HALT state. Requires the 'update' capability. Note: under the production systemd unit (Restart=always), a clean exit (code 0) triggers an immediate service restart.",
+      inputSchema: {
+        timeout_seconds: z
+          .number()
+          .int()
+          .positive()
+          .max(3600)
+          .optional()
+          .describe(
+            "Maximum seconds to wait for active runs to finish before cancelling shutdown (default: 300, max: 3600)"
+          ),
+        reason: z
+          .string()
+          .optional()
+          .describe(
+            "Maintenance reason for the shutdown, included in error-chat notification and audit logs"
+          ),
+      },
+    },
+    async (args) => {
+      try {
+        const outcome = await runShutdownTool(toolDeps, selfId, {
+          timeoutSeconds: args.timeout_seconds,
+          reason: args.reason,
+        });
+        return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "cancel_shutdown",
+    {
+      title: "Cancel pending graceful shutdown",
+      description:
+        "Cancel a pending graceful shutdown request, lifting the admission brake and resuming normal execution. Requires the 'update' capability. Note: callable by in-flight runs (such as the calling turn before completion or concurrent runs) while new runs are barred from starting.",
+      inputSchema: {
+        reason: z
+          .string()
+          .optional()
+          .describe("Reason for cancellation, included in error-chat notification and audit logs"),
+      },
+    },
+    async (args) => {
+      try {
+        const outcome = runCancelShutdownTool(toolDeps, selfId, args.reason);
         return outcome.ok ? toolOk(outcome.message) : toolError(outcome.message);
       } catch (err) {
         return toolError(err);
