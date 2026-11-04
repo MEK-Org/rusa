@@ -2769,6 +2769,7 @@ async function composeStart(
   const maintenanceDrainer = new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), "");
   const maintenanceShutdown = new MaintenanceShutdownCoordinator({
     drain: maintenanceDrainer,
+    defaultTimeoutSeconds: 300,
     notify: sendErrorSink ? { notify: sendErrorSink } : undefined,
     recordAction: (text: string) => {
       try {

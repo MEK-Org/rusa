@@ -38,7 +38,7 @@ function setupCoordinator(opts?: {
       exitCode = code;
       opts?.onExit?.(code);
     },
-    defaultTimeoutSeconds: opts?.defaultTimeoutSeconds ?? 60,
+    defaultTimeoutSeconds: opts?.defaultTimeoutSeconds ?? 300,
     isBusy: opts?.isBusy,
     onResumeWork: () => {
       workResumedCount++;
@@ -328,5 +328,25 @@ describe("MaintenanceShutdownCoordinator (#1225)", () => {
     expect(notifications[1]).toContain(
       "⚠️ Graceful shutdown aborted before commit: exit failed (simulated e2e stop error). Admission resumed."
     );
+  });
+
+  it("defaults to 300s timeout when unspecified", async () => {
+    const graceful = new GracefulShutdown();
+    const drainer = new MeshDrainer(graceful, () => new Set(), "");
+    const notifications: string[] = [];
+    const coordinator = new MaintenanceShutdownCoordinator({
+      drain: drainer,
+      notify: {
+        notify: async (text) => {
+          notifications.push(text);
+        },
+      },
+      exit: () => {},
+    });
+
+    const outcome = await coordinator.request();
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain("draining active runs with 300s timeout");
+    expect(notifications[0]).toContain("timeout: 300s");
   });
 });

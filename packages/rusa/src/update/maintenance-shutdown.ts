@@ -1,7 +1,7 @@
 import type { DrainSeam, NotifySeam } from "./orchestrator.js";
 
 export interface MaintenanceShutdownOptions {
-  /** Maximum seconds to wait for active runs to finish before cancelling (default: 60). */
+  /** Maximum seconds to wait for active runs to finish before cancelling (default: 300). */
   timeoutSeconds?: number;
   /** Reason for the maintenance shutdown. */
   reason?: string;
@@ -14,8 +14,6 @@ export interface MaintenanceShutdownDeps {
   exit: (code: number) => Promise<void> | void;
   log?: (msg: string) => void;
   now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
-  intervalMs?: number;
   defaultTimeoutSeconds?: number;
   isBusy?: () => boolean;
   onResumeWork?: () => void;
@@ -41,11 +39,9 @@ export interface MaintenanceShutdownCancelResult {
 interface ActiveShutdownRequest {
   reason: string;
   startedAt: number;
-  timeoutSeconds: number;
   abortController: AbortController;
   onCancel: () => void;
   resolve: (outcome: MaintenanceShutdownOutcome) => void;
-  promise: Promise<MaintenanceShutdownOutcome>;
 }
 
 /**
@@ -94,7 +90,7 @@ export class MaintenanceShutdownCoordinator {
 
     const timeoutSeconds = Math.max(
       1,
-      opts.timeoutSeconds ?? this.deps.defaultTimeoutSeconds ?? 60
+      opts.timeoutSeconds ?? this.deps.defaultTimeoutSeconds ?? 300
     );
     const reason = opts.reason?.trim() || "maintenance shutdown";
     const timeoutMs = timeoutSeconds * 1000;
@@ -122,11 +118,9 @@ export class MaintenanceShutdownCoordinator {
     const active: ActiveShutdownRequest = {
       reason,
       startedAt: now,
-      timeoutSeconds,
       abortController,
       onCancel: () => cancelResolve?.(),
       resolve: resolveCompletion,
-      promise: completionPromise,
     };
     this.activeRequest = active;
 

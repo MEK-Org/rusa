@@ -179,6 +179,7 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
           .int()
           .positive()
           .optional()
+          .default(300)
           .describe(
             "Maximum seconds to wait for active runs to finish before cancelling shutdown (default: 300)"
           ),

@@ -245,17 +245,17 @@ describe("runShutdownTool & runCancelShutdownTool (#1225)", () => {
       expect(toolNames).toContain("shutdown");
       expect(toolNames).toContain("cancel_shutdown");
 
-      // Verify shutdown tool schema and invocation wiring
-      const shutdownRes = (await client.callTool({
+      // Verify shutdown tool schema and invocation wiring with omitted timeout_seconds (defaults to 300)
+      const shutdownDefaultRes = (await client.callTool({
         name: "shutdown",
         arguments: {
-          timeout_seconds: 45,
-          reason: "mcp test shutdown",
+          reason: "mcp test shutdown default timeout",
         },
       })) as CallToolResult;
-      expect(shutdownRes.isError).toBeFalsy();
-      const shutdownText = (shutdownRes.content[0] as { text: string }).text;
-      expect(shutdownText).toContain("Graceful shutdown initiated");
+      expect(shutdownDefaultRes.isError).toBeFalsy();
+      const shutdownDefaultText = (shutdownDefaultRes.content[0] as { text: string }).text;
+      expect(shutdownDefaultText).toContain("Graceful shutdown initiated");
+      expect(shutdownDefaultText).toContain("300s timeout");
 
       // Verify cancel_shutdown tool schema and invocation wiring
       const cancelRes = (await client.callTool({
@@ -268,6 +268,19 @@ describe("runShutdownTool & runCancelShutdownTool (#1225)", () => {
       const cancelText = (cancelRes.content[0] as { text: string }).text;
       expect(cancelText).toContain("Graceful shutdown cancelled");
       expect(cancelled).toBe(true);
+
+      // Verify shutdown tool schema and invocation wiring with explicit timeout_seconds
+      const shutdownRes = (await client.callTool({
+        name: "shutdown",
+        arguments: {
+          timeout_seconds: 45,
+          reason: "mcp test shutdown explicit",
+        },
+      })) as CallToolResult;
+      expect(shutdownRes.isError).toBeFalsy();
+      const shutdownText = (shutdownRes.content[0] as { text: string }).text;
+      expect(shutdownText).toContain("Graceful shutdown initiated");
+      expect(shutdownText).toContain("45s timeout");
     } finally {
       await client.close();
       await server.close();
