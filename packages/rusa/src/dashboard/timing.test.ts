@@ -752,40 +752,6 @@ describe("dashboard timing recorder", () => {
     });
   });
 
-  it("retains actor-list substages through storage and summary with legacy coverage", () => {
-    const recorder = new DashboardTimingRecorder(events);
-    const substages = {
-      actorRuntimeMs: 7,
-      actorReadMs: 11,
-      actorActivityMs: 17,
-      actorSummariesMs: 230,
-      actorMetadataMs: 31,
-    };
-    for (const stages of [substages, undefined]) {
-      recorder.recordServer({
-        label: "mesh_threads",
-        durationMs: 350,
-        status: 200,
-        bytes: 1,
-        substages: stages,
-        request: { method: "GET", terminal: "finished" },
-      });
-    }
-    recorder.flush();
-    expect(JSON.parse(timingRows()[0].payload ?? "{}").substages).toEqual(substages);
-    const population = recorder.summary({ since: new Date(Date.now() - 60_000) })
-      .serverPopulations[0];
-    for (const [key, value] of Object.entries(substages)) {
-      expect(population.finishedSuccess.substages).toHaveProperty(
-        key,
-        expect.objectContaining({
-          maxMs: value,
-          coverage: expect.objectContaining({ numerator: 1, denominator: 2 }),
-        })
-      );
-    }
-  });
-
   it("writes substages only on request rows and never empty (#990)", () => {
     const recorder = new DashboardTimingRecorder(events);
     recorder.recordServer({

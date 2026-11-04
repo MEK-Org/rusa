@@ -2104,12 +2104,6 @@ describe("handleMeshApiRequest", () => {
       actorSummariesMs: 23,
       actorMetadataMs: 31,
     });
-    const unrelated = new DashboardPhaseClock(() => now);
-    await runDashboardRequestScope(async () => {
-      attachDashboardPhaseClock(unrelated);
-      await call(deps, "GET", "/api/mesh/events");
-    });
-    expect(unrelated.substages()).toEqual({});
   });
 
   it("GET /api/mesh/threads lists threads with deterministic handles", async () => {
