@@ -29,6 +29,10 @@ const String _suffix = String.fromEnvironment(
 final _end = DateTime.utc(2026, 10, 19, 12);
 final _start = _end.subtract(const Duration(days: 3));
 
+const _issueRef = 'github:example/project/issues/100';
+const _commentRef = 'github:example/project/issues/100/comments/1';
+const _meshRef = 'mesh:messages/layout-round-3';
+
 String _iso(DateTime at) => at.toIso8601String();
 
 QuotaHistoryDto _quotaHistory() {
@@ -127,15 +131,52 @@ FakeApi _api() => FakeApi()
       status: 'waiting',
     ),
   ]
+  ..referencesResult = {
+    _issueRef: const ReferenceDto(
+      ref: _issueRef,
+      scheme: 'github',
+      title: 'unused',
+      url: 'https://example.com/project/issues/100',
+      entity: {
+        'type': 'github_issue',
+        'title': 'Let the proposed layout span the page',
+      },
+    ),
+    _commentRef: const ReferenceDto(
+      ref: _commentRef,
+      scheme: 'github',
+      title: _commentRef,
+      author: 'a-reviewer',
+      url: 'https://example.com/project/issues/100#comment-1',
+      entity: {
+        'type': 'github_comment',
+        'body': 'Could the phone layout keep the same order as desktop?',
+      },
+    ),
+    _meshRef: const ReferenceDto(
+      ref: _meshRef,
+      scheme: 'mesh',
+      title: 'root → w3',
+      entity: {'type': 'mesh_message', 'senderId': 'root', 'recipientId': 'w3'},
+    ),
+  }
   ..recentActivityResult = [
-    for (var i = 0; i < 4; i++)
+    // Live handled rows carry a reference, and render through ReferencePreview;
+    // the fourth shows the fallback for one without any.
+    for (final (i, kind, reference) in const [
+      (0, 'GITHUB ISSUE', _issueRef),
+      (1, 'GITHUB COMMENT', _commentRef),
+      (2, 'MESH CHAT', _meshRef),
+      (3, 'GITHUB ISSUE', null),
+    ])
       RecentActivityItem(
         id: 'inbox_$i',
         kind: 'handled_inbox',
         time: _iso(_end.subtract(Duration(minutes: 7 * i))),
         actorId: 'w${i + 1}',
-        sourceKind: 'GITHUB ISSUE',
-        sourceRef: 'github:example/project/issues/${100 + i}',
+        sourceKind: kind,
+        referenceKey: reference,
+        sourceRef: reference ?? 'github:example/project/issues/${100 + i}',
         summary: 'Feedback on the proposed layout, round ${i + 1}',
         handledTime: _iso(_end.subtract(Duration(minutes: 7 * i))),
         addressedNote:
@@ -166,8 +207,8 @@ void main() {
   // The whole Overview, then what a phone actually shows of Recent Activity.
   // Rows at the base commit are far taller, so its capture needs more height.
   final sizes = [
-    ('desktop', const Size(1440, 2400), false),
-    ('phone', Size(390, _suffix == 'before' ? 7000 : 4300), false),
+    ('desktop', const Size(1440, 3040), false),
+    ('phone', Size(390, _suffix == 'before' ? 7000 : 4800), false),
     ('phone_activity', const Size(390, 844), true),
   ];
 
@@ -182,6 +223,7 @@ void main() {
         final store = DashboardStore(api: _api(), stream: FakeStream());
         await store.init();
         addTearDown(store.dispose);
+        await store.refreshRecentActivity(deferUntilPostFrame: false);
         tester.view
           ..physicalSize = size
           ..devicePixelRatio = 1.0;

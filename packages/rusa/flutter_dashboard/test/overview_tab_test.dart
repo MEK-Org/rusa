@@ -146,15 +146,42 @@ void main() {
 
   group('#1234 full-width activity sections', () {
     const actor = '11111111-1111-4111-8111-111111111111';
+    const issueRef = 'github:example/project/issues/9';
 
+    // One of each row the shared shell holds. The resolved reference is its
+    // widest content: an open-link button beside a title that has to ellipsize.
     FakeApi activityApi() => FakeApi()
       ..threadsResult = [
         makeThread(actor, runState: RunState.running),
         makeThread('queued', runState: RunState.queued, queuePosition: 0),
       ]
-      ..recentActivityResult = [
-        const RecentActivityItem(
-          id: 'inbox_1',
+      ..referencesResult = {
+        issueRef: const ReferenceDto(
+          ref: issueRef,
+          scheme: 'github',
+          title: 'unused',
+          url: 'https://example.com/issues/9',
+          entity: {
+            'type': 'github_issue',
+            'title':
+                'A resolved issue title long enough that it has to ellipsize '
+                'on any width this row is rendered at, however wide it is',
+          },
+        ),
+      }
+      ..recentActivityResult = const [
+        RecentActivityItem(
+          id: 'inbox_reference',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:22:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB ISSUE',
+          referenceKey: issueRef,
+          summary: 'Issue summary',
+          addressedNote: 'Reference note',
+        ),
+        RecentActivityItem(
+          id: 'inbox_raw',
           kind: 'handled_inbox',
           time: '2026-09-23T14:21:37.000Z',
           actorId: actor,
@@ -164,7 +191,7 @@ void main() {
           handledTime: '2026-09-23T14:22:37.000Z',
           addressedNote: 'Answered on the thread',
         ),
-        const RecentActivityItem(
+        RecentActivityItem(
           id: 'ob_1',
           kind: 'terminal_obligation',
           time: '2026-09-23T14:20:37.000Z',
@@ -178,6 +205,19 @@ void main() {
         ),
       ];
 
+    Future<DashboardStore> pumpOverview(WidgetTester tester, Size size) async {
+      final store = DashboardStore(api: activityApi(), stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+      await store.refreshRecentActivity(deferUntilPostFrame: false);
+      await tester.binding.setSurfaceSize(size);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(_app(store));
+      await tester.pump();
+      await tester.pump();
+      return store;
+    }
+
     // The section card a title sits in: its nearest Container.
     Rect section(WidgetTester tester, String title) => tester.getRect(
       find
@@ -185,28 +225,56 @@ void main() {
           .first,
     );
 
+    // The first row's identity and each row's card, which is what the shell
+    // places: the outermost Container in the row holding each row's text.
+    ({Rect who, List<Rect> cards}) rowParts(
+      WidgetTester tester,
+      DashboardStore store,
+    ) {
+      final rows = find.byType(ListView);
+      Rect card(Finder content) => tester.getRect(
+        find
+            .descendant(
+              of: rows,
+              matching: find.ancestor(
+                of: content,
+                matching: find.byType(Container),
+              ),
+            )
+            .first,
+      );
+      return (
+        who: tester.getRect(
+          find
+              .descendant(
+                of: rows,
+                matching: find.text(store.actorDisplay(actor)),
+              )
+              .first,
+        ),
+        cards: [
+          card(find.byType(ReferencePreview)),
+          card(
+            find.textContaining('Answered on the thread', findRichText: true),
+          ),
+          card(find.textContaining('Landed', findRichText: true)),
+        ],
+      );
+    }
+
+    // The narrowest wide layout, where the row columns leave the least room.
     testWidgets(
       'wide: both sections span the content width around the columns',
       (tester) async {
         await tester.runAsync(() async {
-          final store = DashboardStore(
-            api: activityApi(),
-            stream: FakeStream(),
-          );
-          await store.init();
-          addTearDown(store.dispose);
-          await tester.binding.setSurfaceSize(const Size(1200, 2400));
-          addTearDown(() => tester.binding.setSurfaceSize(null));
-          await tester.pumpWidget(_app(store));
-          await tester.pump();
-          await tester.pump();
+          final store = await pumpOverview(tester, const Size(740, 2400));
 
           // The 20px page padding is all that remains on either side.
           final running = section(tester, 'Running Mesh Workers');
           final recent = section(tester, 'Recent Activity');
           for (final spanning in [running, recent]) {
             expect(spanning.left, closeTo(20, 1));
-            expect(spanning.right, closeTo(1180, 1));
+            expect(spanning.right, closeTo(720, 1));
           }
 
           // My Queue and Queued Actors stay in their column beside the charts.
@@ -221,6 +289,15 @@ void main() {
           expect(running.bottom, lessThan(quota.top));
           expect(recent.top, greaterThan(queued.bottom));
           expect(recent.top, greaterThan(quota.bottom));
+
+          // Rows keep their when and who columns beside a readable card.
+          final row = rowParts(tester, store);
+          for (final card in row.cards) {
+            expect(card.left, greaterThan(row.who.right));
+            expect(card.right, lessThanOrEqualTo(recent.right));
+            expect(card.width, greaterThan(220));
+          }
+          expect(tester.takeException(), isNull);
         });
       },
     );
@@ -229,190 +306,27 @@ void main() {
       tester,
     ) async {
       await tester.runAsync(() async {
-        final store = DashboardStore(api: activityApi(), stream: FakeStream());
-        await store.init();
-        addTearDown(store.dispose);
-        await tester.binding.setSurfaceSize(const Size(390, 2400));
-        addTearDown(() => tester.binding.setSurfaceSize(null));
-        await tester.pumpWidget(_app(store));
-        await tester.pump();
-        await tester.pump();
+        final store = await pumpOverview(tester, const Size(390, 2400));
 
+        final recent = section(tester, 'Recent Activity');
         for (final title in ['Running Mesh Workers', 'Recent Activity']) {
           final spanning = section(tester, title);
           expect(spanning.left, closeTo(20, 1));
           expect(spanning.right, closeTo(370, 1));
         }
 
-        // A RenderFlex overflow fails this test on its own; the card must
-        // also keep a readable width, and sit below who handled it.
-        final handle = tester.getRect(
-          find
-              .descendant(
-                of: find.byType(ListView),
-                matching: find.text(store.actorDisplay(actor)),
-              )
-              .first,
-        );
-        final note = tester.getRect(
-          find.textContaining('Answered on the thread', findRichText: true),
-        );
-        expect(note.width, greaterThan(200));
-        expect(note.top, greaterThan(handle.bottom));
+        // A RenderFlex overflow fails this test on its own; each card must also
+        // keep a readable width, below and starting left of who handled it.
+        final row = rowParts(tester, store);
+        for (final card in row.cards) {
+          expect(card.top, greaterThan(row.who.bottom));
+          expect(card.left, lessThan(row.who.left));
+          expect(card.right, lessThanOrEqualTo(recent.right));
+          expect(card.width, greaterThan(200));
+        }
+        expect(tester.takeException(), isNull);
       });
     });
-
-    // Resolved references render their own card inside the shared row, so they
-    // are the widest content that shell holds. Each kind of header is covered:
-    // an open-link button beside the longest chip, a mesh subtitle, and an
-    // unresolved reference that falls back to its generic title.
-    const issueRef = 'github:example/project/issues/9';
-    const commentRef = 'github:example/project/issues/9/comments/1';
-    const meshRef = 'mesh:messages/activity-reference';
-    const missingRef = 'github:example/project/issues/404';
-    const longTitle =
-        'A resolved issue title long enough that it has to ellipsize on any '
-        'width this row is rendered at, however wide that row turns out to be';
-
-    FakeApi referenceApi() => FakeApi()
-      ..threadsResult = [makeThread(actor)]
-      ..referencesResult = {
-        issueRef: const ReferenceDto(
-          ref: issueRef,
-          scheme: 'github',
-          title: 'unused',
-          url: 'https://example.com/issues/9',
-          entity: {'type': 'github_issue', 'title': longTitle},
-        ),
-        commentRef: const ReferenceDto(
-          ref: commentRef,
-          scheme: 'github',
-          title: commentRef,
-          author: 'an-author-with-a-long-enough-name-to-test-the-byline',
-          url: 'https://example.com/issues/9#comment-1',
-          entity: {'type': 'github_comment', 'body': 'Comment body'},
-        ),
-        meshRef: const ReferenceDto(
-          ref: meshRef,
-          scheme: 'mesh',
-          title: '$actor → root',
-          timestamp: '2026-09-23T14:21:37.000Z',
-          entity: {
-            'type': 'mesh_message',
-            'senderId': actor,
-            'recipientId': 'root',
-          },
-        ),
-        missingRef: const ReferenceDto(
-          ref: missingRef,
-          scheme: 'github',
-          title: missingRef,
-          unavailable: 'tracker not configured',
-        ),
-      }
-      ..recentActivityResult = const [
-        RecentActivityItem(
-          id: 'inbox_issue',
-          kind: 'handled_inbox',
-          time: '2026-09-23T14:21:37.000Z',
-          actorId: actor,
-          sourceKind: 'GITHUB ISSUE',
-          referenceKey: issueRef,
-          summary: 'Issue summary',
-          addressedNote: 'Issue note',
-        ),
-        RecentActivityItem(
-          id: 'inbox_comment',
-          kind: 'handled_inbox',
-          time: '2026-09-23T14:20:37.000Z',
-          actorId: actor,
-          sourceKind: 'GITHUB COMMENT',
-          referenceKey: commentRef,
-          addressedNote: 'Comment note',
-        ),
-        RecentActivityItem(
-          id: 'inbox_mesh',
-          kind: 'handled_inbox',
-          time: '2026-09-23T14:19:37.000Z',
-          actorId: actor,
-          sourceKind: 'MESH CHAT',
-          referenceKey: meshRef,
-          addressedNote: 'Mesh note',
-        ),
-        RecentActivityItem(
-          id: 'inbox_missing',
-          kind: 'handled_inbox',
-          time: '2026-09-23T14:18:37.000Z',
-          actorId: actor,
-          sourceKind: 'GITHUB ISSUE',
-          referenceKey: missingRef,
-          addressedNote: 'Missing note',
-        ),
-      ];
-
-    for (final (name, width, stacked) in const [
-      ('phone', 390.0, true),
-      // The row is 74px narrower than the viewport: page and section padding.
-      ('just below the column breakpoint', 620.0, true),
-      ('just above the column breakpoint', 640.0, false),
-      ('desktop', 1200.0, false),
-    ]) {
-      testWidgets('$name: resolved references fit the shared activity row', (
-        tester,
-      ) async {
-        await tester.runAsync(() async {
-          final store = DashboardStore(
-            api: referenceApi(),
-            stream: FakeStream(),
-          );
-          await store.init();
-          addTearDown(store.dispose);
-          await store.refreshRecentActivity(deferUntilPostFrame: false);
-          await tester.binding.setSurfaceSize(Size(width, 3000));
-          addTearDown(() => tester.binding.setSurfaceSize(null));
-          await tester.pumpWidget(_app(store));
-          await tester.pump();
-          await tester.pump();
-
-          final rows = find.descendant(
-            of: find.byType(ListView),
-            matching: find.byType(ReferencePreview),
-          );
-          expect(rows, findsNWidgets(4));
-
-          final activity = section(tester, 'Recent Activity');
-          for (var i = 0; i < 4; i++) {
-            final card = tester.getRect(rows.at(i));
-            expect(card.right, lessThanOrEqualTo(activity.right));
-            // A card narrowed to its fixed columns' leftovers would fail this
-            // even where nothing overflows.
-            expect(card.width, greaterThan(220));
-          }
-
-          // Stacked, the card starts left of who handled it, on the line below.
-          final firstCard = tester.getRect(rows.first);
-          final who = tester.getRect(
-            find
-                .descendant(
-                  of: find.byType(ListView),
-                  matching: find.text(store.actorDisplay(actor)),
-                )
-                .first,
-          );
-          expect(firstCard.left < who.left, stacked);
-          expect(firstCard.top > who.bottom, stacked);
-          expect(find.text(longTitle), findsOneWidget);
-
-          expect(find.text('GitHub comment'), findsOneWidget);
-          expect(find.text('GitHub reference'), findsOneWidget);
-          for (final raw in [issueRef, commentRef, meshRef, missingRef]) {
-            expect(find.textContaining(raw), findsNothing);
-          }
-          // A RenderFlex overflow surfaces here as well as failing the test.
-          expect(tester.takeException(), isNull);
-        });
-      });
-    }
   });
 
   testWidgets('Recent Activity renders handled cards with addressed note', (

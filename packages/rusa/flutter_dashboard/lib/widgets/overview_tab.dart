@@ -161,10 +161,11 @@ class _OverviewTabState extends State<OverviewTab> {
   Widget _buildWorkAndCharts() {
     return LayoutBuilder(
       builder: (context, constraints) {
+        final narrow = constraints.maxWidth < kNarrowBreakpoint;
         final myQueue = _buildMyQueueSection();
         final running = _buildRunningWorkersSection();
         final queued = _buildQueuedActorsSection();
-        final recentActivity = _buildRecentActivitySection();
+        final recentActivity = _buildRecentActivitySection(stackRows: narrow);
         final charts = [_buildQuotaPoolsCard(), _buildInboxMetricsCard()];
         Widget column(List<Widget> sections) => Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -175,7 +176,7 @@ class _OverviewTabState extends State<OverviewTab> {
             ],
           ],
         );
-        if (constraints.maxWidth < kNarrowBreakpoint) {
+        if (narrow) {
           return column([myQueue, running, queued, recentActivity, ...charts]);
         }
         return column([
@@ -599,7 +600,12 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(ready, blockerMap, ancestorMap, isReadyList: true),
+                      _buildQueueList(
+                        ready,
+                        blockerMap,
+                        ancestorMap,
+                        isReadyList: true,
+                      ),
                       if (waiting.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (waiting.isNotEmpty) ...[
@@ -640,7 +646,12 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(waiting, blockerMap, ancestorMap, isReadyList: false),
+                      _buildQueueList(
+                        waiting,
+                        blockerMap,
+                        ancestorMap,
+                        isReadyList: false,
+                      ),
                       if (scheduled.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (scheduled.isNotEmpty) ...[
@@ -1191,7 +1202,7 @@ class _OverviewTabState extends State<OverviewTab> {
   }
 
   /// Recent activity section (#664) replacing ceremonial yields.
-  Widget _buildRecentActivitySection() {
+  Widget _buildRecentActivitySection({required bool stackRows}) {
     return StreamBuilder<List<RecentActivityItem>>(
       stream: widget.store.recentActivity,
       initialData: widget.store.recentActivity.value,
@@ -1250,9 +1261,12 @@ class _OverviewTabState extends State<OverviewTab> {
                   itemBuilder: (context, i) {
                     final item = items[i];
                     if (item.isTerminalObligation) {
-                      return _buildTerminalObligationRow(item);
+                      return _buildTerminalObligationRow(
+                        item,
+                        stacked: stackRows,
+                      );
                     }
-                    return _buildHandledActivityRow(item);
+                    return _buildHandledActivityRow(item, stacked: stackRows);
                   },
                 ),
             ],
@@ -1263,8 +1277,13 @@ class _OverviewTabState extends State<OverviewTab> {
   }
 
   /// One Recent Activity row: when and who beside what happened, or above it
-  /// where those fixed columns would leave the card too little width.
-  Widget _activityRow(RecentActivityItem item, Widget card) {
+  /// on phone-sized displays, where those fixed columns would leave the card
+  /// too little width.
+  Widget _activityRow(
+    RecentActivityItem item,
+    Widget card, {
+    required bool stacked,
+  }) {
     final when = SizedBox(
       width: 80,
       child: Padding(
@@ -1320,10 +1339,8 @@ class _OverviewTabState extends State<OverviewTab> {
     );
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          if (constraints.maxWidth < _kActivityRowColumnsMinWidth) {
-            return Column(
+      child: stacked
+          ? Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Row(
@@ -1337,24 +1354,24 @@ class _OverviewTabState extends State<OverviewTab> {
                 const SizedBox(height: 8),
                 card,
               ],
-            );
-          }
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              when,
-              const SizedBox(width: 8),
-              SizedBox(width: 170, child: who),
-              const SizedBox(width: 12),
-              Expanded(child: card),
-            ],
-          );
-        },
-      ),
+            )
+          : Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                when,
+                const SizedBox(width: 8),
+                SizedBox(width: 170, child: who),
+                const SizedBox(width: 12),
+                Expanded(child: card),
+              ],
+            ),
     );
   }
 
-  Widget _buildHandledActivityRow(RecentActivityItem item) {
+  Widget _buildHandledActivityRow(
+    RecentActivityItem item, {
+    required bool stacked,
+  }) {
     final handledTime = formatTs(item.handledTime ?? item.time);
 
     return _activityRow(
@@ -1469,10 +1486,14 @@ class _OverviewTabState extends State<OverviewTab> {
           ],
         ),
       ),
+      stacked: stacked,
     );
   }
 
-  Widget _buildTerminalObligationRow(RecentActivityItem item) {
+  Widget _buildTerminalObligationRow(
+    RecentActivityItem item, {
+    required bool stacked,
+  }) {
     final isDone = item.terminalStatus == 'done';
     final statusColor = isDone
         ? MeshColors.statusActive
@@ -1605,6 +1626,7 @@ class _OverviewTabState extends State<OverviewTab> {
           ],
         ),
       ),
+      stacked: stacked,
     );
   }
 
@@ -1736,10 +1758,6 @@ class _OverviewTabState extends State<OverviewTab> {
 /// The identity takes a quarter and the inbox item three quarters, so this
 /// keeps the identity at least 280px — room for a handle, model, and title.
 const double _kQueuedFocusColumnMinWidth = 1120;
-
-/// Narrowest Recent Activity row that keeps its 270px of when and who columns
-/// beside the card, leaving the card about 290px; narrower rows stack them.
-const double _kActivityRowColumnsMinWidth = 560;
 
 /// What My Queue renders: the store's projection of the viewer's queue
 /// sections and where each section stands with the server.
