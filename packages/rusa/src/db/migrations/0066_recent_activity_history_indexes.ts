@@ -5,9 +5,13 @@ import type { Migration } from "./types.js";
  * Serve the two global Recent Activity feeds (#1239) from their sort order.
  *
  * The existing indexes on these tables lead with actor_id, so each feed scanned
- * its table and sorted it just to read one page. The key is the timestamp alone:
- * SQLite still breaks ties on `id` with a small sort over each tied group, and
- * adding `id` would double the index for a fraction of a millisecond per read.
+ * its table and sorted it just to read one page. The key is the timestamp alone,
+ * so SQLite breaks ties on `id` with a sort over each tied group the page reaches.
+ * That cost grows with the group, and the API doesn't bound it: limits are per
+ * call, and separate calls can share a timestamp. Callers stamp by clock, so small
+ * groups are an engineering expectation, not something observed in production.
+ * Adding `id` removes that dependence at about twice the size in a synthetic seed
+ * (#1240 has the measurements).
  * Each predicate repeats its query's filter literally: SQLite only uses a partial
  * index when the query's WHERE clause implies the predicate.
  */
