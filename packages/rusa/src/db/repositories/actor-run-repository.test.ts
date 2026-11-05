@@ -119,6 +119,23 @@ describe("ActorRunRepository", () => {
     ]);
   });
 
+  it("breaks completed focus ties on the run id, not on insertion order", () => {
+    const endedAt = "2026-08-30T00:00:03.000Z";
+    for (const id of ["tied-a", "tied-b"]) {
+      runs.start({ id, actorId: "actor-a", modelConfig: launch("codex", "gpt-5.5") });
+      db.prepare(`UPDATE actor_runs SET focus_entry_ids_json = ? WHERE id = ?`).run(
+        JSON.stringify([id]),
+        id
+      );
+      runs.complete(id, { endedAt, success: true, exitCode: 0, output: "done" });
+    }
+
+    expect(runs.listRecentCompletedFocuses(10).map((run) => run.entryIds)).toEqual([
+      ["tied-b"],
+      ["tied-a"],
+    ]);
+  });
+
   it("counts only successful focus rows and can exclude the current completed run", () => {
     const completeWithFocus = (id: string, success: boolean) => {
       runs.start({
