@@ -2,14 +2,8 @@ import {
   type MeshGitIdentityResolution,
   meshGitIdentityArgs,
 } from "../gitops/mesh-git-identity.js";
-import type { ActorHandle } from "./actor-record.js";
+import type { ActorRecord } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
-
-/** A handle resolved to its display label for the address book. */
-export interface ResolvedHandle {
-  id: string;
-  label: string;
-}
 
 /**
  * The async-delegation rule, shared by any actor that can spawn/message others
@@ -30,6 +24,18 @@ work done.
 If an actor-to-actor message reaches you but belongs with a different live
 recipient, reply to its sender with \`Not for me — I think this was intended for
 <recipient>.\` Do not forward it yourself.`;
+
+/**
+ * How an actor finds the others (#1231). It stands in for a rendered roster, so
+ * a prompt costs the same however many actors its owner has met, and leaves what
+ * a relationship means to the charters and briefs that establish it. Shared by
+ * root and workers beside {@link DELEGATION_DISCIPLINE}.
+ */
+export const ACTOR_DIRECTORY_GUIDANCE = `## Actor directory
+Use \`list_actors\` to see the actors you've been introduced to and \`view_actor\`
+to read an actor's model and context configuration, charter and brief, including
+your own. Message an actor by its id. Reading an actor grants no authority
+over it.`;
 
 /**
  * Stay grounded in real tool results — the universal anti-confabulation rule for
@@ -359,8 +365,6 @@ export interface WorkerPromptContext {
   threadId: string;
   /** The thread to report back to (the spawning parent); null for a top-level actor (#1003). */
   parentId: string | null;
-  /** Extra actors this worker may message, already resolved to display labels. */
-  handles?: ResolvedHandle[];
   /** Whether the Integrated Understanding read-only filesystem mount is enabled. */
   understandingMountEnabled?: boolean;
   /** The mesh's Git identity for mesh-owned commits, or the configuration gap. */
@@ -380,38 +384,20 @@ export function summarizeCharter(charter: string | undefined, max = 100): string
 }
 
 /**
- * Resolve raw handles to display labels from the target actor itself: its title,
- * else a summary of its charter for older untitled actors. A pairwise `role` on
- * the handle is never shown, so no granter can put its own text into the
- * holder's prompt as a description of someone else (#814).
+ * An actor's directory description, from the actor itself: its title, else a
+ * summary of its charter for older untitled actors. A pairwise `role` on a handle
+ * is never shown, so no granter can describe someone else to the holder (#814).
  */
-export function resolveHandleLabels(
-  handles: ActorHandle[] | undefined,
-  charterOf: (id: string) => string | undefined,
-  titleOf: (id: string) => string | undefined
-): ResolvedHandle[] {
-  return (handles ?? []).map((h) => ({
-    id: h.id,
-    label: titleOf(h.id)?.trim() || summarizeCharter(charterOf(h.id)),
-  }));
-}
-
-/** Render the reachable actors as a bullet list: parent first, then granted handles. */
-function renderAddressBook(ctx: WorkerPromptContext): string {
-  const lines =
-    ctx.parentId === null ? [] : [`- \`${ctx.parentId}\` — your **parent** (report results here)`];
-  for (const h of ctx.handles ?? []) {
-    lines.push(`- \`${h.id}\` — ${h.label}`);
-  }
-  return lines.join("\n");
+export function describeActor(actor: Pick<ActorRecord, "title" | "charter">): string {
+  return actor.title?.trim() || summarizeCharter(actor.charter);
 }
 
 /**
  * The framework scaffolding wrapped around a worker's *authored* charter (the
- * `charter` the parent supplied to `spawn_thread`). It establishes worker
+ * `charter` the parent supplied to `spawn_actor`). It establishes worker
  * identity and reporting boundaries. Like the root prompt it doesn't enumerate
- * exact tool names, but it does name the messaging primitive and the reachable
- * threads, since routing the outbox is the whole point of a worker.
+ * exact tool names, but it does name the messaging primitive and the parent,
+ * since routing the outbox is the whole point of a worker.
  */
 export function buildWorkerScaffold(ctx: WorkerPromptContext): string {
   if (ctx.parentId === null) return buildTopLevelScaffold(ctx);
@@ -420,9 +406,6 @@ export function buildWorkerScaffold(ctx: WorkerPromptContext): string {
 You are a **worker** in a self-similar actor mesh — one focused colleague spun up
 for a specific charter (below). You are thread \`${ctx.threadId}\`; you were
 spawned by thread \`${ctx.parentId}\`, which is your **parent**.
-
-Actors you can message (with your messaging tool, by thread id):
-${renderAddressBook(ctx)}
 
 How you operate:
 - **Re-derive state every wake** with your tools; never trust memory of issues,
@@ -436,7 +419,7 @@ How you operate:
   (\`${ctx.parentId}\`) updated on non-trivial milestones, changes in scope,
   blockers, and proposed completion. Your parent owns your lifecycle and charter
   scope.
-- You may also message the other actors listed above for what their label
+- You may also message the actors in your directory for what their description
   implies (e.g. ask a code-reviewer thread for a review).
 - Do the work your charter describes (real git/gh in the repos you've been
   granted), then report what you did.
@@ -454,15 +437,12 @@ How you operate:
  * reports, so it is told so instead of being handed a parent it does not have.
  */
 function buildTopLevelScaffold(ctx: WorkerPromptContext): string {
-  const addressBook = renderAddressBook(ctx);
   return `# Top-level actor
 
 You are a **top-level actor** in a self-similar actor mesh, working on the charter
 below. You are thread \`${ctx.threadId}\`. You have **no parent**: no actor spawned
 you, receives your reports or retires you. The human operator directs you through
 the messages that wake you, and only an operator can move you under a parent.
-
-${addressBook ? `Actors you can message (with your messaging tool, by thread id):\n${addressBook}` : "No other actors are in your address book yet."}
 
 How you operate:
 - **Re-derive state every wake** with your tools; never trust memory of issues,
@@ -529,6 +509,8 @@ ${buildWorkerScaffold(ctx)}
 ${FORWARD_PROGRESS_DISCIPLINE}
 
 ${DELEGATION_DISCIPLINE}
+
+${ACTOR_DIRECTORY_GUIDANCE}
 
 ${GROUNDING_DISCIPLINE}
 

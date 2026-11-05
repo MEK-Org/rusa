@@ -113,7 +113,7 @@ import {
   SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
 } from "./responsive-interruption.js";
-import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
+import { buildWorkerPrompt, describeActor } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
 
@@ -562,11 +562,6 @@ function setup(
             prompt: buildWorkerPrompt(r.charter, {
               threadId: r.id,
               parentId: r.parentId ?? "human",
-              handles: resolveHandleLabels(
-                r.handles,
-                (hid) => registry.get(hid)?.charter,
-                (hid) => registry.get(hid)?.title
-              ),
               gitIdentity: resolveMeshGitIdentity(undefined),
             }),
           };
@@ -4721,8 +4716,8 @@ describe("ActorMesh", () => {
     const coderCalls = fake(coder).calls;
     const last = coderCalls.at(-1)?.prompt ?? "";
     expect(last).toContain("Work from your inbox");
-    // The coder's prompt advertises the reviewer handle it was granted.
-    expect(last).toContain("code reviewer (high-tier)");
+    // The coder's directory shows the reviewer handle it was granted.
+    expect(mesh.listDirectory(coder).map((actor) => actor.id)).toContain(reviewer);
   });
 
   it("introduces a delivered peer sender with its handle and title", async () => {
@@ -4741,9 +4736,9 @@ describe("ActorMesh", () => {
     expect(registry.get(recipient)?.handles).toEqual([{ id: sender, origin: "message" }]);
 
     await tick();
+    const introduced = mesh.listDirectory(recipient).find((actor) => actor.id === sender);
+    expect(introduced && describeActor(introduced)).toBe("Release reviewer");
     const prompt = fake(recipient).calls.at(-1)?.prompt ?? "";
-    expect(prompt).toContain(`\`${sender}\``);
-    expect(prompt).toContain(`\`${sender}\` — Release reviewer`);
     expect(prompt).toContain("Not for me — I think this was intended for");
   });
 
@@ -4848,9 +4843,15 @@ describe("ActorMesh", () => {
     });
   });
 
-  describe("address-book descriptions come from the target actor (#814)", () => {
+  describe("directory descriptions come from the target actor (#814)", () => {
+    const describedDirectory = (mesh: ActorMesh, holder: string) =>
+      mesh
+        .listDirectory(holder)
+        .filter((record) => record.id !== "root")
+        .map((record) => ({ id: record.id, description: describeActor(record) }));
+
     it("describes a titled target by its own title", () => {
-      const { mesh, registry } = setup();
+      const { mesh } = setup();
       const coder = mesh.spawn({ charter: "implement the patch", parentId: "root" });
       const reviewer = mesh.spawn({
         charter: "review code\nwith care",
@@ -4859,28 +4860,20 @@ describe("ActorMesh", () => {
       });
       mesh.grantHandle(coder, { id: reviewer });
 
-      expect(
-        resolveHandleLabels(
-          registry.get(coder)?.handles,
-          (hid) => registry.get(hid)?.charter,
-          (hid) => registry.get(hid)?.title
-        )
-      ).toEqual([{ id: reviewer, label: "Release reviewer" }]);
+      expect(describedDirectory(mesh, coder)).toEqual([
+        { id: reviewer, description: "Release reviewer" },
+      ]);
     });
 
     it("falls back to the first charter line for an untitled target", () => {
-      const { mesh, registry } = setup();
+      const { mesh } = setup();
       const coder = mesh.spawn({ charter: "implement the patch", parentId: "root" });
       const reviewer = mesh.spawn({ charter: "\n  review code  \nwith care", parentId: "root" });
       mesh.grantHandle(coder, { id: reviewer });
 
-      expect(
-        resolveHandleLabels(
-          registry.get(coder)?.handles,
-          (hid) => registry.get(hid)?.charter,
-          (hid) => registry.get(hid)?.title
-        )
-      ).toEqual([{ id: reviewer, label: "review code" }]);
+      expect(describedDirectory(mesh, coder)).toEqual([
+        { id: reviewer, description: "review code" },
+      ]);
     });
 
     it("never lets a pairwise role label override the target's description", () => {
@@ -4895,19 +4888,15 @@ describe("ActorMesh", () => {
       expect(registry.get(coder)?.handles).toEqual([{ id: titled }]);
 
       // A role already persisted on an older row is not rendered.
-      const legacy = [
-        { id: titled, role: roleOf(titled) },
-        { id: untitled, role: roleOf(untitled) },
-      ];
-      expect(
-        resolveHandleLabels(
-          legacy,
-          (hid) => registry.get(hid)?.charter,
-          (hid) => registry.get(hid)?.title
-        )
-      ).toEqual([
-        { id: titled, label: "Reviewer" },
-        { id: untitled, label: "triage issues" },
+      registry.patch(coder, {
+        handles: [
+          { id: titled, role: roleOf(titled) },
+          { id: untitled, role: roleOf(untitled) },
+        ],
+      });
+      expect(describedDirectory(mesh, coder)).toEqual([
+        { id: titled, description: "Reviewer" },
+        { id: untitled, description: "triage issues" },
       ]);
     });
   });
@@ -7958,7 +7947,6 @@ describe("ActorMesh", () => {
         {
           threadId: worker,
           parentId: "root",
-          handles: [],
           gitIdentity: resolveMeshGitIdentity({
             name: "SiliconFamiliar",
             email: "siliconfamiliar@gmail.com",
@@ -7995,7 +7983,6 @@ describe("ActorMesh", () => {
         {
           threadId: worker,
           parentId: "root",
-          handles: [],
           gitIdentity: resolveMeshGitIdentity({
             name: "SiliconFamiliar",
             email: "siliconfamiliar@gmail.com",
@@ -8032,7 +8019,6 @@ describe("ActorMesh", () => {
         {
           threadId: worker,
           parentId: "root",
-          handles: [],
           gitIdentity: resolveMeshGitIdentity({
             name: "SiliconFamiliar",
             email: "siliconfamiliar@gmail.com",

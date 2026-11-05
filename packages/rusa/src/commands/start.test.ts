@@ -6253,6 +6253,105 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(dropped.readRunIds).toEqual([runId, largeRunId]);
   });
 
+  it("keeps a worker's composed prompt independent of how many actors it has met (#1231)", async () => {
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const modelConfig = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const workerId = mesh.spawn({ charter: "Directory worker", parentId: rootId, modelConfig });
+    const promptOf = () =>
+      (
+        mesh?.get(workerId) as unknown as { opts: { buildPrompt: () => { prompt: string } } }
+      ).opts.buildPrompt().prompt;
+
+    const before = promptOf();
+    for (let index = 0; index < 20; index++) {
+      const peerId = mesh.spawn({
+        charter: `Peer charter ${index}`,
+        title: `Introduced peer ${index}`,
+        parentId: rootId,
+        modelConfig,
+      });
+      mesh.grantHandle(workerId, { id: peerId });
+    }
+
+    const after = promptOf();
+    expect(after).not.toContain("Introduced peer");
+    expect(after.length).toBe(before.length);
+    expect(after).toContain("`list_actors`");
+    expect(after).toContain("`view_actor`");
+  });
+
+  it("serves a run's directory reads from the live run and the stored brief (#1231)", async () => {
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const modelConfig = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const workerId = mesh.spawn({ charter: "Directory worker", parentId: rootId, modelConfig });
+    const peerId = mesh.spawn({
+      charter: "Peer charter",
+      title: "Peer",
+      parentId: rootId,
+      modelConfig,
+    });
+    mesh.grantHandle(workerId, { id: peerId });
+    const store = getRepositories().portableContext;
+    const brief = { text: "peer brief", generation: 3, updatedAt: "2026-11-04T00:00:00Z" };
+    store.save({ ...store.load(peerId), brief });
+
+    const worker = mesh.get(workerId) as Actor;
+    await startLifecycleRun(worker, modelConfig);
+    const url = (
+      worker as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
+    ).opts.mcpServers.find((server) => server.name === "mesh")?.url;
+    if (!url) throw new Error("run mesh endpoint missing");
+    const client = new Client({ name: "actor-directory", version: "0.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    onTestFinished(() => client.close());
+    const read = async (name: string, args: Record<string, unknown>) => {
+      const result = (await client.callTool({ name, arguments: args })) as CallToolResult;
+      expect(result.isError).not.toBe(true);
+      const [first] = result.content as Array<{ type: string; text?: string }>;
+      return JSON.parse(first?.text ?? "null");
+    };
+
+    const self = await read("view_actor", {});
+    expect(self).toMatchObject({ actor_id: workerId, current_run: modelConfig, brief: null });
+    // Viewing an actor without a brief reads it and never seeds one.
+    expect(store.load(workerId).brief).toBeNull();
+
+    const peer = await read("view_actor", { actor_id: peerId });
+    expect(peer).toMatchObject({
+      actor_id: peerId,
+      brief: { text: "peer brief", generation: 3, updated_at: brief.updatedAt },
+    });
+    expect(peer).not.toHaveProperty("current_run");
+
+    expect(await read("list_actors", {})).toContainEqual(
+      expect.objectContaining({ actor_id: peerId, description: "Peer", status: "active" })
+    );
+  });
+
   it("seeds brief mode without a Gemini key and retains its window before and after delta enrollment", async () => {
     let mesh: ActorMesh | undefined;
     writeFileSync(

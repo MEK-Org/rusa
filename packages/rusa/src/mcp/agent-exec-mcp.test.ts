@@ -358,7 +358,7 @@ describe("administrative capability gating of management tools (#549)", () => {
     const names = await toolNames(client);
     for (const tool of ALL_MANAGEMENT_TOOLS) expect(names).not.toContain(tool);
     // The per-actor primitives (mesh-enforced) remain.
-    expect(names).toEqual(expect.arrayContaining(["grant_capability", "spawn_thread"]));
+    expect(names).toEqual(expect.arrayContaining(["grant_capability", "spawn_actor"]));
   });
 
   it("shows exactly the tools each administrative capability unlocks on a capable opaque-id worker", async () => {
@@ -864,6 +864,7 @@ describe("agent-execution MCP server", () => {
         "grant_capability",
         "introduce",
         "list_actor_experiments",
+        "list_actors",
         "list_followers",
         "list_grants",
         "list_pending_messages",
@@ -882,11 +883,12 @@ describe("agent-execution MCP server", () => {
         "set_actor_model",
         "set_event_source_config",
         "set_thread_title",
-        "spawn_thread",
+        "spawn_actor",
         "subscribe_event_source",
         "transfer_voice_session",
         "unenroll_actor_experiment",
         "unsubscribe_event_source",
+        "view_actor",
       ].sort()
     );
   });
@@ -1106,6 +1108,7 @@ describe("agent-execution MCP server", () => {
         "list_event_sources",
         "grant_capability",
         "introduce",
+        "list_actors",
         "list_followers",
         "list_pending_messages",
         "list_threads",
@@ -1118,19 +1121,20 @@ describe("agent-execution MCP server", () => {
         "set_actor_context",
         "set_actor_model",
         "set_event_source_config",
-        "spawn_thread",
+        "spawn_actor",
         "subscribe_event_source",
         "transfer_voice_session",
         "unsubscribe_event_source",
+        "view_actor",
       ].sort()
     );
   });
 
-  it("spawn_thread creates a child parented to the caller and returns its id", async () => {
+  it("spawn_actor creates a child parented to the caller and returns its id", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const res = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "implement X",
         model_config: { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
@@ -1148,7 +1152,7 @@ describe("agent-execution MCP server", () => {
     expect(registry.get("root")?.handles).toEqual([{ id: "t1" }]);
   });
 
-  it("routes root spawn_thread through the shared root control service", async () => {
+  it("routes root spawn_actor through the shared root control service", async () => {
     const { mesh } = setup();
     const spawnChild = vi.fn(() => "delegated-child");
     const rootControl = { spawnChild } as unknown as RootControlService;
@@ -1156,7 +1160,7 @@ describe("agent-execution MCP server", () => {
       createAgentExecMcpServer(mesh, "root", "root", undefined, { rootControl })
     );
     const result = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "review the patch",
         model_config: { provider: "agy", model: "gemini-3.5-flash-medium" },
@@ -1173,12 +1177,12 @@ describe("agent-execution MCP server", () => {
     );
   });
 
-  it("spawn_thread records the requested harness and model", async () => {
+  it("spawn_actor records the requested harness and model", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "review",
           model_config: { provider: "claude", model: "claude-opus-4-8" },
@@ -1190,12 +1194,12 @@ describe("agent-execution MCP server", () => {
     expect(rec?.modelConfig?.[0]?.model).toBe("claude-opus-4-8");
   });
 
-  it("spawn_thread passes the optional title to the record", async () => {
+  it("spawn_actor passes the optional title to the record", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "do tasks",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1207,7 +1211,7 @@ describe("agent-execution MCP server", () => {
     expect(rec?.title).toBe("My custom actor title");
   });
 
-  it("spawn_thread writes the portable context selection onto the record", async () => {
+  it("spawn_actor writes the portable context selection onto the record", async () => {
     // The wiring cell, not a resolver cell: before this, every prod spawn path
     // dropped `context` on the floor, so a portable actor could not be created in
     // the live mesh at all . Asserting on the RECORD is what proves the
@@ -1216,7 +1220,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "own a small issue",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1227,7 +1231,7 @@ describe("agent-execution MCP server", () => {
     expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "ledger" });
   });
 
-  it("spawn_thread lets an ordinary authorized spawner select brief", async () => {
+  it("spawn_actor lets an ordinary authorized spawner select brief", async () => {
     // Brief is a supported selection like ledger and tail: any actor that may
     // spawn can choose it for its own child, with no root-only door.
     const { mesh, registry } = setup();
@@ -1241,7 +1245,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "own a brief-mode trial",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1254,14 +1258,14 @@ describe("agent-execution MCP server", () => {
     expect(child?.context).toMatchObject({ type: "portable", mode: "brief" });
   });
 
-  it("spawn_thread leaves the record's context unset when no mode is asked for", async () => {
+  it("spawn_actor leaves the record's context unset when no mode is asked for", async () => {
     // Counter-assertion to the cell above: the default must still be native, or
     // the cell above would pass for the wrong reason (everything portable).
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "ordinary work",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1271,7 +1275,7 @@ describe("agent-execution MCP server", () => {
     expect(registry.get(thread_id)?.context).toBeUndefined();
   });
 
-  it("spawn_thread forwards the context selection through root control too", async () => {
+  it("spawn_actor forwards the context selection through root control too", async () => {
     const { mesh } = setup();
     const spawnChild = vi.fn(() => "delegated-child");
     const rootControl = { spawnChild } as unknown as RootControlService;
@@ -1279,7 +1283,7 @@ describe("agent-execution MCP server", () => {
       createAgentExecMcpServer(mesh, "root", "root", undefined, { rootControl })
     );
     await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "own a small issue",
         model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1292,31 +1296,31 @@ describe("agent-execution MCP server", () => {
     );
   });
 
-  it("spawn_thread rejects calls with a missing provider", async () => {
+  it("spawn_actor rejects calls with a missing provider", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const missingProvider = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "work", model_config: { model: "claude-sonnet-4-6" } },
     })) as CallToolResult;
     expect(missingProvider.isError).toBe(true);
   });
 
-  it("spawn_thread rejects an empty modelConfig pool", async () => {
+  it("spawn_actor rejects an empty modelConfig pool", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const result = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "work", model_config: [] },
     })) as CallToolResult;
     expect(result.isError).toBe(true);
   });
 
-  it("spawn_thread rejects an omitted model_config before any actor is created", async () => {
+  it("spawn_actor rejects an omitted model_config before any actor is created", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const result = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "work", context_mode: "ledger" },
     })) as CallToolResult;
     expect(result.isError).toBe(true);
@@ -1331,7 +1335,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const a = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "coder",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1340,7 +1344,7 @@ describe("agent-execution MCP server", () => {
     ) as { thread_id: string };
     const b = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "reviewer",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1442,14 +1446,14 @@ describe("agent-execution MCP server", () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "first task\nmore",
         model_config: { provider: "claude", model: "claude-sonnet-4-6" },
       },
     });
     await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "second task",
         model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1468,7 +1472,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "x",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1485,7 +1489,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "build the arm",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1879,7 +1883,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const w1 = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "worker 1",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1888,7 +1892,7 @@ describe("agent-execution MCP server", () => {
     ) as { thread_id: string };
     const w2 = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "worker 2",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1931,7 +1935,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const busy = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "busy",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1940,7 +1944,7 @@ describe("agent-execution MCP server", () => {
     ) as { thread_id: string };
     const idle = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "idle",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -1996,7 +2000,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "worker",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2024,7 +2028,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "x",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2114,7 +2118,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "x",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2267,7 +2271,7 @@ describe("agent-execution MCP server", () => {
     const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id: parentId } = dataOf(
       (await rootSrv.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "parent",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2277,7 +2281,7 @@ describe("agent-execution MCP server", () => {
     const parentSrv = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
     const { thread_id: childId } = dataOf(
       (await parentSrv.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2314,7 +2318,7 @@ describe("agent-execution MCP server", () => {
     const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id: parentId } = dataOf(
       (await rootSrv.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "parent",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2323,7 +2327,7 @@ describe("agent-execution MCP server", () => {
     ) as { thread_id: string };
     const { thread_id: siblingId } = dataOf(
       (await rootSrv.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "sibling (root's child, not parent's)",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2333,7 +2337,7 @@ describe("agent-execution MCP server", () => {
     const parentSrv = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
     const { thread_id: childId } = dataOf(
       (await parentSrv.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2408,7 +2412,7 @@ describe("agent-execution MCP server", () => {
     const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id: childId } = dataOf(
       (await rootSrv.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2436,7 +2440,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const { thread_id } = dataOf(
       (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "x",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2533,7 +2537,7 @@ describe("agent-execution MCP server", () => {
       const { mesh, events } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "space owner",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2676,7 +2680,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "conversation owner",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2764,7 +2768,7 @@ describe("agent-execution MCP server", () => {
       });
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "live obligation owner",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2818,7 +2822,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "space owner",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2883,7 +2887,7 @@ describe("agent-execution MCP server", () => {
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "parent",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2891,7 +2895,7 @@ describe("agent-execution MCP server", () => {
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2962,7 +2966,7 @@ describe("agent-execution MCP server", () => {
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "parent",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -2970,7 +2974,7 @@ describe("agent-execution MCP server", () => {
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3024,7 +3028,7 @@ describe("agent-execution MCP server", () => {
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "parent",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3032,7 +3036,7 @@ describe("agent-execution MCP server", () => {
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3110,7 +3114,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "system owner",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3136,7 +3140,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "parent",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3144,7 +3148,7 @@ describe("agent-execution MCP server", () => {
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "child",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3170,7 +3174,7 @@ describe("agent-execution MCP server", () => {
       mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "repo worker",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3216,7 +3220,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "watcher",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3254,7 +3258,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "watcher",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3309,7 +3313,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "watcher",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3352,7 +3356,7 @@ describe("agent-execution MCP server", () => {
 
       // Spawn investigator/worker actor
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "investigator",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3466,7 +3470,7 @@ describe("agent-execution MCP server", () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: {
           charter: "watcher",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
@@ -3727,7 +3731,7 @@ describe("runtime model-class management", () => {
     })) as CallToolResult;
     expect(firstSet.isError).toBeFalsy();
     const firstSpawn = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "first",
         model_config: { class: "review" },
@@ -3760,7 +3764,7 @@ describe("runtime model-class management", () => {
       { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
     ]);
     const secondSpawn = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "second", model_config: { class: "review" } },
     })) as CallToolResult;
     const secondId = (dataOf(secondSpawn) as { thread_id: string }).thread_id;
@@ -3784,7 +3788,7 @@ describe("runtime model-class management", () => {
     })) as CallToolResult;
     expect(invalid.isError).toBe(true);
     const unknown = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "work", model_config: { class: "missing" } },
     })) as CallToolResult;
     expect(unknown.isError).toBe(true);
@@ -3817,7 +3821,7 @@ describe("runtime model-class management", () => {
     expect(setRes.isError).toBeFalsy();
 
     const spawnRes = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "worker",
         model_config: { class: "review" },
@@ -3918,7 +3922,7 @@ describe("runtime model-class management", () => {
 
     for (const charter of ["w1", "w2"]) {
       const spawned = (await root.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: { charter, model_config: { class: "pool-class" }, context_mode: "ledger" },
       })) as CallToolResult;
       expect(spawned.isError).toBeFalsy();
@@ -3961,7 +3965,7 @@ describe("runtime model-class management", () => {
     });
 
     const spawn = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "w", model_config: { class: "class-a" }, context_mode: "ledger" },
     })) as CallToolResult;
     const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
@@ -4032,7 +4036,7 @@ describe("runtime model-class management", () => {
     });
 
     const spawn = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "temp worker",
         model_config: { class: "temp-class" },
@@ -4297,12 +4301,12 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       ),
   });
 
-  it("spawn_thread expands a model class reference into its configured pool", async () => {
+  it("spawn_actor expands a model class reference into its configured pool", async () => {
     const { mesh, registry } = setup(productionHooks());
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
     const res = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: { charter: "review the PR", model_config: { class: "review" } },
     })) as CallToolResult;
 
@@ -4313,7 +4317,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     ]);
   });
 
-  it("spawn_thread refuses a class reference carrying a sibling tuple field", async () => {
+  it("spawn_actor refuses a class reference carrying a sibling tuple field", async () => {
     const { mesh, registry } = setup(productionHooks());
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
@@ -4324,7 +4328,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       { class: "review", provider: "codex", model: "gpt-5.6-sol" },
     ]) {
       const res = (await client.callTool({
-        name: "spawn_thread",
+        name: "spawn_actor",
         arguments: { charter: "review the PR", model_config },
       })) as CallToolResult;
       expect(res.isError).toBe(true);
@@ -4332,12 +4336,12 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect(registry.list().filter((r) => r.id !== "root")).toEqual([]);
   });
 
-  it("spawn_thread refuses a class reference nested inside a pool", async () => {
+  it("spawn_actor refuses a class reference nested inside a pool", async () => {
     const { mesh, registry } = setup(productionHooks());
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
     const res = (await client.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "review the PR",
         model_config: [{ provider: "codex", model: "gpt-5.6-sol" }, { class: "review" }],
@@ -5197,7 +5201,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
     const spawned = (await root.callTool({
-      name: "spawn_thread",
+      name: "spawn_actor",
       arguments: {
         charter: "rollout subject",
         model_config: { provider: "claude", model: "claude-sonnet-5" },
@@ -5736,5 +5740,251 @@ describe("own voice tools (#817)", () => {
     const names = (await client.listTools()).tools.map((t) => t.name);
     expect(names).not.toContain("set_voice");
     expect(names).not.toContain("get_voice");
+  });
+});
+
+describe("actor directory (#1231)", () => {
+  const CLAUDE = { provider: "claude", model: "claude-sonnet-4-6" };
+  // A handle sharing no text with the id, so a refusal echoing it can't look like a leak.
+  const handleOf = (id: string) => `handle-${id.slice(1)}`;
+
+  function directory(options: Parameters<typeof createAgentExecMcpServer>[4] = {}) {
+    const fixture = setup({ handleForId: handleOf });
+    const { mesh } = fixture;
+    const parent = mesh.spawn({
+      charter: "parent charter",
+      parentId: "root",
+      title: "Parent",
+      modelConfig: CLAUDE,
+    });
+    const viewer = mesh.spawn({ charter: "viewer charter", parentId: parent, modelConfig: CLAUDE });
+    const peer = mesh.spawn({
+      charter: "\n  peer first line\nsecond line",
+      parentId: "root",
+      modelConfig: CLAUDE,
+    });
+    const archived = mesh.spawn({
+      charter: "archived charter",
+      parentId: "root",
+      title: "Old",
+      modelConfig: CLAUDE,
+    });
+    const stranger = mesh.spawn({
+      charter: "stranger charter",
+      parentId: "root",
+      title: "Stranger",
+      modelConfig: CLAUDE,
+    });
+    mesh.grantHandle(viewer, { id: peer });
+    mesh.grantHandle(viewer, { id: archived });
+    mesh.retire(archived);
+    const connectViewer = () =>
+      connect(createAgentExecMcpServer(mesh, viewer, "root", undefined, options));
+    return {
+      ...fixture,
+      parent,
+      viewer,
+      peer,
+      archived,
+      stranger,
+      connectViewer,
+    };
+  }
+
+  const call = async (client: Client, name: string, args: Record<string, unknown> = {}) =>
+    (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+  it("lists introduced actors with their own descriptions and hides archived ones by default", async () => {
+    const { parent, peer, archived, stranger, connectViewer } = directory();
+    const client = await connectViewer();
+
+    const listed = dataOf(await call(client, "list_actors")) as Array<{
+      actor_id: string;
+      handle: string;
+      description: string;
+      status: string;
+    }>;
+    expect(listed).toEqual([
+      { actor_id: parent, handle: handleOf(parent), description: "Parent", status: "active" },
+      {
+        actor_id: peer,
+        handle: handleOf(peer),
+        description: "peer first line",
+        status: "active",
+      },
+    ]);
+    expect(listed.map((actor) => actor.actor_id)).not.toContain(archived);
+    expect(listed.map((actor) => actor.actor_id)).not.toContain(stranger);
+
+    const withArchived = dataOf(
+      await call(client, "list_actors", { include_archived: true })
+    ) as Array<{ actor_id: string; description: string; status: string }>;
+    expect(withArchived.find((actor) => actor.actor_id === archived)).toMatchObject({
+      description: "Old",
+      status: "retired",
+    });
+    expect(withArchived.map((actor) => actor.actor_id)).not.toContain(stranger);
+  });
+
+  it("lists a child through the handle spawning grants, and a delivered sender", async () => {
+    const { mesh, viewer, parent, stranger } = directory();
+    const parentClient = await connect(createAgentExecMcpServer(mesh, parent, "root"));
+    const children = dataOf(await call(parentClient, "list_actors")) as Array<{
+      actor_id: string;
+    }>;
+    expect(children.map((actor) => actor.actor_id)).toContain(viewer);
+
+    mesh.grantHandle(viewer, { id: stranger, origin: "message" });
+    const client = await connect(createAgentExecMcpServer(mesh, viewer, "root"));
+    const listed = dataOf(await call(client, "list_actors")) as Array<{ actor_id: string }>;
+    expect(listed.map((actor) => actor.actor_id)).toContain(stranger);
+  });
+
+  it("shows an actor its own effective model and its in-flight launch without an argument", async () => {
+    const { viewer, connectViewer } = directory({
+      currentRun: () => ({ provider: "claude", model: "launched-model", effort: "high" }),
+      readBrief: (actorId) =>
+        actorId === viewer
+          ? { text: "## WHAT\n", generation: 3, updatedAt: "2026-01-02T00:00:00Z" }
+          : null,
+    });
+    const client = await connectViewer();
+
+    const view = dataOf(await call(client, "view_actor")) as Record<string, unknown>;
+    expect(view).toEqual({
+      actor_id: viewer,
+      handle: handleOf(viewer),
+      status: "active",
+      model_config: [CLAUDE],
+      current_run: { provider: "claude", model: "launched-model", effort: "high" },
+      context: { type: "native" },
+      charter: "viewer charter",
+      brief: { text: "## WHAT\n", generation: 3, updated_at: "2026-01-02T00:00:00Z" },
+    });
+  });
+
+  it("separates pending configuration from what is currently effective", async () => {
+    const { registry, viewer, connectViewer } = directory();
+    registry.patch(viewer, {
+      desiredModelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      desiredModelClass: "fast",
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+    const client = await connectViewer();
+
+    const view = dataOf(await call(client, "view_actor", { actor_id: viewer })) as Record<
+      string,
+      unknown
+    >;
+    expect(view.model_config).toEqual([CLAUDE]);
+    expect(view.context).toEqual({ type: "native" });
+    expect(view.pending).toEqual({
+      model_config: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      model_class: "fast",
+      context: { type: "portable", mode: "brief" },
+    });
+  });
+
+  it("reports a broken class binding instead of a stale pool", async () => {
+    const { registry, stranger, connectViewer } = directory();
+    const record = registry.get(stranger);
+    if (!record) throw new Error("expected stranger");
+    registry.upsert({
+      ...record,
+      modelConfig: undefined,
+      modelClass: "gone",
+      modelClassError: "model class 'gone' is missing",
+    });
+    const client = await connectViewer();
+
+    expect(dataOf(await call(client, "view_actor", { actor_id: stranger }))).toMatchObject({
+      model_config: [],
+      model_class: "gone",
+      model_class_error: "model class 'gone' is missing",
+    });
+  });
+
+  it("reads any actor's metadata by id, retired ones included, without its relationships", async () => {
+    const { stranger, archived, connectViewer } = directory({
+      currentRun: () => ({ provider: "claude", model: "the-caller-not-the-target" }),
+      readBrief: (actorId) =>
+        actorId === stranger
+          ? { text: "stranger brief", generation: 1, updatedAt: "2026-01-02T00:00:00Z" }
+          : null,
+    });
+    const client = await connectViewer();
+
+    expect(dataOf(await call(client, "view_actor", { actor_id: stranger }))).toEqual({
+      actor_id: stranger,
+      handle: handleOf(stranger),
+      title: "Stranger",
+      status: "active",
+      model_config: [CLAUDE],
+      context: { type: "native" },
+      charter: "stranger charter",
+      brief: { text: "stranger brief", generation: 1, updated_at: "2026-01-02T00:00:00Z" },
+    });
+    expect(dataOf(await call(client, "view_actor", { actor_id: archived }))).toMatchObject({
+      status: "retired",
+      charter: "archived charter",
+      brief: null,
+    });
+  });
+
+  it("addresses an actor by exact id, so a display handle or the legacy root address mints none", async () => {
+    const { peer, stranger, connectViewer } = directory();
+    const client = await connectViewer();
+
+    for (const reference of [handleOf(peer), handleOf(stranger), "   ", "no-such-actor"]) {
+      const refused = await call(client, "view_actor", { actor_id: reference });
+      expect(refused.isError).toBe(true);
+      expect(JSON.stringify(refused.content)).toContain("unknown actor id");
+      expect(JSON.stringify(refused.content)).not.toContain(peer);
+      expect(JSON.stringify(refused.content)).not.toContain(stranger);
+    }
+
+    const rootId = "opaque-root-id";
+    const opaque = setup({ rootId });
+    const middle = opaque.mesh.spawn({ charter: "m", parentId: rootId, modelConfig: CLAUDE });
+    const leaf = opaque.mesh.spawn({ charter: "l", parentId: middle, modelConfig: CLAUDE });
+    const leafClient = await connect(createAgentExecMcpServer(opaque.mesh, leaf, rootId));
+    const alias = await call(leafClient, "view_actor", { actor_id: "root" });
+    expect(alias.isError).toBe(true);
+    expect(JSON.stringify(alias.content)).not.toContain(rootId);
+    expect(dataOf(await call(leafClient, "view_actor", { actor_id: rootId }))).toMatchObject({
+      actor_id: rootId,
+    });
+  });
+
+  it("leaves write authority and durable state unchanged after every read", async () => {
+    const onWrite = vi.fn();
+    const { registry, viewer, peer, stranger, connectViewer } = directory({ onWrite });
+    const client = await connectViewer();
+    const handlesBefore = registry.get(viewer)?.handles;
+    const strangerBefore = registry.get(stranger);
+
+    await call(client, "list_actors", { include_archived: true });
+    await call(client, "view_actor", { actor_id: stranger });
+
+    expect(onWrite).not.toHaveBeenCalled();
+    expect(registry.get(viewer)?.handles).toEqual(handlesBefore);
+    expect(registry.get(stranger)).toEqual(strangerBefore);
+
+    // Having read a stranger neither makes it introducible nor retirable.
+    const introduce = await call(client, "introduce", {
+      holder_thread_id: peer,
+      target_thread_id: stranger,
+    });
+    expect(JSON.stringify(introduce.content)).toContain(`you do not hold a handle to ${stranger}`);
+    const retire = await call(client, "retire_thread", { thread_id: stranger });
+    expect(JSON.stringify(retire.content)).toContain("only retire your own descendant");
+    expect(registry.get(stranger)).toEqual(strangerBefore);
+  });
+
+  it("registers the renamed spawn tool with no old-name alias", async () => {
+    const { connectViewer } = directory();
+    const names = (await (await connectViewer()).listTools()).tools.map((tool) => tool.name);
+    expect(names).toEqual(expect.arrayContaining(["spawn_actor", "list_actors", "view_actor"]));
+    expect(names).not.toContain("spawn_thread");
   });
 });

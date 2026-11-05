@@ -155,18 +155,17 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Wide screens put the work sections in the left column and every chart in
-  /// the right (#1018); phone-sized displays stack the work first, then the
-  /// charts.
+  /// Wide screens keep My Queue and Queued Actors beside the charts (#1018),
+  /// then span Running Mesh Workers and Recent Activity below them (#1234);
+  /// phone-sized displays stack the work first, then the charts.
   Widget _buildWorkAndCharts() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final work = [
-          _buildMyQueueSection(),
-          _buildRunningWorkersSection(),
-          _buildQueuedActorsSection(),
-          _buildRecentActivitySection(),
-        ];
+        final narrow = constraints.maxWidth < kNarrowBreakpoint;
+        final myQueue = _buildMyQueueSection();
+        final running = _buildRunningWorkersSection();
+        final queued = _buildQueuedActorsSection();
+        final recentActivity = _buildRecentActivitySection(stackRows: narrow);
         final charts = [_buildQuotaPoolsCard(), _buildInboxMetricsCard()];
         Widget column(List<Widget> sections) => Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -177,17 +176,21 @@ class _OverviewTabState extends State<OverviewTab> {
             ],
           ],
         );
-        if (constraints.maxWidth < kNarrowBreakpoint) {
-          return column([...work, ...charts]);
+        if (narrow) {
+          return column([myQueue, running, queued, recentActivity, ...charts]);
         }
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(child: column(work)),
-            const SizedBox(width: 20),
-            Expanded(child: column(charts)),
-          ],
-        );
+        return column([
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(child: column([myQueue, queued])),
+              const SizedBox(width: 20),
+              Expanded(child: column(charts)),
+            ],
+          ),
+          running,
+          recentActivity,
+        ]);
       },
     );
   }
@@ -1189,7 +1192,7 @@ class _OverviewTabState extends State<OverviewTab> {
   }
 
   /// Recent activity section (#664) replacing ceremonial yields.
-  Widget _buildRecentActivitySection() {
+  Widget _buildRecentActivitySection({required bool stackRows}) {
     return StreamBuilder<List<RecentActivityItem>>(
       stream: widget.store.recentActivity,
       initialData: widget.store.recentActivity.value,
@@ -1248,9 +1251,12 @@ class _OverviewTabState extends State<OverviewTab> {
                   itemBuilder: (context, i) {
                     final item = items[i];
                     if (item.isTerminalObligation) {
-                      return _buildTerminalObligationRow(item);
+                      return _buildTerminalObligationRow(
+                        item,
+                        stacked: stackRows,
+                      );
                     }
-                    return _buildHandledActivityRow(item);
+                    return _buildHandledActivityRow(item, stacked: stackRows);
                   },
                 ),
             ],
@@ -1260,402 +1266,357 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  Widget _buildHandledActivityRow(RecentActivityItem item) {
-    final timeLabel = formatTs(item.time);
-    final handledTime = item.handledTime != null
-        ? formatTs(item.handledTime!)
-        : timeLabel;
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 80,
-            child: Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(
-                timeLabel,
+  /// One Recent Activity row: when and who beside what happened, or above it
+  /// on phone-sized displays, where those fixed columns would leave the card
+  /// too little width.
+  Widget _activityRow(
+    RecentActivityItem item,
+    Widget card, {
+    required bool stacked,
+  }) {
+    final when = SizedBox(
+      width: 80,
+      child: Padding(
+        padding: const EdgeInsets.only(top: 4),
+        child: Text(
+          formatTs(item.time),
+          style: kMonoStyle.copyWith(
+            color: MeshColors.textMuted,
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+    final who = Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ActorAvatarWithStatus(
+          id: item.actorId,
+          state: DotState.idle,
+          size: 26,
+          store: widget.store,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.store.actorDisplay(item.actorId),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: kMonoStyle.copyWith(
-                  color: MeshColors.textMuted,
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
+                  color: MeshColors.textPrimary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-            ),
+              const SizedBox(height: 1),
+              Text(
+                widget.store.actorModelLabel(item.actorId),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 10.5,
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 170,
-            child: Row(
+        ),
+      ],
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: stacked
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    when,
+                    const SizedBox(width: 8),
+                    Expanded(child: who),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                card,
+              ],
+            )
+          : Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                ActorAvatarWithStatus(
-                  id: item.actorId,
-                  state: DotState.idle,
-                  size: 26,
-                  store: widget.store,
-                ),
+                when,
                 const SizedBox(width: 8),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        widget.store.actorDisplay(item.actorId),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: kMonoStyle.copyWith(
-                          color: MeshColors.textPrimary,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 1),
-                      Text(
-                        widget.store.actorModelLabel(item.actorId),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: MeshColors.textSecondary,
-                          fontSize: 10.5,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+                SizedBox(width: 170, child: who),
+                const SizedBox(width: 12),
+                Expanded(child: card),
               ],
             ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: MeshColors.bgTertiary,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: MeshColors.border),
+    );
+  }
+
+  Widget _buildHandledActivityRow(
+    RecentActivityItem item, {
+    required bool stacked,
+  }) {
+    final handledTime = formatTs(item.handledTime ?? item.time);
+
+    return _activityRow(
+      item,
+      Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: MeshColors.bgTertiary,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: MeshColors.border),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (item.reference != null)
+              ReferencePreview(
+                reference: item.reference!,
+                lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+                isViewer: widget.store.isViewer,
+                humanDisplayName: widget.store.operatorDisplayName,
+                kindLabel: item.sourceKind,
+                summary: item.summary,
+                showBody: false,
+                margin: EdgeInsets.zero,
+              )
+            else
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  ReferenceKindChip(item.sourceKind ?? 'INBOX'),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+              decoration: const BoxDecoration(
+                color: Color(0xFF0D201D),
+                border: Border(
+                  left: BorderSide(color: MeshColors.statusActive, width: 2),
+                ),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (item.reference != null)
-                    ReferencePreview(
-                      reference: item.reference!,
-                      lookupActorHandle: (id) => widget.store.actor(id)?.handle,
-                      isViewer: widget.store.isViewer,
-                      humanDisplayName: widget.store.operatorDisplayName,
-                      kindLabel: item.sourceKind,
-                      summary: item.summary,
-                      showBody: false,
-                      margin: EdgeInsets.zero,
-                    )
-                  else
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        ReferenceKindChip(item.sourceKind ?? 'INBOX'),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: MeshColors.textPrimary,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ],
+                  Text(
+                    'Handled: $handledTime',
+                    style: const TextStyle(
+                      color: Color(0xFF6EE7B7),
+                      fontSize: 11,
+                      fontFamily: kMonoFontFamily,
+                      fontWeight: FontWeight.w600,
                     ),
-                  const SizedBox(height: 8),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 11,
-                      vertical: 9,
-                    ),
-                    decoration: const BoxDecoration(
-                      color: Color(0xFF0D201D),
-                      border: Border(
-                        left: BorderSide(
-                          color: MeshColors.statusActive,
-                          width: 2,
-                        ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text.rich(
+                    TextSpan(
+                      style: const TextStyle(
+                        color: Color(0xFFC8DED7),
+                        fontSize: 12,
+                        height: 1.4,
                       ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          'Handled: $handledTime',
-                          style: const TextStyle(
-                            color: Color(0xFF6EE7B7),
-                            fontSize: 11,
-                            fontFamily: kMonoFontFamily,
-                            fontWeight: FontWeight.w600,
-                          ),
+                        const TextSpan(
+                          text: 'Addressed: ',
+                          style: TextStyle(fontWeight: FontWeight.w700),
                         ),
-                        const SizedBox(height: 4),
-                        Text.rich(
-                          TextSpan(
-                            style: const TextStyle(
-                              color: Color(0xFFC8DED7),
-                              fontSize: 12,
-                              height: 1.4,
-                            ),
-                            children: [
-                              const TextSpan(
-                                text: 'Addressed: ',
-                                style: TextStyle(fontWeight: FontWeight.w700),
-                              ),
-                              TextSpan(text: item.addressedNote ?? ''),
-                            ],
-                          ),
-                        ),
+                        TextSpan(text: item.addressedNote ?? ''),
                       ],
                     ),
                   ),
-                  if (item.linkedObligation != null) ...[
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.account_tree_outlined,
-                          size: 13,
-                          color: MeshColors.textMuted,
-                        ),
-                        const SizedBox(width: 5),
-                        Flexible(
-                          child: Text(
-                            item.linkedObligation!,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: kMonoStyle.copyWith(
-                              color: MeshColors.textMuted,
-                              fontSize: 10.5,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
                 ],
               ),
             ),
-          ),
-        ],
+            if (item.linkedObligation != null) ...[
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  const Icon(
+                    Icons.account_tree_outlined,
+                    size: 13,
+                    color: MeshColors.textMuted,
+                  ),
+                  const SizedBox(width: 5),
+                  Flexible(
+                    child: Text(
+                      item.linkedObligation!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: kMonoStyle.copyWith(
+                        color: MeshColors.textMuted,
+                        fontSize: 10.5,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
       ),
+      stacked: stacked,
     );
   }
 
-  Widget _buildTerminalObligationRow(RecentActivityItem item) {
-    final timeLabel = formatTs(item.time);
+  Widget _buildTerminalObligationRow(
+    RecentActivityItem item, {
+    required bool stacked,
+  }) {
     final isDone = item.terminalStatus == 'done';
     final statusColor = isDone
         ? MeshColors.statusActive
         : MeshColors.statusIdle;
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 80,
-            child: Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(
-                timeLabel,
-                style: kMonoStyle.copyWith(
-                  color: MeshColors.textMuted,
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 170,
-            child: Row(
+    return _activityRow(
+      item,
+      Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: MeshColors.bgTertiary,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: MeshColors.border),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                ActorAvatarWithStatus(
-                  id: item.actorId,
-                  state: DotState.idle,
-                  size: 26,
-                  store: widget.store,
-                ),
+                const ReferenceKindChip('OBLIGATION'),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        widget.store.actorDisplay(item.actorId),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: kMonoStyle.copyWith(
-                          color: MeshColors.textPrimary,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 1),
-                      Text(
-                        widget.store.actorModelLabel(item.actorId),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: MeshColors.textSecondary,
-                          fontSize: 10.5,
-                        ),
-                      ),
-                    ],
+                  child: Text(
+                    '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: MeshColors.textPrimary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: statusColor.withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: statusColor.withValues(alpha: 0.45),
+                    ),
+                  ),
+                  child: Text(
+                    item.terminalStatus?.toUpperCase() ?? 'DONE',
+                    style: kMonoStyle.copyWith(
+                      color: statusColor,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],
             ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: MeshColors.bgTertiary,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: MeshColors.border),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const ReferenceKindChip('OBLIGATION'),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: MeshColors.textPrimary,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: statusColor.withValues(alpha: 0.14),
-                          borderRadius: BorderRadius.circular(4),
-                          border: Border.all(
-                            color: statusColor.withValues(alpha: 0.45),
-                          ),
-                        ),
-                        child: Text(
-                          item.terminalStatus?.toUpperCase() ?? 'DONE',
-                          style: kMonoStyle.copyWith(
-                            color: statusColor,
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
-                    ],
+            if (item.terminalNote != null && item.terminalNote!.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 9,
+                ),
+                decoration: BoxDecoration(
+                  color: isDone
+                      ? const Color(0xFF0D201D)
+                      : MeshColors.bgSecondary,
+                  border: Border(
+                    left: BorderSide(color: statusColor, width: 2),
                   ),
-                  if (item.terminalNote != null &&
-                      item.terminalNote!.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 11,
-                        vertical: 9,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Terminal: ${item.terminalStatus}',
+                      style: TextStyle(
+                        color: statusColor,
+                        fontSize: 11,
+                        fontFamily: kMonoFontFamily,
+                        fontWeight: FontWeight.w600,
                       ),
-                      decoration: BoxDecoration(
-                        color: isDone
-                            ? const Color(0xFF0D201D)
-                            : MeshColors.bgSecondary,
-                        border: Border(
-                          left: BorderSide(color: statusColor, width: 2),
+                    ),
+                    const SizedBox(height: 4),
+                    Text.rich(
+                      TextSpan(
+                        style: TextStyle(
+                          color: isDone
+                              ? const Color(0xFFC8DED7)
+                              : MeshColors.textSecondary,
+                          fontSize: 12,
+                          height: 1.4,
                         ),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            'Terminal: ${item.terminalStatus}',
-                            style: TextStyle(
-                              color: statusColor,
-                              fontSize: 11,
-                              fontFamily: kMonoFontFamily,
-                              fontWeight: FontWeight.w600,
-                            ),
+                          const TextSpan(
+                            text: 'Note: ',
+                            style: TextStyle(fontWeight: FontWeight.w700),
                           ),
-                          const SizedBox(height: 4),
-                          Text.rich(
-                            TextSpan(
-                              style: TextStyle(
-                                color: isDone
-                                    ? const Color(0xFFC8DED7)
-                                    : MeshColors.textSecondary,
-                                fontSize: 12,
-                                height: 1.4,
-                              ),
-                              children: [
-                                const TextSpan(
-                                  text: 'Note: ',
-                                  style: TextStyle(fontWeight: FontWeight.w700),
-                                ),
-                                TextSpan(text: item.terminalNote!),
-                              ],
-                            ),
-                          ),
+                          TextSpan(text: item.terminalNote!),
                         ],
                       ),
                     ),
                   ],
-                  if (item.resolutionRef != null) ...[
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.link,
-                          size: 13,
-                          color: MeshColors.textMuted,
-                        ),
-                        const SizedBox(width: 5),
-                        Flexible(
-                          child: Text(
-                            'Resolution: ${item.resolutionRef!}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: kMonoStyle.copyWith(
-                              color: MeshColors.textMuted,
-                              fontSize: 10.5,
-                            ),
-                          ),
-                        ),
-                      ],
+                ),
+              ),
+            ],
+            if (item.resolutionRef != null) ...[
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  const Icon(Icons.link, size: 13, color: MeshColors.textMuted),
+                  const SizedBox(width: 5),
+                  Flexible(
+                    child: Text(
+                      'Resolution: ${item.resolutionRef!}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: kMonoStyle.copyWith(
+                        color: MeshColors.textMuted,
+                        fontSize: 10.5,
+                      ),
                     ),
-                  ],
+                  ),
                 ],
               ),
-            ),
-          ),
-        ],
+            ],
+          ],
+        ),
       ),
+      stacked: stacked,
     );
   }
 

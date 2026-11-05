@@ -10,6 +10,7 @@ import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/inbox_item_row.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
+import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
@@ -142,6 +143,195 @@ void main() {
       });
     },
   );
+
+  group('#1234 full-width activity sections', () {
+    const actor = '11111111-1111-4111-8111-111111111111';
+    const issueRef = 'github:example/project/issues/9';
+
+    // One of each row the shared shell holds. The resolved reference is its
+    // widest content: an open-link button beside a title that has to ellipsize.
+    FakeApi activityApi() => FakeApi()
+      ..threadsResult = [
+        makeThread(actor, runState: RunState.running),
+        makeThread('queued', runState: RunState.queued, queuePosition: 0),
+      ]
+      ..referencesResult = {
+        issueRef: const ReferenceDto(
+          ref: issueRef,
+          scheme: 'github',
+          title: 'unused',
+          url: 'https://example.com/issues/9',
+          entity: {
+            'type': 'github_issue',
+            'title':
+                'A resolved issue title long enough that it has to ellipsize '
+                'on any width this row is rendered at, however wide it is',
+          },
+        ),
+      }
+      ..recentActivityResult = const [
+        RecentActivityItem(
+          id: 'inbox_reference',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:22:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB ISSUE',
+          referenceKey: issueRef,
+          summary: 'Issue summary',
+          addressedNote: 'Reference note',
+        ),
+        RecentActivityItem(
+          id: 'inbox_raw',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:21:37.000Z',
+          actorId: actor,
+          sourceKind: 'GITHUB ISSUE',
+          sourceRef: 'github:example/project/issues/1',
+          summary: 'Handled summary',
+          handledTime: '2026-09-23T14:22:37.000Z',
+          addressedNote: 'Answered on the thread',
+        ),
+        RecentActivityItem(
+          id: 'ob_1',
+          kind: 'terminal_obligation',
+          time: '2026-09-23T14:20:37.000Z',
+          actorId: actor,
+          sourceKind: 'OBLIGATION',
+          sourceRef: 'github:example/project/issues/2',
+          summary: 'Terminal summary',
+          obligationId: '0e655f00-0000-4000-8000-000000000001',
+          terminalStatus: 'done',
+          terminalNote: 'Landed',
+        ),
+      ];
+
+    Future<DashboardStore> pumpOverview(WidgetTester tester, Size size) async {
+      final store = DashboardStore(api: activityApi(), stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+      await store.refreshRecentActivity(deferUntilPostFrame: false);
+      await tester.binding.setSurfaceSize(size);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(_app(store));
+      await tester.pump();
+      await tester.pump();
+      return store;
+    }
+
+    // The section card a title sits in: its nearest Container.
+    Rect section(WidgetTester tester, String title) => tester.getRect(
+      find
+          .ancestor(of: find.text(title), matching: find.byType(Container))
+          .first,
+    );
+
+    // The first row's identity and each row's card, which is what the shell
+    // places: the outermost Container in the row holding each row's text.
+    ({Rect who, List<Rect> cards}) rowParts(
+      WidgetTester tester,
+      DashboardStore store,
+    ) {
+      final rows = find.byType(ListView);
+      Rect card(Finder content) => tester.getRect(
+        find
+            .descendant(
+              of: rows,
+              matching: find.ancestor(
+                of: content,
+                matching: find.byType(Container),
+              ),
+            )
+            .first,
+      );
+      return (
+        who: tester.getRect(
+          find
+              .descendant(
+                of: rows,
+                matching: find.text(store.actorDisplay(actor)),
+              )
+              .first,
+        ),
+        cards: [
+          card(find.byType(ReferencePreview)),
+          card(
+            find.textContaining('Answered on the thread', findRichText: true),
+          ),
+          card(find.textContaining('Landed', findRichText: true)),
+        ],
+      );
+    }
+
+    // The narrowest wide layout, where the row columns leave the least room.
+    testWidgets(
+      'wide: both sections span the content width below the columns',
+      (tester) async {
+        await tester.runAsync(() async {
+          final store = await pumpOverview(tester, const Size(740, 2400));
+
+          // The 20px page padding is all that remains on either side.
+          final running = section(tester, 'Running Mesh Workers');
+          final recent = section(tester, 'Recent Activity');
+          for (final spanning in [running, recent]) {
+            expect(spanning.left, closeTo(20, 1));
+            expect(spanning.right, closeTo(720, 1));
+          }
+
+          // My Queue and Queued Actors stay in their column beside the charts.
+          final myQueue = section(tester, 'My Queue');
+          final queued = section(tester, 'Queued Actors');
+          final quota = tester.getRect(find.textContaining('Quota Pacing'));
+          expect(myQueue.right, lessThan(quota.left));
+          expect(queued.left, closeTo(myQueue.left, 1));
+          expect(queued.right, closeTo(myQueue.right, 1));
+
+          // The columns stay on top, then Running, then Recent Activity.
+          final charts = tester.getRect(
+            find.byKey(const Key('overview-inbox-metrics')),
+          );
+          expect(myQueue.top, lessThan(queued.top));
+          expect(running.top, greaterThan(queued.bottom));
+          expect(running.top, greaterThan(charts.bottom));
+          expect(recent.top, greaterThan(running.bottom));
+
+          // Rows keep their when and who columns beside a readable card.
+          final row = rowParts(tester, store);
+          for (final card in row.cards) {
+            expect(card.left, greaterThan(row.who.right));
+            expect(card.right, lessThanOrEqualTo(recent.right));
+            expect(card.width, greaterThan(220));
+          }
+          expect(tester.takeException(), isNull);
+        });
+      },
+    );
+
+    testWidgets('phone: activity rows stack rather than overflow', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = await pumpOverview(tester, const Size(390, 2400));
+
+        final recent = section(tester, 'Recent Activity');
+        for (final title in ['Running Mesh Workers', 'Recent Activity']) {
+          final spanning = section(tester, title);
+          expect(spanning.left, closeTo(20, 1));
+          expect(spanning.right, closeTo(370, 1));
+        }
+
+        // A RenderFlex overflow fails this test on its own; each card must also
+        // keep a readable width, below and starting left of who handled it.
+        final row = rowParts(tester, store);
+        for (final card in row.cards) {
+          expect(card.top, greaterThan(row.who.bottom));
+          expect(card.left, lessThan(row.who.left));
+          expect(card.right, lessThanOrEqualTo(recent.right));
+          expect(card.width, greaterThan(200));
+        }
+        expect(tester.takeException(), isNull);
+      });
+    });
+  });
 
   testWidgets('Recent Activity renders handled cards with addressed note', (
     tester,

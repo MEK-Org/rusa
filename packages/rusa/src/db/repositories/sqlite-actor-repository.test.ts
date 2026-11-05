@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { ActorRecord } from "../../actor/actor-record.js";
-import { resolveHandleLabels } from "../../actor/worker-prompt.js";
+import { describeActor } from "../../actor/worker-prompt.js";
 
 import { runMigrations } from "../migrations/runner.js";
 import { ModelClassRepository } from "./model-class-repository.js";
@@ -481,14 +481,14 @@ describe("SqliteActorRepository", () => {
       { id: "untitled-peer", role: "trusted operator" },
     ]);
     expect(
-      resolveHandleLabels(
-        loaded?.handles,
-        (id) => repository.get(id)?.charter,
-        (id) => repository.get(id)?.title
-      )
+      loaded?.handles?.map((handle) => {
+        const target = repository.get(handle.id);
+        if (!target) throw new Error(`expected ${handle.id}`);
+        return { id: handle.id, description: describeActor(target) };
+      })
     ).toEqual([
-      { id: "titled-peer", label: "Release reviewer" },
-      { id: "untitled-peer", label: "Triage incoming issues" },
+      { id: "titled-peer", description: "Release reviewer" },
+      { id: "untitled-peer", description: "Triage incoming issues" },
     ]);
 
     // Re-saving the record keeps the stored provenance that sender display

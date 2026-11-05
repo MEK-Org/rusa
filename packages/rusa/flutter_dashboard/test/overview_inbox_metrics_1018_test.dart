@@ -270,15 +270,15 @@ void main() {
       return (api, store);
     }
 
-    testWidgets('wide puts work left and every chart right', (tester) async {
+    testWidgets('wide puts the queues left and every chart right', (
+      tester,
+    ) async {
       await tester.runAsync(() async {
         await pumpOverview(tester, const Size(1200, 3000));
 
         final work = [
           'My Queue',
-          'Running Mesh Workers',
           'Queued Actors',
-          'Recent Activity',
         ].map((t) => tester.getRect(find.text(t))).toList();
         final quota = tester.getRect(find.textContaining('Quota Pacing'));
         final inbox = tester.getRect(find.text('Inbox Size'));

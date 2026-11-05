@@ -163,7 +163,7 @@ import {
   wakeTokenPath,
   writeWakePort,
 } from "../actor/wake-callback.js";
-import { buildWorkerPrompt, resolveHandleLabels } from "../actor/worker-prompt.js";
+import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import type { ActorLiveness } from "../actor/workspace-sweep.js";
 import {
   removableWorkspaceNames,
@@ -4069,11 +4069,6 @@ async function composeStart(
           buildPrompt: () => {
             const r = actors.get(id);
             if (!r) return { prompt: "No active thread record." };
-            const handles = resolveHandleLabels(
-              r.handles,
-              (hid) => actors.get(hid)?.charter,
-              (hid) => actors.get(hid)?.title
-            );
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.
@@ -4090,7 +4085,6 @@ async function composeStart(
                 {
                   threadId: id,
                   parentId: r.parentId,
-                  handles,
                   understandingMountEnabled,
                   gitIdentity: meshGitIdentity,
                   activeQueuePolicy,
@@ -4264,6 +4258,8 @@ async function composeStart(
               onWrite: () => {
                 mesh.markUnkillable(id);
               },
+              currentRun: () => lease.reader.current(),
+              readBrief: (actorId) => portableContextStore.load(actorId).brief,
               modelClasses,
               validateModelClass: (input) =>
                 validateModelConfigPool(config, input, { portable: true }),
