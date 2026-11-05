@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -167,6 +167,16 @@ function abandonedRuns(h: Harness, id: string) {
   return h.meshEvents.filter((event) => event.kind === "run_abandoned" && event.actorId === id);
 }
 
+/** A fixture CLI's plain write makes a file visible before its content; no proper prefix of a JSON array parses. */
+function holdsCompleteJson(path: string): boolean {
+  try {
+    JSON.parse(readFileSync(path, "utf8"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe("monolithic follower instance", () => {
   it("#866 forwards exact real follower argv to leader and rejects stale receipts", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-prompt-"));
@@ -185,7 +195,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       providerFactory: () => new ClaudeProvider("fixture", { cliCommand: cli }),
     });
     const id = h.spawn("Synthetic charter ✓\n  indentation");
-    await waitUntil(() => h.promptEvents.length === 1 && existsSync(dump));
+    await waitUntil(() => h.promptEvents.length === 1 && holdsCompleteJson(dump));
     const event = h.promptEvents[0];
     const argv = JSON.parse(readFileSync(dump, "utf8")) as string[];
     expect(event).toMatchObject({ actorId: id, runId: runStarts(h, id)[0] });
