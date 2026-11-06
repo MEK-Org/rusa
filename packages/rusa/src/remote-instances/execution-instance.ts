@@ -22,6 +22,7 @@ import { createMcpServer } from "../mcp/strict-server.js";
 import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider } from "../providers/types.js";
+import type { InboxDeliveryStore } from "../repositories/inbox-repository.js";
 import { ExecutionActorRepository } from "./execution-actor-repository.js";
 import type { InstanceEntityRef, InstanceInboxEvent, QuotaObservation } from "./protocol.js";
 
@@ -40,6 +41,18 @@ export class ExecutionInstance {
   private draining = false;
   private readonly failures = new FailureEscalationBackoff();
 
+  private deliveryStore(): InboxDeliveryStore {
+    const inbox = this.repositories.inbox as Partial<InboxDeliveryStore>;
+    if (
+      typeof inbox.recordMessageDelivery !== "function" ||
+      typeof inbox.listPendingOutgoing !== "function" ||
+      typeof inbox.markOutgoingDelivered !== "function"
+    ) {
+      throw new Error("Instance execution requires SQLite durable inbox delivery");
+    }
+    return inbox as InboxDeliveryStore;
+  }
+
   constructor(
     readonly id: string,
     repositories: InstanceExecutionRepositories,
@@ -50,6 +63,7 @@ export class ExecutionInstance {
       mcp: McpHttpServer;
       provider: (actorId: string, selected: RawProviderModelConfig) => CodingProvider;
       publish: (fromId: string, event: InstanceInboxEvent) => void;
+      acknowledgeDelivery: (actorId: string, entryId: string) => void;
       fetchMessage: (requesterId: string, ref: InstanceEntityRef) => Promise<MeshChat>;
       maxConcurrent?: number;
       gitIdentity?: unknown;
@@ -276,6 +290,12 @@ export class ExecutionInstance {
       if (record.status === "active" && !this.mesh.get(record.id)) this.mesh.rehydrate(record);
     }
     this.mesh.reconcileInbox();
+    // The durable sender rows, not the process-local HTTP queue, define what
+    // still needs to cross an instance boundary after a restart.
+    for (const entry of this.deliveryStore().listPendingOutgoing()) {
+      const fromId = entry.payload.fromId;
+      if (typeof fromId === "string") this.options.publish(fromId, this.toInstanceEvent(entry));
+    }
   }
 
   observeQuota(observation: QuotaObservation): void {
@@ -296,6 +316,19 @@ export class ExecutionInstance {
     if (!this.repositories.actors.get(event.actorId))
       throw new Error("Recipient is not installed here");
     this.repositories.inbox.append([{ ...event, deliveredAt: new Date(event.deliveredAt) }]);
+    const entity = event.payload.entity as InstanceEntityRef | undefined;
+    // A duplicate is still acknowledged: the sender may have missed the last
+    // acknowledgement, while the existing row proves this receiver is durable.
+    if (
+      event.payload.deliveryAckRequired === true &&
+      entity?.instance &&
+      entity.instance !== this.id
+    )
+      this.options.acknowledgeDelivery(event.actorId, event.id);
+  }
+
+  acknowledgeDelivery(entryId: string): void {
+    this.deliveryStore().markOutgoingDelivered(entryId);
   }
 
   sendMessage(
@@ -311,12 +344,7 @@ export class ExecutionInstance {
     ) {
       throw new Error("Sender has no recipient handle");
     }
-    const messageId = this.repositories.meshChat.record({
-      senderId,
-      recipientId,
-      body,
-      responsive,
-    });
+    const messageId = randomUUID();
     const entity: InstanceEntityRef = { instance: this.id, kind: "message", id: messageId };
     const event: InstanceInboxEvent = {
       id: randomUUID(),
@@ -332,9 +360,34 @@ export class ExecutionInstance {
         ...(responsive ? { priority: "responsive" } : {}),
       },
     };
-    if (this.repositories.actors.get(recipientId)?.status === "active") this.receive(event);
-    else this.options.publish(senderId, event);
+    const local = this.repositories.actors.get(recipientId)?.status === "active";
+    const delivery = this.deliveryStore().recordMessageDelivery({
+      messageId,
+      senderId,
+      recipientId,
+      body,
+      responsive,
+      entry: {
+        ...event,
+        deliveredAt: new Date(event.deliveredAt),
+        deliveryDirection: local ? "incoming" : "outgoing",
+        deliveryState: local ? "delivered" : "pending",
+      },
+    });
+    if (!local) this.options.publish(senderId, this.toInstanceEvent(delivery.entry));
     return entity;
+  }
+
+  private toInstanceEvent(
+    entry: import("../repositories/inbox-repository.js").InboxEntry
+  ): InstanceInboxEvent {
+    return {
+      id: entry.id,
+      actorId: entry.actorId,
+      source: entry.source,
+      deliveredAt: entry.deliveredAt.toISOString(),
+      payload: entry.payload,
+    };
   }
 
   serveMessage(requesterId: string, ref: InstanceEntityRef): MeshChat {

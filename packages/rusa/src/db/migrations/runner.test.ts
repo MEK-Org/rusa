@@ -120,6 +120,7 @@ describe("Database Migration System", () => {
       "0064_metric_samples",
       "0066_recent_activity_history_indexes",
       "0067_push_device_tokens",
+      "0068_instance_inbox_delivery",
     ]);
 
     const tableNames = (

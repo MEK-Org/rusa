@@ -4,10 +4,13 @@ import { validateInboxInterruptionForWrite } from "../../repositories/inbox-inte
 import {
   type InboxActorWork,
   type InboxAppendInput,
+  type InboxDeliveryStore,
   type InboxEntry,
   type InboxItemsAppendedListener,
   type InboxItemsHandledListener,
   type InboxListOptions,
+  type InboxMessageDelivery,
+  type InboxMessageDeliveryInput,
   type InboxPage,
   type InboxPayload,
   type InboxRepository,
@@ -23,6 +26,8 @@ interface InboxRow {
   seen_at: string | null;
   handled_at: string | null;
   handled_note: string | null;
+  delivery_direction: "incoming" | "outgoing";
+  delivery_state: "pending" | "delivered";
   payload_json: string;
 }
 
@@ -68,15 +73,82 @@ function toEntry(row: InboxRow): InboxEntry {
 export type InboxListenerErrorHandler = (error: unknown) => void;
 
 /** SQLite implementation of the actor inbox persistence seam. */
-export class SqliteInboxRepository implements InboxRepository {
+export class SqliteInboxRepository implements InboxRepository, InboxDeliveryStore {
   private readonly listeners = new Set<InboxItemsAppendedListener>();
   private readonly handledListeners = new Set<InboxItemsHandledListener>();
+  /**
+   * The ordinary inbox contract predates draft migration 0068. Keep direct
+   * repository users on that contract until migrations have run; execution
+   * delivery itself refuses to start without the durable columns.
+   */
+  private readonly hasDeliveryColumns: boolean;
   private onListenerError: InboxListenerErrorHandler = () => {};
 
   constructor(
     private readonly db: Database.Database,
     private readonly now: () => Date = () => new Date()
-  ) {}
+  ) {
+    this.hasDeliveryColumns = (
+      this.db.prepare("PRAGMA table_info(actor_inbox_entries)").all() as Array<{ name: string }>
+    ).some((column) => column.name === "delivery_direction");
+  }
+
+  private requireDeliverySchema(): void {
+    if (!this.hasDeliveryColumns)
+      throw new Error("Inbox delivery requires migration 0068_instance_inbox_delivery");
+  }
+
+  private incomingWhere(): string {
+    return this.hasDeliveryColumns ? " AND delivery_direction = 'incoming'" : "";
+  }
+
+  private prepareInboxInsert(): Database.Statement {
+    return this.db.prepare(
+      this.hasDeliveryColumns
+        ? `INSERT INTO actor_inbox_entries
+             (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json, delivery_direction, delivery_state)
+           VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+           ON CONFLICT(id) DO NOTHING`
+        : `INSERT INTO actor_inbox_entries
+             (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
+           VALUES (?, ?, ?, ?, NULL, NULL, ?)
+           ON CONFLICT(id) DO NOTHING`
+    );
+  }
+
+  private insertInboxRow(
+    insert: Database.Statement,
+    row: {
+      id: string;
+      actorId: string;
+      source: string;
+      deliveredAt: Date;
+      payload: InboxPayload;
+      deliveryDirection: "incoming" | "outgoing";
+      deliveryState: "pending" | "delivered";
+    }
+  ): Database.RunResult {
+    if (!this.hasDeliveryColumns) {
+      if (row.deliveryDirection !== "incoming" || row.deliveryState !== "delivered")
+        this.requireDeliverySchema();
+      return insert.run(
+        row.id,
+        row.actorId,
+        row.source,
+        row.deliveredAt.toISOString(),
+        JSON.stringify(row.payload)
+      );
+    }
+    return insert.run(
+      row.id,
+      row.actorId,
+      row.source,
+      row.deliveredAt.toISOString(),
+      JSON.stringify(row.payload),
+      row.deliveryDirection,
+      row.deliveryState
+    );
+  }
 
   /**
    * Journal listener failures. Set from the composition root the way
@@ -97,12 +169,7 @@ export class SqliteInboxRepository implements InboxRepository {
     if (this.db.inTransaction) {
       throw new Error("inbox append must not run inside an enclosing transaction");
     }
-    const insert = this.db.prepare(
-      `INSERT INTO actor_inbox_entries
-        (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
-       VALUES (?, ?, ?, ?, NULL, NULL, ?)
-       ON CONFLICT(id) DO NOTHING`
-    );
+    const insert = this.prepareInboxInsert();
     const rows = inputs.map((input) => {
       if (!input.actorId.trim()) throw new Error("inbox actorId is required");
       if (!input.source.trim()) throw new Error("inbox source is required");
@@ -110,30 +177,36 @@ export class SqliteInboxRepository implements InboxRepository {
       validateInboxInterruptionForWrite(input.payload);
       const deliveredAt = input.deliveredAt ?? this.now();
       if (!Number.isFinite(deliveredAt.getTime())) throw new Error("invalid deliveredAt");
+      const deliveryDirection = input.deliveryDirection ?? "incoming";
+      const deliveryState = input.deliveryState ?? "delivered";
+      if (deliveryDirection !== "incoming" && deliveryDirection !== "outgoing")
+        throw new Error("invalid inbox delivery direction");
+      if (deliveryState !== "pending" && deliveryState !== "delivered")
+        throw new Error("invalid inbox delivery state");
       return {
         id: input.id ?? randomUUID(),
         actorId: input.actorId,
         source: input.source,
         deliveredAt,
+        deliveryDirection,
+        deliveryState,
         payload: input.payload,
       };
     });
     const inserted = this.db.transaction(() => {
       const insertedRows: InboxEntry[] = [];
       for (const row of rows) {
-        const result = insert.run(
-          row.id,
-          row.actorId,
-          row.source,
-          row.deliveredAt.toISOString(),
-          JSON.stringify(row.payload)
-        );
+        const result = this.insertInboxRow(insert, row);
         if (result.changes === 1) {
           insertedRows.push({
-            ...row,
+            id: row.id,
+            actorId: row.actorId,
+            source: row.source,
+            deliveredAt: row.deliveredAt,
             seenAt: null,
             handledAt: null,
             handledNote: null,
+            payload: row.payload,
           });
         }
       }
@@ -144,6 +217,66 @@ export class SqliteInboxRepository implements InboxRepository {
     // wake still follows in the same turn.
     if (inserted.length > 0) this.notifyItemsAppended(inserted);
     return inserted;
+  }
+
+  recordMessageDelivery(input: InboxMessageDeliveryInput): InboxMessageDelivery {
+    this.requireDeliverySchema();
+    const { entry } = input;
+    const entryId = entry.id;
+    if (!input.messageId.trim()) throw new Error("message id is required");
+    if (!input.senderId.trim() || !input.recipientId.trim())
+      throw new Error("message participants are required");
+    if (!entryId || !entryId.trim()) throw new Error("delivery entry id is required");
+    if (!entry.actorId.trim() || !entry.source.trim())
+      throw new Error("delivery actor and source are required");
+    validateInboxPayload(entry.payload);
+    validateInboxInterruptionForWrite(entry.payload);
+    const deliveredAt = input.deliveredAt ?? entry.deliveredAt ?? this.now();
+    if (!Number.isFinite(deliveredAt.getTime())) throw new Error("invalid deliveredAt");
+    const deliveryDirection = entry.deliveryDirection ?? "incoming";
+    const deliveryState = entry.deliveryState ?? "delivered";
+    if (deliveryDirection !== "incoming" && deliveryDirection !== "outgoing")
+      throw new Error("invalid inbox delivery direction");
+    if (deliveryState !== "pending" && deliveryState !== "delivered")
+      throw new Error("invalid inbox delivery state");
+    const inserted = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO mesh_chat
+             (id, ts, sender_id, recipient_id, body, session_id, responsive, responsive_reason)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)`
+        )
+        .run(
+          input.messageId,
+          deliveredAt.toISOString(),
+          input.senderId,
+          input.recipientId,
+          input.body,
+          input.responsive === undefined ? null : Number(input.responsive)
+        );
+      const result = this.insertInboxRow(this.prepareInboxInsert(), {
+        id: entryId,
+        actorId: entry.actorId,
+        source: entry.source,
+        deliveredAt,
+        payload: entry.payload,
+        deliveryDirection,
+        deliveryState,
+      });
+      return result.changes === 1;
+    })();
+    const stored: InboxEntry = {
+      id: entryId,
+      actorId: entry.actorId,
+      source: entry.source,
+      deliveredAt,
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: entry.payload,
+    };
+    if (inserted && deliveryDirection === "incoming") this.notifyItemsAppended([stored]);
+    return { messageId: input.messageId, entry: stored };
   }
 
   onItemsAppended(listener: InboxItemsAppendedListener): () => void {
@@ -167,6 +300,7 @@ export class SqliteInboxRepository implements InboxRepository {
       throw new Error("inbox list limit must be an integer from 1 to 100");
     }
     const where = ["actor_id = ?"];
+    if (this.hasDeliveryColumns) where.push("delivery_direction = 'incoming'");
     const params: Array<string | number> = [actorId];
     if (status === "unhandled") where.push("handled_at IS NULL");
     else if (status === "handled") where.push("handled_at IS NOT NULL");
@@ -204,7 +338,7 @@ export class SqliteInboxRepository implements InboxRepository {
     const row = this.db
       .prepare(
         `SELECT * FROM actor_inbox_entries
-         WHERE actor_id = ? AND handled_at IS NULL
+         WHERE actor_id = ? AND handled_at IS NULL${this.incomingWhere()}
          ORDER BY CASE WHEN json_extract(payload_json, '$.priority') = 'responsive' THEN 0 ELSE 1 END,
                   delivered_at ASC,
                   id ASC
@@ -216,7 +350,9 @@ export class SqliteInboxRepository implements InboxRepository {
 
   read(actorId: string, entryId: string): InboxEntry | null {
     const row = this.db
-      .prepare("SELECT * FROM actor_inbox_entries WHERE actor_id = ? AND id = ?")
+      .prepare(
+        `SELECT * FROM actor_inbox_entries WHERE actor_id = ? AND id = ?${this.incomingWhere()}`
+      )
       .get(actorId, entryId) as InboxRow | undefined;
     return row ? toEntry(row) : null;
   }
@@ -228,18 +364,42 @@ export class SqliteInboxRepository implements InboxRepository {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS count FROM actor_inbox_entries
-         WHERE actor_id = ? AND handled_at IS NULL${responsiveWhere}`
+         WHERE actor_id = ? AND handled_at IS NULL${this.incomingWhere()}${responsiveWhere}`
       )
       .get(actorId) as { count: number };
     return row.count;
   }
 
   actorsWithUnhandled(): InboxActorWork[] {
-    return this.actorsWithPending("handled_at IS NULL");
+    return this.actorsWithPending(`handled_at IS NULL${this.incomingWhere()}`);
   }
 
   actorsWithUnseen(): InboxActorWork[] {
-    return this.actorsWithPending("handled_at IS NULL AND seen_at IS NULL");
+    return this.actorsWithPending(`handled_at IS NULL AND seen_at IS NULL${this.incomingWhere()}`);
+  }
+
+  listPendingOutgoing(): InboxEntry[] {
+    this.requireDeliverySchema();
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM actor_inbox_entries
+         WHERE delivery_direction = 'outgoing' AND delivery_state = 'pending'
+         ORDER BY delivered_at ASC, id ASC`
+      )
+      .all() as InboxRow[];
+    return rows.map(toEntry);
+  }
+
+  markOutgoingDelivered(entryId: string): boolean {
+    this.requireDeliverySchema();
+    return (
+      this.db
+        .prepare(
+          `UPDATE actor_inbox_entries SET delivery_state = 'delivered'
+           WHERE id = ? AND delivery_direction = 'outgoing' AND delivery_state = 'pending'`
+        )
+        .run(entryId).changes === 1
+    );
   }
 
   markSeen(actorId: string, at = this.now()): InboxEntry[] {
@@ -248,7 +408,7 @@ export class SqliteInboxRepository implements InboxRepository {
       const rows = this.db
         .prepare(
           `SELECT * FROM actor_inbox_entries
-           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL
+           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL${this.incomingWhere()}
            ORDER BY delivered_at ASC, id ASC`
         )
         .all(actorId) as InboxRow[];
@@ -257,7 +417,7 @@ export class SqliteInboxRepository implements InboxRepository {
       this.db
         .prepare(
           `UPDATE actor_inbox_entries SET seen_at = ?
-           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL`
+           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL${this.incomingWhere()}`
         )
         .run(stamp, actorId);
       return rows.map((row) => toEntry({ ...row, seen_at: stamp }));
@@ -284,7 +444,7 @@ export class SqliteInboxRepository implements InboxRepository {
       const rows = this.db
         .prepare(
           `SELECT * FROM actor_inbox_entries
-           WHERE actor_id = ? AND id IN (${placeholders})`
+           WHERE actor_id = ? AND id IN (${placeholders})${this.incomingWhere()}`
         )
         .all(actorId, ...entryIds) as InboxRow[];
       if (rows.length !== entryIds.length) throw new Error("inbox entry not found");
@@ -294,7 +454,8 @@ export class SqliteInboxRepository implements InboxRepository {
       this.db
         .prepare(
           `UPDATE actor_inbox_entries SET handled_at = ?, handled_note = ?
-           WHERE actor_id = ? AND id IN (${placeholders}) AND handled_at IS NULL`
+           WHERE actor_id = ? AND id IN (${placeholders})
+             AND handled_at IS NULL${this.incomingWhere()}`
         )
         .run(stamp, note, actorId, ...entryIds);
       return entryIds.map((id) => {
@@ -332,12 +493,7 @@ export class SqliteInboxRepository implements InboxRepository {
     const note = handledNote.trim();
     if (!note) throw new Error("replaceEntries requires a non-empty handledNote");
 
-    const insert = this.db.prepare(
-      `INSERT INTO actor_inbox_entries
-        (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
-       VALUES (?, ?, ?, ?, NULL, NULL, ?)
-       ON CONFLICT(id) DO NOTHING`
-    );
+    const insert = this.prepareInboxInsert();
     const replacementRows = replacements.map((input) => {
       if (!input.actorId.trim()) throw new Error("inbox actorId is required");
       if (!input.source.trim()) throw new Error("inbox source is required");
@@ -345,11 +501,19 @@ export class SqliteInboxRepository implements InboxRepository {
       validateInboxInterruptionForWrite(input.payload);
       const deliveredAt = input.deliveredAt ?? this.now();
       if (!Number.isFinite(deliveredAt.getTime())) throw new Error("invalid deliveredAt");
+      const deliveryDirection = input.deliveryDirection ?? "incoming";
+      const deliveryState = input.deliveryState ?? "delivered";
+      if (deliveryDirection !== "incoming" && deliveryDirection !== "outgoing")
+        throw new Error("invalid inbox delivery direction");
+      if (deliveryState !== "pending" && deliveryState !== "delivered")
+        throw new Error("invalid inbox delivery state");
       return {
         id: input.id ?? randomUUID(),
         actorId: input.actorId,
         source: input.source,
         deliveredAt,
+        deliveryDirection,
+        deliveryState,
         payload: input.payload,
       };
     });
@@ -359,7 +523,7 @@ export class SqliteInboxRepository implements InboxRepository {
       const rows = this.db
         .prepare(
           `SELECT * FROM actor_inbox_entries
-           WHERE actor_id = ? AND id IN (${placeholders})`
+           WHERE actor_id = ? AND id IN (${placeholders})${this.incomingWhere()}`
         )
         .all(actorId, ...entryIds) as InboxRow[];
       if (rows.length !== entryIds.length) throw new Error("inbox entry not found");
@@ -368,7 +532,8 @@ export class SqliteInboxRepository implements InboxRepository {
       this.db
         .prepare(
           `UPDATE actor_inbox_entries SET handled_at = ?, handled_note = ?
-           WHERE actor_id = ? AND id IN (${placeholders}) AND handled_at IS NULL`
+           WHERE actor_id = ? AND id IN (${placeholders})
+             AND handled_at IS NULL${this.incomingWhere()}`
         )
         .run(stamp, note, actorId, ...entryIds);
 
@@ -384,19 +549,17 @@ export class SqliteInboxRepository implements InboxRepository {
 
       const inserted: InboxEntry[] = [];
       for (const row of replacementRows) {
-        const result = insert.run(
-          row.id,
-          row.actorId,
-          row.source,
-          row.deliveredAt.toISOString(),
-          JSON.stringify(row.payload)
-        );
+        const result = this.insertInboxRow(insert, row);
         if (result.changes === 1) {
           inserted.push({
-            ...row,
+            id: row.id,
+            actorId: row.actorId,
+            source: row.source,
+            deliveredAt: row.deliveredAt,
             seenAt: null,
             handledAt: null,
             handledNote: null,
+            payload: row.payload,
           });
         }
       }
@@ -467,9 +630,8 @@ export class SqliteInboxRepository implements InboxRepository {
   listRecentHandledEntries(limit = 50): InboxEntry[] {
     const rows = this.db
       .prepare(
-        `SELECT id, actor_id, source, delivered_at, seen_at, handled_at, handled_note, payload_json
-         FROM actor_inbox_entries
-         WHERE handled_at IS NOT NULL
+        `SELECT * FROM actor_inbox_entries
+         WHERE handled_at IS NOT NULL${this.incomingWhere()}
          ORDER BY handled_at DESC, id DESC
          LIMIT ?`
       )

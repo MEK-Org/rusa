@@ -666,7 +666,8 @@ export class FollowerHub {
         if (existing.generation === body.generation) {
           existing.ownsExecution =
             !!this.opts?.instanceExecution &&
-            (body.instanceExecution as { version?: unknown } | undefined)?.version === 1;
+            (body.instanceExecution as { version?: unknown } | undefined)?.version ===
+              INSTANCE_EXECUTION_CAPABILITY.version;
           existing.renewSession();
           this.staleFollowerIds.delete(existing.id);
           this.log.info("follower_reconnected", {
@@ -717,7 +718,8 @@ export class FollowerHub {
       follower.boundedExecution = offersBoundedExecution(body);
       follower.ownsExecution =
         !!this.opts?.instanceExecution &&
-        (body.instanceExecution as { version?: unknown } | undefined)?.version === 1;
+        (body.instanceExecution as { version?: unknown } | undefined)?.version ===
+          INSTANCE_EXECUTION_CAPABILITY.version;
       this.followers.set(follower.id, follower);
       this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
@@ -907,7 +909,9 @@ export class FollowerHub {
         // Reconstruct the small envelope; never accept an injected body/prompt.
         local.inbox.append([
           {
-            id: `${follower.id}:${entry.id}`,
+            // Keep the source's stable inbox identity. The destination inbox
+            // deduplicates this exact id and can acknowledge a lost reply.
+            id: entry.id,
             actorId: entry.actorId,
             source: `mesh:${fromId}`,
             deliveredAt: new Date(entry.deliveredAt),
@@ -917,10 +921,36 @@ export class FollowerHub {
               messageId: entity.id,
               entity,
               deliveryRole: "owner",
+              deliveryAckRequired: true,
               ...(entry.payload.priority === "responsive" ? { priority: "responsive" } : {}),
             },
           },
         ]);
+      } else if (event.message.type === "inboxAcknowledged") {
+        const local = this.opts?.instanceExecution;
+        const received = local?.inbox.read(event.actorId, event.message.entryId);
+        const entity = received?.payload.entity as InstanceEntityRef | undefined;
+        const senderId = received?.payload.fromId;
+        const origin = entity?.instance ? this.followers.get(entity.instance) : undefined;
+        if (
+          !local ||
+          !follower.ownsExecution ||
+          local.actor(event.actorId)?.executionConfig?.executionTarget !== follower.id ||
+          received?.payload.type !== "mesh.message" ||
+          typeof senderId !== "string" ||
+          !entity ||
+          entity.kind !== "message" ||
+          local.actor(senderId)?.executionConfig?.executionTarget !== entity.instance ||
+          !origin
+        ) {
+          throw new Error("Unauthorized instance delivery acknowledgement");
+        }
+        // The source's persistent outgoing row is the authority. Repeated ACKs
+        // are harmless; an offline source replays the same event after restart.
+        origin.enqueueCommand({
+          actorId: senderId,
+          message: { type: "inboxDeliveryAcknowledged", entryId: received.id },
+        });
       } else follower.receive(event);
     } catch {
       this.log.warn("follower_event_acceptance_failed", {

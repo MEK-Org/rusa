@@ -96,6 +96,9 @@ export class FollowerInstance {
         case "inbox":
           for (const entry of message.entries) this.execution.receive(entry);
           return;
+        case "inboxDeliveryAcknowledged":
+          this.execution.acknowledgeDelivery(message.entryId);
+          return;
         case "quota":
           for (const observation of message.observations) this.execution.observeQuota(observation);
           return;
