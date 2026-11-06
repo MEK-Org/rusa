@@ -357,6 +357,8 @@ export async function composeFollowerStart(
         selected
       ),
     publish: (fromId, entry) => emit(fromId, { type: "inboxEvent", fromId, entry }),
+    acknowledgeDelivery: (actorId, entryId) =>
+      emit(actorId, { type: "inboxAcknowledged", entryId }),
     fetchMessage: (actorId, ref) => post("/entities/read", { actorId, ref }),
   });
   // Installed work survives transport/session replacement and leader downtime.
@@ -460,7 +462,7 @@ export async function composeFollowerStart(
       session = reg.session;
       if (reg.leaderToken) leaderToken = reg.leaderToken;
       runMaterial.accept(reg.boundedExecution);
-      executionEnabled = reg.instanceExecution?.version === 1;
+      executionEnabled = reg.instanceExecution?.version === INSTANCE_EXECUTION_CAPABILITY.version;
       eventTransfer = httpEventTransferSender(
         reg.eventTransfer,
         (fragment) => request("/events/transfer", fragment),

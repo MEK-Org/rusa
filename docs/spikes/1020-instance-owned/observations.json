@@ -49,6 +49,14 @@
         "completedFocusCount": 2,
         "unhandled": 1
       }
+    },
+    {
+      "durableInboxDelivery": {
+        "restartReplay": "same entry id replayed",
+        "lostAck": "two acknowledgements settled one pending row",
+        "reverseDirection": "delivered",
+        "sameInstanceOffline": "delivered without publish"
+      }
     }
   ]
 }

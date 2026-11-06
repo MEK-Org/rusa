@@ -45,8 +45,12 @@ export interface BoundedExecutionCapability {
 }
 export const BOUNDED_EXECUTION_CAPABILITY: BoundedExecutionCapability = { version: 1 };
 
-/** Draft #1020: installed actors use this instance's ordinary coordinator. */
-export const INSTANCE_EXECUTION_CAPABILITY = { version: 1 } as const;
+/**
+ * Draft #1020: installed actors use this instance's ordinary coordinator.
+ * Version 2 adds durable inter-instance inbox acknowledgement. A v1 peer
+ * stays on the legacy path rather than receiving commands it cannot settle.
+ */
+export const INSTANCE_EXECUTION_CAPABILITY = { version: 2 } as const;
 export interface QuotaObservation {
   provider: string;
   model?: string;
@@ -246,6 +250,8 @@ export interface FollowerFileOperationResult {
 export type LeaderCommand =
   | { type: "install"; record: ActorRecord }
   | { type: "inbox"; entries: InstanceInboxEvent[] }
+  /** Sender-side delivery settlement; actor handling remains independent. */
+  | { type: "inboxDeliveryAcknowledged"; entryId: string }
   | { type: "quota"; observations: QuotaObservation[] }
   | { type: "executionRead" }
   | { type: "entityRead"; requestId: string; requesterId: string; ref: InstanceEntityRef }
@@ -298,6 +304,8 @@ export type MaterialReadReply =
 
 export type ActorEvent =
   | { type: "inboxEvent"; fromId: string; entry: InstanceInboxEvent }
+  /** Receiver emitted only after its local inbox row committed. */
+  | { type: "inboxAcknowledged"; entryId: string }
   | { type: "entityReadResult"; requestId: string; value?: unknown; error?: string }
   | { type: "executionSnapshot"; observedAt: string; state: ActorRuntimeState }
   | { type: "ready"; pid: number }

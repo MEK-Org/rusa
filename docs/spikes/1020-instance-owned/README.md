@@ -40,7 +40,8 @@ flowchart LR
    `completedFocusEntryCounts`. The lifecycle stores results here. Failure
    uses the existing `routeRunFailure`; its diagnostic stays in a local
    message body, and its small ordinary event is addressed to the parent.
-   Success sends no mandatory run-end event.
+   Success sends no mandatory run-end event. It also records a message body
+   and its local/remote inbox delivery intent in one SQLite transaction.
 3. [`actor-projection.ts`](../../../packages/rusa/src/remote-instances/actor-projection.ts)
    replaces the leader's `ActorHandle` for a peer that negotiates this path.
    It installs control snapshots and hands off event references. It holds no
@@ -57,13 +58,17 @@ flowchart LR
    peer must own the sender; the sender must have the recipient handle or
    parent relationship. Incoming message envelopes are reconstructed without
    bodies. Explicit message reads check the requester is hosted on the peer
-   and the origin checks participation in the message.
+   and the origin checks participation in the message. A remote recipient
+   acknowledges only after its durable inbox insert; duplicate events and
+   acknowledgements are idempotent.
 6. [`execution-actor-repository.ts`](../../../packages/rusa/src/remote-instances/execution-actor-repository.ts)
    stores installed foreign parent/address-book references in the existing
    versioned cache. The `actors` table has local foreign keys: copying a child
    alone otherwise requires copying its remote tree too. This small adapter
    avoids inventing peer actors or granting a follower global hierarchy writes.
-   No schema or migration is changed.
+   Migration `0067_instance_inbox_delivery` records the direction and delivery
+   state on existing inbox rows. Its concrete shape is provisional and needs
+   explicit schema approval before any staging consideration.
 
 ## Event and entity boundary
 
@@ -82,8 +87,18 @@ offline; uncached content is unavailable until that origin can answer. This is
 The follower's existing authenticated poll/event channel transports these
 operations. No direct peer database access is introduced. The capability is
 advertised by `rusa start`; the standalone legacy follower entry point stays on
-the legacy path. A leader needs an explicit `instance.id` to advertise the
-new execution capability, so message origins have a stable configured name.
+the legacy path. Capability version 2 is required for this durable-delivery
+extension, so a version-1 execution peer stays on the legacy path rather than
+receiving an acknowledgement command it cannot understand. A leader needs an
+explicit `instance.id` to advertise the new execution capability, so message
+origins have a stable configured name.
+
+For a local recipient, the row is incoming and immediately delivered. For a
+remote recipient, the sender records an outgoing pending row with the message
+body, re-emits it after local restart, and marks it delivered only after the
+recipient's durable acknowledgement. Sender delivery is deliberately separate
+from the recipient's `handled_at`; outgoing rows are excluded from the sender's
+actionable inbox.
 
 ## Observed validation
 
@@ -110,17 +125,22 @@ an external provider CLI. The harness was not added to the test suite.
   and launched no extra retry.
 
 TypeScript checking and bundling the changed startup/worker paths were also
-run. No tests were added, edited or run. Synthetic startup does not establish
-real-provider, desktop or sandbox behavior.
+run. The existing SQLite inbox repository suite was run without editing tests.
+A second isolated, disposable SQLite/`ExecutionInstance`/`FollowerHub` harness
+observed restart replay with the same entry id, a duplicate receiver delivery
+after a lost acknowledgement settling one pending row in both directions, and
+offline same-instance delivery without publication. Synthetic startup does not
+establish real-provider, desktop or sandbox behavior.
 
 ## Deliberate gaps
 
-- **Delivery:** the existing outgoing follower queue is still in memory and
-  clears on leader-incarnation changes. Storing a body and enqueueing its event
-  is not atomic. Leader-to-follower delivery replays retained source inbox
-  copies; handled state is not yet projected back, so the leader's inbox view
-  remains stale. A durable ordinary-event outbox and projection reconciliation
-  remain work; neither should turn back into run-completion acknowledgement.
+- **Delivery:** this draft adds a sender-side durable pending/delivered state,
+  not a general queue migration. Re-emission occurs when the source execution
+  instance resumes; continuous retry/backoff, an acknowledgement timeout,
+  transport-incarnation reconciliation and durable central routing remain
+  unfinished. Recipient `handled_at` is intentionally not projected back, so
+  the leader's inbox view remains stale. None of that should turn into a
+  run-completion acknowledgement.
 - **Control and tools:** installed actor metadata is a control snapshot, not
   global authority. This draft mounts local inbox and message tools only.
   Global obligations, attribution of external writes, brief/ledger tools and
