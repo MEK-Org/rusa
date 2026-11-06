@@ -335,9 +335,8 @@ describe("handleVoiceApiRequest", () => {
       await settled(first.res);
 
       expect(first.res.statusCode).toBe(200);
-      expect(sendMessage.mock.calls[0]?.[3]).toMatch(/^[0-9a-f-]{36}$/);
-      expect(sendMessage.mock.calls[0]?.[3]).not.toBe(sessionId);
       expect(service.hasActiveSession(UUID_A)).toBe(false);
+      expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(false);
 
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
       expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(true);
