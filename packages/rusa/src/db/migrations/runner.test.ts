@@ -118,6 +118,7 @@ describe("Database Migration System", () => {
       "0062_portable_brief_revisions",
       "0063_mesh_chat_responsive",
       "0064_metric_samples",
+      "0066_recent_activity_history_indexes",
     ]);
 
     const tableNames = (
