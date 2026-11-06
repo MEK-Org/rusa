@@ -38,6 +38,22 @@ final class ActorReplyEntry extends WalkieEntry {
   final VoiceAnnouncement announcement;
 }
 
+/// A durable chat row restored when a notification opens a fresh assist task.
+/// Historical actor rows have no locally playable audio unless they are the
+/// one reply named by the notification, which is promoted on receipt.
+final class HistoricalChatEntry extends WalkieEntry {
+  const HistoricalChatEntry({
+    required super.timestamp,
+    required this.id,
+    required this.text,
+    required this.isActorReply,
+  });
+
+  final String id;
+  final String text;
+  final bool isActorReply;
+}
+
 /// Walkie-mode connection state (the SSE presence link).
 enum WalkieConnection { off, connecting, connected, reconnecting }
 
@@ -434,6 +450,22 @@ class WalkieController {
   /// live/backlog frame, it may predate this fresh activity's SSE session.
   void presentNotificationReply(VoiceAnnouncement announcement) {
     if (!_enabled.value || _disposed || announcement.actorId != actorId) return;
+    final historicalIndex = _transcript.value.indexWhere(
+      (entry) => entry is HistoricalChatEntry && entry.id == announcement.id,
+    );
+    if (historicalIndex >= 0) {
+      final historical =
+          _transcript.value[historicalIndex] as HistoricalChatEntry;
+      final transcript = [..._transcript.value];
+      transcript[historicalIndex] = ActorReplyEntry(
+        timestamp: historical.timestamp,
+        announcement: announcement,
+      );
+      _seenIds.add(announcement.id);
+      _transcript.add(transcript);
+      replayAnnouncement(announcement);
+      return;
+    }
     final alreadyReceived = _transcript.value.any(
       (entry) =>
           entry is ActorReplyEntry && entry.announcement.id == announcement.id,
@@ -445,6 +477,32 @@ class WalkieController {
       return;
     }
     _enqueue(announcement);
+  }
+
+  /// Prepend a bounded, chronologically ordered view of the current root chat.
+  /// The API has already applied the authenticated principal's chat scope; this
+  /// method only projects those existing rows into the restricted transcript.
+  void restoreConversation(List<MeshChat> messages) {
+    if (!_enabled.value || _disposed) return;
+    final restoredIds = _transcript.value
+        .whereType<HistoricalChatEntry>()
+        .map((entry) => entry.id)
+        .toSet();
+    final restored = <WalkieEntry>[];
+    for (final message in messages) {
+      if (!restoredIds.add(message.id)) continue;
+      restored.add(
+        HistoricalChatEntry(
+          timestamp: message.ts,
+          id: message.id,
+          text: _displayChatBody(message.body),
+          isActorReply: message.senderId == actorId,
+        ),
+      );
+    }
+    if (restored.isNotEmpty) {
+      _transcript.add([...restored, ..._transcript.value]);
+    }
   }
 
   Future<void> _drain() async {
@@ -697,6 +755,13 @@ class WalkieController {
     if (_disposed) return;
     _transcript.add([..._transcript.value, entry]);
   }
+
+  static const _voiceMemoPrefix = '🎙️ [voice memo — reply for the ear]: ';
+
+  static String _displayChatBody(String body) =>
+      body.startsWith(_voiceMemoPrefix)
+      ? body.substring(_voiceMemoPrefix.length)
+      : body;
 
   void _stopRecordTimers() {
     _recordTicker?.cancel();

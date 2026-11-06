@@ -180,6 +180,13 @@ class _AssistantPageState extends State<AssistantPage> {
       throw StateError('No active root actor');
     }
 
+    // Reuse the scoped durable chat route for a notification's fresh task.
+    // It adds the authenticated human participant server-side, rather than
+    // trusting any identity from the Android intent.
+    final historyFuture = notificationOpening
+        ? _api.fetchChat(actors: [root], limit: 20)
+        : null;
+
     unawaited(_controller?.dispose());
     final controller = WalkieController(
       // This surface stays walkie-to-root. A reply target is accepted only
@@ -210,6 +217,17 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
+    if (historyFuture != null) {
+      try {
+        final history = await historyFuture;
+        if (stale()) return discard();
+        // Chat pages are newest-first; transcript rendering is chronological.
+        controller.restoreConversation(history.chat.reversed.toList());
+      } catch (_) {
+        // The exact tapped reply remains independently recoverable. Do not
+        // expand a history-fetch failure into broader dashboard access here.
+      }
+    }
     await captureFuture;
     if (captureError != null) {
       if (_cancelCurrentCapture == cancelCapture) {

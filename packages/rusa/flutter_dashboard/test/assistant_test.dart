@@ -232,40 +232,110 @@ void main() {
       },
     );
 
-    testWidgets('locked notification opening waits for a post-unlock reply target', (
+    testWidgets(
+      'notification tap restores the recent root conversation with its reply',
+      (tester) async {
+        api
+          ..chatPages = [
+            ChatPage(
+              // The API is newest-first. The assistant reverses it before
+              // projecting it into the chronological walkie transcript.
+              chat: [
+                makeChat(
+                  'durable-reply',
+                  sender: 'root',
+                  body: 'The durable answer',
+                ),
+                makeChat(
+                  'recent-memo',
+                  sender: '00000000-0000-4000-8000-000000000001',
+                  body: '🎙️ [voice memo — reply for the ear]: My question',
+                ),
+              ],
+              nextCursor: null,
+            ),
+          ]
+          ..notificationReply = makeAnnouncement(
+            'durable-reply',
+            actor: 'root',
+            text: 'The durable answer',
+            sessionId: 'ended-session',
+          );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              initialReply: const AssistantReplyTarget(
+                actorId: 'root',
+                announcementId: 'durable-reply',
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.chatActorCalls, [
+          ['root'],
+        ]);
+        expect(find.text('My question'), findsOneWidget);
+        expect(find.text('The durable answer'), findsOneWidget);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'locked notification opening waits for a post-unlock reply target',
+      (tester) async {
+        api.notificationReply = makeAnnouncement(
+          'durable-reply',
+          actor: 'root',
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              notificationOpening: true,
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 0);
+        expect(api.notificationReplyCalls, isEmpty);
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'durable-reply',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.notificationReplyCalls, [
+          (actorId: 'root', announcementId: 'durable-reply'),
+        ]);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('notification input cannot rebind the root-only assistant', (
       tester,
     ) async {
-      api.notificationReply = makeAnnouncement('durable-reply', actor: 'root');
-      await tester.pumpWidget(
-        MaterialApp(
-          home: AssistantPage(
-            createApi: () => api,
-            createWalkieDeps: (_) => walkie.deps,
-            signals: assistant,
-            notificationOpening: true,
-          ),
-        ),
-      );
-      await tester.pump();
-      await tester.pump();
-
-      expect(walkie.recorder.startCalls, 0);
-      expect(api.notificationReplyCalls, isEmpty);
-
-      await assistant.onReply!(
-        const AssistantReplyTarget(actorId: 'root', announcementId: 'durable-reply'),
-      );
-      await tester.pump();
-      await tester.pump();
-
-      expect(api.notificationReplyCalls, [
-        (actorId: 'root', announcementId: 'durable-reply'),
-      ]);
-      expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/durable-reply']);
-      await unmount(tester);
-    });
-
-    testWidgets('notification input cannot rebind the root-only assistant', (tester) async {
       await tester.pumpWidget(
         MaterialApp(
           home: AssistantPage(
