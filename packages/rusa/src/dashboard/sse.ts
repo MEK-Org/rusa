@@ -354,7 +354,12 @@ export class SseHub {
     return this.attach(res, actors, "voice", onClose, sessionId, undefined, principalId);
   }
 
-  /** Push a reply-TTS announcement to every voice client watching its actor. */
+  /**
+   * Push a reply-TTS announcement to its recipient's voice clients watching its
+   * actor. A leased client receives only announcements addressed to its own
+   * session; a client with no session receives all of them. A session id here
+   * is addressing: the stream route alone grants a lease.
+   */
   pushVoice(announcement: {
     actorId: string;
     recipientId: string;
