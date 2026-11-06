@@ -186,6 +186,36 @@ describe("VoiceService durable reply recovery", () => {
     await expect(valid).resolves.toMatchObject({ id: messageId, actorId: ACTOR });
   });
 
+  it("keeps one announcement when a notification tap races the live render", async () => {
+    const messageId = "reply-message";
+    const { service } = makeService({
+      meshChat: {
+        getById: () => ({
+          id: messageId,
+          ts: "2026-11-06T00:00:00.000Z",
+          senderId: ACTOR,
+          recipientId: TEST_USER_ID,
+          body: "Your reply is ready.",
+          sessionId: "walkie-session",
+          responsive: null,
+        }),
+      },
+    });
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+
+    const recovered = service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID);
+    const live = service.handleMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId }) })
+    );
+    const [recoveredAnnouncement, liveAnnouncement] = await Promise.all([recovered, live]);
+
+    // A duplicate ring entry would survive `ack` and replay as backlog on the
+    // next connection, because `ack` updates only the first entry with this id.
+    expect(liveAnnouncement).toBe(recoveredAnnouncement);
+    expect(service.ack(messageId)).toBe(true);
+    expect(service.backlog(ACTOR, TEST_USER_ID)).toEqual([]);
+  });
+
   it("fails closed when a durable row belongs to another actor or principal", async () => {
     const { service } = makeService({
       meshChat: {

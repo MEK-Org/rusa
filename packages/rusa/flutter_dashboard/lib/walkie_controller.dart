@@ -536,8 +536,12 @@ class WalkieController {
       }
     }
     final restored = <WalkieEntry>[];
+    // A matched row keeps its receipt time, which a backlog catch-up can make
+    // later than newer durable rows. Order by each slot's durable time instead.
+    final restoredAt = <DateTime>[];
     final placed = <int>{};
     for (final message in messages) {
+      restoredAt.add(message.ts);
       final received = receivedById[message.id];
       if (received != null) {
         restored.add(existing[received]);
@@ -579,13 +583,15 @@ class WalkieController {
           continue;
         }
         final unmatched = existing[index];
-        final insertIndex = combined.indexWhere(
-          (entry) => entry.timestamp.isAfter(unmatched.timestamp),
+        final insertIndex = restoredAt.indexWhere(
+          (at) => at.isAfter(unmatched.timestamp),
         );
         if (insertIndex < 0) {
           combined.add(unmatched);
+          restoredAt.add(unmatched.timestamp);
         } else {
           combined.insert(insertIndex, unmatched);
+          restoredAt.insert(insertIndex, unmatched.timestamp);
         }
       }
       _transcript.add(combined);

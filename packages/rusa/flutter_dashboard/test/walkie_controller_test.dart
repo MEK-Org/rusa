@@ -405,6 +405,61 @@ void main() {
     );
 
     test(
+      'history orders an unmatched row by durable time, not a late receipt time',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'unmatched memo',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        final memoAt = controller.transcript.value
+            .whereType<UserMemoEntry>()
+            .single
+            .timestamp;
+
+        // A backlog catch-up carries its receipt time, later than the memo,
+        // although the reply itself is older than the memo.
+        await Future<void>.delayed(const Duration(milliseconds: 2));
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('late-receipt'));
+        await pumpEventQueue();
+
+        controller.restoreConversation([
+          MeshChat(
+            id: 'late-receipt',
+            ts: memoAt.subtract(const Duration(minutes: 10)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Older reply',
+            sessionId: null,
+          ),
+          MeshChat(
+            id: 'history',
+            ts: memoAt.subtract(const Duration(minutes: 5)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Older history',
+            sessionId: null,
+          ),
+        ]);
+
+        expect(
+          controller.transcript.value.map(
+            (entry) => switch (entry) {
+              HistoricalChatEntry(:final id) => id,
+              UserMemoEntry() => 'unmatched-memo',
+              ActorReplyEntry(:final announcement) => announcement.id,
+            },
+          ),
+          ['late-receipt', 'history', 'unmatched-memo'],
+        );
+      },
+    );
+
+    test(
       'history places an unmatched retained old row in chronological position',
       () async {
         await controller.enable();

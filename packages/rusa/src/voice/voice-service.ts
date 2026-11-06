@@ -677,6 +677,11 @@ export class VoiceService {
       // never influence an outbox path even before its database lookup fails.
       join(dir, `${streamRequestedAt}-${randomUUID()}`)
     );
+    // A notification tap can recover a reply while its live render is still
+    // synthesizing. The id is the durable row, so both renders are one reply: a
+    // second ring entry would survive `ack` and replay as backlog later.
+    const concurrent = this.get(input.id);
+    if (concurrent) return concurrent;
     const announcement: VoiceAnnouncement = {
       ...input,
       audioPath: encoded.path,

@@ -97,4 +97,46 @@ void main() {
       reason: 'Recents/history check must precede replyTarget in onNewIntent',
     );
   });
+
+  test('an assist or Recents intent supersedes a reply awaiting unlock', () {
+    // Android source-boundary test, not device lifecycle proof. Kotlin is not
+    // compiled by this suite.
+    final onNewIntent = RegExp(
+      r'override fun onNewIntent\(intent: Intent\) \{(.*?)\n    \}',
+      dotAll: true,
+    ).firstMatch(assistActivity)!.group(1)!;
+    final recentsBranch = onNewIntent.substring(
+      onNewIntent.indexOf('isRestoringFromRecents(intent)'),
+      onNewIntent.indexOf('replyTarget(intent)'),
+    );
+    expect(recentsBranch, contains('pendingReply = null'));
+
+    // The notification and Recents routes start no capture, so a lock-screen
+    // gesture there starts one instead of toggling a capture that isn't there.
+    final ordinary = onNewIntent.substring(
+      onNewIntent.indexOf('val reply = replyTarget(intent)'),
+    );
+    final dormant = ordinary.indexOf(
+      'val dormantRoute = pendingReply != null || restoringFromRecents',
+    );
+    expect(dormant, isNonNegative);
+    expect(ordinary.indexOf('pendingReply = null'), greaterThan(dormant));
+    expect(
+      ordinary.indexOf('restoringFromRecents = false', dormant),
+      greaterThan(dormant),
+    );
+    expect(ordinary, contains('if (backgrounded || dormantRoute) {'));
+
+    // A superseded keyguard request must not hide or finish the newer surface.
+    final defer = RegExp(
+      r'private fun deferReplyUntilUnlocked\(.*?\n    \}\n',
+      dotAll: true,
+    ).firstMatch(assistActivity)!.group(0)!;
+    expect(defer, contains('if (pendingReply !== reply) return@post'));
+    expect(
+      'if (pendingReply === reply) abandonReplyHandoff(retainBackgroundTask)'
+          .allMatches(defer),
+      hasLength(2),
+    );
+  });
 }

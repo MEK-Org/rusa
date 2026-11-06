@@ -66,6 +66,7 @@ class AssistActivity : FlutterActivity() {
             // not make an old capture or queued reply audible, nor treat the
             // historical launch as a new assistant gesture or stale notification tap.
             restoringFromRecents = true
+            pendingReply = null
             return
         }
         val reply = replyTarget(intent)
@@ -75,15 +76,19 @@ class AssistActivity : FlutterActivity() {
             return
         }
         // An ordinary assist trigger retains the previously approved locked
-        // walkie surface. A reply notification never changes that policy.
+        // walkie surface. A reply notification never changes that policy, and
+        // this intent supersedes any reply still waiting on the keyguard.
+        val dormantRoute = pendingReply != null || restoringFromRecents
+        pendingReply = null
         setShowWhenLocked(true)
         setTurnScreenOn(true)
         restoringFromRecents = false
         if (isDeviceLocked()) {
-            if (backgrounded) {
+            if (backgrounded || dormantRoute) {
                 // A lock-screen gesture after a retained, unlocked session
                 // starts a new restricted capture. Never surface that old
-                // chat or queued audio over the keyguard first.
+                // chat or queued audio over the keyguard first. A notification
+                // or Recents route started no capture for a trigger to stop.
                 backgrounded = false
                 channel.lockedAssist()
             } else {
@@ -169,6 +174,7 @@ class AssistActivity : FlutterActivity() {
         setShowWhenLocked(false)
         setTurnScreenOn(false)
         window.decorView.post {
+            if (pendingReply !== reply) return@post
             val keyguard = getSystemService(KeyguardManager::class.java) ?: return@post
             keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
                 override fun onDismissSucceeded() {
@@ -178,12 +184,13 @@ class AssistActivity : FlutterActivity() {
                 }
 
                 override fun onDismissCancelled() {
-                    // A cancelled keyguard request has no safe reply handoff.
-                    abandonReplyHandoff(retainBackgroundTask)
+                    // A cancelled keyguard request has no safe reply handoff. A
+                    // superseded one must not hide or finish the newer surface.
+                    if (pendingReply === reply) abandonReplyHandoff(retainBackgroundTask)
                 }
 
                 override fun onDismissError() {
-                    abandonReplyHandoff(retainBackgroundTask)
+                    if (pendingReply === reply) abandonReplyHandoff(retainBackgroundTask)
                 }
             })
         }
