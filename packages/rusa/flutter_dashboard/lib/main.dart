@@ -52,6 +52,7 @@ void assistMain() {
       bootstrapSession: platformBootstrapSession,
       browserHooksBuilder: platformBrowserHooksBuilder,
       pageBuilder: (context, session) => AssistantPage(
+        session: session,
         createApi: () => platformCreateDashboardApi(session),
         createWalkieDeps: (api) =>
             platformCreateWalkieDeps(api, session, headset: assistant),

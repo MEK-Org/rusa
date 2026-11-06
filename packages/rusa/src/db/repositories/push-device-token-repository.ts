@@ -57,7 +57,6 @@ export class PushDeviceTokenRepository {
         .all(principalId) as PushDeviceTokenRow[]
     ).map(toPushDeviceToken);
   }
-
 }
 
 function requireToken(value: string): string {

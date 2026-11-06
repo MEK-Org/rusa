@@ -38,6 +38,21 @@ import { speakableText } from "./tts-text.js";
 export const VOICE_MEMO_PREFIX = "🎙️ [voice memo — reply for the ear]: ";
 
 /**
+ * Session ids minted by the Android restricted assistant. The marker survives
+ * in the existing durable `mesh_chat.session_id`, so notification eligibility
+ * follows the conversation even after the transient SSE session/lease ends.
+ */
+export const ANDROID_ASSISTANT_SESSION_PREFIX = "android-assistant:";
+const ANDROID_ASSISTANT_SESSION_ID = new RegExp(
+  `^${ANDROID_ASSISTANT_SESSION_PREFIX}[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+  "i"
+);
+
+export function isAndroidAssistantSessionId(sessionId: string | null): boolean {
+  return sessionId !== null && ANDROID_ASSISTANT_SESSION_ID.test(sessionId);
+}
+
+/**
  * How long after its last `voice` SSE subscription disconnects an actor still
  * counts as "in walkie mode" for reply TTS. Bridges connection blips (LTE drop
  * mid-drive) — the rendered reply waits in the backlog for the reconnect.
@@ -499,6 +514,7 @@ export class VoiceService {
       if (
         !recipientId ||
         !announcementId ||
+        !isAndroidAssistantSessionId(event.detail) ||
         this.isHumanRecipient(event.actorId) ||
         !this.isHumanRecipient(recipientId) ||
         !speakableText(event.body)

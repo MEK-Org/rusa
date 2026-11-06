@@ -10,6 +10,7 @@ import 'package:rusa_dashboard/assistant_platform.dart';
 import 'package:rusa_dashboard/main.dart' show parseAssistantLaunch;
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/reply_notifications_io.dart';
+import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/walkie_controller.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
@@ -17,6 +18,75 @@ import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/walkie_panel.dart';
 
 import 'fakes.dart';
+
+class _SignedInSession extends DashboardSession {
+  @override
+  DashboardSessionStatus status = DashboardSessionStatus.signedIn;
+
+  @override
+  bool get authenticationEnabled => true;
+
+  @override
+  String? get csrfToken => null;
+
+  @override
+  bool get isIdle => false;
+
+  @override
+  String? get profilePhotoUrl => null;
+
+  @override
+  String get operatorDisplayName => 'Operator';
+
+  @override
+  String? get browserTitle => null;
+
+  @override
+  String? get errorMessage => null;
+
+  @override
+  Future<void> requireAuthentication() async {}
+
+  @override
+  Future<void> signIn() async {}
+
+  @override
+  Future<void> signOut() async {
+    status = DashboardSessionStatus.signedOut;
+    notifyListeners();
+  }
+
+  @override
+  Future<void> visit() async {}
+
+  @override
+  void idleFromServer() {}
+
+  @override
+  Future<void> checkSession() async {}
+}
+
+class _PushTokenStorage implements PushTokenStorage {
+  final values = <String, String>{};
+
+  String _scope(Uri origin) => switch (origin.scheme) {
+    'http' || 'https' => origin.origin,
+    _ => origin.toString(),
+  };
+
+  @override
+  Future<void> delete(Uri origin) async {
+    values.remove(_scope(origin));
+  }
+
+  @override
+  Future<String?> read(Uri origin) async => values[_scope(origin)];
+
+  @override
+  Future<void> write(Uri origin, String token) async {
+    values[_scope(origin)] = token;
+  }
+}
 
 // #1193: the Android assist trigger opens walkie recording to root, and the
 // phone drawer leads to the system page that assigns the assistant role.
@@ -206,6 +276,47 @@ void main() {
         await unmount(tester);
       },
     );
+
+    testWidgets('dashboard logout closes a retained assistant session', (
+      tester,
+    ) async {
+      final session = _SignedInSession();
+      final taskOpen = ValueNotifier(true);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ValueListenableBuilder<bool>(
+            valueListenable: taskOpen,
+            builder: (_, open, _) => open
+                ? AssistantPage(
+                    session: session,
+                    createApi: () => api,
+                    createWalkieDeps: (_) => walkie.deps,
+                    signals: assistant,
+                    onClose: () {
+                      closed++;
+                      taskOpen.value = false;
+                    },
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+      final sessionId = walkie.stream.connectCalls.single.sessionId;
+
+      await session.signOut();
+      await tester.pump();
+      await tester.pump();
+
+      expect(closed, 1);
+      expect(walkie.recorder.cancelCalls, greaterThanOrEqualTo(1));
+      expect(api.disabledVoiceSessions, [sessionId]);
+    });
 
     testWidgets(
       'a locked assist re-entry replaces retained unlocked replies with fresh capture',
@@ -1238,13 +1349,28 @@ void main() {
       'logout does not initialize messaging without a registered token',
       () async {
         final api = FakeApi();
-        final notifications = IoReplyNotifications();
+        final notifications = IoReplyNotifications(
+          storage: _PushTokenStorage(),
+        );
         await notifications.revoke(api);
 
         expect(api.revokedPushTokens, isEmpty);
         notifications.dispose();
       },
     );
+
+    test('logout revokes a token registered by an earlier process', () async {
+      final api = FakeApi(base: Uri.parse('https://rusa.example/'));
+      final storage = _PushTokenStorage()
+        ..values['https://rusa.example'] = 'prior-process-token';
+      final notifications = IoReplyNotifications(storage: storage);
+
+      await notifications.revoke(api);
+
+      expect(api.revokedPushTokens, ['prior-process-token']);
+      expect(storage.values, isEmpty);
+      notifications.dispose();
+    });
   });
 
   group('parseAssistantLaunch', () {

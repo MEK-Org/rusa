@@ -104,14 +104,24 @@ const _voiceMemoPrefix = '🎙️ [voice memo — reply for the ear]: ';
 
 /// Mint a V4 UUID in the browser app rather than deriving identity from an SSE
 /// socket. The same value is sent on the stream and every memo until mode exit.
-String newWalkieSessionId() {
+const _androidAssistantSessionPrefix = 'android-assistant:';
+
+/// A durable session value names the conversation that produced a reply. The
+/// assistant's explicit marker is deliberately separate from ordinary dashboard
+/// walkie sessions, so server-side notification delivery can follow the
+/// commissioned Android-assistant flow without inferring it from SSE presence
+/// or a device registration. The UUID suffix retains the existing collision
+/// resistance and remains valid through a stream/lease restart.
+String newWalkieSessionId({bool androidAssistant = false}) {
   final bytes = List<int>.generate(16, (_) => Random.secure().nextInt(256));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   final hex = bytes
       .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
       .join();
-  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  final uuid =
+      '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  return androidAssistant ? '$_androidAssistantSessionPrefix$uuid' : uuid;
 }
 
 /// Per-actor walkie-talkie brain : owns the mode toggle lifecycle
@@ -125,6 +135,7 @@ class WalkieController {
     required WalkieDeps deps,
     this.onTransfer,
     this.sessionRepliesOnly = false,
+    this.androidAssistantSession = false,
   }) : _actorId = actorId,
        _deps = deps,
        _available = BehaviorSubject<bool?>.seeded(deps.voiceAvailable);
@@ -142,6 +153,11 @@ class WalkieController {
   /// carries nothing else; this also keeps unplayed replies from earlier
   /// sessions out of the backlog, leaving them for the next ordinary session.
   final bool sessionRepliesOnly;
+
+  /// Makes this session's durable reply chain eligible for the narrowly scoped
+  /// Android notification path. Ordinary dashboard walkie sessions leave this
+  /// false and keep their pre-existing no-notification behavior.
+  final bool androidAssistantSession;
 
   final _enabled = BehaviorSubject<bool>.seeded(false);
   final _connection = BehaviorSubject<WalkieConnection>.seeded(
@@ -242,7 +258,9 @@ class WalkieController {
     unawaited(_deps.wakeLock.acquire());
 
     final stream = _deps.createStream();
-    final sessionId = newWalkieSessionId();
+    final sessionId = newWalkieSessionId(
+      androidAssistant: androidAssistantSession,
+    );
     _sessionId = sessionId;
     _stream = stream;
     _streamSubs.add(stream.frames.listen(_onFrame));
@@ -446,10 +464,28 @@ class WalkieController {
     _queue.add(_QueueItem(frame));
     _queueDepth.add(_queue.length);
     // Receipt owns the transcript row. Playback only updates that stable row,
-    // so a stalled or replayed clip cannot disappear or append a duplicate.
-    _appendTranscript(
-      ActorReplyEntry(timestamp: DateTime.now(), announcement: frame),
+    // so a stalled or replayed clip cannot disappear or append a duplicate. A
+    // notification history fetch may already have projected this durable id;
+    // promote that neutral row in place instead of adding a second reply.
+    final existingIndex = _transcript.value.indexWhere(
+      (entry) =>
+          (entry is ActorReplyEntry && entry.announcement.id == frame.id) ||
+          (entry is HistoricalChatEntry && entry.id == frame.id),
     );
+    if (existingIndex < 0) {
+      _appendTranscript(
+        ActorReplyEntry(timestamp: DateTime.now(), announcement: frame),
+      );
+    } else if (_transcript.value[existingIndex] is HistoricalChatEntry) {
+      final historical =
+          _transcript.value[existingIndex] as HistoricalChatEntry;
+      final transcript = [..._transcript.value];
+      transcript[existingIndex] = ActorReplyEntry(
+        timestamp: historical.timestamp,
+        announcement: frame,
+      );
+      _transcript.add(transcript);
+    }
     unawaited(_drain());
   }
 
@@ -460,24 +496,6 @@ class WalkieController {
     // A notification selects exactly one durable reply. Once it has played,
     // keep pre-existing background audio suspended until the user opts in.
     _pauseAfterAnnouncementId = announcement.id;
-    final historicalIndex = _transcript.value.indexWhere(
-      (entry) => entry is HistoricalChatEntry && entry.id == announcement.id,
-    );
-    if (historicalIndex >= 0) {
-      final historical =
-          _transcript.value[historicalIndex] as HistoricalChatEntry;
-      final transcript = [..._transcript.value];
-      transcript[historicalIndex] = ActorReplyEntry(
-        timestamp: historical.timestamp,
-        announcement: announcement,
-      );
-      _seenIds.add(announcement.id);
-      _transcript.add(transcript);
-      _queue.insert(0, _QueueItem(announcement));
-      _queueDepth.add(_queue.length);
-      unawaited(_drain());
-      return;
-    }
     final alreadyReceived = _transcript.value.any(
       (entry) =>
           entry is ActorReplyEntry && entry.announcement.id == announcement.id,
@@ -499,28 +517,45 @@ class WalkieController {
   /// method only projects those existing rows into the restricted transcript.
   void restoreConversation(List<MeshChat> messages) {
     if (!_enabled.value || _disposed) return;
-    final restoredIds = <String>{};
-    final localMemoBodies = <String>[];
-    for (final entry in _transcript.value) {
+    final existing = _transcript.value;
+    final receivedById = <String, int>{};
+    final historicalById = <String, int>{};
+    final localMemoBodies = <String, List<int>>{};
+    for (var index = 0; index < existing.length; index++) {
+      final entry = existing[index];
       switch (entry) {
         case HistoricalChatEntry(:final id):
-          restoredIds.add(id);
+          historicalById[id] = index;
         case ActorReplyEntry(:final announcement):
-          restoredIds.add(announcement.id);
+          receivedById[announcement.id] = index;
         case UserMemoEntry(:final transcript):
           // The memo route persists this exact body. Carrying no durable id in
           // its send response, one matching body is the narrow safe dedupe
           // key without collapsing separately sent identical memos.
-          localMemoBodies.add('$_voiceMemoPrefix$transcript');
+          (localMemoBodies['$_voiceMemoPrefix$transcript'] ??= []).add(index);
       }
     }
     final restored = <WalkieEntry>[];
+    final placed = <int>{};
     for (final message in messages) {
-      if (!restoredIds.add(message.id)) continue;
+      final received = receivedById[message.id];
+      if (received != null) {
+        restored.add(existing[received]);
+        placed.add(received);
+        continue;
+      }
+      final historical = historicalById[message.id];
+      if (historical != null) {
+        restored.add(existing[historical]);
+        placed.add(historical);
+        continue;
+      }
       if (message.senderId != actorId) {
-        final localIndex = localMemoBodies.indexOf(message.body);
-        if (localIndex >= 0) {
-          localMemoBodies.removeAt(localIndex);
+        final local = localMemoBodies[message.body];
+        if (local != null && local.isNotEmpty) {
+          final localIndex = local.removeAt(0);
+          restored.add(existing[localIndex]);
+          placed.add(localIndex);
           continue;
         }
       }
@@ -534,7 +569,17 @@ class WalkieController {
       );
     }
     if (restored.isNotEmpty) {
-      _transcript.add([...restored, ..._transcript.value]);
+      // Any unmatched local row was created while the bounded fetch was in
+      // flight, so it belongs after that durable page. Reconstructing the page
+      // first also places an already-rendered local memo at its durable time
+      // rather than prepending older history ahead of it.
+      _transcript.add([
+        ...restored,
+        for (var index = 0; index < existing.length; index++)
+          if (!placed.contains(index) &&
+              existing[index] is! HistoricalChatEntry)
+            existing[index],
+      ]);
     }
   }
 

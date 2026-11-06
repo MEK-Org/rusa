@@ -9,6 +9,7 @@ import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import type { Logger } from "../observability/logger.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import {
+  ANDROID_ASSISTANT_SESSION_PREFIX,
   VOICE_PRESENCE_GRACE_MS,
   VoiceService,
   type VoiceServiceOptions,
@@ -17,6 +18,7 @@ import { attachVoiceOutbound } from "./wiring.js";
 
 const ACTOR = "aaaaaaaa-0000-4000-8000-000000000001";
 const TARGET = "bbbbbbbb-0000-4000-8000-000000000002";
+const ANDROID_SESSION = `${ANDROID_ASSISTANT_SESSION_PREFIX}aaaaaaaa-0000-4000-8000-000000000009`;
 
 function fakeSpeech(overrides: Partial<SpeechClient> = {}): SpeechClient {
   return {
@@ -205,6 +207,33 @@ describe("VoiceService durable reply recovery", () => {
     await expect(
       service.recoverAnnouncement("reply-message", ACTOR, "other-user")
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("VoiceService Android reply notification correlation", () => {
+  it("accepts only replies from the durable Android assistant conversation", () => {
+    const { service } = makeService();
+    const payload = JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" });
+
+    expect(service.pushTargetForMeshEvent(replyEvent({ payload }))).toBeNull();
+    expect(
+      service.pushTargetForMeshEvent(replyEvent({ detail: ANDROID_SESSION, payload }))
+    ).toEqual({ actorId: ACTOR, announcementId: "announcement-1", recipientId: TEST_USER_ID });
+  });
+
+  it("keeps a delayed Android reply eligible after its stream lease expires", () => {
+    let now = 0;
+    const { service } = makeService({ now: () => now, sessionLeaseMs: 10 });
+    const payload = JSON.stringify({ to: TEST_USER_ID, messageId: "delayed-reply" });
+    service.openSession(ANDROID_SESSION, ACTOR, TEST_USER_ID);
+    service.disconnectSession(ANDROID_SESSION);
+    now = 11;
+    service.expireSessions();
+
+    expect(service.hasSession(ANDROID_SESSION, ACTOR, TEST_USER_ID)).toBe(false);
+    expect(
+      service.pushTargetForMeshEvent(replyEvent({ detail: ANDROID_SESSION, payload }))
+    ).toEqual({ actorId: ACTOR, announcementId: "delayed-reply", recipientId: TEST_USER_ID });
   });
 });
 
@@ -537,7 +566,10 @@ describe("attachVoiceOutbound", () => {
     const detach = attachVoiceOutbound(emitter, service, { pushVoice });
 
     emitter.emitMeshEvent(
-      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
+      replyEvent({
+        detail: ANDROID_SESSION,
+        payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }),
+      })
     );
     await vi.waitFor(() => expect(pushVoice).toHaveBeenCalledTimes(1));
     const frame = pushVoice.mock.calls[0][0];
@@ -585,7 +617,10 @@ describe("attachVoiceOutbound", () => {
     attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver }, ACTOR);
 
     emitter.emitMeshEvent(
-      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
+      replyEvent({
+        detail: ANDROID_SESSION,
+        payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }),
+      })
     );
 
     await vi.waitFor(() =>

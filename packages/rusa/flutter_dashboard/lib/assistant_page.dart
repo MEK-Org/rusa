@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'api.dart';
 import 'assistant_platform.dart';
 import 'models.dart';
+import 'session.dart';
 import 'theme.dart';
 import 'voice_platform.dart';
 import 'walkie_controller.dart';
@@ -25,6 +26,7 @@ class AssistantPage extends StatefulWidget {
     this.initialReply,
     this.notificationOpening = false,
     this.restoringFromRecents = false,
+    this.session,
     this.onClose,
   });
 
@@ -40,6 +42,11 @@ class AssistantPage extends StatefulWidget {
   /// Android restored this task from Recents. It mounts an inert restricted
   /// session rather than treating the historical route as a new assist.
   final bool restoringFromRecents;
+
+  /// The independently mounted assist engine observes the shared Firebase
+  /// session too. A dashboard logout therefore closes this retained task rather
+  /// than leaving its transcript, capture, or transport alive on the device.
+  final DashboardSession? session;
 
   /// Leaves the assist screen; defaults to finishing the activity.
   final VoidCallback? onClose;
@@ -65,6 +72,7 @@ class _AssistantPageState extends State<AssistantPage> {
   bool _backgrounded = false;
   bool _suppressInitialCapture = false;
   bool _pendingStop = false;
+  bool _closingForLogout = false;
   Future<void> Function()? _cancelCurrentCapture;
   AssistantReplyTarget? _pendingReply;
 
@@ -87,7 +95,37 @@ class _AssistantPageState extends State<AssistantPage> {
       signals.onLockedAssist = _restartLockedAssist;
       signals.onReply = _receiveReply;
     }
+    widget.session?.addListener(_onSessionChanged);
     _ready = _start();
+  }
+
+  void _onSessionChanged() {
+    if (widget.session?.status == DashboardSessionStatus.signedOut) {
+      unawaited(_closeForLogout());
+    }
+  }
+
+  Future<void> _closeForLogout() async {
+    if (_disposed || _closingForLogout) return;
+    _closingForLogout = true;
+    ++_attempt;
+    _pendingReply = null;
+    _pendingStop = false;
+    _backgrounded = true;
+    final cancelCapture = _cancelCurrentCapture;
+    _cancelCurrentCapture = null;
+    await cancelCapture?.call();
+    final previousEnabled = _enabledSub;
+    _enabledSub = null;
+    unawaited(previousEnabled?.cancel());
+    final previous = _controller;
+    _controller = null;
+    _live = null;
+    // Closing the activity unmounts WalkiePanel's stream listeners. Dispose
+    // only after requesting that close: waiting for the subjects here would
+    // deadlock against the still-mounted panel that owns those listeners.
+    unawaited(previous?.dispose());
+    if (!_disposed) _close();
   }
 
   Future<WalkieController> _start() async {
@@ -202,6 +240,7 @@ class _AssistantPageState extends State<AssistantPage> {
       actorId: root,
       deps: deps,
       sessionRepliesOnly: true,
+      androidAssistantSession: true,
     );
     _controller = controller;
     if (_backgrounded || captureSuppressed) controller.suspendPlayback();
@@ -422,6 +461,7 @@ class _AssistantPageState extends State<AssistantPage> {
   @override
   void dispose() {
     _disposed = true;
+    widget.session?.removeListener(_onSessionChanged);
     final signals = widget.signals;
     if (signals != null) {
       if (signals.onBackground == _background) signals.onBackground = null;

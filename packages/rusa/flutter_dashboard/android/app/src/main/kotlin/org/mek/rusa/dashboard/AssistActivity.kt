@@ -53,7 +53,7 @@ class AssistActivity : FlutterActivity() {
             withHeadset = true,
         )
         assistant = channel
-        answerHeadset(intent, channel)
+        if (!restoringFromRecents) answerHeadset(intent, channel)
         pendingReply?.let { deferReplyUntilUnlocked(channel, it) }
     }
 
@@ -163,6 +163,7 @@ class AssistActivity : FlutterActivity() {
             return
         }
         pendingReply = reply
+        val retainBackgroundTask = backgrounded
         // Keep a generic system notification on the lock screen, but never
         // show its old conversation or play audio until device authentication.
         setShowWhenLocked(false)
@@ -178,18 +179,28 @@ class AssistActivity : FlutterActivity() {
 
                 override fun onDismissCancelled() {
                     // A cancelled keyguard request has no safe reply handoff.
-                    // Do not reveal a retained session or start capture from a
-                    // notification route that never reached post-unlock Dart.
-                    pendingReply = null
-                    finish()
+                    abandonReplyHandoff(retainBackgroundTask)
                 }
 
                 override fun onDismissError() {
-                    pendingReply = null
-                    finish()
+                    abandonReplyHandoff(retainBackgroundTask)
                 }
             })
         }
+    }
+
+    private fun abandonReplyHandoff(retainBackgroundTask: Boolean) {
+        // A warm retained activity belongs back in Android's background after
+        // a cancelled unlock: closing it would discard the session that the
+        // notification never safely handed to Dart. A cold notification task
+        // has no retained session and can finish normally.
+        pendingReply = null
+        if (retainBackgroundTask) {
+            setShowWhenLocked(false)
+            setTurnScreenOn(false)
+            return
+        }
+        finish()
     }
 
     private fun deliverReply(channel: AssistantChannel, reply: Pair<String, String>) {
