@@ -564,12 +564,6 @@ export class VoiceService {
 
     const text = speakableText(event.body);
     if (!text) return null;
-    const prior = messageId ? this.get(messageId) : undefined;
-    if (prior) {
-      if (prior.actorId !== senderId || prior.recipientId !== recipientId) return null;
-      onAnnouncement?.(prior);
-      return prior;
-    }
 
     // The emitter invokes this method synchronously up to its first await.
     // Register the marker before starting synthesis so a transfer called in the

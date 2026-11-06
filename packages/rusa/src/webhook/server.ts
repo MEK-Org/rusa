@@ -660,18 +660,12 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           log.child({ component: "voice-push" })
         )
       : undefined;
+  // The Android assistant is walkie-to-root. The voice wire applies that
+  // eligibility check before delivery, so a transferred session can still use
+  // its own SSE path without creating a notification that the root-only page
+  // would reject.
   const pushDelivery: VoicePushDelivery | undefined =
-    fcmDelivery && options.voice?.rootActorId
-      ? {
-          // The Android assistant remains walkie-to-root. A transferred voice
-          // session may still stream its own actor's replies, but it must not
-          // turn a generic notification into a non-root capture surface.
-          deliver: (push) =>
-            push.actorId === options.voice?.rootActorId
-              ? fcmDelivery.deliver(push)
-              : Promise.resolve(),
-        }
-      : undefined;
+    fcmDelivery && options.voice?.rootActorId ? fcmDelivery : undefined;
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
@@ -758,7 +752,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           options.voice.service,
           sseHub,
           log.child({ component: "voice-outbound" }),
-          pushDelivery
+          pushDelivery,
+          options.voice.rootActorId
         )
       : null;
   // The session registry lives in VoiceService while the targeted wire channel

@@ -29,9 +29,7 @@ export class PushDeviceTokenRepository {
            principal_id = excluded.principal_id`
       )
       .run(normalizedToken, principalId);
-    const stored = this.get(normalizedToken);
-    if (!stored) throw new Error("push token registration was not stored");
-    return stored;
+    return { token: normalizedToken, principalId };
   }
 
   /** Delete only a token the authenticated principal owns. */
@@ -60,12 +58,6 @@ export class PushDeviceTokenRepository {
     ).map(toPushDeviceToken);
   }
 
-  get(token: string): PushDeviceToken | undefined {
-    const row = this.db
-      .prepare(`SELECT ${COLUMNS} FROM push_device_tokens WHERE token = ?`)
-      .get(token) as PushDeviceTokenRow | undefined;
-    return row ? toPushDeviceToken(row) : undefined;
-  }
 }
 
 function requireToken(value: string): string {

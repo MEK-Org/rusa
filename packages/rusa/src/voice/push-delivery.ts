@@ -1,17 +1,12 @@
 import type { PushDeviceTokenRepository } from "../db/repositories/push-device-token-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import type { VoicePushTarget } from "./voice-service.js";
 
 export const REPLY_NOTIFICATION_CLICK_ACTION = "org.mek.rusa.dashboard.OPEN_REPLY";
 
-export interface VoicePush {
-  actorId: string;
-  announcementId: string;
-  recipientId: string;
-}
-
 /** Delivery boundary kept small enough to fake without Firebase in unit tests. */
 export interface VoicePushDelivery {
-  deliver(push: VoicePush): Promise<void>;
+  deliver(push: VoicePushTarget): Promise<void>;
 }
 
 export interface FcmMessageSender {
@@ -40,7 +35,7 @@ export class FcmVoicePushDelivery implements VoicePushDelivery {
     private readonly logger: Logger = nullLogger
   ) {}
 
-  async deliver(push: VoicePush): Promise<void> {
+  async deliver(push: VoicePushTarget): Promise<void> {
     const registrations = this.tokens.listForPrincipal(push.recipientId);
     await Promise.all(
       registrations.map(async ({ token }) => {

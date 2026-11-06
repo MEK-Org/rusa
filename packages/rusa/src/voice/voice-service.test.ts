@@ -582,7 +582,7 @@ describe("attachVoiceOutbound", () => {
     const emitter = new MeshEventEmitter();
     const pushVoice = vi.fn();
     const deliver = vi.fn(async () => undefined);
-    attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver });
+    attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver }, ACTOR);
 
     emitter.emitMeshEvent(
       replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
@@ -596,6 +596,20 @@ describe("attachVoiceOutbound", () => {
       })
     );
     expect(pushVoice).not.toHaveBeenCalled();
+  });
+
+  it("does not notify for a non-root transferred voice actor", async () => {
+    const { service } = makeService();
+    const emitter = new MeshEventEmitter();
+    const pushVoice = vi.fn();
+    const deliver = vi.fn(async () => undefined);
+    attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver }, TARGET);
+
+    emitter.emitMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
+    );
+
+    expect(deliver).not.toHaveBeenCalled();
   });
 });
 

@@ -99,11 +99,12 @@ export function attachVoiceOutbound(
   service: VoiceService,
   hub: { pushVoice(frame: VoiceAnnouncementFrame): void },
   logger: Logger = nullLogger,
-  pushDelivery?: VoicePushDelivery
+  pushDelivery?: VoicePushDelivery,
+  rootActorId?: string
 ): () => void {
   return emitter.onMeshEvent((event) => {
     const push = service.pushTargetForMeshEvent(event);
-    if (pushDelivery && push) {
+    if (pushDelivery && push && (!rootActorId || push.actorId === rootActorId)) {
       void pushDelivery
         .deliver(push)
         .catch((err) => logger.warn("voice_push_dispatch_failed", { actorId: push.actorId, err }));
