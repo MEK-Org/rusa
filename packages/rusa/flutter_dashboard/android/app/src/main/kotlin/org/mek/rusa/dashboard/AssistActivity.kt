@@ -80,11 +80,17 @@ class AssistActivity : FlutterActivity() {
         setTurnScreenOn(true)
         restoringFromRecents = false
         if (isDeviceLocked()) {
-            // A lock-screen gesture starts a new restricted session. Never
-            // surface retained unlocked chat rows or queued audio over the
-            // keyguard before its fresh capture begins.
-            backgrounded = false
-            channel.lockedAssist()
+            if (backgrounded) {
+                // A lock-screen gesture after a retained, unlocked session
+                // starts a new restricted capture. Never surface that old
+                // chat or queued audio over the keyguard first.
+                backgrounded = false
+                channel.lockedAssist()
+            } else {
+                // The initial locked capture is already restricted; a second
+                // gesture keeps its existing stop-and-send contract.
+                channel.trigger()
+            }
             answerHeadset(intent, channel)
             return
         }
@@ -112,6 +118,15 @@ class AssistActivity : FlutterActivity() {
     override fun onStart() {
         super.onStart()
         if (!backgrounded || pendingReply != null) return
+        if (isDeviceLocked()) {
+            // A retained unlocked task must not render its transcript over the
+            // keyguard merely because Android starts it again. A later locked
+            // assist gesture explicitly re-enables this restricted surface and
+            // requests a fresh capture through onNewIntent().
+            setShowWhenLocked(false)
+            setTurnScreenOn(false)
+            return
+        }
         backgrounded = false
         restoringFromRecents = false
         // Dart restores visibility while retaining the playback suspension;

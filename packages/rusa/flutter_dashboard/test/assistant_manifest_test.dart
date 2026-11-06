@@ -71,6 +71,16 @@ void main() {
     );
     expect(assistActivity, contains('Uri.Builder().path("recents")'));
     expect(assistActivity, contains('assistant?.foreground()'));
+    expect(
+      assistActivity,
+      contains('A retained unlocked task must not render its transcript'),
+    );
+    expect(assistActivity, contains('setShowWhenLocked(false)'));
+    expect(
+      assistActivity,
+      contains('The initial locked capture is already restricted'),
+    );
+    expect(assistActivity, contains('channel.trigger()'));
     expect(assistActivity, contains('finish()'));
   });
 }

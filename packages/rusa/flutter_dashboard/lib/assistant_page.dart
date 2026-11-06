@@ -252,9 +252,11 @@ class _AssistantPageState extends State<AssistantPage> {
     }
 
     // Walkie off (the panel's power button) ends the assist session.
-    _enabledSub = controller.enabled.skip(1).listen((enabled) {
-      if (!enabled) _close();
+    late final StreamSubscription<bool> enabledSub;
+    enabledSub = controller.enabled.skip(1).listen((enabled) {
+      if (!enabled && identical(_enabledSub, enabledSub)) _close();
     });
+    _enabledSub = enabledSub;
     _live = controller;
     final pendingReply = _pendingReply;
     _pendingReply = null;
@@ -388,6 +390,12 @@ class _AssistantPageState extends State<AssistantPage> {
     _backgrounded = false;
     _suppressInitialCapture = false;
     await _cancelCurrentCapture?.call();
+    // Disposing a walkie controller emits `enabled: false`. Detach its
+    // walkie-off listener before disposal so replacing a retained session does
+    // not also finish the newly requested locked assist task.
+    final previousEnabled = _enabledSub;
+    _enabledSub = null;
+    unawaited(previousEnabled?.cancel());
     final previous = _controller;
     _controller = null;
     _live = null;

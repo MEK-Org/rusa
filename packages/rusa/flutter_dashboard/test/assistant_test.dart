@@ -238,6 +238,12 @@ void main() {
         );
         expect(walkie.player.playedUrls, isEmpty);
         expect(walkie.recorder.startCalls, 2);
+        expect(
+          closed,
+          0,
+          reason:
+              'disposing the replaced session must not finish its replacement',
+        );
         await unmount(tester);
       },
     );
