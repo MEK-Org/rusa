@@ -3,18 +3,14 @@ import type Database from "better-sqlite3";
 export interface PushDeviceToken {
   token: string;
   principalId: string;
-  registeredAt: string;
-  refreshedAt: string;
 }
 
 type PushDeviceTokenRow = {
   token: string;
   principal_id: string;
-  registered_at: string;
-  refreshed_at: string;
 };
 
-const COLUMNS = "token, principal_id, registered_at, refreshed_at";
+const COLUMNS = "token, principal_id";
 
 /**
  * Principal-bound FCM device registration storage. A token can belong to only
@@ -24,21 +20,15 @@ const COLUMNS = "token, principal_id, registered_at, refreshed_at";
 export class PushDeviceTokenRepository {
   constructor(private readonly db: Database.Database) {}
 
-  register(principalId: string, token: string, now: string): PushDeviceToken {
+  register(principalId: string, token: string): PushDeviceToken {
     const normalizedToken = requireToken(token);
     this.db
       .prepare(
-        `INSERT INTO push_device_tokens (${COLUMNS}) VALUES (?, ?, ?, ?)
+        `INSERT INTO push_device_tokens (${COLUMNS}) VALUES (?, ?)
          ON CONFLICT(token) DO UPDATE SET
-           principal_id = excluded.principal_id,
-           registered_at = CASE
-             WHEN push_device_tokens.principal_id = excluded.principal_id
-               THEN push_device_tokens.registered_at
-             ELSE excluded.registered_at
-           END,
-           refreshed_at = excluded.refreshed_at`
+           principal_id = excluded.principal_id`
       )
-      .run(normalizedToken, principalId, now, now);
+      .run(normalizedToken, principalId);
     const stored = this.get(normalizedToken);
     if (!stored) throw new Error("push token registration was not stored");
     return stored;
@@ -64,7 +54,7 @@ export class PushDeviceTokenRepository {
         .prepare(
           `SELECT ${COLUMNS} FROM push_device_tokens
            WHERE principal_id = ?
-           ORDER BY registered_at ASC, token ASC`
+           ORDER BY token ASC`
         )
         .all(principalId) as PushDeviceTokenRow[]
     ).map(toPushDeviceToken);
@@ -88,7 +78,5 @@ function toPushDeviceToken(row: PushDeviceTokenRow): PushDeviceToken {
   return {
     token: row.token,
     principalId: row.principal_id,
-    registeredAt: row.registered_at,
-    refreshedAt: row.refreshed_at,
   };
 }

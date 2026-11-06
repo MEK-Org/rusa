@@ -33,13 +33,16 @@ Future<DashboardSession> platformBootstrapSession() =>
     bootstrapDashboardSession();
 
 DashboardSessionHooksDisposer Function(DashboardSession session)?
-get platformBrowserHooksBuilder =>
-    (session) => DashboardSessionBrowserHooks(session).dispose;
+    get platformBrowserHooksBuilder =>
+        (session) => DashboardSessionBrowserHooks(session).dispose;
 
 DashboardApi platformCreateDashboardApi(DashboardSession session) =>
     DashboardApi(base: Uri.base, session: session);
 
-MeshStreamSource platformCreateMeshStream(DashboardSession session, Uri base) =>
+MeshStreamSource platformCreateMeshStream(
+  DashboardSession session,
+  Uri base,
+) =>
     WebEventSourceStream(session);
 
 QuotaCache platformCreateQuotaCache() => WebQuotaCache();
@@ -56,7 +59,8 @@ WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
   DashboardSession session, {
   HeadsetRoute? headset,
-}) => webWalkieDeps(api, session);
+}) =>
+    webWalkieDeps(api, session);
 
 AvatarFilePicker platformCreateAvatarFilePicker() => WebAvatarFilePicker();
 

@@ -150,10 +150,7 @@ describe("VoiceService durable reply recovery", () => {
       },
     });
 
-    const [first, second] = await Promise.all([
-      service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID),
-      service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID),
-    ]);
+    const first = await service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID);
 
     expect(first).toMatchObject({
       id: messageId,
@@ -162,7 +159,29 @@ describe("VoiceService durable reply recovery", () => {
       sessionId: "walkie-session",
       text: "Your reply is ready.",
     });
-    expect(second).toBe(first);
+  });
+
+  it("rejects a foreign recovery while a valid recovery is rendering", async () => {
+    const messageId = "reply-message";
+    const { service } = makeService({
+      meshChat: {
+        getById: () => ({
+          id: messageId,
+          ts: "2026-11-06T00:00:00.000Z",
+          senderId: ACTOR,
+          recipientId: TEST_USER_ID,
+          body: "private reply",
+          sessionId: null,
+          responsive: null,
+        }),
+      },
+    });
+
+    const valid = service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID);
+    await expect(
+      service.recoverAnnouncement(messageId, TARGET, TEST_USER_ID)
+    ).resolves.toBeUndefined();
+    await expect(valid).resolves.toMatchObject({ id: messageId, actorId: ACTOR });
   });
 
   it("fails closed when a durable row belongs to another actor or principal", async () => {
@@ -517,7 +536,9 @@ describe("attachVoiceOutbound", () => {
     const pushVoice = vi.fn();
     const detach = attachVoiceOutbound(emitter, service, { pushVoice });
 
-    emitter.emitMeshEvent(replyEvent());
+    emitter.emitMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
+    );
     await vi.waitFor(() => expect(pushVoice).toHaveBeenCalledTimes(1));
     const frame = pushVoice.mock.calls[0][0];
     expect(frame.actorId).toBe(ACTOR);
@@ -547,6 +568,33 @@ describe("attachVoiceOutbound", () => {
     attachVoiceOutbound(emitter, service, { pushVoice });
     expect(() => emitter.emitMeshEvent(replyEvent())).not.toThrow();
     await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pushVoice).not.toHaveBeenCalled();
+  });
+
+  it("dispatches a durable reply notification without SSE presence or TTS", async () => {
+    const { service } = makeService({
+      speech: fakeSpeech({
+        streamSynthesize: async () => {
+          throw new Error("tts down");
+        },
+      }),
+    });
+    const emitter = new MeshEventEmitter();
+    const pushVoice = vi.fn();
+    const deliver = vi.fn(async () => undefined);
+    attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver });
+
+    emitter.emitMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
+    );
+
+    await vi.waitFor(() =>
+      expect(deliver).toHaveBeenCalledWith({
+        actorId: ACTOR,
+        announcementId: "announcement-1",
+        recipientId: TEST_USER_ID,
+      })
+    );
     expect(pushVoice).not.toHaveBeenCalled();
   });
 });

@@ -95,6 +95,13 @@ export interface VoiceAnnouncementFrame {
   createdAt: string;
 }
 
+/** A durable actor reply that may be announced by a device notification. */
+export interface VoicePushTarget {
+  actorId: string;
+  announcementId: string;
+  recipientId: string;
+}
+
 export function toFrame(announcement: VoiceAnnouncement): VoiceAnnouncementFrame {
   return {
     id: announcement.id,
@@ -215,9 +222,6 @@ export class VoiceService {
   private readonly pendingOutboundRenders = new Map<string, Set<Promise<void>>>();
   /** The source-render barrier captured atomically with a session rebind. */
   private readonly pendingTransferControls = new Map<string, Promise<void>>();
-  /** Coalesce simultaneous notification-tap recoveries of one durable reply. */
-  private readonly pendingRecoveries = new Map<string, Promise<VoiceAnnouncement | undefined>>();
-
   constructor(options: VoiceServiceOptions) {
     this.speechFor = options.speechFor;
     this.home = options.home;
@@ -478,6 +482,35 @@ export class VoiceService {
     return lastSeen !== undefined && this.now() - lastSeen < this.presenceGraceMs;
   }
 
+  /**
+   * Extract the durable, principal-scoped identity of a reply eligible for a
+   * device notification. This deliberately does not consult SSE presence or
+   * TTS: either is volatile, while a notification tap recovers from chat.
+   */
+  pushTargetForMeshEvent(event: MeshEvent): VoicePushTarget | null {
+    if (event.kind !== "message_sent" || !event.actorId || !event.payload || !event.body) {
+      return null;
+    }
+    try {
+      const payload = JSON.parse(event.payload) as { to?: unknown; messageId?: unknown };
+      const recipientId = typeof payload.to === "string" ? payload.to : null;
+      const announcementId =
+        typeof payload.messageId === "string" && payload.messageId ? payload.messageId : null;
+      if (
+        !recipientId ||
+        !announcementId ||
+        this.isHumanRecipient(event.actorId) ||
+        !this.isHumanRecipient(recipientId) ||
+        !speakableText(event.body)
+      ) {
+        return null;
+      }
+      return { actorId: event.actorId, announcementId, recipientId };
+    } catch {
+      return null;
+    }
+  }
+
   // ── Inbound: memos ──────────────────────────────────────────────────────
 
   /** Persist raw memo audio under `voice/inbox/`; returns the stored path. */
@@ -582,40 +615,33 @@ export class VoiceService {
         current.actorId === actorId && current.recipientId === principalId ? current : undefined
       );
     }
-    const pending = this.pendingRecoveries.get(id);
-    if (pending) return pending;
-    const recovery = (async () => {
-      const message = this.meshChat?.getById(id);
-      if (
-        !message ||
-        message.senderId !== actorId ||
-        message.recipientId !== principalId ||
-        !this.isHumanRecipient(principalId)
-      ) {
-        return undefined;
-      }
-      const text = speakableText(message.body);
-      if (!text) return undefined;
-      // A concurrent normal render may have populated the ring after the
-      // initial lookup, so do not duplicate audio or change its played state.
-      const raced = this.get(id);
-      if (raced) {
-        return raced.actorId === actorId && raced.recipientId === principalId ? raced : undefined;
-      }
-      return this.renderAnnouncement({
-        id,
-        actorId,
-        recipientId: principalId,
-        sessionId: message.sessionId,
-        text,
-      });
-    })();
-    this.pendingRecoveries.set(id, recovery);
-    void recovery.then(
-      () => this.pendingRecoveries.delete(id),
-      () => this.pendingRecoveries.delete(id)
-    );
-    return recovery;
+    // The row and its complete scope are checked before doing asynchronous
+    // synthesis. Do not coalesce requests: an id-only promise key would let a
+    // concurrent foreign principal receive another user's recovered frame.
+    const message = this.meshChat?.getById(id);
+    if (
+      !message ||
+      message.senderId !== actorId ||
+      message.recipientId !== principalId ||
+      !this.isHumanRecipient(principalId)
+    ) {
+      return Promise.resolve(undefined);
+    }
+    const text = speakableText(message.body);
+    if (!text) return Promise.resolve(undefined);
+    return this.renderAnnouncement({
+      id,
+      actorId,
+      recipientId: principalId,
+      sessionId: message.sessionId,
+      text,
+    }).then((announcement) => {
+      // A recovery is already directed to a specific notification tap. Do not
+      // offer that historical reply again as generic SSE backlog to another
+      // connection before the tapping client finishes playback and acks it.
+      announcement.playedAt = new Date(this.now()).toISOString();
+      return announcement;
+    });
   }
 
   private async renderAnnouncement(input: {

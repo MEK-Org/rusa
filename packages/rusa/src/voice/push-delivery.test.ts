@@ -8,8 +8,6 @@ describe("FcmVoicePushDelivery", () => {
         {
           token: "fcm-a",
           principalId: "principal-a",
-          registeredAt: "2026-11-06T00:00:00.000Z",
-          refreshedAt: "2026-11-06T00:00:00.000Z",
         },
       ]),
       remove: vi.fn(),
@@ -41,14 +39,10 @@ describe("FcmVoicePushDelivery", () => {
         {
           token: "bad",
           principalId: "principal-a",
-          registeredAt: "2026-11-06T00:00:00.000Z",
-          refreshedAt: "2026-11-06T00:00:00.000Z",
         },
         {
           token: "retry",
           principalId: "principal-a",
-          registeredAt: "2026-11-06T00:00:00.000Z",
-          refreshedAt: "2026-11-06T00:00:00.000Z",
         },
       ]),
       remove: vi.fn(),

@@ -434,6 +434,16 @@ class WalkieController {
   /// live/backlog frame, it may predate this fresh activity's SSE session.
   void presentNotificationReply(VoiceAnnouncement announcement) {
     if (!_enabled.value || _disposed || announcement.actorId != actorId) return;
+    final alreadyReceived = _transcript.value.any(
+      (entry) =>
+          entry is ActorReplyEntry && entry.announcement.id == announcement.id,
+    );
+    if (alreadyReceived) {
+      // A notification names one exact reply. Do not let the live SSE queue or
+      // prior playback turn a tap on that reply into a no-op or another reply.
+      replayAnnouncement(announcement);
+      return;
+    }
     _enqueue(announcement);
   }
 

@@ -166,37 +166,6 @@ void main() {
       expect(closed, 1);
     });
 
-    testWidgets('leaving the screen discards the take and ends the session', (
-      tester,
-    ) async {
-      await pumpPage(tester);
-      expect(walkie.recorder.startCalls, 1);
-
-      var ended = false;
-      unawaited(assistant.onEnd!().then((_) => ended = true));
-      await tester.pump();
-      await tester.pump();
-
-      expect(ended, isTrue);
-      expect(walkie.recorder.cancelCalls, 1);
-      expect(walkie.recorder.stopCalls, 0);
-      expect(api.memoSends, isEmpty);
-      expect(api.disabledVoiceSessions, hasLength(1));
-      expect(walkie.wakeLock.releaseCalls, 1);
-      // Native closes the screen; the page does not close it a second time.
-      expect(closed, 0);
-      // A trigger can bring the closing screen back to the front before it
-      // finishes; it shows no panel of the ended session to tap.
-      expect(find.byType(WalkiePanel), findsNothing);
-
-      // A trigger reaching the closing screen starts nothing.
-      assistant.triggerCtrl.add(null);
-      await tester.pump();
-      expect(walkie.recorder.startCalls, 1);
-      await unmount(tester);
-      expect(assistant.onEnd, isNull);
-    });
-
     testWidgets(
       'backgrounding cancels capture but retains the session and queues its reply for return',
       (tester) async {
@@ -263,6 +232,63 @@ void main() {
       },
     );
 
+    testWidgets('locked notification opening waits for a post-unlock reply target', (
+      tester,
+    ) async {
+      api.notificationReply = makeAnnouncement('durable-reply', actor: 'root');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            notificationOpening: true,
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.recorder.startCalls, 0);
+      expect(api.notificationReplyCalls, isEmpty);
+
+      await assistant.onReply!(
+        const AssistantReplyTarget(actorId: 'root', announcementId: 'durable-reply'),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(api.notificationReplyCalls, [
+        (actorId: 'root', announcementId: 'durable-reply'),
+      ]);
+      expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/durable-reply']);
+      await unmount(tester);
+    });
+
+    testWidgets('notification input cannot rebind the root-only assistant', (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            initialReply: const AssistantReplyTarget(
+              actorId: 'worker',
+              announcementId: 'foreign-conversation-reply',
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.stream.connectCalls.single.actors, ['root']);
+      expect(walkie.recorder.startCalls, 0);
+      expect(api.notificationReplyCalls, isEmpty);
+      await unmount(tester);
+    });
+
     testWidgets('backgrounding during startup returns with an idle session', (
       tester,
     ) async {
@@ -297,38 +323,6 @@ void main() {
       final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
       expect(panel.controller.record.value.phase, RecordPhase.idle);
 
-      await unmount(tester);
-    });
-
-    testWidgets('leaving the screen during the root lookup cancels capture', (
-      tester,
-    ) async {
-      final gate = Completer<ThreadsSnapshot>();
-      api.threadSnapshotGates.add(gate);
-      await pumpPage(tester);
-
-      var ended = false;
-      unawaited(assistant.onEnd!().then((_) => ended = true));
-      await tester.pump();
-      // Ending waits for the start in flight to settle.
-      expect(ended, isFalse);
-
-      gate.complete(
-        ThreadsSnapshot(
-          halted: false,
-          threads: api.threadsResult,
-          rootActorId: 'root',
-        ),
-      );
-      await tester.pump();
-      await tester.pump();
-
-      expect(ended, isTrue);
-      expect(walkie.streams, isEmpty);
-      expect(walkie.recorder.startCalls, 1);
-      expect(walkie.recorder.cancelCalls, 1);
-      expect(walkie.recorder.stopCalls, 0);
-      expect(api.memoSends, isEmpty);
       await unmount(tester);
     });
 
@@ -1001,36 +995,6 @@ void main() {
       expect(await assistant.acquire(), isFalse);
       await assistant.release();
       expect(calls, ['acquireHeadset', 'releaseHeadset']);
-    });
-
-    test('answers native\'s end once the session has ended', () async {
-      final assistant = IoAssistantChannel(channel: channel);
-      final ending = Completer<void>();
-      assistant.onEnd = () => ending.future;
-      var replied = false;
-      unawaited(
-        messenger.handlePlatformMessage(
-          channel.name,
-          const StandardMethodCodec().encodeMethodCall(const MethodCall('end')),
-          (_) => replied = true,
-        ),
-      );
-      await pumpEventQueue();
-      expect(replied, isFalse);
-
-      ending.complete();
-      await pumpEventQueue();
-      expect(replied, isTrue);
-
-      // With no page to end, native gets its answer at once.
-      assistant.onEnd = null;
-      replied = false;
-      await messenger.handlePlatformMessage(
-        channel.name,
-        const StandardMethodCodec().encodeMethodCall(const MethodCall('end')),
-        (_) => replied = true,
-      );
-      expect(replied, isTrue);
     });
 
     test('forwards native triggers and route loss', () async {

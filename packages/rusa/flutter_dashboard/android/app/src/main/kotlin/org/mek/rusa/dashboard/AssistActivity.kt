@@ -1,6 +1,7 @@
 package org.mek.rusa.dashboard
 
 import android.content.Intent
+import android.app.KeyguardManager
 import android.net.Uri
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -16,11 +17,19 @@ import io.flutter.embedding.engine.FlutterEngine
 class AssistActivity : FlutterActivity() {
     private var assistant: AssistantChannel? = null
     private var backgrounded = false
+    private var pendingReply: Pair<String, String>? = null
 
     override fun getDartEntrypointFunctionName(): String = "assistMain"
 
     override fun getInitialRoute(): String? {
         val reply = replyTarget(intent) ?: return super.getInitialRoute()
+        if (isDeviceLocked()) {
+            pendingReply = reply
+            // Do not hand reply identifiers to Dart until the keyguard has
+            // been dismissed. The page waits without starting microphone
+            // capture, then receives the target through the channel.
+            return Uri.Builder().path("reply-pending").build().toString()
+        }
         return Uri.Builder()
             .path("reply")
             .appendQueryParameter("actorId", reply.first)
@@ -38,20 +47,25 @@ class AssistActivity : FlutterActivity() {
         )
         assistant = channel
         answerHeadset(intent, channel)
+        pendingReply?.let { deferReplyUntilUnlocked(channel, it) }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         val channel = assistant ?: return
+        val reply = replyTarget(intent)
+        if (reply != null) {
+            deferReplyUntilUnlocked(channel, reply)
+            return
+        }
+        // An ordinary assist trigger retains the previously approved locked
+        // walkie surface. A reply notification never changes that policy.
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
         if (backgrounded) {
             backgrounded = false
             channel.foreground()
-        }
-        val reply = replyTarget(intent)
-        if (reply != null) {
-            channel.reply(reply.first, reply.second)
-            return
         }
         answerHeadset(intent, channel)
         channel.trigger()
@@ -72,13 +86,9 @@ class AssistActivity : FlutterActivity() {
 
     override fun onStart() {
         super.onStart()
-        if (!backgrounded) return
+        if (!backgrounded || pendingReply != null) return
         backgrounded = false
         assistant?.foreground()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
     }
 
     /**
@@ -99,6 +109,32 @@ class AssistActivity : FlutterActivity() {
             ?: return null
         return actorId to announcementId
     }
+
+    private fun deferReplyUntilUnlocked(channel: AssistantChannel, reply: Pair<String, String>) {
+        if (!isDeviceLocked()) {
+            pendingReply = null
+            channel.reply(reply.first, reply.second)
+            return
+        }
+        pendingReply = reply
+        // Keep a generic system notification on the lock screen, but never
+        // show its old conversation or play audio until device authentication.
+        setShowWhenLocked(false)
+        setTurnScreenOn(false)
+        window.decorView.post {
+            val keyguard = getSystemService(KeyguardManager::class.java) ?: return@post
+            keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                override fun onDismissSucceeded() {
+                    val target = pendingReply ?: return
+                    pendingReply = null
+                    channel.reply(target.first, target.second)
+                }
+            })
+        }
+    }
+
+    private fun isDeviceLocked(): Boolean =
+        getSystemService(KeyguardManager::class.java)?.isDeviceLocked == true
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         assistant?.dispose()

@@ -102,20 +102,15 @@ export function attachVoiceOutbound(
   pushDelivery?: VoicePushDelivery
 ): () => void {
   return emitter.onMeshEvent((event) => {
+    const push = service.pushTargetForMeshEvent(event);
+    if (pushDelivery && push) {
+      void pushDelivery
+        .deliver(push)
+        .catch((err) => logger.warn("voice_push_dispatch_failed", { actorId: push.actorId, err }));
+    }
     void service
       .handleMeshEvent(event, (announcement) => {
         hub.pushVoice(toFrame(announcement));
-        if (pushDelivery) {
-          void pushDelivery
-            .deliver({
-              actorId: announcement.actorId,
-              announcementId: announcement.id,
-              recipientId: announcement.recipientId,
-            })
-            .catch((err) =>
-              logger.warn("voice_push_dispatch_failed", { actorId: announcement.actorId, err })
-            );
-        }
       })
       .catch((err) => {
         logger.warn("voice_reply_tts_failed", { actorId: event.actorId, err });

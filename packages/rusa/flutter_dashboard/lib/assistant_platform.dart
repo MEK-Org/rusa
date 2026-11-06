@@ -61,11 +61,6 @@ abstract interface class AssistantSignals {
   /// Plays a short audible ready cue once capture is actively listening.
   Future<void> playReadyCue();
 
-  /// Ends the session when the assist screen is closing because it left the
-  /// screen. The screen closes once the returned future settles, or after a
-  /// native deadline. Null when no page owns the screen.
-  abstract Future<void> Function()? onEnd;
-
   /// The assist task is no longer visible. Stop capture and playback without
   /// ending its authenticated reply session, so it can be returned to.
   abstract Future<void> Function()? onBackground;

@@ -38,9 +38,6 @@ class IoAssistantChannel implements AssistantPlatform {
   }
 
   @override
-  Future<void> Function()? onEnd;
-
-  @override
   Future<void> Function()? onBackground;
 
   @override
@@ -55,8 +52,6 @@ class IoAssistantChannel implements AssistantPlatform {
         _triggers.add(null);
       case 'routeLost':
         _routeLost.add(null);
-      case 'end':
-        await onEnd?.call();
       case 'background':
         await onBackground?.call();
       case 'foreground':

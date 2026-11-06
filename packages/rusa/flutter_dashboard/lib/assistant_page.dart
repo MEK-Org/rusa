@@ -6,7 +6,6 @@ import 'package:flutter/services.dart';
 import 'api.dart';
 import 'assistant_platform.dart';
 import 'models.dart';
-import 'reply_notifications.dart';
 import 'theme.dart';
 import 'voice_platform.dart';
 import 'walkie_controller.dart';
@@ -24,7 +23,7 @@ class AssistantPage extends StatefulWidget {
     required this.createWalkieDeps,
     this.signals,
     this.initialReply,
-    this.notifications,
+    this.notificationOpening = false,
     this.onClose,
   });
 
@@ -32,7 +31,9 @@ class AssistantPage extends StatefulWidget {
   final WalkieDeps? Function(DashboardApi api) createWalkieDeps;
   final AssistantSignals? signals;
   final AssistantReplyTarget? initialReply;
-  final ReplyNotifications? notifications;
+  /// A notification was opened while the keyguard was locked; native code
+  /// supplies its target only after the user unlocks.
+  final bool notificationOpening;
 
   /// Leaves the assist screen; defaults to finishing the activity.
   final VoidCallback? onClose;
@@ -54,7 +55,6 @@ class _AssistantPageState extends State<AssistantPage> {
   final _subs = <StreamSubscription<Object?>>[];
   StreamSubscription<bool>? _enabledSub;
   int _attempt = 0;
-  bool _ended = false;
   bool _disposed = false;
   bool _backgrounded = false;
   bool _pendingStop = false;
@@ -71,7 +71,6 @@ class _AssistantPageState extends State<AssistantPage> {
     if (signals != null) {
       _subs.add(signals.triggers.listen((_) => unawaited(_onTrigger())));
       _subs.add(signals.routeLost.listen((_) => unawaited(_onRouteLost())));
-      signals.onEnd = _end;
       signals.onBackground = _background;
       signals.onForeground = _foreground;
       signals.onReply = _receiveReply;
@@ -97,8 +96,9 @@ class _AssistantPageState extends State<AssistantPage> {
     //
     // Scoped per attempt: cancellation only affects the active attempt;
     // a stale attempt never touches the shared recorder so it cannot cancel a
-    // newer take, leaving _end(), dispose() and a newer start() to release it.
-    final notificationOpening = widget.initialReply != null;
+    // newer take, leaving dispose() and a newer start() to release it.
+    final notificationOpening =
+        widget.initialReply != null || widget.notificationOpening;
     var captureActive = !notificationOpening;
     Future<void> cancelCapture() async {
       if (!captureActive) return;
@@ -182,9 +182,10 @@ class _AssistantPageState extends State<AssistantPage> {
 
     unawaited(_controller?.dispose());
     final controller = WalkieController(
-      // A notification can only select the actor that sent its durable reply;
-      // the page still exposes no general navigation surface.
-      actorId: widget.initialReply?.actorId ?? root,
+      // This surface stays walkie-to-root. A reply target is accepted only
+      // when it belongs to that same root conversation; it never rebinds the
+      // recipient of a later assist gesture or headset trigger.
+      actorId: root,
       deps: deps,
       sessionRepliesOnly: true,
     );
@@ -209,10 +210,6 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
-    // Registration is intentionally best-effort: an unavailable FCM service
-    // must not disrupt an already-authenticated assistant capture.
-    unawaited(widget.notifications?.register(_api).catchError((_) {}));
-
     await captureFuture;
     if (captureError != null) {
       if (_cancelCurrentCapture == cancelCapture) {
@@ -262,7 +259,16 @@ class _AssistantPageState extends State<AssistantPage> {
     final controller = _live;
     if (controller == null) return;
     _pendingReply = null;
+    // A reply tap never sends a partial memo or resumes an older queued reply
+    // first. It selects one reply and then resumes only that playback path.
+    _pendingStop = false;
+    await _cancelCurrentCapture?.call();
+    await controller.cancelRecord();
+    controller.suspendPlayback();
     await _presentReply(controller, target);
+    if (!_disposed && identical(_controller, controller)) {
+      controller.resumePlayback();
+    }
   }
 
   Future<void> _presentReply(
@@ -325,37 +331,6 @@ class _AssistantPageState extends State<AssistantPage> {
     _controller?.resumePlayback();
   }
 
-  /// The screen is closing because it left the screen. End the session
-  /// before the engine goes, as walkie off does: the recorder cancels, which
-  /// deletes the partial take, and the server's voice session is disabled.
-  Future<void> _end() async {
-    // A start still in flight is now stale and discards what it built.
-    _attempt++;
-    // A trigger can bring the closing screen back to the front before it
-    // finishes; it shows nothing of the ended session to tap.
-    if (mounted) setState(() => _ended = true);
-    // Cancelled now, walkie off below cannot also close the screen.
-    unawaited(_enabledSub?.cancel());
-    _enabledSub = null;
-    final controller = _controller;
-    _controller = null;
-    _live = null;
-    final cancelCapture = _cancelCurrentCapture;
-    _cancelCurrentCapture = null;
-    final pending = _ready;
-    if (controller != null) {
-      await controller.dispose();
-    }
-    if (cancelCapture != null) {
-      await cancelCapture();
-    }
-    try {
-      await pending;
-    } catch (_) {
-      // A failed or discarded start holds nothing.
-    }
-  }
-
   void _close() {
     final onClose = widget.onClose;
     if (onClose != null) {
@@ -370,7 +345,6 @@ class _AssistantPageState extends State<AssistantPage> {
     _disposed = true;
     final signals = widget.signals;
     if (signals != null) {
-      if (signals.onEnd == _end) signals.onEnd = null;
       if (signals.onBackground == _background) signals.onBackground = null;
       if (signals.onForeground == _foreground) signals.onForeground = null;
       if (signals.onReply == _receiveReply) signals.onReply = null;
@@ -385,7 +359,6 @@ class _AssistantPageState extends State<AssistantPage> {
     if (_cancelCurrentCapture != null) {
       unawaited(_cancelCurrentCapture?.call());
     }
-    widget.notifications?.dispose();
     super.dispose();
   }
 
@@ -406,7 +379,6 @@ class _AssistantPageState extends State<AssistantPage> {
         child: FutureBuilder<WalkieController>(
           future: _ready,
           builder: (context, snapshot) {
-            if (_ended) return const SizedBox.shrink();
             final controller = snapshot.data;
             if (controller != null) {
               return WalkiePanel(controller: controller, expanded: true);

@@ -300,11 +300,7 @@ describe("handleVoiceApiRequest", () => {
 
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({ ok: true });
-      expect(pushDeviceTokens.register).toHaveBeenCalledWith(
-        LOCAL_USER,
-        "fcm-token",
-        expect.any(String)
-      );
+      expect(pushDeviceTokens.register).toHaveBeenCalledWith(LOCAL_USER, "fcm-token");
     });
 
     it("revokes only the authenticated principal's registration", async () => {

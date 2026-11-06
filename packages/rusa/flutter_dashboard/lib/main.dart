@@ -43,7 +43,7 @@ void assistMain() {
   WidgetsFlutterBinding.ensureInitialized();
   platformInit();
   final assistant = platformCreateAssistant();
-  final initialReply = _initialAssistantReply();
+  final launch = _initialAssistantLaunch();
   runApp(
     RusaDashboardApp(
       title: resolveDashboardTitle(platformDocumentTitle),
@@ -54,26 +54,41 @@ void assistMain() {
         createWalkieDeps: (api) =>
             platformCreateWalkieDeps(api, session, headset: assistant),
         signals: assistant,
-        initialReply: initialReply,
-        notifications: platformCreateReplyNotifications(),
+        initialReply: launch.reply,
+        notificationOpening: launch.waitingForUnlock,
       ),
     ),
   );
 }
 
-AssistantReplyTarget? _initialAssistantReply() {
+class _AssistantLaunch {
+  const _AssistantLaunch({this.reply, this.waitingForUnlock = false});
+
+  final AssistantReplyTarget? reply;
+  final bool waitingForUnlock;
+}
+
+_AssistantLaunch _initialAssistantLaunch() {
   final route = WidgetsBinding.instance.platformDispatcher.defaultRouteName;
   final uri = Uri.tryParse(route);
-  if (uri == null || (uri.path != 'reply' && uri.path != '/reply')) return null;
+  if (uri == null) return const _AssistantLaunch();
+  if (uri.path == 'reply-pending' || uri.path == '/reply-pending') {
+    return const _AssistantLaunch(waitingForUnlock: true);
+  }
+  if (uri.path != 'reply' && uri.path != '/reply') {
+    return const _AssistantLaunch();
+  }
   final actorId = uri.queryParameters['actorId'];
   final announcementId = uri.queryParameters['announcementId'];
   if (actorId == null ||
       actorId.isEmpty ||
       announcementId == null ||
       announcementId.isEmpty) {
-    return null;
+    return const _AssistantLaunch();
   }
-  return AssistantReplyTarget(actorId: actorId, announcementId: announcementId);
+  return _AssistantLaunch(
+    reply: AssistantReplyTarget(actorId: actorId, announcementId: announcementId),
+  );
 }
 
 class DashboardPage extends StatefulWidget {
@@ -97,6 +112,12 @@ class _DashboardPageState extends State<DashboardPage> {
     _api = platformCreateDashboardApi(widget.session);
     _replyNotifications = platformCreateReplyNotifications();
     widget.session.addBeforeLogoutListener(_revokePushToken);
+    if (widget.session.authenticationEnabled) {
+      // Ask while the ordinary unlocked dashboard is visible. An FCM
+      // permission prompt must never interrupt an immediate assist capture or
+      // be presented over the keyguard.
+      unawaited(_registerPushToken());
+    }
     _store = DashboardStore(
       api: _api,
       stream: platformCreateMeshStream(widget.session, _api.base),
@@ -126,6 +147,15 @@ class _DashboardPageState extends State<DashboardPage> {
     } catch (_) {
       // Logout still clears the authenticated dashboard session. The server's
       // generic notification contains no reply body and cleans invalid tokens.
+    }
+  }
+
+  Future<void> _registerPushToken() async {
+    try {
+      await _replyNotifications?.register(_api);
+    } catch (_) {
+      // Registration is additive: dashboard use and normal session refresh
+      // remain available when Firebase Messaging is unavailable.
     }
   }
 

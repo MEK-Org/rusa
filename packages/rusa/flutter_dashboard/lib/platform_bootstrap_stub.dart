@@ -19,12 +19,15 @@ Future<DashboardSession> platformBootstrapSession() =>
     throw UnsupportedError('platformBootstrapSession');
 
 DashboardSessionHooksDisposer Function(DashboardSession session)?
-get platformBrowserHooksBuilder => null;
+    get platformBrowserHooksBuilder => null;
 
 DashboardApi platformCreateDashboardApi(DashboardSession session) =>
     DashboardApi(session: session);
 
-MeshStreamSource platformCreateMeshStream(DashboardSession session, Uri base) =>
+MeshStreamSource platformCreateMeshStream(
+  DashboardSession session,
+  Uri base,
+) =>
     throw UnsupportedError('platformCreateMeshStream');
 
 QuotaCache platformCreateQuotaCache() => const NoopQuotaCache();
@@ -42,7 +45,8 @@ WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
   DashboardSession session, {
   HeadsetRoute? headset,
-}) => null;
+}) =>
+    null;
 
 AvatarFilePicker? platformCreateAvatarFilePicker() => null;
 

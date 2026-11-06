@@ -12,9 +12,7 @@ export const pushDeviceTokens: Migration = {
     db.exec(`
       CREATE TABLE push_device_tokens (
         token TEXT PRIMARY KEY CHECK (length(trim(token)) > 0),
-        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
-        registered_at TEXT NOT NULL,
-        refreshed_at TEXT NOT NULL
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE
       );
       CREATE INDEX push_device_tokens_principal_idx
         ON push_device_tokens(principal_id);

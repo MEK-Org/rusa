@@ -26,35 +26,31 @@ describe("PushDeviceTokenRepository", () => {
     }).id;
   });
 
-  it("refreshes a principal's token without changing its original registration", () => {
-    tokens.register(one, " token-a ", "2026-11-06T01:00:00.000Z");
-    const refreshed = tokens.register(one, "token-a", "2026-11-06T02:00:00.000Z");
+  it("normalizes a principal's repeated token registration", () => {
+    tokens.register(one, " token-a ");
+    const refreshed = tokens.register(one, "token-a");
 
     expect(refreshed).toEqual({
       token: "token-a",
       principalId: one,
-      registeredAt: "2026-11-06T01:00:00.000Z",
-      refreshedAt: "2026-11-06T02:00:00.000Z",
     });
   });
 
   it("moves a refreshed device token to its newly authenticated principal", () => {
-    tokens.register(one, "token-a", "2026-11-06T01:00:00.000Z");
-    tokens.register(two, "token-a", "2026-11-06T02:00:00.000Z");
+    tokens.register(one, "token-a");
+    tokens.register(two, "token-a");
 
     expect(tokens.listForPrincipal(one)).toEqual([]);
     expect(tokens.listForPrincipal(two)).toEqual([
       {
         token: "token-a",
         principalId: two,
-        registeredAt: "2026-11-06T02:00:00.000Z",
-        refreshedAt: "2026-11-06T02:00:00.000Z",
       },
     ]);
   });
 
   it("cannot revoke another principal's token", () => {
-    tokens.register(one, "token-a", "2026-11-06T01:00:00.000Z");
+    tokens.register(one, "token-a");
 
     expect(tokens.revoke(two, "token-a")).toBe(false);
     expect(tokens.listForPrincipal(one)).toHaveLength(1);
@@ -63,7 +59,7 @@ describe("PushDeviceTokenRepository", () => {
   });
 
   it("removes an invalid token independently of its principal", () => {
-    tokens.register(one, "token-a", "2026-11-06T01:00:00.000Z");
+    tokens.register(one, "token-a");
     expect(tokens.remove("token-a")).toBe(true);
     expect(tokens.remove("token-a")).toBe(false);
   });

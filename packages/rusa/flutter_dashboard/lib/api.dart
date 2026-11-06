@@ -623,7 +623,10 @@ class DashboardApi {
     String announcementId,
   ) async {
     final j = await _getJson(
-      _u('/api/mesh/actors/$actorId/voice/replies/$announcementId'),
+      _u(
+        '/api/mesh/actors/${Uri.encodeComponent(actorId)}/voice/replies/'
+        '${Uri.encodeComponent(announcementId)}',
+      ),
     );
     final announcement = j['announcement'];
     if (announcement is! Map<String, dynamic>) {
@@ -635,13 +638,8 @@ class DashboardApi {
   /// Associate this Firebase registration token with the authenticated
   /// dashboard principal. The server owns the account binding.
   Future<void> registerPushToken(String token) async {
-    await _putVoicePushToken(token);
-  }
-
-  /// Remove this device's registration before its dashboard session logs out.
-  Future<void> revokePushToken(String token) async {
     final uri = _u('/api/mesh/voice/push-token');
-    final res = await _client.delete(
+    final res = await _client.put(
       uri,
       headers: {
         'Accept': 'application/json',
@@ -654,9 +652,10 @@ class DashboardApi {
     }
   }
 
-  Future<void> _putVoicePushToken(String token) async {
+  /// Remove this device's registration before its dashboard session logs out.
+  Future<void> revokePushToken(String token) async {
     final uri = _u('/api/mesh/voice/push-token');
-    final res = await _client.put(
+    final res = await _client.delete(
       uri,
       headers: {
         'Accept': 'application/json',

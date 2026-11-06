@@ -1,21 +1,19 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'api.dart';
 import 'reply_notifications.dart';
 
-ReplyNotifications? platformCreateReplyNotifications() =>
-    Platform.isAndroid ? IoReplyNotifications() : null;
-
 /// FCM token lifecycle for an Android device. Registration failures deliberately
 /// leave walkie capture usable; the live SSE path remains the foreground route.
 class IoReplyNotifications implements ReplyNotifications {
   IoReplyNotifications({FirebaseMessaging? messaging})
-    : _messaging = messaging ?? FirebaseMessaging.instance;
+    : _providedMessaging = messaging;
 
-  final FirebaseMessaging _messaging;
+  FirebaseMessaging? _providedMessaging;
+  FirebaseMessaging get _messaging =>
+      _providedMessaging ??= FirebaseMessaging.instance;
   StreamSubscription<String>? _refreshes;
   String? _registeredToken;
   DashboardApi? _api;

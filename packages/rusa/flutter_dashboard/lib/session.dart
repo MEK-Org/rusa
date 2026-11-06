@@ -373,7 +373,7 @@ class FirebaseDashboardSession extends DashboardSession {
     // best-effort and cannot block the normal server logout.
     for (final listener in _beforeLogoutListeners.toList()) {
       try {
-        await listener();
+        await listener().timeout(const Duration(seconds: 2));
       } catch (_) {}
     }
     final response = await _post('logout');

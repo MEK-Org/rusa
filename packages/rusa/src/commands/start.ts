@@ -4776,13 +4776,18 @@ async function composeStart(
           logger: log.child({ component: "voice-session" }),
         })
       : null;
-  if (voiceService && config.auth) {
+  if (voiceService && config.auth && rootId) {
     const fcm = createFcmVoicePushDelivery({
       firebase: config.auth.firebase,
       tokens: getRepositories().pushDeviceTokens,
       logger: log.child({ component: "voice-push" }),
     });
-    replyPushDelivery = fcm.delivery;
+    // The Android assistant remains walkie-to-root. A transferred voice
+    // session may still stream its own actor's replies, but it must not turn
+    // a generic notification into a new non-root capture surface.
+    replyPushDelivery = {
+      deliver: (push) => (push.actorId === rootId ? fcm.delivery.deliver(push) : Promise.resolve()),
+    };
     resources.acquire("reply push delivery", fcm.close);
   }
   const bindDashboard = shouldBindDashboardServer({

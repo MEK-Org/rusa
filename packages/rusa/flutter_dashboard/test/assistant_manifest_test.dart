@@ -6,8 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// voice-command triggers reach only the restricted assist screen, which shows
 /// over the keyguard without unlocking. The main dashboard activity never
 /// shows over the keyguard. These read the shipped manifest; device behavior
-/// is unproven here. The session teardown before the screen finishes is
-/// exercised in `assistant_test.dart`.
+/// is unproven here.
 void main() {
   final manifest = File(
     'android/app/src/main/AndroidManifest.xml',
@@ -49,7 +48,6 @@ void main() {
     expect(assist, contains('android:turnScreenOn="true"'));
     expect(assist, contains('android:exported="true"'));
     expect(assist, contains('android:launchMode="singleTask"'));
-    expect(assist, isNot(contains('android:excludeFromRecents="true"')));
   });
 
   test('the main dashboard activity does not show over the keyguard', () {

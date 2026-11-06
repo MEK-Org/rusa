@@ -324,7 +324,7 @@ export function handleVoiceApiRequest(
       }
       try {
         if (req.method === "PUT") {
-          tokens.register(principalId, token, new Date().toISOString());
+          tokens.register(principalId, token);
         } else {
           tokens.revoke(principalId, token);
         }

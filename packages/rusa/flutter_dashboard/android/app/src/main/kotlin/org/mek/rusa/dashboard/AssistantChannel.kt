@@ -70,17 +70,6 @@ class AssistantChannel(
         mapOf("actorId" to actorId, "announcementId" to announcementId),
     )
 
-    /** Asks Dart to end the session; [done] runs once it has, or failed to. */
-    fun end(done: () -> Unit) = channel.invokeMethod(
-        "end",
-        null,
-        object : MethodChannel.Result {
-            override fun success(result: Any?) = done()
-            override fun error(code: String, message: String?, details: Any?) = done()
-            override fun notImplemented() = done()
-        },
-    )
-
     /** Plays a short audible prompt cue once capture is actively listening. */
     private fun playReadyCue() {
         try {

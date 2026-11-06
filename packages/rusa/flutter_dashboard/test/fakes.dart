@@ -1791,9 +1791,6 @@ class FakeAssistant implements AssistantPlatform {
   }
 
   @override
-  Future<void> Function()? onEnd;
-
-  @override
   Future<void> Function()? onBackground;
 
   @override
