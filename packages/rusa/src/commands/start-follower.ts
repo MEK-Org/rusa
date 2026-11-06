@@ -5,9 +5,12 @@ import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
+import { McpHttpServer } from "../mcp/http-server.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
+import { createProvider } from "../remote-instances/configured-provider.js";
+import { ExecutionInstance } from "../remote-instances/execution-instance.js";
 import {
   FollowerEventAcceptanceFailedError,
   type FollowerEventBatch,
@@ -29,6 +32,7 @@ import {
   type BoundedExecutionCapability,
   type EventTransferCapability,
   type FollowerUpdateCommand,
+  INSTANCE_EXECUTION_CAPABILITY,
   INSTANCE_PROTOCOL_VERSION,
 } from "../remote-instances/protocol.js";
 import { FollowerRunMaterial } from "../remote-instances/run-material.js";
@@ -330,6 +334,34 @@ export async function composeFollowerStart(
     log.warn("run_material_sweep_failed", { err })
   );
   resources.acquire("runMaterialSweep", stopMaterialSweep);
+  let executionEnabled = true;
+  if (!repos.execution) throw new Error("Local execution repositories are unavailable");
+  const localMcp = new McpHttpServer({ servers: {}, logger: log });
+  await localMcp.start();
+  resources.acquire("executionMcp", () => localMcp.close());
+  const execution = new ExecutionInstance(identity.instanceId, repos.execution, {
+    home: mcHome,
+    sandbox: config.sandbox === "bwrap",
+    logger: log,
+    mcp: localMcp,
+    maxConcurrent: config.mesh?.maxConcurrent,
+    gitIdentity: config.gitIdentity,
+    provider: (_actorId, selected) =>
+      (opts?.e2e?.followerProviderFactory ?? createProvider)(
+        {
+          sendMessage: async () => {
+            throw new Error("Use local mesh MCP");
+          },
+        },
+        { providers: config.providers },
+        selected
+      ),
+    publish: (fromId, entry) => emit(fromId, { type: "inboxEvent", fromId, entry }),
+    fetchMessage: (actorId, ref) => post("/entities/read", { actorId, ref }),
+  });
+  // Installed work survives transport/session replacement and leader downtime.
+  repos.actorRuns.abandonOpen("execution instance restarted");
+  execution.resume();
   const instance = new FollowerInstance(
     mcHome,
     config.sandbox === "bwrap",
@@ -337,6 +369,8 @@ export async function composeFollowerStart(
     opts?.e2e?.followerProviderFactory,
     {
       requireReconciliation: true,
+      execution,
+      executionEnabled: () => executionEnabled,
       repositories: repos,
       // Provider executable settings are host-local. The leader still owns
       // the admitted provider/model tuple carried in each actor Bootstrap.
@@ -396,6 +430,7 @@ export async function composeFollowerStart(
         leaderToken?: string;
         eventTransfer?: EventTransferCapability;
         boundedExecution?: BoundedExecutionCapability;
+        instanceExecution?: { version: number };
       }>("/register", {
         platform: process.platform,
         pid: process.pid,
@@ -404,6 +439,7 @@ export async function composeFollowerStart(
         // The leader's update reconciliation compares this with its target.
         ...(release.runningSha ? { commitSha: release.runningSha } : {}),
         boundedExecution: runMaterial.offer,
+        instanceExecution: INSTANCE_EXECUTION_CAPABILITY,
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
@@ -424,6 +460,7 @@ export async function composeFollowerStart(
       session = reg.session;
       if (reg.leaderToken) leaderToken = reg.leaderToken;
       runMaterial.accept(reg.boundedExecution);
+      executionEnabled = reg.instanceExecution?.version === 1;
       eventTransfer = httpEventTransferSender(
         reg.eventTransfer,
         (fragment) => request("/events/transfer", fragment),

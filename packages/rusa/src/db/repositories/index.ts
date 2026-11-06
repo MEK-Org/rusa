@@ -38,13 +38,19 @@ import {
 
 /**
  * The host-local execution capabilities a follower instance writes and reads
- * (#1019): its own run accounting and retained prompts. Global coordination
- * state (actors, obligations, inbox, principals, grants) belongs to the leader
- * and is absent here, not guarded: each member is a frozen object of bound
- * methods, so neither a repository instance nor its database handle is
- * reachable from follower services.
+ * (#1019): run accounting and retained prompts, plus the #1020 draft local
+ * execution port. Actor rows on this port are installed control snapshots,
+ * while inbox consumption and run focus are owned here. Global obligation,
+ * placement and grant mutation APIs remain absent.
  */
+export type InstanceExecutionRepositories = Pick<
+  Repositories,
+  "actors" | "inbox" | "inboxFocus" | "meshChat" | "referenceCache" | "actorRuns" | "runPrompts"
+>;
+
 export interface FollowerRepositories {
+  /** Locally owned execution state; global obligations and grants stay off this port. */
+  readonly execution?: InstanceExecutionRepositories;
   readonly actorRuns: Pick<
     ActorRunRepository,
     "start" | "complete" | "abandon" | "abandonOpen" | "listRecentCompleted"
@@ -55,7 +61,17 @@ export interface FollowerRepositories {
 export function createFollowerRepositories(db: Database.Database): FollowerRepositories {
   const runs = new ActorRunRepository(db);
   const prompts = new RunPromptRepository(db);
+  const local = new Repositories(db);
   return Object.freeze({
+    execution: Object.freeze({
+      actors: local.actors,
+      inbox: local.inbox,
+      inboxFocus: local.inboxFocus,
+      meshChat: local.meshChat,
+      referenceCache: local.referenceCache,
+      actorRuns: runs,
+      runPrompts: prompts,
+    }),
     actorRuns: Object.freeze({
       start: (opts) => runs.start(opts),
       complete: (id, opts) => runs.complete(id, opts),
