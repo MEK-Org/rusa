@@ -24,6 +24,7 @@ class AssistantPage extends StatefulWidget {
     this.signals,
     this.initialReply,
     this.notificationOpening = false,
+    this.restoringFromRecents = false,
     this.onClose,
   });
 
@@ -35,6 +36,10 @@ class AssistantPage extends StatefulWidget {
   /// A notification was opened while the keyguard was locked; native code
   /// supplies its target only after the user unlocks.
   final bool notificationOpening;
+
+  /// Android restored this task from Recents. It mounts an inert restricted
+  /// session rather than treating the historical route as a new assist.
+  final bool restoringFromRecents;
 
   /// Leaves the assist screen; defaults to finishing the activity.
   final VoidCallback? onClose;
@@ -58,6 +63,7 @@ class _AssistantPageState extends State<AssistantPage> {
   int _attempt = 0;
   bool _disposed = false;
   bool _backgrounded = false;
+  bool _suppressInitialCapture = false;
   bool _pendingStop = false;
   Future<void> Function()? _cancelCurrentCapture;
   AssistantReplyTarget? _pendingReply;
@@ -68,6 +74,10 @@ class _AssistantPageState extends State<AssistantPage> {
     _api = widget.createApi();
     _deps = widget.createWalkieDeps(_api);
     _pendingReply = widget.initialReply;
+    _suppressInitialCapture =
+        widget.initialReply != null ||
+        widget.notificationOpening ||
+        widget.restoringFromRecents;
     final signals = widget.signals;
     if (signals != null) {
       _subs.add(signals.triggers.listen((_) => unawaited(_onTrigger())));
@@ -99,9 +109,11 @@ class _AssistantPageState extends State<AssistantPage> {
     // Scoped per attempt: cancellation only affects the active attempt;
     // a stale attempt never touches the shared recorder so it cannot cancel a
     // newer take, leaving dispose() and a newer start() to release it.
-    final notificationOpening =
-        widget.initialReply != null || widget.notificationOpening;
-    var captureActive = !notificationOpening;
+    // Notification and Recents routes suppress capture only for the route
+    // that opened this task. A later ordinary locked assist is a new request,
+    // so [_restartLockedAssist] clears this before replacement startup.
+    final captureSuppressed = _suppressInitialCapture;
+    var captureActive = !captureSuppressed;
     Future<void> cancelCapture() async {
       if (!captureActive) return;
       captureActive = false;
@@ -114,7 +126,7 @@ class _AssistantPageState extends State<AssistantPage> {
 
     final captureStartedAt = DateTime.now();
     Object? captureError;
-    final captureFuture = notificationOpening
+    final captureFuture = captureSuppressed
         ? Future<void>.value()
         : () async {
             try {
@@ -192,7 +204,7 @@ class _AssistantPageState extends State<AssistantPage> {
       sessionRepliesOnly: true,
     );
     _controller = controller;
-    if (_backgrounded || notificationOpening) controller.suspendPlayback();
+    if (_backgrounded || captureSuppressed) controller.suspendPlayback();
     Future<Never> discard([String reason = 'Assist screen closed']) async {
       if (_cancelCurrentCapture == cancelCapture) {
         _cancelCurrentCapture = null;
@@ -273,11 +285,11 @@ class _AssistantPageState extends State<AssistantPage> {
     await _cancelCurrentCapture?.call();
     await controller.cancelRecord();
     controller.suspendPlayback();
-    await Future.wait([
-      _restoreNotificationConversation(controller),
-      _presentReply(controller, target),
-    ]);
-    if (!_disposed && identical(_controller, controller)) {
+    // History is chronological and gives the selected durable row a stable
+    // place to replace. Do not race its mutation with exact-reply promotion.
+    await _restoreNotificationConversation(controller);
+    final presented = await _presentReply(controller, target);
+    if (presented && !_disposed && identical(_controller, controller)) {
       controller.resumePlayback();
     }
   }
@@ -301,22 +313,24 @@ class _AssistantPageState extends State<AssistantPage> {
     }
   }
 
-  Future<void> _presentReply(
+  Future<bool> _presentReply(
     WalkieController controller,
     AssistantReplyTarget target,
   ) async {
     // The native intent carries opaque keys, but keep this UI boundary narrow:
     // only the current restricted conversation may receive its exact reply.
-    if (controller.actorId != target.actorId) return;
+    if (controller.actorId != target.actorId) return false;
     try {
       final reply = await _api.fetchVoiceReply(
         target.actorId,
         target.announcementId,
       );
-      if (_disposed || _controller != controller) return;
+      if (_disposed || _controller != controller) return false;
       controller.presentNotificationReply(reply);
+      return true;
     } catch (_) {
       // Failed/stale notification recovery reveals no wider dashboard state.
+      return false;
     }
   }
 
@@ -358,7 +372,8 @@ class _AssistantPageState extends State<AssistantPage> {
 
   Future<void> _foreground() async {
     _backgrounded = false;
-    _controller?.resumePlayback();
+    // Returning a stopped task (including from Recents) restores the visible
+    // session, but not automatic audio. An explicit reply tap resumes audio.
   }
 
   /// A lock-screen assist gesture is a new restricted capture, not a return
@@ -371,6 +386,7 @@ class _AssistantPageState extends State<AssistantPage> {
     _pendingReply = null;
     _pendingStop = false;
     _backgrounded = false;
+    _suppressInitialCapture = false;
     await _cancelCurrentCapture?.call();
     final previous = _controller;
     _controller = null;

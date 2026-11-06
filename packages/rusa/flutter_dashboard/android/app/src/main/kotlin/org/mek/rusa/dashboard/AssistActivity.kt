@@ -23,6 +23,12 @@ class AssistActivity : FlutterActivity() {
     override fun getDartEntrypointFunctionName(): String = "assistMain"
 
     override fun getInitialRoute(): String? {
+        if (isRestoringFromRecents(intent)) {
+            restoringFromRecents = true
+            // A process-recreated task must not interpret its historical
+            // launch as a fresh assist gesture or stale notification tap.
+            return Uri.Builder().path("recents").build().toString()
+        }
         val reply = replyTarget(intent) ?: return super.getInitialRoute()
         if (isDeviceLocked()) {
             pendingReply = reply
@@ -106,8 +112,10 @@ class AssistActivity : FlutterActivity() {
     override fun onStart() {
         super.onStart()
         if (!backgrounded || pendingReply != null) return
-        if (restoringFromRecents) return
         backgrounded = false
+        restoringFromRecents = false
+        // Dart restores visibility while retaining the playback suspension;
+        // only an explicit reply interaction can resume queued audio.
         assistant?.foreground()
     }
 
@@ -154,13 +162,16 @@ class AssistActivity : FlutterActivity() {
                 }
 
                 override fun onDismissCancelled() {
-                    // A cancelled keyguard request must not leave a stale
-                    // target suppressing future foreground lifecycle events.
+                    // A cancelled keyguard request has no safe reply handoff.
+                    // Do not reveal a retained session or start capture from a
+                    // notification route that never reached post-unlock Dart.
                     pendingReply = null
+                    finish()
                 }
 
                 override fun onDismissError() {
                     pendingReply = null
+                    finish()
                 }
             })
         }

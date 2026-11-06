@@ -19,6 +19,8 @@ class IoAssistantChannel implements AssistantPlatform {
   final MethodChannel _channel;
   final _triggers = StreamController<void>.broadcast();
   final _routeLost = StreamController<void>.broadcast();
+  Future<void> Function(AssistantReplyTarget target)? _onReply;
+  AssistantReplyTarget? _pendingReply;
 
   @override
   Stream<void> get triggers => _triggers.stream;
@@ -47,7 +49,19 @@ class IoAssistantChannel implements AssistantPlatform {
   Future<void> Function()? onLockedAssist;
 
   @override
-  Future<void> Function(AssistantReplyTarget target)? onReply;
+  Future<void> Function(AssistantReplyTarget target)? get onReply => _onReply;
+
+  @override
+  set onReply(Future<void> Function(AssistantReplyTarget target)? handler) {
+    _onReply = handler;
+    final pending = _pendingReply;
+    if (handler == null || pending == null) return;
+    _pendingReply = null;
+    // Flutter may receive the native reply while session bootstrap is still
+    // mounting AssistantPage. Keep only the opaque target until that page can
+    // enforce its root/session boundary.
+    unawaited(handler(pending));
+  }
 
   Future<Object?> _handle(MethodCall call) async {
     switch (call.method) {
@@ -70,12 +84,16 @@ class IoAssistantChannel implements AssistantPlatform {
               announcementId is String &&
               actorId.isNotEmpty &&
               announcementId.isNotEmpty) {
-            await onReply?.call(
-              AssistantReplyTarget(
-                actorId: actorId,
-                announcementId: announcementId,
-              ),
+            final target = AssistantReplyTarget(
+              actorId: actorId,
+              announcementId: announcementId,
             );
+            final handler = _onReply;
+            if (handler == null) {
+              _pendingReply = target;
+            } else {
+              await handler(target);
+            }
           }
         }
     }

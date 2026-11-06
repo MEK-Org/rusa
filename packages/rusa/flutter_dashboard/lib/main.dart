@@ -58,16 +58,22 @@ void assistMain() {
         signals: assistant,
         initialReply: launch.reply,
         notificationOpening: launch.waitingForUnlock,
+        restoringFromRecents: launch.restoringFromRecents,
       ),
     ),
   );
 }
 
 class AssistantLaunch {
-  const AssistantLaunch({this.reply, this.waitingForUnlock = false});
+  const AssistantLaunch({
+    this.reply,
+    this.waitingForUnlock = false,
+    this.restoringFromRecents = false,
+  });
 
   final AssistantReplyTarget? reply;
   final bool waitingForUnlock;
+  final bool restoringFromRecents;
 }
 
 /// Parses only the content-free routes native code is allowed to pass to Dart.
@@ -76,6 +82,9 @@ AssistantLaunch parseAssistantLaunch(String route) {
   if (uri == null) return const AssistantLaunch();
   if (uri.path == 'reply-pending' || uri.path == '/reply-pending') {
     return const AssistantLaunch(waitingForUnlock: true);
+  }
+  if (uri.path == 'recents' || uri.path == '/recents') {
+    return const AssistantLaunch(restoringFromRecents: true);
   }
   if (uri.path != 'reply' && uri.path != '/reply') {
     return const AssistantLaunch();

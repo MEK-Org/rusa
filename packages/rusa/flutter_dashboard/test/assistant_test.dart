@@ -192,6 +192,15 @@ void main() {
         await assistant.onForeground!();
         await tester.pump();
         await tester.pump();
+        expect(
+          walkie.player.playedUrls,
+          isEmpty,
+          reason: 'returning a task must not auto-replay a retained reply',
+        );
+        final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
+        panel.controller.replayLast();
+        await tester.pump();
+        await tester.pump();
         expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/answer']);
 
         await unmount(tester);
@@ -232,6 +241,54 @@ void main() {
         await unmount(tester);
       },
     );
+
+    testWidgets(
+      'a locked assist after a notification route starts fresh capture',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              notificationOpening: true,
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.recorder.startCalls, 0);
+
+        await assistant.onLockedAssist!();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 1);
+        expect(assistant.readyCueCalls, 1);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('a Recents route mounts without capture or automatic audio', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            restoringFromRecents: true,
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.player.playedUrls, isEmpty);
+      await unmount(tester);
+    });
 
     testWidgets(
       'notification tap restores its exact reply without opening capture',
@@ -319,9 +376,10 @@ void main() {
         expect(api.chatActorCalls, [
           ['root'],
         ]);
+        expect(find.text('My question'), findsOneWidget);
         expect(
           find.text('🎙️ [voice memo — reply for the ear]: My question'),
-          findsOneWidget,
+          findsNothing,
         );
         expect(find.text('The durable answer'), findsOneWidget);
         expect(walkie.player.playedUrls, [
@@ -474,6 +532,32 @@ void main() {
       expect(api.notificationReplyCalls, isEmpty);
       await unmount(tester);
     });
+
+    testWidgets(
+      'a failed exact notification lookup does not replay old audio',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+        await assistant.onBackground!();
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement('older-reply', actor: 'root', sessionId: sessionId),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'missing-durable-reply',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.player.playedUrls, isEmpty);
+        await unmount(tester);
+      },
+    );
 
     testWidgets('backgrounding during startup returns with an idle session', (
       tester,
@@ -1176,6 +1260,13 @@ void main() {
       expect(missingId.reply, isNull);
       expect(missingId.waitingForUnlock, isFalse);
     });
+
+    test('keeps a Recents launch inert', () {
+      final launch = parseAssistantLaunch('recents');
+
+      expect(launch.restoringFromRecents, isTrue);
+      expect(launch.reply, isNull);
+    });
   });
 
   group('IoAssistantChannel', () {
@@ -1196,11 +1287,14 @@ void main() {
     });
     tearDown(() => messenger.setMockMethodCallHandler(channel, null));
 
-    Future<void> fromNative(String method) => messenger.handlePlatformMessage(
-      channel.name,
-      const StandardMethodCodec().encodeMethodCall(MethodCall(method)),
-      (_) {},
-    );
+    Future<void> fromNative(String method, [Object? arguments]) =>
+        messenger.handlePlatformMessage(
+          channel.name,
+          const StandardMethodCodec().encodeMethodCall(
+            MethodCall(method, arguments),
+          ),
+          (_) {},
+        );
 
     test('reads the role status', () async {
       answer = (_) => {'available': true, 'held': true};
@@ -1243,6 +1337,24 @@ void main() {
 
       expect(resets, 1);
     });
+
+    test(
+      'buffers an early native reply until the page binds its handler',
+      () async {
+        final assistant = IoAssistantChannel(channel: channel);
+        await fromNative('reply', {
+          'actorId': 'root',
+          'announcementId': 'durable-reply',
+        });
+
+        AssistantReplyTarget? received;
+        assistant.onReply = (target) async => received = target;
+        await pumpEventQueue();
+
+        expect(received?.actorId, 'root');
+        expect(received?.announcementId, 'durable-reply');
+      },
+    );
 
     test('plays ready cue via platform channel', () async {
       final assistant = IoAssistantChannel(channel: channel);

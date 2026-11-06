@@ -73,12 +73,28 @@ void main() {
         'screenshots/1244_reply_history_phone_before.png',
       );
       controller.restoreConversation([
-        makeChat('memo-1', body: 'Should I send the report?'),
+        makeChat(
+          'past-reply',
+          sender: 'root',
+          body: 'Earlier answer: send the brief first.',
+        ),
+        makeChat(
+          'memo-1',
+          body:
+              '🎙️ [voice memo — reply for the ear]: Should I send the report?',
+        ),
       ]);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 250));
 
       expect(find.text('Should I send the report?'), findsOneWidget);
+      expect(find.text('PAST REPLY'), findsOneWidget);
+      expect(
+        find.text(
+          '🎙️ [voice memo — reply for the ear]: Should I send the report?',
+        ),
+        findsNothing,
+      );
       await captureBoundary(
         key,
         'screenshots/1244_reply_history_phone_after.png',

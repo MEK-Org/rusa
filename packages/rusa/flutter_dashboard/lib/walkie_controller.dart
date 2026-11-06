@@ -97,6 +97,11 @@ class _QueueItem {
 /// via the normal mesh_event SSE push, so nothing is lost).
 const Duration kDeliveredResetDelay = Duration(seconds: 4);
 
+/// The durable mesh-chat representation of a walkie memo includes delivery
+/// instructions for the actor. The restricted transcript already labels the
+/// row as the user's, so historical rendering shows just their words.
+const _voiceMemoPrefix = '🎙️ [voice memo — reply for the ear]: ';
+
 /// Mint a V4 UUID in the browser app rather than deriving identity from an SSE
 /// socket. The same value is sent on the stream and every memo until mode exit.
 String newWalkieSessionId() {
@@ -171,6 +176,7 @@ class WalkieController {
   DateTime? _recordStartedAt;
   int _recordGeneration = 0;
   bool _playbackSuspended = false;
+  String? _pauseAfterAnnouncementId;
   bool _disposed = false;
 
   // ── Exposed streams ──
@@ -360,7 +366,8 @@ class WalkieController {
 
   /// Keep the reply session and transcript alive while the assist task is in
   /// the background, but never continue automatic reply audio there. An
-  /// interrupted reply stays unacknowledged and is replayed on foreground.
+  /// interrupted reply stays unacknowledged until the user explicitly selects
+  /// it after returning; foreground alone never restarts audio.
   void suspendPlayback() {
     if (_playbackSuspended) return;
     _playbackSuspended = true;
@@ -450,6 +457,9 @@ class WalkieController {
   /// live/backlog frame, it may predate this fresh activity's SSE session.
   void presentNotificationReply(VoiceAnnouncement announcement) {
     if (!_enabled.value || _disposed || announcement.actorId != actorId) return;
+    // A notification selects exactly one durable reply. Once it has played,
+    // keep pre-existing background audio suspended until the user opts in.
+    _pauseAfterAnnouncementId = announcement.id;
     final historicalIndex = _transcript.value.indexWhere(
       (entry) => entry is HistoricalChatEntry && entry.id == announcement.id,
     );
@@ -475,13 +485,13 @@ class WalkieController {
     if (alreadyReceived) {
       // A notification names one exact reply. Do not let the live SSE queue or
       // prior playback turn a tap on that reply into a no-op or another reply.
-      replayAnnouncement(announcement);
+      replayAnnouncement(announcement, preserveNotificationBoundary: true);
       return;
     }
     _enqueue(announcement);
     // `_enqueue` preserves the normal first-play acknowledgement; move the
     // selected reply ahead of older suspended audio without adding a row.
-    replayAnnouncement(announcement);
+    replayAnnouncement(announcement, preserveNotificationBoundary: true);
   }
 
   /// Prepend a bounded, chronologically ordered view of the current root chat.
@@ -490,24 +500,35 @@ class WalkieController {
   void restoreConversation(List<MeshChat> messages) {
     if (!_enabled.value || _disposed) return;
     final restoredIds = <String>{};
+    final localMemoBodies = <String>[];
     for (final entry in _transcript.value) {
       switch (entry) {
         case HistoricalChatEntry(:final id):
           restoredIds.add(id);
         case ActorReplyEntry(:final announcement):
           restoredIds.add(announcement.id);
-        case UserMemoEntry():
-          break;
+        case UserMemoEntry(:final transcript):
+          // The memo route persists this exact body. Carrying no durable id in
+          // its send response, one matching body is the narrow safe dedupe
+          // key without collapsing separately sent identical memos.
+          localMemoBodies.add('$_voiceMemoPrefix$transcript');
       }
     }
     final restored = <WalkieEntry>[];
     for (final message in messages) {
       if (!restoredIds.add(message.id)) continue;
+      if (message.senderId != actorId) {
+        final localIndex = localMemoBodies.indexOf(message.body);
+        if (localIndex >= 0) {
+          localMemoBodies.removeAt(localIndex);
+          continue;
+        }
+      }
       restored.add(
         HistoricalChatEntry(
           timestamp: message.ts,
           id: message.id,
-          text: message.body,
+          text: _historicalText(message.body),
           isActorReply: message.senderId == actorId,
         ),
       );
@@ -537,7 +558,14 @@ class WalkieController {
         // `stop` resolves the player future. Put the interrupted reply back
         // before acknowledgement so foreground return plays this exact item.
         if (_playbackSuspended) {
-          _queue.insert(0, item);
+          // A concurrently selected notification reply stays ahead of an
+          // interrupted older clip when its fetch completed during stop().
+          final selectedIndex = _pauseAfterAnnouncementId == null
+              ? -1
+              : _queue.indexWhere(
+                  (queued) => queued.frame.id == _pauseAfterAnnouncementId,
+                );
+          _queue.insert(selectedIndex < 0 ? 0 : selectedIndex + 1, item);
           _queueDepth.add(_queue.length);
           break;
         }
@@ -556,6 +584,11 @@ class WalkieController {
             if (_disposed) return;
             _lastError.add('Ack failed: $e');
           }
+        }
+        if (item.frame.id == _pauseAfterAnnouncementId) {
+          _pauseAfterAnnouncementId = null;
+          _playbackSuspended = true;
+          break;
         }
       }
     } finally {
@@ -585,13 +618,19 @@ class WalkieController {
 
   /// Bring a received reply to the front of playback without adding another
   /// transcript row. Used by the Replay control and by taps on older rows.
-  void replayAnnouncement(VoiceAnnouncement announcement) {
+  void replayAnnouncement(
+    VoiceAnnouncement announcement, {
+    bool preserveNotificationBoundary = false,
+  }) {
     if (!_enabled.value || _disposed) return;
     final received = _transcript.value.any(
       (entry) =>
           entry is ActorReplyEntry && entry.announcement.id == announcement.id,
     );
     if (!received) return;
+    if (!preserveNotificationBoundary) {
+      _pauseAfterAnnouncementId = null;
+    }
     // An already-queued target moves rather than plays twice, and keeps its
     // pending first-play ack. A reply that has already started or finished
     // owns its own server acknowledgement, so a replay never acks again.
@@ -602,12 +641,19 @@ class WalkieController {
         queuedIndex >= 0 && _queue.removeAt(queuedIndex).ackNeeded;
     _queue.insert(0, _QueueItem(announcement, ackNeeded: ackNeeded));
     _queueDepth.add(_queue.length);
+    if (_playbackSuspended) {
+      _playbackSuspended = false;
+    }
     if (_nowPlaying.value != null) {
       _deps.player.stop();
     } else {
       unawaited(_drain());
     }
   }
+
+  String _historicalText(String body) => body.startsWith(_voiceMemoPrefix)
+      ? body.substring(_voiceMemoPrefix.length)
+      : body;
 
   // ── Record flow (tap-toggle) ──
 

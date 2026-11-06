@@ -299,6 +299,35 @@ void main() {
       },
     );
 
+    test(
+      'history restoration skips only its matching retained voice memo',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'same words',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        controller.restoreConversation([
+          makeChat(
+            'memo-1',
+            sender: 'user',
+            body: '🎙️ [voice memo — reply for the ear]: same words',
+          ),
+          makeChat('ordinary-chat', sender: 'user', body: 'same words'),
+        ]);
+
+        expect(
+          controller.transcript.value.whereType<HistoricalChatEntry>().map(
+            (entry) => entry.id,
+          ),
+          ['ordinary-chat'],
+        );
+      },
+    );
+
     test('frames for another actor are ignored', () async {
       await controller.enable();
       await pumpEventQueue();
@@ -455,6 +484,11 @@ void main() {
         walkie.player.finishCurrent();
         await pumpEventQueue();
         expect(api.ackedIds, ['selected']);
+        expect(
+          walkie.player.playedUrls,
+          ['/api/mesh/voice/audio/old-a', '/api/mesh/voice/audio/selected'],
+          reason: 'a notification tap must not drain older suspended audio',
+        );
       },
     );
 

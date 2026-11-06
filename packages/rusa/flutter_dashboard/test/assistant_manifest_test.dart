@@ -69,6 +69,8 @@ void main() {
       assistActivity,
       contains('Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY'),
     );
-    expect(assistActivity, contains('if (restoringFromRecents) return'));
+    expect(assistActivity, contains('Uri.Builder().path("recents")'));
+    expect(assistActivity, contains('assistant?.foreground()'));
+    expect(assistActivity, contains('finish()'));
   });
 }
