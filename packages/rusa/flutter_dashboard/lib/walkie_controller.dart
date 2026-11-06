@@ -569,17 +569,26 @@ class WalkieController {
       );
     }
     if (restored.isNotEmpty) {
-      // Any unmatched local row was created while the bounded fetch was in
-      // flight, so it belongs after that durable page. Reconstructing the page
-      // first also places an already-rendered local memo at its durable time
-      // rather than prepending older history ahead of it.
-      _transcript.add([
-        ...restored,
-        for (var index = 0; index < existing.length; index++)
-          if (!placed.contains(index) &&
-              existing[index] is! HistoricalChatEntry)
-            existing[index],
-      ]);
+      // Reconstructing the durable page first places already-rendered local
+      // memos at their durable time. Merge any unmatched retained rows in
+      // chronological order so a warm retained row older than the fetched page
+      // is not appended after the newest history.
+      final combined = <WalkieEntry>[...restored];
+      for (var index = 0; index < existing.length; index++) {
+        if (placed.contains(index) || existing[index] is HistoricalChatEntry) {
+          continue;
+        }
+        final unmatched = existing[index];
+        final insertIndex = combined.indexWhere(
+          (entry) => entry.timestamp.isAfter(unmatched.timestamp),
+        );
+        if (insertIndex < 0) {
+          combined.add(unmatched);
+        } else {
+          combined.insert(insertIndex, unmatched);
+        }
+      }
+      _transcript.add(combined);
     }
   }
 
@@ -793,6 +802,13 @@ class WalkieController {
   Future<void> _stopAndSend() async {
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));
+    // Sending a new memo indicates active user engagement in the foreground.
+    // Suppress any pre-existing suspended audio queue so old background clips
+    // do not play over the live conversation, and resume playback for new replies.
+    _playbackSuspended = false;
+    _pauseAfterAnnouncementId = null;
+    _queue.clear();
+    _queueDepth.add(0);
     try {
       final clip = await _deps.recorder.stop();
       final result = await _deps.api.sendVoiceMemo(

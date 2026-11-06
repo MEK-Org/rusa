@@ -641,7 +641,10 @@ describe("attachVoiceOutbound", () => {
     attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver }, TARGET);
 
     emitter.emitMeshEvent(
-      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }) })
+      replyEvent({
+        detail: ANDROID_SESSION,
+        payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }),
+      })
     );
 
     expect(deliver).not.toHaveBeenCalled();

@@ -82,5 +82,19 @@ void main() {
     );
     expect(assistActivity, contains('channel.trigger()'));
     expect(assistActivity, contains('finish()'));
+
+    final onNewIntent = RegExp(
+      r'override fun onNewIntent\(intent: Intent\) \{(.*?)\n    \}',
+      dotAll: true,
+    ).firstMatch(assistActivity)!.group(1)!;
+    final recentsIndex = onNewIntent.indexOf('isRestoringFromRecents(intent)');
+    final replyIndex = onNewIntent.indexOf('replyTarget(intent)');
+    expect(recentsIndex, isNonNegative);
+    expect(replyIndex, isNonNegative);
+    expect(
+      recentsIndex,
+      lessThan(replyIndex),
+      reason: 'Recents/history check must precede replyTarget in onNewIntent',
+    );
   });
 }

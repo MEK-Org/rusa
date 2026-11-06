@@ -665,6 +665,8 @@ class FakeApi extends DashboardApi {
   final disabledVoiceSessions = <String>[];
   VoiceAnnouncement? notificationReply;
   final notificationReplyCalls = <({String actorId, String announcementId})>[];
+  Completer<void>? notificationReplyGate;
+  final registeredPushTokens = <String>[];
   final revokedPushTokens = <String>[];
 
   @override
@@ -688,9 +690,16 @@ class FakeApi extends DashboardApi {
       actorId: actorId,
       announcementId: announcementId,
     ));
+    final gate = notificationReplyGate;
+    if (gate != null) await gate.future;
     final reply = notificationReply;
     if (reply == null) throw StateError('no notification reply');
     return reply;
+  }
+
+  @override
+  Future<void> registerPushToken(String token) async {
+    registeredPushTokens.add(token);
   }
 
   @override

@@ -85,30 +85,44 @@ class IoReplyNotifications implements ReplyNotifications {
   StreamSubscription<String>? _refreshes;
   String? _registeredToken;
   DashboardApi? _api;
+  int _generation = 0;
+  bool _disposed = false;
 
   @override
   Future<void> register(DashboardApi api) async {
+    if (_disposed) return;
+    final generation = ++_generation;
     _api = api;
     final settings = await _messaging.requestPermission();
+    if (_disposed || generation != _generation || _api != api) return;
     if (settings.authorizationStatus != AuthorizationStatus.authorized &&
         settings.authorizationStatus != AuthorizationStatus.provisional) {
       return;
     }
     final token = await _messaging.getToken();
+    if (_disposed || generation != _generation || _api != api) return;
     if (token == null || token.isEmpty) return;
     await api.registerPushToken(token);
+    if (_disposed || generation != _generation || _api != api) return;
     _registeredToken = token;
     await _storage.write(api.base, token);
+    if (_disposed || generation != _generation || _api != api) return;
     _refreshes ??= _messaging.onTokenRefresh.listen((refreshed) {
       final activeApi = _api;
       if (activeApi == null) return;
-      unawaited(_registerRefresh(activeApi, refreshed));
+      unawaited(_registerRefresh(activeApi, refreshed, generation));
     });
   }
 
-  Future<void> _registerRefresh(DashboardApi api, String token) async {
+  Future<void> _registerRefresh(
+    DashboardApi api,
+    String token,
+    int generation,
+  ) async {
+    if (_disposed || generation != _generation || _api != api) return;
     try {
       await api.registerPushToken(token);
+      if (_disposed || generation != _generation || _api != api) return;
       _registeredToken = token;
       await _storage.write(api.base, token);
     } catch (_) {
@@ -118,17 +132,30 @@ class IoReplyNotifications implements ReplyNotifications {
 
   @override
   Future<void> revoke(DashboardApi api) async {
+    // Settle/invalidate in-flight registration and refreshes first, stopping
+    // further registration and refresh listeners before revoking credentials.
+    ++_generation;
+    unawaited(_refreshes?.cancel());
+    _refreshes = null;
+    _api = null;
+
     // Do not initialize Firebase Messaging merely to sign out. A prior
     // successful registration is instead recovered from local secure storage.
     final token = _registeredToken ?? await _storage.read(api.base);
-    if (token == null || token.isEmpty) return;
-    await api.revokePushToken(token);
     _registeredToken = null;
-    await _storage.delete(api.base);
+    try {
+      if (token != null && token.isNotEmpty) {
+        await api.revokePushToken(token);
+      }
+    } finally {
+      await _storage.delete(api.base);
+    }
   }
 
   @override
   void dispose() {
+    _disposed = true;
+    ++_generation;
     unawaited(_refreshes?.cancel());
     _refreshes = null;
     _api = null;

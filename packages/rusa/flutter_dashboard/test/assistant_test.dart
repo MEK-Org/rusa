@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -87,6 +88,48 @@ class _PushTokenStorage implements PushTokenStorage {
   Future<void> write(Uri origin, String token) async {
     values[_scope(origin)] = token;
   }
+}
+
+class _FakeMessaging extends Fake implements FirebaseMessaging {
+  Completer<String?> tokenCompleter = Completer<String?>();
+  final StreamController<String> refreshController =
+      StreamController<String>.broadcast();
+
+  @override
+  Future<NotificationSettings> requestPermission({
+    bool alert = true,
+    bool announcement = false,
+    bool badge = true,
+    bool carPlay = false,
+    bool criticalAlert = false,
+    bool provisional = false,
+    bool sound = true,
+    bool providesAppNotificationSettings = false,
+  }) async =>
+      const NotificationSettings(
+        alert: AppleNotificationSetting.enabled,
+        announcement: AppleNotificationSetting.disabled,
+        authorizationStatus: AuthorizationStatus.authorized,
+        badge: AppleNotificationSetting.disabled,
+        carPlay: AppleNotificationSetting.disabled,
+        lockScreen: AppleNotificationSetting.disabled,
+        notificationCenter: AppleNotificationSetting.disabled,
+        showPreviews: AppleShowPreviewSetting.never,
+        timeSensitive: AppleNotificationSetting.disabled,
+        criticalAlert: AppleNotificationSetting.disabled,
+        sound: AppleNotificationSetting.disabled,
+        providesAppNotificationSettings: AppleNotificationSetting.disabled,
+      );
+
+  @override
+  Future<String?> getToken({
+    String? vapidKey,
+    String? serviceWorkerScriptPath,
+  }) =>
+      tokenCompleter.future;
+
+  @override
+  Stream<String> get onTokenRefresh => refreshController.stream;
 }
 
 // #1193: the Android assist trigger opens walkie recording to root, and the
@@ -503,6 +546,53 @@ void main() {
         expect(walkie.player.playedUrls, [
           '/api/mesh/voice/audio/durable-reply',
         ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'backgrounding while reply lookup is awaiting invalidates recovery and keeps playback suspended',
+      (tester) async {
+        final gate = Completer<void>();
+        api
+          ..notificationReplyGate = gate
+          ..notificationReply = makeAnnouncement(
+            'durable-reply',
+            actor: 'root',
+            text: 'The durable answer',
+            sessionId: 'ended-session',
+          );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        final replyFuture = assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'durable-reply',
+          ),
+        );
+        await tester.pump();
+
+        expect(api.notificationReplyCalls, hasLength(1));
+        await assistant.onBackground!();
+        await tester.pump();
+
+        gate.complete();
+        await replyFuture;
+        await tester.pump();
+
+        expect(walkie.player.playedUrls, isEmpty);
+        expect(find.text('The durable answer'), findsNothing);
         await unmount(tester);
       },
     );
@@ -1440,6 +1530,32 @@ void main() {
       await notifications.revoke(api);
 
       expect(api.revokedPushTokens, ['prior-process-token']);
+      expect(storage.values, isEmpty);
+      notifications.dispose();
+    });
+
+    test('logout drops an in-flight registration racing revocation', () async {
+      final api = FakeApi(base: Uri.parse('https://rusa.example/'));
+      final storage = _PushTokenStorage()
+        ..values['https://rusa.example'] = 'old-token';
+      final messaging = _FakeMessaging();
+      final notifications = IoReplyNotifications(
+        messaging: messaging,
+        storage: storage,
+      );
+
+      final registerFuture = notifications.register(api);
+      await pumpEventQueue();
+
+      await notifications.revoke(api);
+      expect(api.revokedPushTokens, ['old-token']);
+      expect(storage.values, isEmpty);
+
+      messaging.tokenCompleter.complete('racing-new-token');
+      await registerFuture;
+      await pumpEventQueue();
+
+      expect(api.registeredPushTokens, isEmpty);
       expect(storage.values, isEmpty);
       notifications.dispose();
     });

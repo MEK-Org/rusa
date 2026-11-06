@@ -61,17 +61,17 @@ class AssistActivity : FlutterActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val channel = assistant ?: return
+        if (isRestoringFromRecents(intent)) {
+            // Restoring the task may render the retained screen, but it must
+            // not make an old capture or queued reply audible, nor treat the
+            // historical launch as a new assistant gesture or stale notification tap.
+            restoringFromRecents = true
+            return
+        }
         val reply = replyTarget(intent)
         if (reply != null) {
             restoringFromRecents = false
             deferReplyUntilUnlocked(channel, reply)
-            return
-        }
-        if (isRestoringFromRecents(intent)) {
-            // Restoring the task may render the retained screen, but it must
-            // not make an old capture or queued reply audible, nor treat the
-            // historical launch as a new assistant gesture.
-            restoringFromRecents = true
             return
         }
         // An ordinary assist trigger retains the previously approved locked
@@ -154,7 +154,7 @@ class AssistActivity : FlutterActivity() {
     }
 
     private fun isRestoringFromRecents(intent: Intent?): Boolean =
-        intent?.flags?.and(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+        intent != null && (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
 
     private fun deferReplyUntilUnlocked(channel: AssistantChannel, reply: Pair<String, String>) {
         if (!isDeviceLocked()) {

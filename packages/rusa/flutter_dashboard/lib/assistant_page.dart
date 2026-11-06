@@ -331,18 +331,26 @@ class _AssistantPageState extends State<AssistantPage> {
       return;
     }
     _pendingReply = null;
+    final replyAttempt = _attempt;
     // A reply tap never sends a partial memo or resumes an older queued reply
     // first. It selects one reply and then resumes only that playback path.
     _backgrounded = false;
     _pendingStop = false;
     await _cancelCurrentCapture?.call();
+    if (_disposed || _controller != controller || _backgrounded || _attempt != replyAttempt) return;
     await controller.cancelRecord();
+    if (_disposed || _controller != controller || _backgrounded || _attempt != replyAttempt) return;
     controller.suspendPlayback();
     // History is chronological and gives the selected durable row a stable
     // place to replace. Do not race its mutation with exact-reply promotion.
-    await _restoreNotificationConversation(controller);
-    final presented = await _presentReply(controller, target);
-    if (presented && !_disposed && identical(_controller, controller)) {
+    await _restoreNotificationConversation(controller, replyAttempt);
+    if (_disposed || _controller != controller || _backgrounded || _attempt != replyAttempt) return;
+    final presented = await _presentReply(controller, target, replyAttempt);
+    if (presented &&
+        !_disposed &&
+        identical(_controller, controller) &&
+        !_backgrounded &&
+        _attempt == replyAttempt) {
       controller.resumePlayback();
     }
   }
@@ -389,6 +397,7 @@ class _AssistantPageState extends State<AssistantPage> {
 
   Future<void> _restoreNotificationConversation(
     WalkieController controller,
+    int replyAttempt,
   ) async {
     try {
       // This route applies the authenticated human participant server-side.
@@ -397,7 +406,7 @@ class _AssistantPageState extends State<AssistantPage> {
         actors: [controller.actorId],
         limit: 20,
       );
-      if (_disposed || _controller != controller) return;
+      if (_disposed || _controller != controller || _backgrounded || _attempt != replyAttempt) return;
       // Chat pages are newest-first; transcript rendering is chronological.
       controller.restoreConversation(history.chat.reversed.toList());
     } catch (_) {
@@ -409,6 +418,7 @@ class _AssistantPageState extends State<AssistantPage> {
   Future<bool> _presentReply(
     WalkieController controller,
     AssistantReplyTarget target,
+    int replyAttempt,
   ) async {
     // The native intent carries opaque keys, but keep this UI boundary narrow:
     // only the current restricted conversation may receive its exact reply.
@@ -418,7 +428,7 @@ class _AssistantPageState extends State<AssistantPage> {
         target.actorId,
         target.announcementId,
       );
-      if (_disposed || _controller != controller) return false;
+      if (_disposed || _controller != controller || _backgrounded || _attempt != replyAttempt) return false;
       controller.presentNotificationReply(reply);
       return true;
     } catch (_) {
@@ -474,7 +484,7 @@ class _AssistantPageState extends State<AssistantPage> {
   /// retained. Dispose that old session before starting capture again; this
   /// preserves the commissioned lock-screen path without exposing old state.
   Future<void> _restartLockedAssist() async {
-    if (_disposed) return;
+    if (_disposed || _closingForLogout) return;
     ++_attempt;
     _pendingReply = null;
     _pendingStop = false;

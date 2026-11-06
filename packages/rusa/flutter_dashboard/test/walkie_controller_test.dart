@@ -404,6 +404,51 @@ void main() {
       },
     );
 
+    test(
+      'history places an unmatched retained old row in chronological position',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'old memo',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+
+        final baseTime = DateTime.now();
+        controller.restoreConversation([
+          MeshChat(
+            id: 'newer-1',
+            ts: baseTime.add(const Duration(minutes: 5)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Newer 1',
+            sessionId: null,
+          ),
+          MeshChat(
+            id: 'newer-2',
+            ts: baseTime.add(const Duration(minutes: 10)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Newer 2',
+            sessionId: null,
+          ),
+        ]);
+
+        expect(
+          controller.transcript.value.map(
+            (entry) => switch (entry) {
+              HistoricalChatEntry(:final id) => id,
+              UserMemoEntry() => 'old-local-memo',
+              ActorReplyEntry(:final announcement) => announcement.id,
+            },
+          ),
+          ['old-local-memo', 'newer-1', 'newer-2'],
+        );
+      },
+    );
+
     test('frames for another actor are ignored', () async {
       await controller.enable();
       await pumpEventQueue();
@@ -564,6 +609,42 @@ void main() {
           walkie.player.playedUrls,
           ['/api/mesh/voice/audio/old-a', '/api/mesh/voice/audio/selected'],
           reason: 'a notification tap must not drain older suspended audio',
+        );
+      },
+    );
+
+    test(
+      'recording and sending a new memo lifts suspension so new replies play',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('old-a'), makeAnnouncement('old-b')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+
+        walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
+        await pumpEventQueue();
+
+        expect(controller.nowPlaying.value?.id, 'new-reply');
+        expect(
+          walkie.player.playedUrls,
+          [
+            '/api/mesh/voice/audio/old-a',
+            '/api/mesh/voice/audio/selected',
+            '/api/mesh/voice/audio/new-reply',
+          ],
         );
       },
     );
