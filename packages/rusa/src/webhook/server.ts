@@ -56,7 +56,7 @@ import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.j
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
-import type { VoicePushDelivery } from "../voice/push-delivery.js";
+import { FcmVoicePushDelivery, type VoicePushDelivery } from "../voice/push-delivery.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { attachVoiceOutbound } from "../voice/wiring.js";
@@ -251,7 +251,7 @@ export interface DashboardServerBaseOptions {
    * voice-SSE / backlog / ack / audio routes and renders reply TTS for actors
    * with walkie presence. Absent → those routes 503 with a clear error.
    */
-  voice?: { service: VoiceService; pushDelivery?: VoicePushDelivery };
+  voice?: { service: VoiceService; rootActorId?: string };
   /** Application logger for request diagnostics. Absent → nothing is logged. */
   logger?: Logger;
 }
@@ -651,6 +651,27 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   const auth =
     options.e2eAuth ??
     (options.auth ? createDashboardAuth(options.auth, options.principals, log) : null);
+  const sender = auth?.getFcmSender();
+  const fcmDelivery =
+    options.voice && options.mesh?.pushDeviceTokens && sender
+      ? new FcmVoicePushDelivery(
+          options.mesh.pushDeviceTokens,
+          sender,
+          log.child({ component: "voice-push" })
+        )
+      : undefined;
+  const pushDelivery: VoicePushDelivery | undefined =
+    fcmDelivery && options.voice?.rootActorId
+      ? {
+          // The Android assistant remains walkie-to-root. A transferred voice
+          // session may still stream its own actor's replies, but it must not
+          // turn a generic notification into a non-root capture surface.
+          deliver: (push) =>
+            push.actorId === options.voice?.rootActorId
+              ? fcmDelivery.deliver(push)
+              : Promise.resolve(),
+        }
+      : undefined;
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
@@ -737,7 +758,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           options.voice.service,
           sseHub,
           log.child({ component: "voice-outbound" }),
-          options.voice.pushDelivery
+          pushDelivery
         )
       : null;
   // The session registry lives in VoiceService while the targeted wire channel
