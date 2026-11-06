@@ -75,6 +75,7 @@ class _AssistantPageState extends State<AssistantPage> {
   bool _closingForLogout = false;
   Future<void> Function()? _cancelCurrentCapture;
   AssistantReplyTarget? _pendingReply;
+  String? _rootActorId;
 
   @override
   void initState() {
@@ -231,6 +232,7 @@ class _AssistantPageState extends State<AssistantPage> {
       }
       throw StateError('No active root actor');
     }
+    _rootActorId = root;
 
     unawaited(_controller?.dispose());
     final controller = WalkieController(
@@ -312,12 +314,22 @@ class _AssistantPageState extends State<AssistantPage> {
   Future<void> _receiveReply(AssistantReplyTarget target) async {
     final controller = _live;
     if (controller == null) {
+      // A native reply can arrive while the initial root lookup is pending,
+      // but it must not replace a known root reply during a transfer recovery.
+      if (_rootActorId != null && target.actorId != _rootActorId) return;
       _pendingReply = target;
       return;
     }
-    // A notification never rebinds a retained walkie session. Reject a target
-    // for another actor before it can interrupt this session's capture/audio.
-    if (controller.actorId != target.actorId) return;
+    // A notification target is never authority to adopt a transferred actor.
+    // Only the root selected by the fresh restricted-assistant lifecycle may
+    // recover its exact reply. A delayed root reply can arrive after the
+    // original Android session has transferred, so replace that controller
+    // with a fresh root one rather than rebinding the transferred session.
+    if (target.actorId != _rootActorId) return;
+    if (controller.actorId != target.actorId) {
+      _restartForNotification(target);
+      return;
+    }
     _pendingReply = null;
     // A reply tap never sends a partial memo or resumes an older queued reply
     // first. It selects one reply and then resumes only that playback path.
@@ -333,6 +345,46 @@ class _AssistantPageState extends State<AssistantPage> {
     if (presented && !_disposed && identical(_controller, controller)) {
       controller.resumePlayback();
     }
+  }
+
+  void _restartForNotification(AssistantReplyTarget target) {
+    if (_disposed) return;
+    final restartAttempt = ++_attempt;
+    _pendingReply = target;
+    _pendingStop = false;
+    _backgrounded = false;
+    // This is an exact-reply recovery, not a new assist gesture: build the
+    // restricted root session without microphone capture or automatic audio.
+    _suppressInitialCapture = true;
+    final cancelCapture = _cancelCurrentCapture;
+    _cancelCurrentCapture = null;
+    unawaited(cancelCapture?.call());
+    final previousEnabled = _enabledSub;
+    _enabledSub = null;
+    unawaited(previousEnabled?.cancel());
+    final previous = _controller;
+    _controller = null;
+    _live = null;
+    final restart = _finishNotificationRestart(previous, restartAttempt);
+    setState(() {
+      _ready = restart;
+    });
+  }
+
+  Future<WalkieController> _finishNotificationRestart(
+    WalkieController? previous,
+    int restartAttempt,
+  ) async {
+    // Disable first so the transferred lease and shared wakelock are released
+    // before the fresh root session starts. Its stream subjects must finish
+    // closing after FutureBuilder has swapped out the old WalkiePanel; waiting
+    // here would deadlock on that still-mounted panel's subscriptions.
+    await previous?.disable();
+    unawaited(previous?.dispose());
+    if (_disposed || restartAttempt != _attempt) {
+      throw StateError('Assist screen closed');
+    }
+    return _start();
   }
 
   Future<void> _restoreNotificationConversation(

@@ -13,6 +13,7 @@ import 'package:rusa_dashboard/reply_notifications_io.dart';
 import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/walkie_controller.dart';
+import 'package:rusa_dashboard/voice_platform.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/walkie_panel.dart';
@@ -649,6 +650,77 @@ void main() {
       expect(api.notificationReplyCalls, isEmpty);
       await unmount(tester);
     });
+
+    testWidgets(
+      'a root notification after a transfer starts a fresh restricted root session',
+      (tester) async {
+        await pumpPage(tester);
+        await assistant.onBackground!();
+        await tester.pump();
+        final rootStream = walkie.stream;
+
+        rootStream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'worker'),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.stream.connectCalls.single.actors, ['worker']);
+
+        api.notificationReply = makeAnnouncement(
+          'root-reply-before-transfer',
+          actor: 'root',
+          text: 'Reply from root before handoff',
+        );
+        unawaited(
+          assistant.onReply!(
+            const AssistantReplyTarget(
+              actorId: 'root',
+              announcementId: 'root-reply-before-transfer',
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.stream.connectCalls.single.actors, ['root']);
+        expect(walkie.recorder.startCalls, 1);
+        expect(api.notificationReplyCalls, [
+          (actorId: 'root', announcementId: 'root-reply-before-transfer'),
+        ]);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/root-reply-before-transfer',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a non-root notification after a transfer leaves the transferred session alone',
+      (tester) async {
+        await pumpPage(tester);
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'worker'),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'worker',
+            announcementId: 'foreign-after-transfer',
+          ),
+        );
+        await tester.pump();
+
+        expect(walkie.streams, hasLength(2));
+        expect(walkie.stream.connectCalls.single.actors, ['worker']);
+        expect(api.notificationReplyCalls, isEmpty);
+        await unmount(tester);
+      },
+    );
 
     testWidgets(
       'a failed exact notification lookup does not replay old audio',
