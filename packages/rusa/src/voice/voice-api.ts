@@ -20,6 +20,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import { requireOperatorPrincipal } from "../dashboard/api.js";
 import type { SseHub } from "../dashboard/sse.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { PushDeviceTokenRepository } from "../db/repositories/push-device-token-repository.js";
 import type { Logger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { toFrame, VOICE_MEMO_PREFIX, type VoiceService } from "./voice-service.js";
@@ -34,19 +35,24 @@ export interface VoiceApiDeps {
   service: VoiceService | null;
   /** Durable principals used to bind each request to its sender. */
   principals?: PrincipalRepository;
+  /** Principal-bound Android push registrations. */
+  pushDeviceTokens?: PushDeviceTokenRepository;
   /** Optional structured logger for route events (silenced under tests when omitted). */
   logger?: Logger;
 }
 
 const MEMO_ROUTE = /^\/api\/mesh\/actors\/([^/]+)\/voice-memo$/;
 const BACKLOG_ROUTE = /^\/api\/mesh\/actors\/([^/]+)\/voice\/backlog$/;
+const REPLY_ROUTE = /^\/api\/mesh\/actors\/([^/]+)\/voice\/replies\/([^/]+)$/;
 const AUDIO_ROUTE = /^\/api\/mesh\/voice\/audio\/([^/]+)$/;
 const STREAM_ROUTE = "/api/mesh/voice/stream";
 const ACK_ROUTE = "/api/mesh/voice/ack";
 const SESSION_DISABLE_ROUTE = "/api/mesh/voice/session/disable";
+const PUSH_TOKEN_ROUTE = "/api/mesh/voice/push-token";
 
 /** Cap inbound memo audio well above any realistic tap-to-talk clip. */
 const MAX_MEMO_BYTES = 25 * 1024 * 1024;
+const MAX_PUSH_TOKEN_BYTES = 16 * 1024;
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
@@ -121,9 +127,11 @@ function isVoicePath(pathname: string): boolean {
     pathname === STREAM_ROUTE ||
     pathname === ACK_ROUTE ||
     pathname === SESSION_DISABLE_ROUTE ||
+    pathname === PUSH_TOKEN_ROUTE ||
     AUDIO_ROUTE.test(pathname) ||
     MEMO_ROUTE.test(pathname) ||
-    BACKLOG_ROUTE.test(pathname)
+    BACKLOG_ROUTE.test(pathname) ||
+    REPLY_ROUTE.test(pathname)
   );
 }
 
@@ -292,6 +300,46 @@ export function handleVoiceApiRequest(
     return true;
   }
 
+  // PUT/DELETE /api/mesh/voice/push-token — an FCM registration is bound only
+  // to the verified request principal. Neither endpoint echoes the opaque token
+  // or tells a caller whether another principal has ever registered it.
+  if ((req.method === "PUT" || req.method === "DELETE") && pathname === PUSH_TOKEN_ROUTE) {
+    const tokens = deps.pushDeviceTokens;
+    if (!tokens) {
+      sendJson(res, 503, { error: "push notifications are unavailable" });
+      return true;
+    }
+    void (async () => {
+      let token: unknown;
+      try {
+        const raw = (await readRawBody(req, MAX_PUSH_TOKEN_BYTES)).toString("utf-8");
+        token = (JSON.parse(raw) as { token?: unknown }).token;
+      } catch {
+        sendJson(res, 400, { error: "Invalid JSON body" });
+        return;
+      }
+      if (typeof token !== "string" || !token.trim()) {
+        sendJson(res, 400, { error: "Missing push token" });
+        return;
+      }
+      try {
+        if (req.method === "PUT") {
+          tokens.register(principalId, token, new Date().toISOString());
+        } else {
+          tokens.revoke(principalId, token);
+        }
+      } catch {
+        // The opaque token is deliberately not included in the response or log.
+        sendJson(res, 400, { error: "Invalid push token" });
+        return;
+      }
+      sendJson(res, 200, { ok: true });
+    })().catch(() => {
+      sendJson(res, 500, { error: "push token request failed" });
+    });
+    return true;
+  }
+
   // GET /api/mesh/voice/audio/:id — announcement audio. Lookup is by registry
   // id ONLY (never a path from the client), so there is no traversal surface.
   const audioMatch = req.method === "GET" ? pathname.match(AUDIO_ROUTE) : null;
@@ -361,6 +409,27 @@ export function handleVoiceApiRequest(
     })().catch(() => {
       sendJson(res, 404, { error: "announcement audio missing" });
     });
+    return true;
+  }
+
+  // GET /api/mesh/actors/:actorId/voice/replies/:id — resolve the exact reply
+  // named by an FCM tap. A ring miss may be safely reconstructed from the
+  // durable mesh_chat row only when its sender and recipient match the route
+  // and authenticated principal.
+  const replyMatch = req.method === "GET" ? pathname.match(REPLY_ROUTE) : null;
+  if (replyMatch) {
+    void service
+      .recoverAnnouncement(replyMatch[2], replyMatch[1], principalId)
+      .then((announcement) => {
+        if (!announcement) {
+          sendJson(res, 404, { error: "unknown announcement id" });
+          return;
+        }
+        sendJson(res, 200, { announcement: toFrame(announcement) });
+      })
+      .catch(() => {
+        sendJson(res, 502, { error: "reply audio unavailable" });
+      });
     return true;
   }
 

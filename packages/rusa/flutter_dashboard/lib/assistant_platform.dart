@@ -26,6 +26,18 @@ class AssistantRoleStatus {
   final bool held;
 }
 
+/// The two opaque lookup keys in an Android reply-notification tap. They never
+/// contain message text; the server resolves them under the current session.
+class AssistantReplyTarget {
+  const AssistantReplyTarget({
+    required this.actorId,
+    required this.announcementId,
+  });
+
+  final String actorId;
+  final String announcementId;
+}
+
 /// The Bluetooth headset microphone for one recording: the headset's voice
 /// recognition audio (HFP) plus the communication route to it.
 abstract interface class HeadsetRoute {
@@ -53,6 +65,17 @@ abstract interface class AssistantSignals {
   /// screen. The screen closes once the returned future settles, or after a
   /// native deadline. Null when no page owns the screen.
   abstract Future<void> Function()? onEnd;
+
+  /// The assist task is no longer visible. Stop capture and playback without
+  /// ending its authenticated reply session, so it can be returned to.
+  abstract Future<void> Function()? onBackground;
+
+  /// The stopped assist task has returned to the foreground. Queued reply
+  /// playback may resume only after this signal.
+  abstract Future<void> Function()? onForeground;
+
+  /// A reply-notification tap selected one exact durable announcement.
+  abstract Future<void> Function(AssistantReplyTarget target)? onReply;
 }
 
 /// The whole native surface, as the one assistant channel serves it.

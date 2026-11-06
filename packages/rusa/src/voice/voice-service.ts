@@ -18,6 +18,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
@@ -143,6 +144,8 @@ export interface VoiceServiceOptions {
    * Without this resolver, no messages are synthesized.
    */
   isHumanRecipient?: (principalId: string) => boolean;
+  /** Durable mesh replies, used to recover an announcement after a restart. */
+  meshChat?: Pick<MeshChatRepository, "getById">;
   speechFor?: (actorId: string) => { speech: SpeechClient; voiceName?: string } | undefined;
   /** Injectable clock for presence/grace tests. */
   now?: () => number;
@@ -195,6 +198,7 @@ export class VoiceService {
   private readonly presenceGraceMs: number;
   private readonly sessionLeaseMs: number;
   private readonly isHumanRecipient: (principalId: string) => boolean;
+  private readonly meshChat?: Pick<MeshChatRepository, "getById">;
   private readonly log: Logger;
 
   /** Live `voice` SSE subscription count per actor. */
@@ -211,6 +215,8 @@ export class VoiceService {
   private readonly pendingOutboundRenders = new Map<string, Set<Promise<void>>>();
   /** The source-render barrier captured atomically with a session rebind. */
   private readonly pendingTransferControls = new Map<string, Promise<void>>();
+  /** Coalesce simultaneous notification-tap recoveries of one durable reply. */
+  private readonly pendingRecoveries = new Map<string, Promise<VoiceAnnouncement | undefined>>();
 
   constructor(options: VoiceServiceOptions) {
     this.speechFor = options.speechFor;
@@ -228,6 +234,7 @@ export class VoiceService {
       throw new Error("sessionLeaseMs must be a positive finite number");
     }
     this.isHumanRecipient = options.isHumanRecipient ?? (() => false);
+    this.meshChat = options.meshChat;
     this.onSessionEnded = options.onSessionEnded;
     this.log = options.logger ?? nullLogger;
   }
@@ -503,12 +510,14 @@ export class VoiceService {
 
     let senderId: string | null = null;
     let recipientId: string | null = null;
+    let messageId: string | null = null;
 
     if (event.payload) {
       try {
         const p = JSON.parse(event.payload);
         senderId = event.actorId ?? null;
         recipientId = p.to ?? null;
+        messageId = typeof p.messageId === "string" && p.messageId ? p.messageId : null;
       } catch (_e) {
         // ignore
       }
@@ -522,6 +531,12 @@ export class VoiceService {
 
     const text = speakableText(event.body);
     if (!text) return null;
+    const prior = messageId ? this.get(messageId) : undefined;
+    if (prior) {
+      if (prior.actorId !== senderId || prior.recipientId !== recipientId) return null;
+      onAnnouncement?.(prior);
+      return prior;
+    }
 
     // The emitter invokes this method synchronously up to its first await.
     // Register the marker before starting synthesis so a transfer called in the
@@ -533,36 +548,13 @@ export class VoiceService {
       // — an actor whose voice the operator just changed speaks with the new one
       // on the very next reply. No persisted setting → undefined → the speech
       // client's instance-wide default, which is the pre-existing behavior.
-      const streamRequestedAt = this.now();
-      const selected = this.speechFor?.(senderId);
-      const streamInfo = await (selected?.speech ?? this.speech).streamSynthesize(
-        text,
-        selected?.voiceName
-      );
-      const dir = join(this.home, "voice", "outbox");
-      await mkdir(dir, { recursive: true });
-      const id = randomUUID();
-      const encoded = await this.encodeStream(
-        streamInfo.pcmStream,
-        streamInfo.sampleRate,
-        join(dir, `${streamRequestedAt}-${id}`)
-      );
-
-      const announcement: VoiceAnnouncement = {
-        id,
+      const announcement = await this.renderAnnouncement({
+        id: messageId ?? randomUUID(),
         actorId: senderId,
         recipientId,
         sessionId: event.detail,
         text,
-        audioPath: encoded.path,
-        mime: encoded.mime,
-        createdAt: new Date(this.now()).toISOString(),
-        playedAt: null,
-        subscribeStream: encoded.subscribe,
-        streamRequestedAt,
-      };
-      this.announcements.push(announcement);
-      while (this.announcements.length > this.maxAnnouncements) this.announcements.shift();
+      });
       // The outbound bridge writes the source frame synchronously here. Only
       // then may the transfer barrier release its control frame, preserving
       // the source-frame → control order on the leased SSE connection.
@@ -571,6 +563,96 @@ export class VoiceService {
     } finally {
       finishRender();
     }
+  }
+
+  /**
+   * Rebuild a one-reply announcement from the durable mesh chat row. This is
+   * deliberately a precise principal+actor lookup: a notification identifier
+   * never expands the caller's chat access and a restarted process does not
+   * need the old in-memory announcement ring to honor a tap.
+   */
+  recoverAnnouncement(
+    id: string,
+    actorId: string,
+    principalId: string
+  ): Promise<VoiceAnnouncement | undefined> {
+    const current = this.get(id);
+    if (current) {
+      return Promise.resolve(
+        current.actorId === actorId && current.recipientId === principalId ? current : undefined
+      );
+    }
+    const pending = this.pendingRecoveries.get(id);
+    if (pending) return pending;
+    const recovery = (async () => {
+      const message = this.meshChat?.getById(id);
+      if (
+        !message ||
+        message.senderId !== actorId ||
+        message.recipientId !== principalId ||
+        !this.isHumanRecipient(principalId)
+      ) {
+        return undefined;
+      }
+      const text = speakableText(message.body);
+      if (!text) return undefined;
+      // A concurrent normal render may have populated the ring after the
+      // initial lookup, so do not duplicate audio or change its played state.
+      const raced = this.get(id);
+      if (raced) {
+        return raced.actorId === actorId && raced.recipientId === principalId ? raced : undefined;
+      }
+      return this.renderAnnouncement({
+        id,
+        actorId,
+        recipientId: principalId,
+        sessionId: message.sessionId,
+        text,
+      });
+    })();
+    this.pendingRecoveries.set(id, recovery);
+    void recovery.then(
+      () => this.pendingRecoveries.delete(id),
+      () => this.pendingRecoveries.delete(id)
+    );
+    return recovery;
+  }
+
+  private async renderAnnouncement(input: {
+    id: string;
+    actorId: string;
+    recipientId: string;
+    sessionId: string | null;
+    text: string;
+  }): Promise<VoiceAnnouncement> {
+    const streamRequestedAt = this.now();
+    const selected = this.speechFor?.(input.actorId);
+    const streamInfo = await (selected?.speech ?? this.speech).streamSynthesize(
+      input.text,
+      selected?.voiceName
+    );
+    const dir = join(this.home, "voice", "outbox");
+    await mkdir(dir, { recursive: true });
+    const encoded = await this.encodeStream(
+      streamInfo.pcmStream,
+      streamInfo.sampleRate,
+      // The durable message id remains the external announcement id. Keep a
+      // fresh local filename instead, so a caller-controlled lookup string can
+      // never influence an outbox path even before its database lookup fails.
+      join(dir, `${streamRequestedAt}-${randomUUID()}`)
+    );
+    const announcement: VoiceAnnouncement = {
+      ...input,
+      audioPath: encoded.path,
+      mime: encoded.mime,
+      createdAt: new Date(this.now()).toISOString(),
+      playedAt: null,
+      subscribeStream: encoded.subscribe,
+      streamRequestedAt,
+    };
+    this.announcements.push(announcement);
+    while (this.announcements.length > this.maxAnnouncements) this.announcements.shift();
+    return announcement;
   }
 
   /** Mark a source render so a same-turn transfer can order its control after it. */

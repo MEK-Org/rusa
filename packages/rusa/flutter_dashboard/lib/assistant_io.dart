@@ -40,6 +40,15 @@ class IoAssistantChannel implements AssistantPlatform {
   @override
   Future<void> Function()? onEnd;
 
+  @override
+  Future<void> Function()? onBackground;
+
+  @override
+  Future<void> Function()? onForeground;
+
+  @override
+  Future<void> Function(AssistantReplyTarget target)? onReply;
+
   Future<Object?> _handle(MethodCall call) async {
     switch (call.method) {
       case 'trigger':
@@ -48,6 +57,27 @@ class IoAssistantChannel implements AssistantPlatform {
         _routeLost.add(null);
       case 'end':
         await onEnd?.call();
+      case 'background':
+        await onBackground?.call();
+      case 'foreground':
+        await onForeground?.call();
+      case 'reply':
+        final args = call.arguments;
+        if (args is Map) {
+          final actorId = args['actorId'];
+          final announcementId = args['announcementId'];
+          if (actorId is String &&
+              announcementId is String &&
+              actorId.isNotEmpty &&
+              announcementId.isNotEmpty) {
+            await onReply?.call(
+              AssistantReplyTarget(
+                actorId: actorId,
+                announcementId: announcementId,
+              ),
+            );
+          }
+        }
     }
     return null;
   }

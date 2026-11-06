@@ -616,6 +616,59 @@ class DashboardApi {
         .toList();
   }
 
+  /// Recover the one durable reply named by an Android notification tap. The
+  /// server still verifies the current session principal and actor pairing.
+  Future<VoiceAnnouncement> fetchVoiceReply(
+    String actorId,
+    String announcementId,
+  ) async {
+    final j = await _getJson(
+      _u('/api/mesh/actors/$actorId/voice/replies/$announcementId'),
+    );
+    final announcement = j['announcement'];
+    if (announcement is! Map<String, dynamic>) {
+      throw StateError('Voice reply response is malformed');
+    }
+    return VoiceAnnouncement.fromJson(announcement);
+  }
+
+  /// Associate this Firebase registration token with the authenticated
+  /// dashboard principal. The server owns the account binding.
+  Future<void> registerPushToken(String token) async {
+    await _putVoicePushToken(token);
+  }
+
+  /// Remove this device's registration before its dashboard session logs out.
+  Future<void> revokePushToken(String token) async {
+    final uri = _u('/api/mesh/voice/push-token');
+    final res = await _client.delete(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'token': token}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
+  Future<void> _putVoicePushToken(String token) async {
+    final uri = _u('/api/mesh/voice/push-token');
+    final res = await _client.put(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'token': token}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
   /// `POST /api/mesh/voice/ack` — mark an announcement played (sent after it
   /// finishes playing, or is manually skipped).
   Future<void> ackVoiceAnnouncement(String id) async {

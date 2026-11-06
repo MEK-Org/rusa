@@ -408,6 +408,7 @@ import {
 } from "../update/runner.js";
 import { ChatRoomService } from "../voice/chat-room.js";
 import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
+import { createFcmVoicePushDelivery, type VoicePushDelivery } from "../voice/push-delivery.js";
 import { RoomEntryService } from "../voice/room-entry.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
@@ -3163,6 +3164,7 @@ async function composeStart(
   // The mesh is built before the configured voice client. The closure keeps
   // authority host-owned while letting the later service attach its registry.
   let voiceService: VoiceService | null = null;
+  let replyPushDelivery: VoicePushDelivery | undefined;
 
   // One ownership ladder, assembled at the host boundary. Both EventManager
   // delivery and ActorMesh authority checks use these same narrow read ports;
@@ -4769,10 +4771,20 @@ async function composeStart(
             const user = getRepositories().principals.getUser(principalId);
             return user !== undefined && !user.disabledAt;
           },
+          meshChat: getRepositories().meshChat,
           onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
           logger: log.child({ component: "voice-session" }),
         })
       : null;
+  if (voiceService && config.auth) {
+    const fcm = createFcmVoicePushDelivery({
+      firebase: config.auth.firebase,
+      tokens: getRepositories().pushDeviceTokens,
+      logger: log.child({ component: "voice-push" }),
+    });
+    replyPushDelivery = fcm.delivery;
+    resources.acquire("reply push delivery", fcm.close);
+  }
   const bindDashboard = shouldBindDashboardServer({
     e2eMode,
     e2eDashboard: opts?.e2e?.dashboard === true,
@@ -4804,6 +4816,7 @@ async function composeStart(
           meshEvents: getRepositories().meshEvents,
           timings: dashboardTimings,
           meshChat: getRepositories().meshChat,
+          pushDeviceTokens: getRepositories().pushDeviceTokens,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
@@ -4946,7 +4959,9 @@ async function composeStart(
         dashboardConfig: { quotaProviders: config.dashboard?.quotaProviders },
         // Walkie-talkie voice routes + reply-TTS hook ; undefined when
         // voice credentials are unconfigured (routes then 503).
-        voice: voiceService ? { service: voiceService } : undefined,
+        voice: voiceService
+          ? { service: voiceService, pushDelivery: replyPushDelivery }
+          : undefined,
       })
     : null;
   if (dashboardServer) {

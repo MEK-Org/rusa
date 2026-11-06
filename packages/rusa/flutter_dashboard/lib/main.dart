@@ -5,12 +5,14 @@ import 'package:flutter/material.dart';
 import 'api.dart';
 import 'app.dart';
 import 'assistant_page.dart';
+import 'assistant_platform.dart';
 import 'breakpoints.dart';
 import 'dashboard_title.dart';
 import 'io_session.dart';
 import 'iu/iu_reports_view.dart';
 import 'iu/iu_tree_view.dart';
 import 'platform_bootstrap.dart';
+import 'reply_notifications.dart';
 import 'store.dart';
 import 'session.dart';
 import 'theme.dart';
@@ -41,6 +43,7 @@ void assistMain() {
   WidgetsFlutterBinding.ensureInitialized();
   platformInit();
   final assistant = platformCreateAssistant();
+  final initialReply = _initialAssistantReply();
   runApp(
     RusaDashboardApp(
       title: resolveDashboardTitle(platformDocumentTitle),
@@ -51,9 +54,26 @@ void assistMain() {
         createWalkieDeps: (api) =>
             platformCreateWalkieDeps(api, session, headset: assistant),
         signals: assistant,
+        initialReply: initialReply,
+        notifications: platformCreateReplyNotifications(),
       ),
     ),
   );
+}
+
+AssistantReplyTarget? _initialAssistantReply() {
+  final route = WidgetsBinding.instance.platformDispatcher.defaultRouteName;
+  final uri = Uri.tryParse(route);
+  if (uri == null || (uri.path != 'reply' && uri.path != '/reply')) return null;
+  final actorId = uri.queryParameters['actorId'];
+  final announcementId = uri.queryParameters['announcementId'];
+  if (actorId == null ||
+      actorId.isEmpty ||
+      announcementId == null ||
+      announcementId.isEmpty) {
+    return null;
+  }
+  return AssistantReplyTarget(actorId: actorId, announcementId: announcementId);
 }
 
 class DashboardPage extends StatefulWidget {
@@ -68,12 +88,15 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   late final DashboardApi _api;
   late final DashboardStore _store;
+  ReplyNotifications? _replyNotifications;
   late Future<void> _ready;
 
   @override
   void initState() {
     super.initState();
     _api = platformCreateDashboardApi(widget.session);
+    _replyNotifications = platformCreateReplyNotifications();
+    widget.session.addBeforeLogoutListener(_revokePushToken);
     _store = DashboardStore(
       api: _api,
       stream: platformCreateMeshStream(widget.session, _api.base),
@@ -91,8 +114,19 @@ class _DashboardPageState extends State<DashboardPage> {
 
   @override
   void dispose() {
+    widget.session.removeBeforeLogoutListener(_revokePushToken);
+    _replyNotifications?.dispose();
     _store.dispose();
     super.dispose();
+  }
+
+  Future<void> _revokePushToken() async {
+    try {
+      await _replyNotifications?.revoke(_api);
+    } catch (_) {
+      // Logout still clears the authenticated dashboard session. The server's
+      // generic notification contains no reply body and cleans invalid tokens.
+    }
   }
 
   @override

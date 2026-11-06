@@ -154,6 +154,7 @@ class WalkieController {
   Timer? _deliveredReset;
   DateTime? _recordStartedAt;
   int _recordGeneration = 0;
+  bool _playbackSuspended = false;
   bool _disposed = false;
 
   // ── Exposed streams ──
@@ -341,6 +342,23 @@ class WalkieController {
     _enqueue(frame);
   }
 
+  /// Keep the reply session and transcript alive while the assist task is in
+  /// the background, but never continue automatic reply audio there. An
+  /// interrupted reply stays unacknowledged and is replayed on foreground.
+  void suspendPlayback() {
+    if (_playbackSuspended) return;
+    _playbackSuspended = true;
+    _deps.player.stop();
+  }
+
+  /// Resume the queued reply selected by the retained session after the task
+  /// becomes visible again.
+  void resumePlayback() {
+    if (!_playbackSuspended) return;
+    _playbackSuspended = false;
+    unawaited(_drain());
+  }
+
   Future<void> _recoverHandoffBacklogs(
     String sourceActorId,
     String targetActorId,
@@ -412,11 +430,18 @@ class WalkieController {
     unawaited(_drain());
   }
 
+  /// Queue exactly the reply selected by a verified notification tap. Unlike a
+  /// live/backlog frame, it may predate this fresh activity's SSE session.
+  void presentNotificationReply(VoiceAnnouncement announcement) {
+    if (!_enabled.value || _disposed || announcement.actorId != actorId) return;
+    _enqueue(announcement);
+  }
+
   Future<void> _drain() async {
-    if (_draining) return;
+    if (_draining || _playbackSuspended) return;
     _draining = true;
     try {
-      while (_enabled.value && _queue.isNotEmpty) {
+      while (_enabled.value && !_playbackSuspended && _queue.isNotEmpty) {
         final item = _queue.removeAt(0);
         _queueDepth.add(_queue.length);
         _nowPlaying.add(item.frame);
@@ -429,6 +454,13 @@ class WalkieController {
         }
         if (_disposed) return;
         _nowPlaying.add(null);
+        // `stop` resolves the player future. Put the interrupted reply back
+        // before acknowledgement so foreground return plays this exact item.
+        if (_playbackSuspended) {
+          _queue.insert(0, item);
+          _queueDepth.add(_queue.length);
+          break;
+        }
         _lastPlayed.add(item.frame);
         // Turned off mid-play: leave it unacked so it replays next mode entry.
         if (!_enabled.value) break;

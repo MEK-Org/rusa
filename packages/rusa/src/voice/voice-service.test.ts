@@ -41,6 +41,7 @@ function makeService(
     onSessionEnded?: (actorId: string) => void;
     isHumanRecipient?: (principalId: string) => boolean;
     speechFor?: VoiceServiceOptions["speechFor"];
+    meshChat?: VoiceServiceOptions["meshChat"];
     logger?: Logger;
   } = {}
 ) {
@@ -54,6 +55,7 @@ function makeService(
     onSessionEnded: opts.onSessionEnded,
     isHumanRecipient: opts.isHumanRecipient ?? ((id) => id === TEST_USER_ID),
     speechFor: opts.speechFor,
+    meshChat: opts.meshChat,
     logger: opts.logger,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
@@ -114,6 +116,76 @@ describe("VoiceService presence & grace", () => {
     service.presenceDisconnect([ACTOR], TEST_USER_ID);
     now += VOICE_PRESENCE_GRACE_MS * 10; // grace irrelevant: one is still live
     expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(true);
+  });
+});
+
+describe("VoiceService durable reply recovery", () => {
+  it("uses the durable mesh message id as the notification announcement id", async () => {
+    const { service } = makeService();
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+
+    const announcement = await service.handleMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "durable-reply" }) })
+    );
+
+    expect(announcement?.id).toBe("durable-reply");
+  });
+
+  it("rebuilds a notification-targeted reply after its in-memory registry is gone", async () => {
+    const messageId = "reply-message";
+    const { service } = makeService({
+      meshChat: {
+        getById: (id) =>
+          id === messageId
+            ? {
+                id,
+                ts: "2026-11-06T00:00:00.000Z",
+                senderId: ACTOR,
+                recipientId: TEST_USER_ID,
+                body: "Your reply is ready.",
+                sessionId: "walkie-session",
+                responsive: null,
+              }
+            : null,
+      },
+    });
+
+    const [first, second] = await Promise.all([
+      service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID),
+      service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID),
+    ]);
+
+    expect(first).toMatchObject({
+      id: messageId,
+      actorId: ACTOR,
+      recipientId: TEST_USER_ID,
+      sessionId: "walkie-session",
+      text: "Your reply is ready.",
+    });
+    expect(second).toBe(first);
+  });
+
+  it("fails closed when a durable row belongs to another actor or principal", async () => {
+    const { service } = makeService({
+      meshChat: {
+        getById: () => ({
+          id: "reply-message",
+          ts: "2026-11-06T00:00:00.000Z",
+          senderId: ACTOR,
+          recipientId: TEST_USER_ID,
+          body: "private reply",
+          sessionId: null,
+          responsive: null,
+        }),
+      },
+    });
+
+    await expect(
+      service.recoverAnnouncement("reply-message", TARGET, TEST_USER_ID)
+    ).resolves.toBeUndefined();
+    await expect(
+      service.recoverAnnouncement("reply-message", ACTOR, "other-user")
+    ).resolves.toBeUndefined();
   });
 });
 

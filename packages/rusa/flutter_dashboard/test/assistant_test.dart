@@ -197,6 +197,109 @@ void main() {
       expect(assistant.onEnd, isNull);
     });
 
+    testWidgets(
+      'backgrounding cancels capture but retains the session and queues its reply for return',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+
+        await assistant.onBackground!();
+        await tester.pump();
+
+        expect(walkie.recorder.cancelCalls, 1);
+        expect(api.disabledVoiceSessions, isEmpty);
+        expect(walkie.stream.disposed, isFalse);
+        expect(find.byKey(const ValueKey('walkie-panel')), findsOneWidget);
+
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement('answer', actor: 'root', sessionId: sessionId),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.playedUrls, isEmpty);
+
+        await assistant.onForeground!();
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/answer']);
+
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'notification tap restores its exact reply without opening capture',
+      (tester) async {
+        api.notificationReply = makeAnnouncement(
+          'durable-reply',
+          actor: 'root',
+          sessionId: 'ended-session',
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              initialReply: const AssistantReplyTarget(
+                actorId: 'root',
+                announcementId: 'durable-reply',
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 0);
+        expect(api.notificationReplyCalls, [
+          (actorId: 'root', announcementId: 'durable-reply'),
+        ]);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('backgrounding during startup returns with an idle session', (
+      tester,
+    ) async {
+      final gate = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(gate);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            onClose: () => closed++,
+          ),
+        ),
+      );
+      await tester.pump();
+
+      await assistant.onBackground!();
+      gate.complete(
+        ThreadsSnapshot(
+          halted: false,
+          threads: api.threadsResult,
+          rootActorId: 'root',
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(api.disabledVoiceSessions, isEmpty);
+      final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
+      expect(panel.controller.record.value.phase, RecordPhase.idle);
+
+      await unmount(tester);
+    });
+
     testWidgets('leaving the screen during the root lookup cancels capture', (
       tester,
     ) async {
@@ -410,10 +513,10 @@ void main() {
         await tester.pump();
 
         ThreadsSnapshot snapshot() => ThreadsSnapshot(
-              halted: false,
-              threads: api.threadsResult,
-              rootActorId: 'root',
-            );
+          halted: false,
+          threads: api.threadsResult,
+          rootActorId: 'root',
+        );
 
         // First (superseded) attempt completes while second is still awaiting threads lookup:
         first.complete(snapshot());
@@ -571,9 +674,7 @@ void main() {
       await unmount(tester);
     });
 
-    testWidgets('closing while voice starts cancels capture', (
-      tester,
-    ) async {
+    testWidgets('closing while voice starts cancels capture', (tester) async {
       final probe = Completer<List<VoiceAnnouncement>>();
       api.backlogGates.add(probe);
       await pumpPage(tester);

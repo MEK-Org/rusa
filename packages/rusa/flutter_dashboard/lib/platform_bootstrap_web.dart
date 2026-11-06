@@ -10,6 +10,7 @@ import 'avatar_upload_web.dart';
 import 'mesh_stream.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
+import 'reply_notifications.dart';
 import 'session.dart';
 import 'session_events_web.dart';
 import 'session_web.dart';
@@ -32,16 +33,13 @@ Future<DashboardSession> platformBootstrapSession() =>
     bootstrapDashboardSession();
 
 DashboardSessionHooksDisposer Function(DashboardSession session)?
-    get platformBrowserHooksBuilder =>
-        (session) => DashboardSessionBrowserHooks(session).dispose;
+get platformBrowserHooksBuilder =>
+    (session) => DashboardSessionBrowserHooks(session).dispose;
 
 DashboardApi platformCreateDashboardApi(DashboardSession session) =>
     DashboardApi(base: Uri.base, session: session);
 
-MeshStreamSource platformCreateMeshStream(
-  DashboardSession session,
-  Uri base,
-) =>
+MeshStreamSource platformCreateMeshStream(DashboardSession session, Uri base) =>
     WebEventSourceStream(session);
 
 QuotaCache platformCreateQuotaCache() => WebQuotaCache();
@@ -58,9 +56,10 @@ WalkieDeps? platformCreateWalkieDeps(
   DashboardApi api,
   DashboardSession session, {
   HeadsetRoute? headset,
-}) =>
-    webWalkieDeps(api, session);
+}) => webWalkieDeps(api, session);
 
 AvatarFilePicker platformCreateAvatarFilePicker() => WebAvatarFilePicker();
 
 AssistantPlatform? platformCreateAssistant() => null;
+
+ReplyNotifications? platformCreateReplyNotifications() => null;

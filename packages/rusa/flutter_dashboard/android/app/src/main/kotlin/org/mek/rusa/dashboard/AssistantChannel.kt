@@ -58,6 +58,18 @@ class AssistantChannel(
 
     fun trigger() = channel.invokeMethod("trigger", null)
 
+    /** The assist task stopped but remains returnable. */
+    fun background() = channel.invokeMethod("background", null)
+
+    /** The stopped assist task is visible again. */
+    fun foreground() = channel.invokeMethod("foreground", null)
+
+    /** Deliver the two opaque reply lookup keys from an FCM notification tap. */
+    fun reply(actorId: String, announcementId: String) = channel.invokeMethod(
+        "reply",
+        mapOf("actorId" to actorId, "announcementId" to announcementId),
+    )
+
     /** Asks Dart to end the session; [done] runs once it has, or failed to. */
     fun end(done: () -> Unit) = channel.invokeMethod(
         "end",

@@ -663,6 +663,8 @@ class FakeApi extends DashboardApi {
         ({String actorId, int byteLength, String mimeType, String? sessionId})
       >[];
   final disabledVoiceSessions = <String>[];
+  VoiceAnnouncement? notificationReply;
+  final notificationReplyCalls = <({String actorId, String announcementId})>[];
 
   @override
   Future<List<VoiceAnnouncement>> fetchVoiceBacklog(String actorId) async {
@@ -674,6 +676,20 @@ class FakeApi extends DashboardApi {
     if (backlogPages.isEmpty) return const [];
     final i = backlogCalls - 1;
     return backlogPages[i < backlogPages.length ? i : backlogPages.length - 1];
+  }
+
+  @override
+  Future<VoiceAnnouncement> fetchVoiceReply(
+    String actorId,
+    String announcementId,
+  ) async {
+    notificationReplyCalls.add((
+      actorId: actorId,
+      announcementId: announcementId,
+    ));
+    final reply = notificationReply;
+    if (reply == null) throw StateError('no notification reply');
+    return reply;
   }
 
   @override
@@ -1773,8 +1789,18 @@ class FakeAssistant implements AssistantPlatform {
   Future<void> playReadyCue() async {
     readyCueCalls++;
   }
+
   @override
   Future<void> Function()? onEnd;
+
+  @override
+  Future<void> Function()? onBackground;
+
+  @override
+  Future<void> Function()? onForeground;
+
+  @override
+  Future<void> Function(AssistantReplyTarget target)? onReply;
 
   @override
   Future<AssistantRoleStatus> status() async =>

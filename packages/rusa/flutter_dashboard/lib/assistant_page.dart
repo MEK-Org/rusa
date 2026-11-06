@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'api.dart';
 import 'assistant_platform.dart';
 import 'models.dart';
+import 'reply_notifications.dart';
 import 'theme.dart';
 import 'voice_platform.dart';
 import 'walkie_controller.dart';
@@ -22,12 +23,16 @@ class AssistantPage extends StatefulWidget {
     required this.createApi,
     required this.createWalkieDeps,
     this.signals,
+    this.initialReply,
+    this.notifications,
     this.onClose,
   });
 
   final DashboardApi Function() createApi;
   final WalkieDeps? Function(DashboardApi api) createWalkieDeps;
   final AssistantSignals? signals;
+  final AssistantReplyTarget? initialReply;
+  final ReplyNotifications? notifications;
 
   /// Leaves the assist screen; defaults to finishing the activity.
   final VoidCallback? onClose;
@@ -51,19 +56,25 @@ class _AssistantPageState extends State<AssistantPage> {
   int _attempt = 0;
   bool _ended = false;
   bool _disposed = false;
+  bool _backgrounded = false;
   bool _pendingStop = false;
   Future<void> Function()? _cancelCurrentCapture;
+  AssistantReplyTarget? _pendingReply;
 
   @override
   void initState() {
     super.initState();
     _api = widget.createApi();
     _deps = widget.createWalkieDeps(_api);
+    _pendingReply = widget.initialReply;
     final signals = widget.signals;
     if (signals != null) {
       _subs.add(signals.triggers.listen((_) => unawaited(_onTrigger())));
       _subs.add(signals.routeLost.listen((_) => unawaited(_onRouteLost())));
       signals.onEnd = _end;
+      signals.onBackground = _background;
+      signals.onForeground = _foreground;
+      signals.onReply = _receiveReply;
     }
     _ready = _start();
   }
@@ -87,7 +98,8 @@ class _AssistantPageState extends State<AssistantPage> {
     // Scoped per attempt: cancellation only affects the active attempt;
     // a stale attempt never touches the shared recorder so it cannot cancel a
     // newer take, leaving _end(), dispose() and a newer start() to release it.
-    var captureActive = true;
+    final notificationOpening = widget.initialReply != null;
+    var captureActive = !notificationOpening;
     Future<void> cancelCapture() async {
       if (!captureActive) return;
       captureActive = false;
@@ -95,33 +107,37 @@ class _AssistantPageState extends State<AssistantPage> {
         await deps.recorder.cancel();
       } catch (_) {}
     }
+
     _cancelCurrentCapture = cancelCapture;
 
     final captureStartedAt = DateTime.now();
     Object? captureError;
-    final captureFuture = () async {
-      try {
-        await deps.recorder.start();
-        if (stale() || !captureActive) {
-          if (!stale()) {
+    final captureFuture = notificationOpening
+        ? Future<void>.value()
+        : () async {
             try {
-              await deps.recorder.cancel();
-            } catch (_) {}
-          }
-          return;
-        }
-        final elapsed =
-            DateTime.now().difference(captureStartedAt).inMilliseconds;
-        debugPrint('assistant_page: Capture live in ${elapsed}ms');
-        // Play audible ready cue at observed capture readiness for assist entry only.
-        await widget.signals?.playReadyCue();
-      } catch (e) {
-        if (!stale()) {
-          captureActive = false;
-          captureError = e;
-        }
-      }
-    }();
+              await deps.recorder.start();
+              if (stale() || !captureActive) {
+                if (!stale()) {
+                  try {
+                    await deps.recorder.cancel();
+                  } catch (_) {}
+                }
+                return;
+              }
+              final elapsed = DateTime.now()
+                  .difference(captureStartedAt)
+                  .inMilliseconds;
+              debugPrint('assistant_page: Capture live in ${elapsed}ms');
+              // Play audible ready cue at observed capture readiness for assist entry only.
+              await widget.signals?.playReadyCue();
+            } catch (e) {
+              if (!stale()) {
+                captureActive = false;
+                captureError = e;
+              }
+            }
+          }();
 
     ThreadsSnapshot snapshot;
     try {
@@ -166,11 +182,14 @@ class _AssistantPageState extends State<AssistantPage> {
 
     unawaited(_controller?.dispose());
     final controller = WalkieController(
-      actorId: root,
+      // A notification can only select the actor that sent its durable reply;
+      // the page still exposes no general navigation surface.
+      actorId: widget.initialReply?.actorId ?? root,
       deps: deps,
       sessionRepliesOnly: true,
     );
     _controller = controller;
+    if (_backgrounded) controller.suspendPlayback();
     Future<Never> discard([String reason = 'Assist screen closed']) async {
       if (_cancelCurrentCapture == cancelCapture) {
         _cancelCurrentCapture = null;
@@ -190,6 +209,9 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
+    // Registration is intentionally best-effort: an unavailable FCM service
+    // must not disrupt an already-authenticated assistant capture.
+    unawaited(widget.notifications?.register(_api).catchError((_) {}));
 
     await captureFuture;
     if (captureError != null) {
@@ -207,22 +229,59 @@ class _AssistantPageState extends State<AssistantPage> {
       return discard('Voice is not configured on this instance');
     }
 
+    final captureCancelled = !captureActive;
     captureActive = false;
     if (_cancelCurrentCapture == cancelCapture) {
       _cancelCurrentCapture = null;
     }
-    controller.adoptRecording(startedAt: captureStartedAt);
+    // Backgrounding while startup is still resolving keeps the reply session,
+    // but a discarded take must not be adopted as an active recording.
+    if (!captureCancelled) {
+      controller.adoptRecording(startedAt: captureStartedAt);
+    }
 
     // Walkie off (the panel's power button) ends the assist session.
     _enabledSub = controller.enabled.skip(1).listen((enabled) {
       if (!enabled) _close();
     });
     _live = controller;
+    final pendingReply = _pendingReply;
+    _pendingReply = null;
+    if (pendingReply != null) {
+      unawaited(_presentReply(controller, pendingReply));
+    }
     if (_pendingStop) {
       _pendingStop = false;
       unawaited(controller.toggleRecord());
     }
     return controller;
+  }
+
+  Future<void> _receiveReply(AssistantReplyTarget target) async {
+    _pendingReply = target;
+    final controller = _live;
+    if (controller == null) return;
+    _pendingReply = null;
+    await _presentReply(controller, target);
+  }
+
+  Future<void> _presentReply(
+    WalkieController controller,
+    AssistantReplyTarget target,
+  ) async {
+    // The native intent carries opaque keys, but keep this UI boundary narrow:
+    // only the current restricted conversation may receive its exact reply.
+    if (controller.actorId != target.actorId) return;
+    try {
+      final reply = await _api.fetchVoiceReply(
+        target.actorId,
+        target.announcementId,
+      );
+      if (_disposed || _controller != controller) return;
+      controller.presentNotificationReply(reply);
+    } catch (_) {
+      // Failed/stale notification recovery reveals no wider dashboard state.
+    }
   }
 
   Future<void> _onTrigger() async {
@@ -249,6 +308,21 @@ class _AssistantPageState extends State<AssistantPage> {
     if (_cancelCurrentCapture != null) {
       _pendingStop = true;
     }
+  }
+
+  /// Leaving the visible assist task is not session termination: capture ends
+  /// independently, and reply audio waits until the task is foregrounded.
+  Future<void> _background() async {
+    _backgrounded = true;
+    _pendingStop = false;
+    await _cancelCurrentCapture?.call();
+    await _controller?.cancelRecord();
+    _controller?.suspendPlayback();
+  }
+
+  Future<void> _foreground() async {
+    _backgrounded = false;
+    _controller?.resumePlayback();
   }
 
   /// The screen is closing because it left the screen. End the session
@@ -295,7 +369,12 @@ class _AssistantPageState extends State<AssistantPage> {
   void dispose() {
     _disposed = true;
     final signals = widget.signals;
-    if (signals != null && signals.onEnd == _end) signals.onEnd = null;
+    if (signals != null) {
+      if (signals.onEnd == _end) signals.onEnd = null;
+      if (signals.onBackground == _background) signals.onBackground = null;
+      if (signals.onForeground == _foreground) signals.onForeground = null;
+      if (signals.onReply == _receiveReply) signals.onReply = null;
+    }
     for (final sub in _subs) {
       unawaited(sub.cancel());
     }
@@ -306,6 +385,7 @@ class _AssistantPageState extends State<AssistantPage> {
     if (_cancelCurrentCapture != null) {
       unawaited(_cancelCurrentCapture?.call());
     }
+    widget.notifications?.dispose();
     super.dispose();
   }
 

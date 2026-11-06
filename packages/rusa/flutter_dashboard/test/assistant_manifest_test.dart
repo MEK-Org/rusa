@@ -34,12 +34,22 @@ void main() {
     }
   });
 
+  test('only the assist screen handles a reply-notification tap', () {
+    const action = 'org.mek.rusa.dashboard.OPEN_REPLY';
+    final handlers = [
+      for (final e in activities.entries)
+        if (e.value.contains('<action android:name="$action"/>')) e.key,
+    ];
+    expect(handlers, ['.AssistActivity']);
+  });
+
   test('the assist screen shows over the keyguard without unlocking', () {
     final assist = activities['.AssistActivity']!;
     expect(assist, contains('android:showWhenLocked="true"'));
     expect(assist, contains('android:turnScreenOn="true"'));
     expect(assist, contains('android:exported="true"'));
     expect(assist, contains('android:launchMode="singleTask"'));
+    expect(assist, isNot(contains('android:excludeFromRecents="true"')));
   });
 
   test('the main dashboard activity does not show over the keyguard', () {

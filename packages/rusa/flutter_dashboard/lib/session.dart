@@ -57,6 +57,12 @@ abstract class DashboardSession extends ChangeNotifier
 
   Future<void> signIn();
   Future<void> signOut();
+
+  /// A platform resource (for example an FCM registration) may revoke its
+  /// authenticated server state immediately before logout clears the cookie.
+  /// Local sessions have no authenticated cookie and keep this a no-op.
+  void addBeforeLogoutListener(Future<void> Function() listener) {}
+  void removeBeforeLogoutListener(Future<void> Function() listener) {}
   Future<void> visit();
   void idleFromServer();
 
@@ -148,6 +154,17 @@ class FirebaseDashboardSession extends DashboardSession {
   bool _expiring = false;
   String? _browserTitle;
   String? _errorMessage;
+  final _beforeLogoutListeners = <Future<void> Function()>{};
+
+  @override
+  void addBeforeLogoutListener(Future<void> Function() listener) {
+    _beforeLogoutListeners.add(listener);
+  }
+
+  @override
+  void removeBeforeLogoutListener(Future<void> Function() listener) {
+    _beforeLogoutListeners.remove(listener);
+  }
 
   @override
   bool get authenticationEnabled => true;
@@ -351,6 +368,14 @@ class FirebaseDashboardSession extends DashboardSession {
 
   @override
   Future<void> signOut() async {
+    // Losing local sign-out would be worse than leaving a generic notification
+    // registration for FCM's invalid-token cleanup, so every hook is
+    // best-effort and cannot block the normal server logout.
+    for (final listener in _beforeLogoutListeners.toList()) {
+      try {
+        await listener();
+      } catch (_) {}
+    }
     final response = await _post('logout');
     if (response.statusCode != 200) {
       _setError('Unable to log out. Please try again.');
