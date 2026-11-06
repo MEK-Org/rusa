@@ -122,9 +122,7 @@ class _AssistantPageState extends State<AssistantPage> {
     final previous = _controller;
     _controller = null;
     _live = null;
-    // Closing the activity unmounts WalkiePanel's stream listeners. Dispose
-    // only after requesting that close: waiting for the subjects here would
-    // deadlock against the still-mounted panel that owns those listeners.
+    // Logout closes the task promptly; it does not wait on subject shutdown.
     unawaited(previous?.dispose());
     if (!_disposed) _close();
   }
@@ -383,12 +381,10 @@ class _AssistantPageState extends State<AssistantPage> {
     WalkieController? previous,
     int restartAttempt,
   ) async {
-    // Disable first so the transferred lease and shared wakelock are released
-    // before the fresh root session starts. Its stream subjects must finish
-    // closing after FutureBuilder has swapped out the old WalkiePanel; waiting
-    // here would deadlock on that still-mounted panel's subscriptions.
-    await previous?.disable();
-    unawaited(previous?.dispose());
+    // Release the transferred lease and shared wakelock before the fresh root
+    // session starts. FutureBuilder keeps the old WalkiePanel mounted until
+    // that start resolves; a disposed controller ignores its record taps.
+    await previous?.dispose();
     if (_disposed || restartAttempt != _attempt) {
       throw StateError('Assist screen closed');
     }

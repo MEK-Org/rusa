@@ -104,7 +104,7 @@ export function attachVoiceOutbound(
 ): () => void {
   return emitter.onMeshEvent((event) => {
     const push = service.pushTargetForMeshEvent(event);
-    if (pushDelivery && push && (!rootActorId || push.actorId === rootActorId)) {
+    if (pushDelivery && push && push.actorId === rootActorId) {
       void pushDelivery
         .deliver(push)
         .catch((err) => logger.warn("voice_push_dispatch_failed", { actorId: push.actorId, err }));

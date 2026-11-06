@@ -802,13 +802,16 @@ class WalkieController {
   Future<void> _stopAndSend() async {
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));
-    // Sending a new memo indicates active user engagement in the foreground.
-    // Suppress any pre-existing suspended audio queue so old background clips
-    // do not play over the live conversation, and resume playback for new replies.
-    _playbackSuspended = false;
-    _pauseAfterAnnouncementId = null;
-    _queue.clear();
-    _queueDepth.add(0);
+    // A memo sent past a notification/return boundary lets its reply play
+    // without first releasing the audio that boundary held back; those rows
+    // stay replayable in the transcript. An ordinary walkie never has a
+    // boundary, so its queue keeps playing in order.
+    if (_playbackSuspended || _pauseAfterAnnouncementId != null) {
+      _playbackSuspended = false;
+      _pauseAfterAnnouncementId = null;
+      _queue.clear();
+      _queueDepth.add(0);
+    }
     try {
       final clip = await _deps.recorder.stop();
       final result = await _deps.api.sendVoiceMemo(
