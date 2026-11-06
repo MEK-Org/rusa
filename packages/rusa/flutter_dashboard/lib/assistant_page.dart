@@ -31,6 +31,7 @@ class AssistantPage extends StatefulWidget {
   final WalkieDeps? Function(DashboardApi api) createWalkieDeps;
   final AssistantSignals? signals;
   final AssistantReplyTarget? initialReply;
+
   /// A notification was opened while the keyguard was locked; native code
   /// supplies its target only after the user unlocks.
   final bool notificationOpening;
@@ -73,6 +74,7 @@ class _AssistantPageState extends State<AssistantPage> {
       _subs.add(signals.routeLost.listen((_) => unawaited(_onRouteLost())));
       signals.onBackground = _background;
       signals.onForeground = _foreground;
+      signals.onLockedAssist = _restartLockedAssist;
       signals.onReply = _receiveReply;
     }
     _ready = _start();
@@ -180,13 +182,6 @@ class _AssistantPageState extends State<AssistantPage> {
       throw StateError('No active root actor');
     }
 
-    // Reuse the scoped durable chat route for a notification's fresh task.
-    // It adds the authenticated human participant server-side, rather than
-    // trusting any identity from the Android intent.
-    final historyFuture = notificationOpening
-        ? _api.fetchChat(actors: [root], limit: 20)
-        : null;
-
     unawaited(_controller?.dispose());
     final controller = WalkieController(
       // This surface stays walkie-to-root. A reply target is accepted only
@@ -197,7 +192,7 @@ class _AssistantPageState extends State<AssistantPage> {
       sessionRepliesOnly: true,
     );
     _controller = controller;
-    if (_backgrounded) controller.suspendPlayback();
+    if (_backgrounded || notificationOpening) controller.suspendPlayback();
     Future<Never> discard([String reason = 'Assist screen closed']) async {
       if (_cancelCurrentCapture == cancelCapture) {
         _cancelCurrentCapture = null;
@@ -217,17 +212,6 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     await controller.enable();
     if (stale()) return discard();
-    if (historyFuture != null) {
-      try {
-        final history = await historyFuture;
-        if (stale()) return discard();
-        // Chat pages are newest-first; transcript rendering is chronological.
-        controller.restoreConversation(history.chat.reversed.toList());
-      } catch (_) {
-        // The exact tapped reply remains independently recoverable. Do not
-        // expand a history-fetch failure into broader dashboard access here.
-      }
-    }
     await captureFuture;
     if (captureError != null) {
       if (_cancelCurrentCapture == cancelCapture) {
@@ -263,7 +247,7 @@ class _AssistantPageState extends State<AssistantPage> {
     final pendingReply = _pendingReply;
     _pendingReply = null;
     if (pendingReply != null) {
-      unawaited(_presentReply(controller, pendingReply));
+      unawaited(_receiveReply(pendingReply));
     }
     if (_pendingStop) {
       _pendingStop = false;
@@ -273,19 +257,47 @@ class _AssistantPageState extends State<AssistantPage> {
   }
 
   Future<void> _receiveReply(AssistantReplyTarget target) async {
-    _pendingReply = target;
     final controller = _live;
-    if (controller == null) return;
+    if (controller == null) {
+      _pendingReply = target;
+      return;
+    }
+    // A notification never rebinds a retained walkie session. Reject a target
+    // for another actor before it can interrupt this session's capture/audio.
+    if (controller.actorId != target.actorId) return;
     _pendingReply = null;
     // A reply tap never sends a partial memo or resumes an older queued reply
     // first. It selects one reply and then resumes only that playback path.
+    _backgrounded = false;
     _pendingStop = false;
     await _cancelCurrentCapture?.call();
     await controller.cancelRecord();
     controller.suspendPlayback();
-    await _presentReply(controller, target);
+    await Future.wait([
+      _restoreNotificationConversation(controller),
+      _presentReply(controller, target),
+    ]);
     if (!_disposed && identical(_controller, controller)) {
       controller.resumePlayback();
+    }
+  }
+
+  Future<void> _restoreNotificationConversation(
+    WalkieController controller,
+  ) async {
+    try {
+      // This route applies the authenticated human participant server-side.
+      // Delay it until native keyguard dismissal supplied the opaque target.
+      final history = await _api.fetchChat(
+        actors: [controller.actorId],
+        limit: 20,
+      );
+      if (_disposed || _controller != controller) return;
+      // Chat pages are newest-first; transcript rendering is chronological.
+      controller.restoreConversation(history.chat.reversed.toList());
+    } catch (_) {
+      // The exact tapped reply remains independently recoverable. Do not
+      // expand a history-fetch failure into broader dashboard access here.
     }
   }
 
@@ -349,6 +361,31 @@ class _AssistantPageState extends State<AssistantPage> {
     _controller?.resumePlayback();
   }
 
+  /// A lock-screen assist gesture is a new restricted capture, not a return
+  /// to whatever unlocked transcript and reply queue this returnable activity
+  /// retained. Dispose that old session before starting capture again; this
+  /// preserves the commissioned lock-screen path without exposing old state.
+  Future<void> _restartLockedAssist() async {
+    if (_disposed) return;
+    ++_attempt;
+    _pendingReply = null;
+    _pendingStop = false;
+    _backgrounded = false;
+    await _cancelCurrentCapture?.call();
+    final previous = _controller;
+    _controller = null;
+    _live = null;
+    await previous?.dispose();
+    if (_disposed) return;
+    // Keep the replacement start observed by the visible FutureBuilder. That
+    // also makes a later activity teardown own a stale-start error rather
+    // than leaving it as an unhandled asynchronous exception.
+    final restart = _start();
+    setState(() {
+      _ready = restart;
+    });
+  }
+
   void _close() {
     final onClose = widget.onClose;
     if (onClose != null) {
@@ -365,6 +402,9 @@ class _AssistantPageState extends State<AssistantPage> {
     if (signals != null) {
       if (signals.onBackground == _background) signals.onBackground = null;
       if (signals.onForeground == _foreground) signals.onForeground = null;
+      if (signals.onLockedAssist == _restartLockedAssist) {
+        signals.onLockedAssist = null;
+      }
       if (signals.onReply == _receiveReply) signals.onReply = null;
     }
     for (final sub in _subs) {

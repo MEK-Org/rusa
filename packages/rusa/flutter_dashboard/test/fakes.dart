@@ -665,6 +665,7 @@ class FakeApi extends DashboardApi {
   final disabledVoiceSessions = <String>[];
   VoiceAnnouncement? notificationReply;
   final notificationReplyCalls = <({String actorId, String announcementId})>[];
+  final revokedPushTokens = <String>[];
 
   @override
   Future<List<VoiceAnnouncement>> fetchVoiceBacklog(String actorId) async {
@@ -690,6 +691,11 @@ class FakeApi extends DashboardApi {
     final reply = notificationReply;
     if (reply == null) throw StateError('no notification reply');
     return reply;
+  }
+
+  @override
+  Future<void> revokePushToken(String token) async {
+    revokedPushTokens.add(token);
   }
 
   @override
@@ -1795,6 +1801,9 @@ class FakeAssistant implements AssistantPlatform {
 
   @override
   Future<void> Function()? onForeground;
+
+  @override
+  Future<void> Function()? onLockedAssist;
 
   @override
   Future<void> Function(AssistantReplyTarget target)? onReply;

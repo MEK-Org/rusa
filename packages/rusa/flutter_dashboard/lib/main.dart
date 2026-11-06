@@ -43,7 +43,9 @@ void assistMain() {
   WidgetsFlutterBinding.ensureInitialized();
   platformInit();
   final assistant = platformCreateAssistant();
-  final launch = _initialAssistantLaunch();
+  final launch = parseAssistantLaunch(
+    WidgetsBinding.instance.platformDispatcher.defaultRouteName,
+  );
   runApp(
     RusaDashboardApp(
       title: resolveDashboardTitle(platformDocumentTitle),
@@ -61,22 +63,22 @@ void assistMain() {
   );
 }
 
-class _AssistantLaunch {
-  const _AssistantLaunch({this.reply, this.waitingForUnlock = false});
+class AssistantLaunch {
+  const AssistantLaunch({this.reply, this.waitingForUnlock = false});
 
   final AssistantReplyTarget? reply;
   final bool waitingForUnlock;
 }
 
-_AssistantLaunch _initialAssistantLaunch() {
-  final route = WidgetsBinding.instance.platformDispatcher.defaultRouteName;
+/// Parses only the content-free routes native code is allowed to pass to Dart.
+AssistantLaunch parseAssistantLaunch(String route) {
   final uri = Uri.tryParse(route);
-  if (uri == null) return const _AssistantLaunch();
+  if (uri == null) return const AssistantLaunch();
   if (uri.path == 'reply-pending' || uri.path == '/reply-pending') {
-    return const _AssistantLaunch(waitingForUnlock: true);
+    return const AssistantLaunch(waitingForUnlock: true);
   }
   if (uri.path != 'reply' && uri.path != '/reply') {
-    return const _AssistantLaunch();
+    return const AssistantLaunch();
   }
   final actorId = uri.queryParameters['actorId'];
   final announcementId = uri.queryParameters['announcementId'];
@@ -84,10 +86,13 @@ _AssistantLaunch _initialAssistantLaunch() {
       actorId.isEmpty ||
       announcementId == null ||
       announcementId.isEmpty) {
-    return const _AssistantLaunch();
+    return const AssistantLaunch();
   }
-  return _AssistantLaunch(
-    reply: AssistantReplyTarget(actorId: actorId, announcementId: announcementId),
+  return AssistantLaunch(
+    reply: AssistantReplyTarget(
+      actorId: actorId,
+      announcementId: announcementId,
+    ),
   );
 }
 
@@ -156,6 +161,7 @@ class _DashboardPageState extends State<DashboardPage> {
     } catch (_) {
       // Registration is additive: dashboard use and normal session refresh
       // remain available when Firebase Messaging is unavailable.
+      debugPrint('dashboard: Android reply-notification registration failed');
     }
   }
 

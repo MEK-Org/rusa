@@ -463,7 +463,9 @@ class WalkieController {
       );
       _seenIds.add(announcement.id);
       _transcript.add(transcript);
-      replayAnnouncement(announcement);
+      _queue.insert(0, _QueueItem(announcement));
+      _queueDepth.add(_queue.length);
+      unawaited(_drain());
       return;
     }
     final alreadyReceived = _transcript.value.any(
@@ -477,6 +479,9 @@ class WalkieController {
       return;
     }
     _enqueue(announcement);
+    // `_enqueue` preserves the normal first-play acknowledgement; move the
+    // selected reply ahead of older suspended audio without adding a row.
+    replayAnnouncement(announcement);
   }
 
   /// Prepend a bounded, chronologically ordered view of the current root chat.
@@ -484,10 +489,17 @@ class WalkieController {
   /// method only projects those existing rows into the restricted transcript.
   void restoreConversation(List<MeshChat> messages) {
     if (!_enabled.value || _disposed) return;
-    final restoredIds = _transcript.value
-        .whereType<HistoricalChatEntry>()
-        .map((entry) => entry.id)
-        .toSet();
+    final restoredIds = <String>{};
+    for (final entry in _transcript.value) {
+      switch (entry) {
+        case HistoricalChatEntry(:final id):
+          restoredIds.add(id);
+        case ActorReplyEntry(:final announcement):
+          restoredIds.add(announcement.id);
+        case UserMemoEntry():
+          break;
+      }
+    }
     final restored = <WalkieEntry>[];
     for (final message in messages) {
       if (!restoredIds.add(message.id)) continue;
@@ -495,7 +507,7 @@ class WalkieController {
         HistoricalChatEntry(
           timestamp: message.ts,
           id: message.id,
-          text: _displayChatBody(message.body),
+          text: message.body,
           isActorReply: message.senderId == actorId,
         ),
       );
@@ -755,13 +767,6 @@ class WalkieController {
     if (_disposed) return;
     _transcript.add([..._transcript.value, entry]);
   }
-
-  static const _voiceMemoPrefix = '🎙️ [voice memo — reply for the ear]: ';
-
-  static String _displayChatBody(String body) =>
-      body.startsWith(_voiceMemoPrefix)
-      ? body.substring(_voiceMemoPrefix.length)
-      : body;
 
   void _stopRecordTimers() {
     _recordTicker?.cancel();

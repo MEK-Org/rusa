@@ -69,6 +69,11 @@ abstract interface class AssistantSignals {
   /// playback may resume only after this signal.
   abstract Future<void> Function()? onForeground;
 
+  /// A fresh ordinary assist invocation arrived while the keyguard is locked.
+  /// It must replace, rather than reveal, any retained unlocked transcript or
+  /// queued audio before immediate root capture begins.
+  abstract Future<void> Function()? onLockedAssist;
+
   /// A reply-notification tap selected one exact durable announcement.
   abstract Future<void> Function(AssistantReplyTarget target)? onReply;
 }

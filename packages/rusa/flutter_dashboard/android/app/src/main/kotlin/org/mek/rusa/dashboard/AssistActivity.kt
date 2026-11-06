@@ -18,6 +18,7 @@ class AssistActivity : FlutterActivity() {
     private var assistant: AssistantChannel? = null
     private var backgrounded = false
     private var pendingReply: Pair<String, String>? = null
+    private var restoringFromRecents = false
 
     override fun getDartEntrypointFunctionName(): String = "assistMain"
 
@@ -56,13 +57,31 @@ class AssistActivity : FlutterActivity() {
         val channel = assistant ?: return
         val reply = replyTarget(intent)
         if (reply != null) {
+            restoringFromRecents = false
             deferReplyUntilUnlocked(channel, reply)
+            return
+        }
+        if (isRestoringFromRecents(intent)) {
+            // Restoring the task may render the retained screen, but it must
+            // not make an old capture or queued reply audible, nor treat the
+            // historical launch as a new assistant gesture.
+            restoringFromRecents = true
             return
         }
         // An ordinary assist trigger retains the previously approved locked
         // walkie surface. A reply notification never changes that policy.
         setShowWhenLocked(true)
         setTurnScreenOn(true)
+        restoringFromRecents = false
+        if (isDeviceLocked()) {
+            // A lock-screen gesture starts a new restricted session. Never
+            // surface retained unlocked chat rows or queued audio over the
+            // keyguard before its fresh capture begins.
+            backgrounded = false
+            channel.lockedAssist()
+            answerHeadset(intent, channel)
+            return
+        }
         if (backgrounded) {
             backgrounded = false
             channel.foreground()
@@ -87,6 +106,7 @@ class AssistActivity : FlutterActivity() {
     override fun onStart() {
         super.onStart()
         if (!backgrounded || pendingReply != null) return
+        if (restoringFromRecents) return
         backgrounded = false
         assistant?.foreground()
     }
@@ -110,10 +130,13 @@ class AssistActivity : FlutterActivity() {
         return actorId to announcementId
     }
 
+    private fun isRestoringFromRecents(intent: Intent?): Boolean =
+        intent?.flags?.and(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+
     private fun deferReplyUntilUnlocked(channel: AssistantChannel, reply: Pair<String, String>) {
         if (!isDeviceLocked()) {
             pendingReply = null
-            channel.reply(reply.first, reply.second)
+            deliverReply(channel, reply)
             return
         }
         pendingReply = reply
@@ -127,10 +150,28 @@ class AssistActivity : FlutterActivity() {
                 override fun onDismissSucceeded() {
                     val target = pendingReply ?: return
                     pendingReply = null
-                    channel.reply(target.first, target.second)
+                    deliverReply(channel, target)
+                }
+
+                override fun onDismissCancelled() {
+                    // A cancelled keyguard request must not leave a stale
+                    // target suppressing future foreground lifecycle events.
+                    pendingReply = null
+                }
+
+                override fun onDismissError() {
+                    pendingReply = null
                 }
             })
         }
+    }
+
+    private fun deliverReply(channel: AssistantChannel, reply: Pair<String, String>) {
+        // This task is visible for the notification handoff. Mark it foreground
+        // before Dart suspends its old queue and resolves the one selected reply,
+        // so a later onStop() cannot accidentally skip the background boundary.
+        backgrounded = false
+        channel.reply(reply.first, reply.second)
     }
 
     private fun isDeviceLocked(): Boolean =

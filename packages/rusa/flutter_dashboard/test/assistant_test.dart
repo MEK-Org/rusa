@@ -7,7 +7,9 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/assistant_io.dart';
 import 'package:rusa_dashboard/assistant_page.dart';
 import 'package:rusa_dashboard/assistant_platform.dart';
+import 'package:rusa_dashboard/main.dart' show parseAssistantLaunch;
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/reply_notifications_io.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/walkie_controller.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
@@ -197,6 +199,41 @@ void main() {
     );
 
     testWidgets(
+      'a locked assist re-entry replaces retained unlocked replies with fresh capture',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+
+        await assistant.onBackground!();
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement(
+            'retained-reply',
+            actor: 'root',
+            text: 'Unlocked reply',
+            sessionId: sessionId,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Unlocked reply'), findsOneWidget);
+
+        await assistant.onLockedAssist!();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('Unlocked reply'),
+          findsNothing,
+          reason: 'lock-screen capture must not reveal the retained session',
+        );
+        expect(walkie.player.playedUrls, isEmpty);
+        expect(walkie.recorder.startCalls, 2);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
       'notification tap restores its exact reply without opening capture',
       (tester) async {
         api.notificationReply = makeAnnouncement(
@@ -282,7 +319,10 @@ void main() {
         expect(api.chatActorCalls, [
           ['root'],
         ]);
-        expect(find.text('My question'), findsOneWidget);
+        expect(
+          find.text('🎙️ [voice memo — reply for the ear]: My question'),
+          findsOneWidget,
+        );
         expect(find.text('The durable answer'), findsOneWidget);
         expect(walkie.player.playedUrls, [
           '/api/mesh/voice/audio/durable-reply',
@@ -313,6 +353,11 @@ void main() {
 
         expect(walkie.recorder.startCalls, 0);
         expect(api.notificationReplyCalls, isEmpty);
+        expect(
+          api.chatActorCalls,
+          isEmpty,
+          reason: 'reply-pending must not load conversation before unlock',
+        );
 
         await assistant.onReply!(
           const AssistantReplyTarget(
@@ -326,6 +371,59 @@ void main() {
         expect(api.notificationReplyCalls, [
           (actorId: 'root', announcementId: 'durable-reply'),
         ]);
+        expect(api.chatActorCalls, [
+          ['root'],
+        ]);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a warm notification tap restores history before replaying its exact reply',
+      (tester) async {
+        api
+          ..chatPages = [
+            ChatPage(
+              chat: [
+                makeChat(
+                  'durable-reply',
+                  sender: 'root',
+                  body: 'The durable answer',
+                ),
+                makeChat(
+                  'recent-memo',
+                  sender: '00000000-0000-4000-8000-000000000001',
+                  body: 'A missed question',
+                ),
+              ],
+              nextCursor: null,
+            ),
+          ]
+          ..notificationReply = makeAnnouncement(
+            'durable-reply',
+            actor: 'root',
+            text: 'The durable answer',
+          );
+        await pumpPage(tester);
+        await assistant.onBackground!();
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'durable-reply',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.chatActorCalls, [
+          ['root'],
+        ]);
+        expect(find.text('A missed question'), findsOneWidget);
+        expect(find.text('The durable answer'), findsOneWidget);
         expect(walkie.player.playedUrls, [
           '/api/mesh/voice/audio/durable-reply',
         ]);
@@ -355,6 +453,24 @@ void main() {
 
       expect(walkie.stream.connectCalls.single.actors, ['root']);
       expect(walkie.recorder.startCalls, 0);
+      expect(api.notificationReplyCalls, isEmpty);
+      await unmount(tester);
+    });
+
+    testWidgets('foreign notification leaves a live root capture alone', (
+      tester,
+    ) async {
+      await pumpPage(tester);
+
+      await assistant.onReply!(
+        const AssistantReplyTarget(
+          actorId: 'worker',
+          announcementId: 'foreign-conversation-reply',
+        ),
+      );
+      await tester.pump();
+
+      expect(walkie.recorder.cancelCalls, 0);
       expect(api.notificationReplyCalls, isEmpty);
       await unmount(tester);
     });
@@ -1027,6 +1143,41 @@ void main() {
     });
   });
 
+  group('IoReplyNotifications', () {
+    test(
+      'logout does not initialize messaging without a registered token',
+      () async {
+        final api = FakeApi();
+        final notifications = IoReplyNotifications();
+        await notifications.revoke(api);
+
+        expect(api.revokedPushTokens, isEmpty);
+        notifications.dispose();
+      },
+    );
+  });
+
+  group('parseAssistantLaunch', () {
+    test('keeps a locked notification content-free until native unlock', () {
+      final launch = parseAssistantLaunch('reply-pending');
+
+      expect(launch.waitingForUnlock, isTrue);
+      expect(launch.reply, isNull);
+    });
+
+    test('requires both opaque lookup keys for a reply route', () {
+      final valid = parseAssistantLaunch(
+        'reply?actorId=root&announcementId=durable-reply',
+      );
+      final missingId = parseAssistantLaunch('reply?actorId=root');
+
+      expect(valid.reply?.actorId, 'root');
+      expect(valid.reply?.announcementId, 'durable-reply');
+      expect(missingId.reply, isNull);
+      expect(missingId.waitingForUnlock, isFalse);
+    });
+  });
+
   group('IoAssistantChannel', () {
     TestWidgetsFlutterBinding.ensureInitialized();
     const channel = MethodChannel(IoAssistantChannel.kName);
@@ -1081,6 +1232,16 @@ void main() {
 
       expect(triggers, hasLength(2));
       expect(losses, hasLength(1));
+    });
+
+    test('forwards a locked assist reset', () async {
+      final assistant = IoAssistantChannel(channel: channel);
+      var resets = 0;
+      assistant.onLockedAssist = () async => resets++;
+
+      await fromNative('lockedAssist');
+
+      expect(resets, 1);
     });
 
     test('plays ready cue via platform channel', () async {

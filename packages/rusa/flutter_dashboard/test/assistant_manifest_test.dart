@@ -11,6 +11,9 @@ void main() {
   final manifest = File(
     'android/app/src/main/AndroidManifest.xml',
   ).readAsStringSync();
+  final assistActivity = File(
+    'android/app/src/main/kotlin/org/mek/rusa/dashboard/AssistActivity.kt',
+  ).readAsStringSync();
   final activities = {
     for (final m in RegExp(
       r'<activity\b(?:[^>]*/>|.*?</activity>)',
@@ -55,5 +58,17 @@ void main() {
     expect(main, contains('android:exported="true"'));
     expect(main, isNot(contains('showWhenLocked')));
     expect(main, isNot(contains('turnScreenOn')));
+  });
+
+  test('locked re-entry resets retained state and Recents stays dormant', () {
+    // This is an Android source-boundary test, not device lifecycle proof.
+    // The physical lock-screen flow remains a release/device acceptance gate.
+    expect(assistActivity, contains('channel.lockedAssist()'));
+    expect(assistActivity, contains('isDeviceLocked()'));
+    expect(
+      assistActivity,
+      contains('Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY'),
+    );
+    expect(assistActivity, contains('if (restoringFromRecents) return'));
   });
 }

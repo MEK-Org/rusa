@@ -48,7 +48,9 @@ class IoReplyNotifications implements ReplyNotifications {
 
   @override
   Future<void> revoke(DashboardApi api) async {
-    final token = _registeredToken ?? await _messaging.getToken();
+    // Do not initialize Firebase Messaging merely to sign out: without a
+    // successful registration this process has no token it can revoke.
+    final token = _registeredToken;
     if (token == null || token.isEmpty) return;
     await api.revokePushToken(token);
     _registeredToken = null;

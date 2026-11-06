@@ -44,6 +44,9 @@ class IoAssistantChannel implements AssistantPlatform {
   Future<void> Function()? onForeground;
 
   @override
+  Future<void> Function()? onLockedAssist;
+
+  @override
   Future<void> Function(AssistantReplyTarget target)? onReply;
 
   Future<Object?> _handle(MethodCall call) async {
@@ -56,6 +59,8 @@ class IoAssistantChannel implements AssistantPlatform {
         await onBackground?.call();
       case 'foreground':
         await onForeground?.call();
+      case 'lockedAssist':
+        await onLockedAssist?.call();
       case 'reply':
         final args = call.arguments;
         if (args is Map) {

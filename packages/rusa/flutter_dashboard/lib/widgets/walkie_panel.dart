@@ -466,14 +466,12 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
             ),
           ),
           HistoricalChatEntry e => _WalkieTranscriptEntry(
-            label: e.isActorReply ? 'PAST REPLY' : 'YOU SAID',
-            labelColor: e.isActorReply
-                ? MeshColors.textMuted
-                : MeshColors.accent,
-            labelIcon: e.isActorReply ? Icons.history : Icons.mic,
+            label: e.isActorReply ? 'PAST REPLY' : 'YOU',
+            labelColor: MeshColors.textMuted,
+            labelIcon: e.isActorReply ? Icons.history : Icons.person,
             text: e.text.isEmpty ? '(no transcript)' : e.text,
             textColor: MeshColors.textSecondary,
-            isMemo: !e.isActorReply,
+            isMemo: false,
           ),
         };
       },

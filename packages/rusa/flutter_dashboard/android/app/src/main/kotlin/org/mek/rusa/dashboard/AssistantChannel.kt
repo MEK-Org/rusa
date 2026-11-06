@@ -64,6 +64,9 @@ class AssistantChannel(
     /** The stopped assist task is visible again. */
     fun foreground() = channel.invokeMethod("foreground", null)
 
+    /** Begin a fresh restricted capture after a lock-screen assist gesture. */
+    fun lockedAssist() = channel.invokeMethod("lockedAssist", null)
+
     /** Deliver the two opaque reply lookup keys from an FCM notification tap. */
     fun reply(actorId: String, announcementId: String) = channel.invokeMethod(
         "reply",

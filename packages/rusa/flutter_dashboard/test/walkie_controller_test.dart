@@ -271,6 +271,34 @@ void main() {
       },
     );
 
+    test(
+      'history restoration skips a reply already received from the live stream',
+      () async {
+        await controller.enable();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('durable-reply'));
+        await pumpEventQueue();
+
+        controller.restoreConversation([
+          makeChat('durable-reply', sender: 'a', body: 'The durable answer'),
+        ]);
+
+        expect(
+          controller.transcript.value
+              .where(
+                (entry) => switch (entry) {
+                  ActorReplyEntry(:final announcement) =>
+                    announcement.id == 'durable-reply',
+                  HistoricalChatEntry(:final id) => id == 'durable-reply',
+                  UserMemoEntry() => false,
+                },
+              )
+              .toList(),
+          hasLength(1),
+        );
+      },
+    );
+
     test('frames for another actor are ignored', () async {
       await controller.enable();
       await pumpEventQueue();
@@ -400,6 +428,33 @@ void main() {
           '/api/mesh/voice/audio/c',
         ]);
         expect(api.ackedIds, ['b', 'c']);
+      },
+    );
+
+    test(
+      'a notification reply moves ahead of suspended older audio and acks once',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('old-a'), makeAnnouncement('old-b')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'old-a');
+
+        controller.suspendPlayback();
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/old-a',
+          '/api/mesh/voice/audio/selected',
+        ]);
+        expect(controller.nowPlaying.value?.id, 'selected');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['selected']);
       },
     );
 
