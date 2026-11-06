@@ -312,20 +312,18 @@ class _AssistantPageState extends State<AssistantPage> {
   Future<void> _receiveReply(AssistantReplyTarget target) async {
     final controller = _live;
     if (controller == null) {
-      // A native reply can arrive while the initial root lookup is pending,
-      // but it must not replace a known root reply during a transfer recovery.
+      // A native reply can arrive while the root lookup is pending, but a
+      // foreign target must not replace an already pending root reply.
       if (_rootActorId != null && target.actorId != _rootActorId) return;
       _pendingReply = target;
       return;
     }
-    // A notification target is never authority to adopt a transferred actor.
-    // Only the root selected by the fresh restricted-assistant lifecycle may
-    // recover its exact reply. A delayed root reply can arrive after the
-    // original Android session has transferred, so replace that controller
-    // with a fresh root one rather than rebinding the transferred session.
-    if (target.actorId != _rootActorId) return;
-    if (controller.actorId != target.actorId) {
-      _restartForNotification(target);
+    // A notification target is never authority to adopt a transferred actor,
+    // and a delayed root reply is no reason to end the conversation that moved
+    // there. Leave a session that no longer matches untouched; the reply stays
+    // durable in the root conversation and its unacknowledged audio backlog.
+    if (target.actorId != _rootActorId ||
+        controller.actorId != target.actorId) {
       return;
     }
     _pendingReply = null;
@@ -351,44 +349,6 @@ class _AssistantPageState extends State<AssistantPage> {
         _attempt == replyAttempt) {
       controller.resumePlayback();
     }
-  }
-
-  void _restartForNotification(AssistantReplyTarget target) {
-    if (_disposed) return;
-    final restartAttempt = ++_attempt;
-    _pendingReply = target;
-    _pendingStop = false;
-    _backgrounded = false;
-    // This is an exact-reply recovery, not a new assist gesture: build the
-    // restricted root session without microphone capture or automatic audio.
-    _suppressInitialCapture = true;
-    final cancelCapture = _cancelCurrentCapture;
-    _cancelCurrentCapture = null;
-    unawaited(cancelCapture?.call());
-    final previousEnabled = _enabledSub;
-    _enabledSub = null;
-    unawaited(previousEnabled?.cancel());
-    final previous = _controller;
-    _controller = null;
-    _live = null;
-    final restart = _finishNotificationRestart(previous, restartAttempt);
-    setState(() {
-      _ready = restart;
-    });
-  }
-
-  Future<WalkieController> _finishNotificationRestart(
-    WalkieController? previous,
-    int restartAttempt,
-  ) async {
-    // Release the transferred lease and shared wakelock before the fresh root
-    // session starts. FutureBuilder keeps the old WalkiePanel mounted until
-    // that start resolves; a disposed controller ignores its record taps.
-    await previous?.dispose();
-    if (_disposed || restartAttempt != _attempt) {
-      throw StateError('Assist screen closed');
-    }
-    return _start();
   }
 
   Future<void> _restoreNotificationConversation(

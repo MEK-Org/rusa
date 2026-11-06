@@ -742,47 +742,100 @@ void main() {
     });
 
     testWidgets(
-      'a root notification after a transfer starts a fresh restricted root session',
+      'a delayed root notification leaves a live transferred session untouched',
       (tester) async {
         await pumpPage(tester);
-        await assistant.onBackground!();
-        await tester.pump();
-        final rootStream = walkie.stream;
-
-        rootStream.controlsCtrl.add(
+        walkie.stream.controlsCtrl.add(
           const VoiceSessionControl(targetActorId: 'worker'),
         );
         await tester.pump();
         await tester.pump();
-        expect(walkie.stream.connectCalls.single.actors, ['worker']);
+        final workerStream = walkie.stream;
+        expect(workerStream.connectCalls.single.actors, ['worker']);
+        workerStream.framesCtrl.add(
+          makeAnnouncement(
+            'worker-live',
+            actor: 'worker',
+            sessionId: workerStream.connectCalls.single.sessionId,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.isPlaying, isTrue);
 
         api.notificationReply = makeAnnouncement(
-          'root-reply-before-transfer',
+          'root-after-transfer',
           actor: 'root',
-          text: 'Reply from root before handoff',
+          text: 'Delayed reply from root',
         );
         unawaited(
           assistant.onReply!(
             const AssistantReplyTarget(
               actorId: 'root',
-              announcementId: 'root-reply-before-transfer',
+              announcementId: 'root-after-transfer',
             ),
           ),
         );
+        for (var i = 0; i < 5; i++) {
+          await tester.pump();
+        }
+
+        expect(walkie.streams, hasLength(2));
+        expect(identical(walkie.stream, workerStream), isTrue);
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.cancelCalls, 0);
+        expect(api.notificationReplyCalls, isEmpty);
+        expect(walkie.player.isPlaying, isTrue);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/worker-live',
+        ]);
+        expect(closed, 0);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a delayed root notification keeps a transferred session audio suspended',
+      (tester) async {
+        await pumpPage(tester);
+        await assistant.onBackground!();
+        await tester.pump();
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'worker'),
+        );
         await tester.pump();
         await tester.pump();
-        await tester.pump();
-        await tester.pump();
+        final workerStream = walkie.stream;
+        workerStream.framesCtrl.add(
+          makeAnnouncement(
+            'worker-held',
+            actor: 'worker',
+            sessionId: workerStream.connectCalls.single.sessionId,
+          ),
+        );
         await tester.pump();
 
-        expect(walkie.stream.connectCalls.single.actors, ['root']);
-        expect(walkie.recorder.startCalls, 1);
-        expect(api.notificationReplyCalls, [
-          (actorId: 'root', announcementId: 'root-reply-before-transfer'),
-        ]);
-        expect(walkie.player.playedUrls, [
-          '/api/mesh/voice/audio/root-reply-before-transfer',
-        ]);
+        api.notificationReply = makeAnnouncement(
+          'root-after-transfer',
+          actor: 'root',
+        );
+        await assistant.onForeground!();
+        unawaited(
+          assistant.onReply!(
+            const AssistantReplyTarget(
+              actorId: 'root',
+              announcementId: 'root-after-transfer',
+            ),
+          ),
+        );
+        for (var i = 0; i < 5; i++) {
+          await tester.pump();
+        }
+
+        expect(walkie.streams, hasLength(2));
+        expect(identical(walkie.stream, workerStream), isTrue);
+        expect(api.notificationReplyCalls, isEmpty);
+        expect(walkie.player.playedUrls, isEmpty);
         await unmount(tester);
       },
     );
