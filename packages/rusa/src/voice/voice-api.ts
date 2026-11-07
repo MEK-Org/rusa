@@ -183,13 +183,10 @@ export function handleVoiceApiRequest(
       return true;
     }
     const suppliedSessionId = url.searchParams.get("sessionId");
-    // The stream route alone grants session authority. Keep the pre-session
-    // delivery behavior for a stale/unknown supplied id (including a restart
-    // race): rekey this one memo, deliver it, and do not create a lease.
-    const sessionId =
-      suppliedSessionId && service.hasSession(suppliedSessionId, actorId, principalId)
-        ? suppliedSessionId
-        : randomUUID();
+    // A session id on a message is addressing, so the reply reaches the client
+    // holding this id. The stream route alone grants session authority: a stale
+    // or unknown id (including a restart race) gets delivery and no lease.
+    const sessionId = suppliedSessionId?.trim() ? suppliedSessionId : randomUUID();
 
     void (async () => {
       const audio = await readRawBody(req, MAX_MEMO_BYTES);

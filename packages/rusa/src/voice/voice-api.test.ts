@@ -324,6 +324,20 @@ describe("handleVoiceApiRequest", () => {
       expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
     });
 
+    it.each([
+      ["empty", ""],
+      ["blank", "%20%20"],
+    ])("treats an %s session id as absent", async (_label, sessionId) => {
+      const { res } = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("x"), contentType: "audio/webm" }
+      );
+      await settled(res);
+      expect(sendMessage.mock.calls[0]?.[3]).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
     it("delivers an unknown session id during a restart race without granting it authority", async () => {
       const sessionId = "reconnect-after-restart";
       const first = call(
@@ -335,12 +349,11 @@ describe("handleVoiceApiRequest", () => {
       await settled(first.res);
 
       expect(first.res.statusCode).toBe(200);
-      expect(sendMessage.mock.calls[0]?.[3]).toMatch(/^[0-9a-f-]{36}$/);
-      expect(sendMessage.mock.calls[0]?.[3]).not.toBe(sessionId);
+      expect(sendMessage.mock.calls[0]?.[3]).toBe(sessionId);
       expect(service.hasActiveSession(UUID_A)).toBe(false);
 
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
-      expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A)).toEqual({ sessionId, principalId: TEST_USER_ID });
 
       const second = call(
         deps,
@@ -452,20 +465,20 @@ describe("handleVoiceApiRequest", () => {
 
     it("keeps an explicit session through an SSE drop and ends it only on disable", async () => {
       const first = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
 
       // A healthy EventSource holds authority beyond the reconnect allowance.
       now += VOICE_SESSION_LEASE_MS * 2;
       service.expireSessions();
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
 
       // An EventSource error/reconnect does not release background work.
       first.res.req.emit("close");
       now += VOICE_SESSION_LEASE_MS - 1;
       service.expireSessions();
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
 
       const { res } = call(deps, "POST", "/api/mesh/voice/session/disable", {
         body: JSON.stringify({ sessionId: "walkie-1" }),
@@ -488,6 +501,105 @@ describe("handleVoiceApiRequest", () => {
         targetActorId: UUID_B,
       });
       expect(other.res.frames()).toEqual([]);
+    });
+
+    describe("a reply to a memo sent without a lease", () => {
+      const sendMemo = async (sessionId: string) => {
+        const memo = call(
+          deps,
+          "POST",
+          `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+          { body: Buffer.from("x"), contentType: "audio/webm" }
+        );
+        await settled(memo.res);
+        return sendMessage.mock.calls.at(-1)?.[3] as string;
+      };
+      const frameSessionIds = (res: MockRes) =>
+        res.frames().map((frame) => JSON.parse(frame.split("\ndata: ")[1]).sessionId);
+
+      it.each([
+        ["the memo beat the stream", () => {}],
+        [
+          "its lease expired",
+          (sessionId: string) => {
+            const dropped = call(
+              deps,
+              "GET",
+              `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`
+            );
+            dropped.res.req.emit("close");
+            now += VOICE_SESSION_LEASE_MS;
+            service.expireSessions();
+          },
+        ],
+      ])("reaches the client's stream, with no lease from the memo, when %s", async (_label, setup) => {
+        const detach = attachVoiceOutbound(emitter, service, hub);
+        const sessionId = "memo-without-lease";
+        setup(sessionId);
+
+        const delivered = await sendMemo(sessionId);
+        expect(service.hasActiveSession(UUID_A)).toBe(false);
+
+        const { res } = call(
+          deps,
+          "GET",
+          `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`
+        );
+        emitter.emitMeshEvent(replyEvent({ detail: delivered }));
+        await vi.waitFor(() => expect(frameSessionIds(res)).toEqual([sessionId]));
+        detach();
+      });
+
+      it("backlogs under the client's session when no stream is attached yet", async () => {
+        const sessionId = "reply-before-stream";
+        service.presenceConnect([UUID_A], TEST_USER_ID);
+        const delivered = await sendMemo(sessionId);
+        await service.handleMeshEvent(replyEvent({ detail: delivered }));
+
+        const backlog = call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice/backlog`);
+        await settled(backlog.res);
+        expect(
+          JSON.parse(backlog.res.body).announcements.map((a: { sessionId: string }) => a.sessionId)
+        ).toEqual([sessionId]);
+      });
+
+      it.each([
+        ["another principal", UUID_A, "other-principal"],
+        ["another actor", UUID_B, TEST_USER_ID],
+      ])("leaves an id leased to %s with its holder and delivers the holder no audio", async (_label, holderActor, holderPrincipal) => {
+        const detach = attachVoiceOutbound(emitter, service, hub);
+        const sessionId = "held-by-someone-else";
+        const held = new MockRes();
+        hub.addVoiceConnection(
+          held as unknown as ServerResponse,
+          new Set([holderActor]),
+          undefined,
+          sessionId,
+          holderPrincipal
+        );
+        service.openSession(sessionId, holderActor, holderPrincipal);
+        service.presenceConnect([UUID_A], TEST_USER_ID);
+
+        const delivered = await sendMemo(sessionId);
+        expect(delivered).toBe(sessionId);
+        expect(service.activeSessionFor(holderActor)).toEqual({
+          sessionId,
+          principalId: holderPrincipal,
+        });
+        const refused = call(
+          deps,
+          "GET",
+          `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`
+        );
+        expect(refused.res.statusCode).toBe(409);
+
+        emitter.emitMeshEvent(replyEvent({ detail: delivered }));
+        await vi.waitFor(() =>
+          expect(service.backlog(UUID_A, TEST_USER_ID).map((a) => a.sessionId)).toEqual([sessionId])
+        );
+        detach();
+        expect(held.frames()).toEqual([]);
+      });
     });
 
     it("a connected subscription is presence; replies stream as voice frames", async () => {

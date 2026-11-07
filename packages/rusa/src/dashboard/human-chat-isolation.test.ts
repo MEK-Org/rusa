@@ -891,7 +891,12 @@ describe("human chat isolation (#590)", () => {
       expect(stolen.status).toBe(409);
       await stolen.text();
       await post("/api/mesh/voice/session/disable", { sessionId: "alice-session" }, b.cookie);
-      expect(service.hasSession("alice-session", ACTOR, a.id)).toBe(true);
+      const stillStolen = await fetch(
+        `${origin}/api/mesh/voice/stream?actors=${ACTOR}&sessionId=alice-session`,
+        { headers: { Cookie: b.cookie } }
+      );
+      expect(stillStolen.status).toBe(409);
+      await stillStolen.text();
 
       record(ACTOR, a.id, "alice voice answer", "alice-session");
       record(ACTOR, b.id, "bob voice answer", "bob-session");
