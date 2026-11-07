@@ -316,16 +316,6 @@ export class VoiceService {
     }
   }
 
-  /** Whether this stable UUID currently authorizes voice memos for its actor. */
-  hasSession(sessionId: string, actorId: string, principalId: string): boolean {
-    const session = this.sessions.get(sessionId);
-    return (
-      session?.actorId === actorId &&
-      session.principalId === principalId &&
-      (session.expiresAt === null || session.expiresAt > this.now())
-    );
-  }
-
   /** The caller's sole active session UUID, or an error when transfer is ambiguous. */
   activeSessionFor(actorId: string): { sessionId: string; principalId: string } {
     this.expireSessions();

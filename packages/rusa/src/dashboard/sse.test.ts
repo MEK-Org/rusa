@@ -144,6 +144,80 @@ describe("LiveOutputBuffer", () => {
 });
 
 describe("SseHub", () => {
+  describe("pushVoice announcement filter", () => {
+    const WATCHED = "actor-a";
+    const OWNER = "owner-id";
+
+    function voiceClient(
+      hub: SseHub,
+      opts: { actors?: string[]; sessionId?: string; principalId?: string } = {}
+    ): MockRes {
+      const res = new MockRes();
+      hub.addVoiceConnection(
+        res as unknown as ServerResponse,
+        new Set(opts.actors ?? [WATCHED]),
+        undefined,
+        opts.sessionId,
+        opts.principalId ?? OWNER
+      );
+      return res;
+    }
+
+    const voiceFrames = (res: MockRes) => res.writes.filter((w) => w.startsWith("event: voice\n"));
+
+    const announce = (sessionId?: string | null) => ({
+      actorId: WATCHED,
+      recipientId: OWNER,
+      sessionId,
+    });
+
+    it("gives a leased client only the announcements addressed to its own session", () => {
+      const hub = new SseHub(new MeshEventEmitter());
+      const leased = voiceClient(hub, { sessionId: "session-1" });
+      const otherLease = voiceClient(hub, { sessionId: "session-2" });
+
+      hub.pushVoice(announce("session-1"));
+      expect(voiceFrames(leased)).toHaveLength(1);
+      expect(voiceFrames(otherLease)).toHaveLength(0);
+
+      for (const unaddressed of ["some-other-session", null, undefined]) {
+        hub.pushVoice(announce(unaddressed));
+      }
+      expect(voiceFrames(leased)).toHaveLength(1);
+      expect(voiceFrames(otherLease)).toHaveLength(0);
+      hub.close();
+    });
+
+    it("gives a client with no session every announcement for its principal and watched actors", () => {
+      const hub = new SseHub(new MeshEventEmitter());
+      const unleased = voiceClient(hub);
+
+      for (const sessionId of ["session-1", "session-2", null, undefined]) {
+        hub.pushVoice(announce(sessionId));
+      }
+      expect(voiceFrames(unleased)).toHaveLength(4);
+
+      hub.pushVoice({ ...announce("session-1"), actorId: "unwatched-actor" });
+      expect(voiceFrames(unleased)).toHaveLength(4);
+      hub.close();
+    });
+
+    it("never gives another principal's client the announcement, even on the same session id", () => {
+      const hub = new SseHub(new MeshEventEmitter());
+      const sameIdOtherPrincipal = voiceClient(hub, {
+        sessionId: "session-1",
+        principalId: "other-id",
+      });
+      const unleasedOtherPrincipal = voiceClient(hub, { principalId: "other-id" });
+
+      hub.pushVoice(announce("session-1"));
+
+      expect(voiceFrames(sameIdOtherPrincipal)).toHaveLength(0);
+      expect(voiceFrames(unleasedOtherPrincipal)).toHaveLength(0);
+      hub.close();
+    });
+  });
+
   it("writes SSE headers and an opening comment on connect", () => {
     const hub = new SseHub(new MeshEventEmitter());
     const res = connect(hub, ["a"]);
