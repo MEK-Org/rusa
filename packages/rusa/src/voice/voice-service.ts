@@ -316,7 +316,7 @@ export class VoiceService {
     }
   }
 
-  /** Whether this stable UUID currently authorizes voice memos for its actor. */
+  /** Whether this stable UUID currently holds a lease for this actor and principal. */
   hasSession(sessionId: string, actorId: string, principalId: string): boolean {
     const session = this.sessions.get(sessionId);
     return (
