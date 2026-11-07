@@ -24,7 +24,7 @@ export const PROVIDER_CAPABILITIES = {
   kimi: {},
   copilot: {},
   fake: {},
-  openrouter: {},
+  pi: {},
 } as const satisfies Readonly<Record<string, ProviderCapability>>;
 
 export type ProviderCommand = keyof typeof PROVIDER_CAPABILITIES;
@@ -64,15 +64,9 @@ export function validateProviderSelection(
     );
   }
   const capabilityName = providerCapabilityName(providerName, config);
-  const poc = providerConfig.openrouterPoc;
-  if (
-    capabilityName === "openrouter" &&
-    (process.env.RUSA_OPENROUTER_POC !== "1" ||
-      !poc ||
-      !model?.trim() ||
-      (poc.piCommand !== undefined && !poc.piCommand.trim()))
-  ) {
-    throw new Error("OpenRouter prototype requires RUSA_OPENROUTER_POC=1, openrouterPoc and model");
+  // Pi has no default model to fall back to.
+  if (capabilityName === "pi" && !model?.trim()) {
+    throw new Error(`provider "${providerName}" (Pi/OpenRouter) requires a model`);
   }
   const selection = normalizeModelEffortSelection(capabilityName, model, effort);
   if (model !== undefined && !selection.model) {
