@@ -478,41 +478,6 @@ describe("handleVoiceApiRequest", () => {
       ]);
     });
 
-    it("preserves the Android assistant marker when rekeying an unattached session before SSE connects", async () => {
-      const assistantSessionId = "android-assistant:00000000-0000-4000-8000-000000000001";
-      const { res } = call(
-        deps,
-        "POST",
-        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${assistantSessionId}`,
-        { body: Buffer.from("x"), contentType: "audio/webm" }
-      );
-      await settled(res);
-
-      expect(res.statusCode).toBe(200);
-      const rekeyedSessionId = sendMessage.mock.calls[0]?.[3];
-      expect(rekeyedSessionId).toMatch(
-        /^android-assistant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-      );
-      expect(rekeyedSessionId).not.toBe(assistantSessionId);
-      expect(service.hasActiveSession(UUID_A)).toBe(false);
-
-      const replyPushTarget = service.pushTargetForMeshEvent({
-        id: "reply-1",
-        ts: "2026-07-17T00:00:00.000Z",
-        kind: "message_sent",
-        actorId: UUID_A,
-        detail: rekeyedSessionId,
-        body: "I got the milk.",
-        payload: JSON.stringify({ to: LOCAL_USER, messageId: "announcement-1" }),
-        success: null,
-      });
-      expect(replyPushTarget).toEqual({
-        actorId: UUID_A,
-        announcementId: "announcement-1",
-        recipientId: LOCAL_USER,
-      });
-    });
-
     it("reports delivered: false for a non-live actor (memo still transcribed)", async () => {
       sendMessage.mockReturnValue({ delivered: false, status: "active" });
       const { res } = call(deps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo`, {

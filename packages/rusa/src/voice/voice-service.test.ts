@@ -260,7 +260,7 @@ describe("VoiceService Android reply notification correlation", () => {
     now = 11;
     service.expireSessions();
 
-    expect(service.hasSession(ANDROID_SESSION, ACTOR, TEST_USER_ID)).toBe(false);
+    expect(service.hasActiveSession(ACTOR)).toBe(false);
     expect(
       service.pushTargetForMeshEvent(replyEvent({ detail: ANDROID_SESSION, payload }))
     ).toEqual({ actorId: ACTOR, announcementId: "delayed-reply", recipientId: TEST_USER_ID });
