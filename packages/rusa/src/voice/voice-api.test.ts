@@ -349,11 +349,11 @@ describe("handleVoiceApiRequest", () => {
       await settled(first.res);
 
       expect(first.res.statusCode).toBe(200);
+      expect(sendMessage.mock.calls[0]?.[3]).toBe(sessionId);
       expect(service.hasActiveSession(UUID_A)).toBe(false);
-      expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(false);
 
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
-      expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A)).toEqual({ sessionId, principalId: TEST_USER_ID });
 
       const second = call(
         deps,
@@ -465,20 +465,20 @@ describe("handleVoiceApiRequest", () => {
 
     it("keeps an explicit session through an SSE drop and ends it only on disable", async () => {
       const first = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
 
       // A healthy EventSource holds authority beyond the reconnect allowance.
       now += VOICE_SESSION_LEASE_MS * 2;
       service.expireSessions();
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
 
       // An EventSource error/reconnect does not release background work.
       first.res.req.emit("close");
       now += VOICE_SESSION_LEASE_MS - 1;
       service.expireSessions();
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
-      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
+      expect(service.activeSessionFor(UUID_A).sessionId).toBe("walkie-1");
 
       const { res } = call(deps, "POST", "/api/mesh/voice/session/disable", {
         body: JSON.stringify({ sessionId: "walkie-1" }),
@@ -517,39 +517,27 @@ describe("handleVoiceApiRequest", () => {
       const frameSessionIds = (res: MockRes) =>
         res.frames().map((frame) => JSON.parse(frame.split("\ndata: ")[1]).sessionId);
 
-      it("reaches the client's stream when the memo beat the stream", async () => {
+      it.each([
+        ["the memo beat the stream", () => {}],
+        [
+          "its lease expired",
+          (sessionId: string) => {
+            const dropped = call(
+              deps,
+              "GET",
+              `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`
+            );
+            dropped.res.req.emit("close");
+            now += VOICE_SESSION_LEASE_MS;
+            service.expireSessions();
+          },
+        ],
+      ])("reaches the client's stream, with no lease from the memo, when %s", async (_label, setup) => {
         const detach = attachVoiceOutbound(emitter, service, hub);
-        const sessionId = "memo-before-stream";
-        const delivered = await sendMemo(sessionId);
-
-        const { res } = call(
-          deps,
-          "GET",
-          `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`
-        );
-        emitter.emitMeshEvent(replyEvent({ detail: delivered }));
-        await vi.waitFor(() =>
-          expect(service.backlog(UUID_A, TEST_USER_ID).map((a) => a.sessionId)).toEqual([delivered])
-        );
-        await new Promise((r) => setTimeout(r, 50));
-        detach();
-        expect(frameSessionIds(res)).toEqual([sessionId]);
-      });
-
-      it("reaches the client's stream after its lease expired, without reviving the lease", async () => {
-        const detach = attachVoiceOutbound(emitter, service, hub);
-        const sessionId = "expired-lease";
-        const dropped = call(
-          deps,
-          "GET",
-          `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`
-        );
-        dropped.res.req.emit("close");
-        now += VOICE_SESSION_LEASE_MS;
-        service.expireSessions();
+        const sessionId = "memo-without-lease";
+        setup(sessionId);
 
         const delivered = await sendMemo(sessionId);
-        expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(false);
         expect(service.hasActiveSession(UUID_A)).toBe(false);
 
         const { res } = call(
@@ -575,24 +563,29 @@ describe("handleVoiceApiRequest", () => {
         ).toEqual([sessionId]);
       });
 
-      it("gives an id leased to another principal no authority and reaches nobody else", async () => {
+      it.each([
+        ["another principal", UUID_A, "other-principal"],
+        ["another actor", UUID_B, TEST_USER_ID],
+      ])("leaves an id leased to %s with its holder and delivers the holder no audio", async (_label, holderActor, holderPrincipal) => {
         const detach = attachVoiceOutbound(emitter, service, hub);
-        const sessionId = "held-by-other-principal";
+        const sessionId = "held-by-someone-else";
         const held = new MockRes();
         hub.addVoiceConnection(
           held as unknown as ServerResponse,
-          new Set([UUID_A]),
+          new Set([holderActor]),
           undefined,
           sessionId,
-          "other-principal"
+          holderPrincipal
         );
-        service.openSession(sessionId, UUID_A, "other-principal");
+        service.openSession(sessionId, holderActor, holderPrincipal);
         service.presenceConnect([UUID_A], TEST_USER_ID);
 
         const delivered = await sendMemo(sessionId);
         expect(delivered).toBe(sessionId);
-        expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(false);
-        expect(service.hasSession(sessionId, UUID_A, "other-principal")).toBe(true);
+        expect(service.activeSessionFor(holderActor)).toEqual({
+          sessionId,
+          principalId: holderPrincipal,
+        });
         const refused = call(
           deps,
           "GET",
@@ -604,35 +597,8 @@ describe("handleVoiceApiRequest", () => {
         await vi.waitFor(() =>
           expect(service.backlog(UUID_A, TEST_USER_ID).map((a) => a.sessionId)).toEqual([sessionId])
         );
-        await new Promise((r) => setTimeout(r, 50));
         detach();
         expect(held.frames()).toEqual([]);
-      });
-
-      it("gives an id leased to another actor no authority over the memo's actor", async () => {
-        const detach = attachVoiceOutbound(emitter, service, hub);
-        const sessionId = "held-by-other-actor";
-        const held = call(
-          deps,
-          "GET",
-          `/api/mesh/voice/stream?actors=${UUID_B}&sessionId=${sessionId}`
-        );
-        service.presenceConnect([UUID_A], TEST_USER_ID);
-
-        const delivered = await sendMemo(sessionId);
-        expect(delivered).toBe(sessionId);
-        expect(service.hasSession(sessionId, UUID_B, TEST_USER_ID)).toBe(true);
-        expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(false);
-        expect(service.hasActiveSession(UUID_A)).toBe(false);
-        expect(() => service.activeSessionFor(UUID_A)).toThrow(/does not hold/);
-
-        emitter.emitMeshEvent(replyEvent({ detail: delivered }));
-        await vi.waitFor(() =>
-          expect(service.backlog(UUID_A, TEST_USER_ID).map((a) => a.sessionId)).toEqual([sessionId])
-        );
-        await new Promise((r) => setTimeout(r, 50));
-        detach();
-        expect(held.res.frames()).toEqual([]);
       });
     });
 

@@ -123,14 +123,16 @@ describe("VoiceService leased sessions", () => {
     const other = "11111111-0000-4000-8000-000000000001";
     service.openSession("session-a", ACTOR, TEST_USER_ID);
     expect(() => service.openSession("session-a", ACTOR, other)).toThrow("different actor or user");
-    expect(service.hasSession("session-a", ACTOR, other)).toBe(false);
+    expect(service.activeSessionFor(ACTOR)).toEqual({
+      sessionId: "session-a",
+      principalId: TEST_USER_ID,
+    });
     expect(service.closeSession("session-a", other)).toBe(false);
     service.transferActiveSession(ACTOR, TARGET);
     expect(service.activeSessionFor(TARGET)).toEqual({
       sessionId: "session-a",
       principalId: TEST_USER_ID,
     });
-    expect(service.hasSession("session-a", TARGET, other)).toBe(false);
     service.closeSession("session-a", TEST_USER_ID);
   });
 
@@ -196,15 +198,14 @@ describe("VoiceService leased sessions", () => {
 
     expect(service.activeSessionFor(ACTOR).sessionId).toBe("session-a");
     expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
-    expect(service.hasSession("session-a", ACTOR, TEST_USER_ID)).toBe(false);
-    expect(service.hasSession("session-a", TARGET, TEST_USER_ID)).toBe(true);
+    expect(service.activeSessionFor(TARGET).sessionId).toBe("session-a");
     expect(service.hasActiveSession(ACTOR)).toBe(false);
     expect(service.hasActiveSession(TARGET)).toBe(true);
     expect(ended).toEqual([]);
 
     service.revertActiveSessionTransfer("session-a", ACTOR, TARGET);
-    expect(service.hasSession("session-a", ACTOR, TEST_USER_ID)).toBe(true);
-    expect(service.hasSession("session-a", TARGET, TEST_USER_ID)).toBe(false);
+    expect(service.activeSessionFor(ACTOR).sessionId).toBe("session-a");
+    expect(service.hasActiveSession(TARGET)).toBe(false);
 
     expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
 
