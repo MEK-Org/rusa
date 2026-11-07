@@ -145,6 +145,38 @@ void main() {
   });
 
   test(
+    'push-token registration and revocation use the authenticated CSRF boundary',
+    () async {
+      final client = _Client([
+        http.Response('{"token":"csrf-token"}', 200),
+        http.Response('{"ok":true}', 200),
+        http.Response('{"token":"csrf-token"}', 200),
+        http.Response('{"ok":true}', 200),
+      ]);
+      final api = DashboardApi(
+        base: Uri.parse('http://localhost:3000'),
+        client: client,
+        session: _AuthenticatedSession(),
+      );
+
+      await api.registerPushToken('fcm-token');
+      await api.revokePushToken('fcm-token');
+
+      expect(client.paths, [
+        '/api/auth/csrf',
+        '/api/mesh/voice/push-token',
+        '/api/auth/csrf',
+        '/api/mesh/voice/push-token',
+      ]);
+      expect(client.methods, ['GET', 'PUT', 'GET', 'DELETE']);
+      expect(client.requestBodies.where((body) => body.isNotEmpty), [
+        '{"token":"fcm-token"}',
+        '{"token":"fcm-token"}',
+      ]);
+    },
+  );
+
+  test(
     'restored Firebase user reaches the dashboard before background cookie validation',
     () async {
       final auth = _Auth(
@@ -378,6 +410,34 @@ void main() {
     session.dispose();
     await auth.close();
   });
+
+  test(
+    'sign-out runs a device-registration revocation hook before logout',
+    () async {
+      final auth = _Auth(_User('restored-token'));
+      final client = _Client([
+        http.Response('{}', 200),
+        http.Response('{}', 200),
+        http.Response('{}', 200),
+      ]);
+      final session = FirebaseDashboardSession(
+        auth,
+        client: client,
+        csrfToken: () => 'csrf-token',
+      );
+      final events = <String>[];
+      session.addBeforeLogoutListener(() async => events.add('revoke-token'));
+      session.start();
+      await Future<void>.delayed(Duration.zero);
+
+      await session.signOut();
+
+      expect(events, ['revoke-token']);
+      expect(client.paths.last, '/api/auth/logout');
+      session.dispose();
+      await auth.close();
+    },
+  );
 
   test(
     'a failed logout stays signed in and exposes a retryable error',

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -7,14 +8,129 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/assistant_io.dart';
 import 'package:rusa_dashboard/assistant_page.dart';
 import 'package:rusa_dashboard/assistant_platform.dart';
+import 'package:rusa_dashboard/main.dart' show parseAssistantLaunch;
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/reply_notifications_io.dart';
+import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/walkie_controller.dart';
+import 'package:rusa_dashboard/voice_platform.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/walkie_panel.dart';
 
 import 'fakes.dart';
+
+class _SignedInSession extends DashboardSession {
+  @override
+  DashboardSessionStatus status = DashboardSessionStatus.signedIn;
+
+  @override
+  bool get authenticationEnabled => true;
+
+  @override
+  String? get csrfToken => null;
+
+  @override
+  bool get isIdle => false;
+
+  @override
+  String? get profilePhotoUrl => null;
+
+  @override
+  String get operatorDisplayName => 'Operator';
+
+  @override
+  String? get browserTitle => null;
+
+  @override
+  String? get errorMessage => null;
+
+  @override
+  Future<void> requireAuthentication() async {}
+
+  @override
+  Future<void> signIn() async {}
+
+  @override
+  Future<void> signOut() async {
+    status = DashboardSessionStatus.signedOut;
+    notifyListeners();
+  }
+
+  @override
+  Future<void> visit() async {}
+
+  @override
+  void idleFromServer() {}
+
+  @override
+  Future<void> checkSession() async {}
+}
+
+class _PushTokenStorage implements PushTokenStorage {
+  final values = <String, String>{};
+
+  String _scope(Uri origin) => switch (origin.scheme) {
+    'http' || 'https' => origin.origin,
+    _ => origin.toString(),
+  };
+
+  @override
+  Future<void> delete(Uri origin) async {
+    values.remove(_scope(origin));
+  }
+
+  @override
+  Future<String?> read(Uri origin) async => values[_scope(origin)];
+
+  @override
+  Future<void> write(Uri origin, String token) async {
+    values[_scope(origin)] = token;
+  }
+}
+
+class _FakeMessaging extends Fake implements FirebaseMessaging {
+  Completer<String?> tokenCompleter = Completer<String?>();
+  final StreamController<String> refreshController =
+      StreamController<String>.broadcast();
+
+  @override
+  Future<NotificationSettings> requestPermission({
+    bool alert = true,
+    bool announcement = false,
+    bool badge = true,
+    bool carPlay = false,
+    bool criticalAlert = false,
+    bool provisional = false,
+    bool sound = true,
+    bool providesAppNotificationSettings = false,
+  }) async =>
+      const NotificationSettings(
+        alert: AppleNotificationSetting.enabled,
+        announcement: AppleNotificationSetting.disabled,
+        authorizationStatus: AuthorizationStatus.authorized,
+        badge: AppleNotificationSetting.disabled,
+        carPlay: AppleNotificationSetting.disabled,
+        lockScreen: AppleNotificationSetting.disabled,
+        notificationCenter: AppleNotificationSetting.disabled,
+        showPreviews: AppleShowPreviewSetting.never,
+        timeSensitive: AppleNotificationSetting.disabled,
+        criticalAlert: AppleNotificationSetting.disabled,
+        sound: AppleNotificationSetting.disabled,
+        providesAppNotificationSettings: AppleNotificationSetting.disabled,
+      );
+
+  @override
+  Future<String?> getToken({
+    String? vapidKey,
+    String? serviceWorkerScriptPath,
+  }) =>
+      tokenCompleter.future;
+
+  @override
+  Stream<String> get onTokenRefresh => refreshController.stream;
+}
 
 // #1193: the Android assist trigger opens walkie recording to root, and the
 // phone drawer leads to the system page that assigns the assistant role.
@@ -166,50 +282,633 @@ void main() {
       expect(closed, 1);
     });
 
-    testWidgets('leaving the screen discards the take and ends the session', (
+    testWidgets(
+      'backgrounding cancels capture but retains the session and queues its reply for return',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+
+        await assistant.onBackground!();
+        await tester.pump();
+
+        expect(walkie.recorder.cancelCalls, 1);
+        expect(api.disabledVoiceSessions, isEmpty);
+        expect(walkie.stream.disposed, isFalse);
+        expect(find.byKey(const ValueKey('walkie-panel')), findsOneWidget);
+
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement('answer', actor: 'root', sessionId: sessionId),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.playedUrls, isEmpty);
+
+        await assistant.onForeground!();
+        await tester.pump();
+        await tester.pump();
+        expect(
+          walkie.player.playedUrls,
+          isEmpty,
+          reason: 'returning a task must not auto-replay a retained reply',
+        );
+        final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
+        panel.controller.replayLast();
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/answer']);
+
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('dashboard logout closes a retained assistant session', (
+      tester,
+    ) async {
+      final session = _SignedInSession();
+      final taskOpen = ValueNotifier(true);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ValueListenableBuilder<bool>(
+            valueListenable: taskOpen,
+            builder: (_, open, _) => open
+                ? AssistantPage(
+                    session: session,
+                    createApi: () => api,
+                    createWalkieDeps: (_) => walkie.deps,
+                    signals: assistant,
+                    onClose: () {
+                      closed++;
+                      taskOpen.value = false;
+                    },
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+      final sessionId = walkie.stream.connectCalls.single.sessionId;
+
+      await session.signOut();
+      await tester.pump();
+      await tester.pump();
+
+      expect(closed, 1);
+      expect(walkie.recorder.cancelCalls, greaterThanOrEqualTo(1));
+      expect(api.disabledVoiceSessions, [sessionId]);
+    });
+
+    testWidgets(
+      'a locked assist re-entry replaces retained unlocked replies with fresh capture',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+
+        await assistant.onBackground!();
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement(
+            'retained-reply',
+            actor: 'root',
+            text: 'Unlocked reply',
+            sessionId: sessionId,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Unlocked reply'), findsOneWidget);
+
+        await assistant.onLockedAssist!();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('Unlocked reply'),
+          findsNothing,
+          reason: 'lock-screen capture must not reveal the retained session',
+        );
+        expect(walkie.player.playedUrls, isEmpty);
+        expect(walkie.recorder.startCalls, 2);
+        expect(
+          closed,
+          0,
+          reason:
+              'disposing the replaced session must not finish its replacement',
+        );
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a locked assist after a notification route starts fresh capture',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              notificationOpening: true,
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.recorder.startCalls, 0);
+
+        await assistant.onLockedAssist!();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 1);
+        expect(assistant.readyCueCalls, 1);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('a Recents route mounts without capture or automatic audio', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            restoringFromRecents: true,
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.recorder.startCalls, 0);
+      expect(walkie.player.playedUrls, isEmpty);
+      await unmount(tester);
+    });
+
+    testWidgets(
+      'notification tap restores its exact reply without opening capture',
+      (tester) async {
+        api.notificationReply = makeAnnouncement(
+          'durable-reply',
+          actor: 'root',
+          sessionId: 'ended-session',
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              initialReply: const AssistantReplyTarget(
+                actorId: 'root',
+                announcementId: 'durable-reply',
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 0);
+        expect(api.notificationReplyCalls, [
+          (actorId: 'root', announcementId: 'durable-reply'),
+        ]);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'notification tap restores the recent root conversation with its reply',
+      (tester) async {
+        api
+          ..chatPages = [
+            ChatPage(
+              // The API is newest-first. The assistant reverses it before
+              // projecting it into the chronological walkie transcript.
+              chat: [
+                makeChat(
+                  'durable-reply',
+                  sender: 'root',
+                  body: 'The durable answer',
+                ),
+                makeChat(
+                  'recent-memo',
+                  sender: '00000000-0000-4000-8000-000000000001',
+                  body: '🎙️ [voice memo — reply for the ear]: My question',
+                ),
+              ],
+              nextCursor: null,
+            ),
+          ]
+          ..notificationReply = makeAnnouncement(
+            'durable-reply',
+            actor: 'root',
+            text: 'The durable answer',
+            sessionId: 'ended-session',
+          );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              initialReply: const AssistantReplyTarget(
+                actorId: 'root',
+                announcementId: 'durable-reply',
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.chatActorCalls, [
+          ['root'],
+        ]);
+        expect(find.text('My question'), findsOneWidget);
+        expect(
+          find.text('🎙️ [voice memo — reply for the ear]: My question'),
+          findsNothing,
+        );
+        expect(find.text('The durable answer'), findsOneWidget);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'backgrounding while reply lookup is awaiting invalidates recovery and keeps playback suspended',
+      (tester) async {
+        final gate = Completer<void>();
+        api
+          ..notificationReplyGate = gate
+          ..notificationReply = makeAnnouncement(
+            'durable-reply',
+            actor: 'root',
+            text: 'The durable answer',
+            sessionId: 'ended-session',
+          );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        final replyFuture = assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'durable-reply',
+          ),
+        );
+        await tester.pump();
+
+        expect(api.notificationReplyCalls, hasLength(1));
+        await assistant.onBackground!();
+        await tester.pump();
+
+        gate.complete();
+        await replyFuture;
+        await tester.pump();
+
+        expect(walkie.player.playedUrls, isEmpty);
+        expect(find.text('The durable answer'), findsNothing);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'locked notification opening waits for a post-unlock reply target',
+      (tester) async {
+        api.notificationReply = makeAnnouncement(
+          'durable-reply',
+          actor: 'root',
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AssistantPage(
+              createApi: () => api,
+              createWalkieDeps: (_) => walkie.deps,
+              signals: assistant,
+              notificationOpening: true,
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.recorder.startCalls, 0);
+        expect(api.notificationReplyCalls, isEmpty);
+        expect(
+          api.chatActorCalls,
+          isEmpty,
+          reason: 'reply-pending must not load conversation before unlock',
+        );
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'durable-reply',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.notificationReplyCalls, [
+          (actorId: 'root', announcementId: 'durable-reply'),
+        ]);
+        expect(api.chatActorCalls, [
+          ['root'],
+        ]);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a warm notification tap restores history before replaying its exact reply',
+      (tester) async {
+        api
+          ..chatPages = [
+            ChatPage(
+              chat: [
+                makeChat(
+                  'durable-reply',
+                  sender: 'root',
+                  body: 'The durable answer',
+                ),
+                makeChat(
+                  'recent-memo',
+                  sender: '00000000-0000-4000-8000-000000000001',
+                  body: 'A missed question',
+                ),
+              ],
+              nextCursor: null,
+            ),
+          ]
+          ..notificationReply = makeAnnouncement(
+            'durable-reply',
+            actor: 'root',
+            text: 'The durable answer',
+          );
+        await pumpPage(tester);
+        await assistant.onBackground!();
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'durable-reply',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.chatActorCalls, [
+          ['root'],
+        ]);
+        expect(find.text('A missed question'), findsOneWidget);
+        expect(find.text('The durable answer'), findsOneWidget);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/durable-reply',
+        ]);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('notification input cannot rebind the root-only assistant', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            initialReply: const AssistantReplyTarget(
+              actorId: 'worker',
+              announcementId: 'foreign-conversation-reply',
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.stream.connectCalls.single.actors, ['root']);
+      expect(walkie.recorder.startCalls, 0);
+      expect(api.notificationReplyCalls, isEmpty);
+      await unmount(tester);
+    });
+
+    testWidgets('foreign notification leaves a live root capture alone', (
       tester,
     ) async {
       await pumpPage(tester);
-      expect(walkie.recorder.startCalls, 1);
 
-      var ended = false;
-      unawaited(assistant.onEnd!().then((_) => ended = true));
-      await tester.pump();
+      await assistant.onReply!(
+        const AssistantReplyTarget(
+          actorId: 'worker',
+          announcementId: 'foreign-conversation-reply',
+        ),
+      );
       await tester.pump();
 
-      expect(ended, isTrue);
-      expect(walkie.recorder.cancelCalls, 1);
-      expect(walkie.recorder.stopCalls, 0);
-      expect(api.memoSends, isEmpty);
-      expect(api.disabledVoiceSessions, hasLength(1));
-      expect(walkie.wakeLock.releaseCalls, 1);
-      // Native closes the screen; the page does not close it a second time.
-      expect(closed, 0);
-      // A trigger can bring the closing screen back to the front before it
-      // finishes; it shows no panel of the ended session to tap.
-      expect(find.byType(WalkiePanel), findsNothing);
-
-      // A trigger reaching the closing screen starts nothing.
-      assistant.triggerCtrl.add(null);
-      await tester.pump();
-      expect(walkie.recorder.startCalls, 1);
+      expect(walkie.recorder.cancelCalls, 0);
+      expect(api.notificationReplyCalls, isEmpty);
       await unmount(tester);
-      expect(assistant.onEnd, isNull);
     });
 
-    testWidgets('leaving the screen during the root lookup cancels capture', (
+    testWidgets(
+      'a delayed root notification leaves a live transferred session untouched',
+      (tester) async {
+        await pumpPage(tester);
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'worker'),
+        );
+        await tester.pump();
+        await tester.pump();
+        final workerStream = walkie.stream;
+        expect(workerStream.connectCalls.single.actors, ['worker']);
+        workerStream.framesCtrl.add(
+          makeAnnouncement(
+            'worker-live',
+            actor: 'worker',
+            sessionId: workerStream.connectCalls.single.sessionId,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.isPlaying, isTrue);
+
+        api.notificationReply = makeAnnouncement(
+          'root-after-transfer',
+          actor: 'root',
+          text: 'Delayed reply from root',
+        );
+        unawaited(
+          assistant.onReply!(
+            const AssistantReplyTarget(
+              actorId: 'root',
+              announcementId: 'root-after-transfer',
+            ),
+          ),
+        );
+        for (var i = 0; i < 5; i++) {
+          await tester.pump();
+        }
+
+        expect(walkie.streams, hasLength(2));
+        expect(identical(walkie.stream, workerStream), isTrue);
+        expect(walkie.recorder.startCalls, 1);
+        expect(walkie.recorder.cancelCalls, 0);
+        expect(api.notificationReplyCalls, isEmpty);
+        expect(walkie.player.isPlaying, isTrue);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/worker-live',
+        ]);
+        expect(closed, 0);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a delayed root notification keeps a transferred session audio suspended',
+      (tester) async {
+        await pumpPage(tester);
+        await assistant.onBackground!();
+        await tester.pump();
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'worker'),
+        );
+        await tester.pump();
+        await tester.pump();
+        final workerStream = walkie.stream;
+        workerStream.framesCtrl.add(
+          makeAnnouncement(
+            'worker-held',
+            actor: 'worker',
+            sessionId: workerStream.connectCalls.single.sessionId,
+          ),
+        );
+        await tester.pump();
+
+        api.notificationReply = makeAnnouncement(
+          'root-after-transfer',
+          actor: 'root',
+        );
+        await assistant.onForeground!();
+        unawaited(
+          assistant.onReply!(
+            const AssistantReplyTarget(
+              actorId: 'root',
+              announcementId: 'root-after-transfer',
+            ),
+          ),
+        );
+        for (var i = 0; i < 5; i++) {
+          await tester.pump();
+        }
+
+        expect(walkie.streams, hasLength(2));
+        expect(identical(walkie.stream, workerStream), isTrue);
+        expect(api.notificationReplyCalls, isEmpty);
+        expect(walkie.player.playedUrls, isEmpty);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a non-root notification after a transfer leaves the transferred session alone',
+      (tester) async {
+        await pumpPage(tester);
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'worker'),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'worker',
+            announcementId: 'foreign-after-transfer',
+          ),
+        );
+        await tester.pump();
+
+        expect(walkie.streams, hasLength(2));
+        expect(walkie.stream.connectCalls.single.actors, ['worker']);
+        expect(api.notificationReplyCalls, isEmpty);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets(
+      'a failed exact notification lookup does not replay old audio',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+        await assistant.onBackground!();
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement('older-reply', actor: 'root', sessionId: sessionId),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        await assistant.onReply!(
+          const AssistantReplyTarget(
+            actorId: 'root',
+            announcementId: 'missing-durable-reply',
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(walkie.player.playedUrls, isEmpty);
+        await unmount(tester);
+      },
+    );
+
+    testWidgets('backgrounding during startup returns with an idle session', (
       tester,
     ) async {
       final gate = Completer<ThreadsSnapshot>();
       api.threadSnapshotGates.add(gate);
-      await pumpPage(tester);
-
-      var ended = false;
-      unawaited(assistant.onEnd!().then((_) => ended = true));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AssistantPage(
+            createApi: () => api,
+            createWalkieDeps: (_) => walkie.deps,
+            signals: assistant,
+            onClose: () => closed++,
+          ),
+        ),
+      );
       await tester.pump();
-      // Ending waits for the start in flight to settle.
-      expect(ended, isFalse);
 
+      await assistant.onBackground!();
       gate.complete(
         ThreadsSnapshot(
           halted: false,
@@ -219,13 +918,13 @@ void main() {
       );
       await tester.pump();
       await tester.pump();
+      await tester.pump();
 
-      expect(ended, isTrue);
-      expect(walkie.streams, isEmpty);
-      expect(walkie.recorder.startCalls, 1);
       expect(walkie.recorder.cancelCalls, 1);
-      expect(walkie.recorder.stopCalls, 0);
-      expect(api.memoSends, isEmpty);
+      expect(api.disabledVoiceSessions, isEmpty);
+      final panel = tester.widget<WalkiePanel>(find.byType(WalkiePanel));
+      expect(panel.controller.record.value.phase, RecordPhase.idle);
+
       await unmount(tester);
     });
 
@@ -410,10 +1109,10 @@ void main() {
         await tester.pump();
 
         ThreadsSnapshot snapshot() => ThreadsSnapshot(
-              halted: false,
-              threads: api.threadsResult,
-              rootActorId: 'root',
-            );
+          halted: false,
+          threads: api.threadsResult,
+          rootActorId: 'root',
+        );
 
         // First (superseded) attempt completes while second is still awaiting threads lookup:
         first.complete(snapshot());
@@ -571,9 +1270,7 @@ void main() {
       await unmount(tester);
     });
 
-    testWidgets('closing while voice starts cancels capture', (
-      tester,
-    ) async {
+    testWidgets('closing while voice starts cancels capture', (tester) async {
       final probe = Completer<List<VoiceAnnouncement>>();
       api.backlogGates.add(probe);
       await pumpPage(tester);
@@ -862,6 +1559,89 @@ void main() {
     });
   });
 
+  group('IoReplyNotifications', () {
+    test(
+      'logout does not initialize messaging without a registered token',
+      () async {
+        final api = FakeApi();
+        final notifications = IoReplyNotifications(
+          storage: _PushTokenStorage(),
+        );
+        await notifications.revoke(api);
+
+        expect(api.revokedPushTokens, isEmpty);
+        notifications.dispose();
+      },
+    );
+
+    test('logout revokes a token registered by an earlier process', () async {
+      final api = FakeApi(base: Uri.parse('https://rusa.example/'));
+      final storage = _PushTokenStorage()
+        ..values['https://rusa.example'] = 'prior-process-token';
+      final notifications = IoReplyNotifications(storage: storage);
+
+      await notifications.revoke(api);
+
+      expect(api.revokedPushTokens, ['prior-process-token']);
+      expect(storage.values, isEmpty);
+      notifications.dispose();
+    });
+
+    test('logout drops an in-flight registration racing revocation', () async {
+      final api = FakeApi(base: Uri.parse('https://rusa.example/'));
+      final storage = _PushTokenStorage()
+        ..values['https://rusa.example'] = 'old-token';
+      final messaging = _FakeMessaging();
+      final notifications = IoReplyNotifications(
+        messaging: messaging,
+        storage: storage,
+      );
+
+      final registerFuture = notifications.register(api);
+      await pumpEventQueue();
+
+      await notifications.revoke(api);
+      expect(api.revokedPushTokens, ['old-token']);
+      expect(storage.values, isEmpty);
+
+      messaging.tokenCompleter.complete('racing-new-token');
+      await registerFuture;
+      await pumpEventQueue();
+
+      expect(api.registeredPushTokens, isEmpty);
+      expect(storage.values, isEmpty);
+      notifications.dispose();
+    });
+  });
+
+  group('parseAssistantLaunch', () {
+    test('keeps a locked notification content-free until native unlock', () {
+      final launch = parseAssistantLaunch('reply-pending');
+
+      expect(launch.waitingForUnlock, isTrue);
+      expect(launch.reply, isNull);
+    });
+
+    test('requires both opaque lookup keys for a reply route', () {
+      final valid = parseAssistantLaunch(
+        'reply?actorId=root&announcementId=durable-reply',
+      );
+      final missingId = parseAssistantLaunch('reply?actorId=root');
+
+      expect(valid.reply?.actorId, 'root');
+      expect(valid.reply?.announcementId, 'durable-reply');
+      expect(missingId.reply, isNull);
+      expect(missingId.waitingForUnlock, isFalse);
+    });
+
+    test('keeps a Recents launch inert', () {
+      final launch = parseAssistantLaunch('recents');
+
+      expect(launch.restoringFromRecents, isTrue);
+      expect(launch.reply, isNull);
+    });
+  });
+
   group('IoAssistantChannel', () {
     TestWidgetsFlutterBinding.ensureInitialized();
     const channel = MethodChannel(IoAssistantChannel.kName);
@@ -880,11 +1660,14 @@ void main() {
     });
     tearDown(() => messenger.setMockMethodCallHandler(channel, null));
 
-    Future<void> fromNative(String method) => messenger.handlePlatformMessage(
-      channel.name,
-      const StandardMethodCodec().encodeMethodCall(MethodCall(method)),
-      (_) {},
-    );
+    Future<void> fromNative(String method, [Object? arguments]) =>
+        messenger.handlePlatformMessage(
+          channel.name,
+          const StandardMethodCodec().encodeMethodCall(
+            MethodCall(method, arguments),
+          ),
+          (_) {},
+        );
 
     test('reads the role status', () async {
       answer = (_) => {'available': true, 'held': true};
@@ -902,36 +1685,6 @@ void main() {
       expect(calls, ['acquireHeadset', 'releaseHeadset']);
     });
 
-    test('answers native\'s end once the session has ended', () async {
-      final assistant = IoAssistantChannel(channel: channel);
-      final ending = Completer<void>();
-      assistant.onEnd = () => ending.future;
-      var replied = false;
-      unawaited(
-        messenger.handlePlatformMessage(
-          channel.name,
-          const StandardMethodCodec().encodeMethodCall(const MethodCall('end')),
-          (_) => replied = true,
-        ),
-      );
-      await pumpEventQueue();
-      expect(replied, isFalse);
-
-      ending.complete();
-      await pumpEventQueue();
-      expect(replied, isTrue);
-
-      // With no page to end, native gets its answer at once.
-      assistant.onEnd = null;
-      replied = false;
-      await messenger.handlePlatformMessage(
-        channel.name,
-        const StandardMethodCodec().encodeMethodCall(const MethodCall('end')),
-        (_) => replied = true,
-      );
-      expect(replied, isTrue);
-    });
-
     test('forwards native triggers and route loss', () async {
       final assistant = IoAssistantChannel(channel: channel);
       final triggers = <void>[];
@@ -947,6 +1700,34 @@ void main() {
       expect(triggers, hasLength(2));
       expect(losses, hasLength(1));
     });
+
+    test('forwards a locked assist reset', () async {
+      final assistant = IoAssistantChannel(channel: channel);
+      var resets = 0;
+      assistant.onLockedAssist = () async => resets++;
+
+      await fromNative('lockedAssist');
+
+      expect(resets, 1);
+    });
+
+    test(
+      'buffers an early native reply until the page binds its handler',
+      () async {
+        final assistant = IoAssistantChannel(channel: channel);
+        await fromNative('reply', {
+          'actorId': 'root',
+          'announcementId': 'durable-reply',
+        });
+
+        AssistantReplyTarget? received;
+        assistant.onReply = (target) async => received = target;
+        await pumpEventQueue();
+
+        expect(received?.actorId, 'root');
+        expect(received?.announcementId, 'durable-reply');
+      },
+    );
 
     test('plays ready cue via platform channel', () async {
       final assistant = IoAssistantChannel(channel: channel);

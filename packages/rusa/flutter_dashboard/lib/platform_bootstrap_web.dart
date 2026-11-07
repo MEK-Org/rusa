@@ -10,6 +10,7 @@ import 'avatar_upload_web.dart';
 import 'mesh_stream.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
+import 'reply_notifications.dart';
 import 'session.dart';
 import 'session_events_web.dart';
 import 'session_web.dart';
@@ -64,3 +65,5 @@ WalkieDeps? platformCreateWalkieDeps(
 AvatarFilePicker platformCreateAvatarFilePicker() => WebAvatarFilePicker();
 
 AssistantPlatform? platformCreateAssistant() => null;
+
+ReplyNotifications? platformCreateReplyNotifications() => null;

@@ -9,6 +9,7 @@ import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import type { Logger } from "../observability/logger.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import {
+  ANDROID_ASSISTANT_SESSION_PREFIX,
   VOICE_PRESENCE_GRACE_MS,
   VoiceService,
   type VoiceServiceOptions,
@@ -17,6 +18,7 @@ import { attachVoiceOutbound } from "./wiring.js";
 
 const ACTOR = "aaaaaaaa-0000-4000-8000-000000000001";
 const TARGET = "bbbbbbbb-0000-4000-8000-000000000002";
+const ANDROID_SESSION = `${ANDROID_ASSISTANT_SESSION_PREFIX}aaaaaaaa-0000-4000-8000-000000000009`;
 
 function fakeSpeech(overrides: Partial<SpeechClient> = {}): SpeechClient {
   return {
@@ -41,6 +43,7 @@ function makeService(
     onSessionEnded?: (actorId: string) => void;
     isHumanRecipient?: (principalId: string) => boolean;
     speechFor?: VoiceServiceOptions["speechFor"];
+    meshChat?: VoiceServiceOptions["meshChat"];
     logger?: Logger;
   } = {}
 ) {
@@ -54,6 +57,7 @@ function makeService(
     onSessionEnded: opts.onSessionEnded,
     isHumanRecipient: opts.isHumanRecipient ?? ((id) => id === TEST_USER_ID),
     speechFor: opts.speechFor,
+    meshChat: opts.meshChat,
     logger: opts.logger,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
@@ -114,6 +118,152 @@ describe("VoiceService presence & grace", () => {
     service.presenceDisconnect([ACTOR], TEST_USER_ID);
     now += VOICE_PRESENCE_GRACE_MS * 10; // grace irrelevant: one is still live
     expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(true);
+  });
+});
+
+describe("VoiceService durable reply recovery", () => {
+  it("uses the durable mesh message id as the notification announcement id", async () => {
+    const { service } = makeService();
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+
+    const announcement = await service.handleMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId: "durable-reply" }) })
+    );
+
+    expect(announcement?.id).toBe("durable-reply");
+  });
+
+  it("rebuilds a notification-targeted reply after its in-memory registry is gone", async () => {
+    const messageId = "reply-message";
+    const { service } = makeService({
+      meshChat: {
+        getById: (id) =>
+          id === messageId
+            ? {
+                id,
+                ts: "2026-11-06T00:00:00.000Z",
+                senderId: ACTOR,
+                recipientId: TEST_USER_ID,
+                body: "Your reply is ready.",
+                sessionId: "walkie-session",
+                responsive: null,
+              }
+            : null,
+      },
+    });
+
+    const first = await service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID);
+
+    expect(first).toMatchObject({
+      id: messageId,
+      actorId: ACTOR,
+      recipientId: TEST_USER_ID,
+      sessionId: "walkie-session",
+      text: "Your reply is ready.",
+    });
+  });
+
+  it("rejects a foreign recovery while a valid recovery is rendering", async () => {
+    const messageId = "reply-message";
+    const { service } = makeService({
+      meshChat: {
+        getById: () => ({
+          id: messageId,
+          ts: "2026-11-06T00:00:00.000Z",
+          senderId: ACTOR,
+          recipientId: TEST_USER_ID,
+          body: "private reply",
+          sessionId: null,
+          responsive: null,
+        }),
+      },
+    });
+
+    const valid = service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID);
+    await expect(
+      service.recoverAnnouncement(messageId, TARGET, TEST_USER_ID)
+    ).resolves.toBeUndefined();
+    await expect(valid).resolves.toMatchObject({ id: messageId, actorId: ACTOR });
+  });
+
+  it("keeps one announcement when a notification tap races the live render", async () => {
+    const messageId = "reply-message";
+    const { service } = makeService({
+      meshChat: {
+        getById: () => ({
+          id: messageId,
+          ts: "2026-11-06T00:00:00.000Z",
+          senderId: ACTOR,
+          recipientId: TEST_USER_ID,
+          body: "Your reply is ready.",
+          sessionId: "walkie-session",
+          responsive: null,
+        }),
+      },
+    });
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+
+    const recovered = service.recoverAnnouncement(messageId, ACTOR, TEST_USER_ID);
+    const live = service.handleMeshEvent(
+      replyEvent({ payload: JSON.stringify({ to: TEST_USER_ID, messageId }) })
+    );
+    const [recoveredAnnouncement, liveAnnouncement] = await Promise.all([recovered, live]);
+
+    // A duplicate ring entry would survive `ack` and replay as backlog on the
+    // next connection, because `ack` updates only the first entry with this id.
+    expect(liveAnnouncement).toBe(recoveredAnnouncement);
+    expect(service.ack(messageId)).toBe(true);
+    expect(service.backlog(ACTOR, TEST_USER_ID)).toEqual([]);
+  });
+
+  it("fails closed when a durable row belongs to another actor or principal", async () => {
+    const { service } = makeService({
+      meshChat: {
+        getById: () => ({
+          id: "reply-message",
+          ts: "2026-11-06T00:00:00.000Z",
+          senderId: ACTOR,
+          recipientId: TEST_USER_ID,
+          body: "private reply",
+          sessionId: null,
+          responsive: null,
+        }),
+      },
+    });
+
+    await expect(
+      service.recoverAnnouncement("reply-message", TARGET, TEST_USER_ID)
+    ).resolves.toBeUndefined();
+    await expect(
+      service.recoverAnnouncement("reply-message", ACTOR, "other-user")
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("VoiceService Android reply notification correlation", () => {
+  it("accepts only replies from the durable Android assistant conversation", () => {
+    const { service } = makeService();
+    const payload = JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" });
+
+    expect(service.pushTargetForMeshEvent(replyEvent({ payload }))).toBeNull();
+    expect(
+      service.pushTargetForMeshEvent(replyEvent({ detail: ANDROID_SESSION, payload }))
+    ).toEqual({ actorId: ACTOR, announcementId: "announcement-1", recipientId: TEST_USER_ID });
+  });
+
+  it("keeps a delayed Android reply eligible after its stream lease expires", () => {
+    let now = 0;
+    const { service } = makeService({ now: () => now, sessionLeaseMs: 10 });
+    const payload = JSON.stringify({ to: TEST_USER_ID, messageId: "delayed-reply" });
+    service.openSession(ANDROID_SESSION, ACTOR, TEST_USER_ID);
+    service.disconnectSession(ANDROID_SESSION);
+    now = 11;
+    service.expireSessions();
+
+    expect(service.hasActiveSession(ACTOR)).toBe(false);
+    expect(
+      service.pushTargetForMeshEvent(replyEvent({ detail: ANDROID_SESSION, payload }))
+    ).toEqual({ actorId: ACTOR, announcementId: "delayed-reply", recipientId: TEST_USER_ID });
   });
 });
 
@@ -445,7 +595,12 @@ describe("attachVoiceOutbound", () => {
     const pushVoice = vi.fn();
     const detach = attachVoiceOutbound(emitter, service, { pushVoice });
 
-    emitter.emitMeshEvent(replyEvent());
+    emitter.emitMeshEvent(
+      replyEvent({
+        detail: ANDROID_SESSION,
+        payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }),
+      })
+    );
     await vi.waitFor(() => expect(pushVoice).toHaveBeenCalledTimes(1));
     const frame = pushVoice.mock.calls[0][0];
     expect(frame.actorId).toBe(ACTOR);
@@ -476,6 +631,53 @@ describe("attachVoiceOutbound", () => {
     expect(() => emitter.emitMeshEvent(replyEvent())).not.toThrow();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(pushVoice).not.toHaveBeenCalled();
+  });
+
+  it("dispatches a durable reply notification without SSE presence or TTS", async () => {
+    const { service } = makeService({
+      speech: fakeSpeech({
+        streamSynthesize: async () => {
+          throw new Error("tts down");
+        },
+      }),
+    });
+    const emitter = new MeshEventEmitter();
+    const pushVoice = vi.fn();
+    const deliver = vi.fn(async () => undefined);
+    attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver }, ACTOR);
+
+    emitter.emitMeshEvent(
+      replyEvent({
+        detail: ANDROID_SESSION,
+        payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }),
+      })
+    );
+
+    await vi.waitFor(() =>
+      expect(deliver).toHaveBeenCalledWith({
+        actorId: ACTOR,
+        announcementId: "announcement-1",
+        recipientId: TEST_USER_ID,
+      })
+    );
+    expect(pushVoice).not.toHaveBeenCalled();
+  });
+
+  it("does not notify for a non-root transferred voice actor", async () => {
+    const { service } = makeService();
+    const emitter = new MeshEventEmitter();
+    const pushVoice = vi.fn();
+    const deliver = vi.fn(async () => undefined);
+    attachVoiceOutbound(emitter, service, { pushVoice }, undefined, { deliver }, TARGET);
+
+    emitter.emitMeshEvent(
+      replyEvent({
+        detail: ANDROID_SESSION,
+        payload: JSON.stringify({ to: TEST_USER_ID, messageId: "announcement-1" }),
+      })
+    );
+
+    expect(deliver).not.toHaveBeenCalled();
   });
 });
 

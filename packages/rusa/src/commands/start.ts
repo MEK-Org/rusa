@@ -4769,6 +4769,7 @@ async function composeStart(
             const user = getRepositories().principals.getUser(principalId);
             return user !== undefined && !user.disabledAt;
           },
+          meshChat: getRepositories().meshChat,
           onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
           logger: log.child({ component: "voice-session" }),
         })
@@ -4804,6 +4805,7 @@ async function composeStart(
           meshEvents: getRepositories().meshEvents,
           timings: dashboardTimings,
           meshChat: getRepositories().meshChat,
+          pushDeviceTokens: getRepositories().pushDeviceTokens,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
@@ -4946,7 +4948,7 @@ async function composeStart(
         dashboardConfig: { quotaProviders: config.dashboard?.quotaProviders },
         // Walkie-talkie voice routes + reply-TTS hook ; undefined when
         // voice credentials are unconfigured (routes then 503).
-        voice: voiceService ? { service: voiceService } : undefined,
+        voice: voiceService ? { service: voiceService, rootActorId: rootId } : undefined,
       })
     : null;
   if (dashboardServer) {

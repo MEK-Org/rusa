@@ -19,6 +19,8 @@ class IoAssistantChannel implements AssistantPlatform {
   final MethodChannel _channel;
   final _triggers = StreamController<void>.broadcast();
   final _routeLost = StreamController<void>.broadcast();
+  Future<void> Function(AssistantReplyTarget target)? _onReply;
+  AssistantReplyTarget? _pendingReply;
 
   @override
   Stream<void> get triggers => _triggers.stream;
@@ -38,7 +40,28 @@ class IoAssistantChannel implements AssistantPlatform {
   }
 
   @override
-  Future<void> Function()? onEnd;
+  Future<void> Function()? onBackground;
+
+  @override
+  Future<void> Function()? onForeground;
+
+  @override
+  Future<void> Function()? onLockedAssist;
+
+  @override
+  Future<void> Function(AssistantReplyTarget target)? get onReply => _onReply;
+
+  @override
+  set onReply(Future<void> Function(AssistantReplyTarget target)? handler) {
+    _onReply = handler;
+    final pending = _pendingReply;
+    if (handler == null || pending == null) return;
+    _pendingReply = null;
+    // Flutter may receive the native reply while session bootstrap is still
+    // mounting AssistantPage. Keep only the opaque target until that page can
+    // enforce its root/session boundary.
+    unawaited(handler(pending));
+  }
 
   Future<Object?> _handle(MethodCall call) async {
     switch (call.method) {
@@ -46,8 +69,33 @@ class IoAssistantChannel implements AssistantPlatform {
         _triggers.add(null);
       case 'routeLost':
         _routeLost.add(null);
-      case 'end':
-        await onEnd?.call();
+      case 'background':
+        await onBackground?.call();
+      case 'foreground':
+        await onForeground?.call();
+      case 'lockedAssist':
+        await onLockedAssist?.call();
+      case 'reply':
+        final args = call.arguments;
+        if (args is Map) {
+          final actorId = args['actorId'];
+          final announcementId = args['announcementId'];
+          if (actorId is String &&
+              announcementId is String &&
+              actorId.isNotEmpty &&
+              announcementId.isNotEmpty) {
+            final target = AssistantReplyTarget(
+              actorId: actorId,
+              announcementId: announcementId,
+            );
+            final handler = _onReply;
+            if (handler == null) {
+              _pendingReply = target;
+            } else {
+              await handler(target);
+            }
+          }
+        }
     }
     return null;
   }

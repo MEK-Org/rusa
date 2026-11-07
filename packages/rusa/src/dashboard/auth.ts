@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { cert, deleteApp, initializeApp, type ServiceAccount } from "firebase-admin/app";
 import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
+import { getMessaging } from "firebase-admin/messaging";
 import { validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
 import {
@@ -12,6 +13,7 @@ import {
 import { type Logger, nullLogger } from "../observability/logger.js";
 import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
+import type { FcmMessageSender } from "../voice/push-delivery.js";
 import { DashboardCsrf } from "./csrf.js";
 import {
   DASHBOARD_IDENTITY_CLAIM_ERROR,
@@ -125,7 +127,8 @@ export class DashboardAuth {
     private readonly identities: DashboardIdentityResolver,
     private readonly now = Date.now,
     private readonly dispose: () => Promise<void> = async () => {},
-    private readonly emulatorUrl?: string
+    private readonly emulatorUrl?: string,
+    private readonly fcmSender?: FcmMessageSender
   ) {
     this.allowedEmails = new Set(config.allowedEmails ?? (config.email ? [config.email] : []));
   }
@@ -147,6 +150,11 @@ export class DashboardAuth {
       },
       ...(this.emulatorUrl ? { emulatorUrl: this.emulatorUrl } : {}),
     };
+  }
+
+  /** Present only for the real Firebase Admin boundary, never the e2e adapter. */
+  getFcmSender(): FcmMessageSender | undefined {
+    return this.fcmSender;
   }
 
   private admitted(token: DecodedIdToken): void {
@@ -403,12 +411,15 @@ export function createDashboardAuth(
       { projectId, credential: cert(credential as ServiceAccount) },
       `rusa-dashboard-${randomUUID()}`
     );
+    const messaging = getMessaging(app);
     return new DashboardAuth(
       config,
       getAuth(app),
       new DashboardIdentityResolver(() => principals, projectId, logger),
       Date.now,
-      () => deleteApp(app)
+      () => deleteApp(app),
+      undefined,
+      { send: (message) => messaging.send(message) }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

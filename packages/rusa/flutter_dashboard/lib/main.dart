@@ -5,12 +5,14 @@ import 'package:flutter/material.dart';
 import 'api.dart';
 import 'app.dart';
 import 'assistant_page.dart';
+import 'assistant_platform.dart';
 import 'breakpoints.dart';
 import 'dashboard_title.dart';
 import 'io_session.dart';
 import 'iu/iu_reports_view.dart';
 import 'iu/iu_tree_view.dart';
 import 'platform_bootstrap.dart';
+import 'reply_notifications.dart';
 import 'store.dart';
 import 'session.dart';
 import 'theme.dart';
@@ -41,17 +43,65 @@ void assistMain() {
   WidgetsFlutterBinding.ensureInitialized();
   platformInit();
   final assistant = platformCreateAssistant();
+  final launch = parseAssistantLaunch(
+    WidgetsBinding.instance.platformDispatcher.defaultRouteName,
+  );
   runApp(
     RusaDashboardApp(
       title: resolveDashboardTitle(platformDocumentTitle),
       bootstrapSession: platformBootstrapSession,
       browserHooksBuilder: platformBrowserHooksBuilder,
       pageBuilder: (context, session) => AssistantPage(
+        session: session,
         createApi: () => platformCreateDashboardApi(session),
         createWalkieDeps: (api) =>
             platformCreateWalkieDeps(api, session, headset: assistant),
         signals: assistant,
+        initialReply: launch.reply,
+        notificationOpening: launch.waitingForUnlock,
+        restoringFromRecents: launch.restoringFromRecents,
       ),
+    ),
+  );
+}
+
+class AssistantLaunch {
+  const AssistantLaunch({
+    this.reply,
+    this.waitingForUnlock = false,
+    this.restoringFromRecents = false,
+  });
+
+  final AssistantReplyTarget? reply;
+  final bool waitingForUnlock;
+  final bool restoringFromRecents;
+}
+
+/// Parses only the content-free routes native code is allowed to pass to Dart.
+AssistantLaunch parseAssistantLaunch(String route) {
+  final uri = Uri.tryParse(route);
+  if (uri == null) return const AssistantLaunch();
+  if (uri.path == 'reply-pending' || uri.path == '/reply-pending') {
+    return const AssistantLaunch(waitingForUnlock: true);
+  }
+  if (uri.path == 'recents' || uri.path == '/recents') {
+    return const AssistantLaunch(restoringFromRecents: true);
+  }
+  if (uri.path != 'reply' && uri.path != '/reply') {
+    return const AssistantLaunch();
+  }
+  final actorId = uri.queryParameters['actorId'];
+  final announcementId = uri.queryParameters['announcementId'];
+  if (actorId == null ||
+      actorId.isEmpty ||
+      announcementId == null ||
+      announcementId.isEmpty) {
+    return const AssistantLaunch();
+  }
+  return AssistantLaunch(
+    reply: AssistantReplyTarget(
+      actorId: actorId,
+      announcementId: announcementId,
     ),
   );
 }
@@ -68,12 +118,21 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   late final DashboardApi _api;
   late final DashboardStore _store;
+  ReplyNotifications? _replyNotifications;
   late Future<void> _ready;
 
   @override
   void initState() {
     super.initState();
     _api = platformCreateDashboardApi(widget.session);
+    _replyNotifications = platformCreateReplyNotifications();
+    widget.session.addBeforeLogoutListener(_revokePushToken);
+    if (widget.session.authenticationEnabled) {
+      // Ask while the ordinary unlocked dashboard is visible. An FCM
+      // permission prompt must never interrupt an immediate assist capture or
+      // be presented over the keyguard.
+      unawaited(_registerPushToken());
+    }
     _store = DashboardStore(
       api: _api,
       stream: platformCreateMeshStream(widget.session, _api.base),
@@ -91,8 +150,29 @@ class _DashboardPageState extends State<DashboardPage> {
 
   @override
   void dispose() {
+    widget.session.removeBeforeLogoutListener(_revokePushToken);
+    _replyNotifications?.dispose();
     _store.dispose();
     super.dispose();
+  }
+
+  Future<void> _revokePushToken() async {
+    try {
+      await _replyNotifications?.revoke(_api);
+    } catch (_) {
+      // Logout still clears the authenticated dashboard session. The server's
+      // generic notification contains no reply body and cleans invalid tokens.
+    }
+  }
+
+  Future<void> _registerPushToken() async {
+    try {
+      await _replyNotifications?.register(_api);
+    } catch (_) {
+      // Registration is additive: dashboard use and normal session refresh
+      // remain available when Firebase Messaging is unavailable.
+      debugPrint('dashboard: Android reply-notification registration failed');
+    }
   }
 
   @override

@@ -45,6 +45,7 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { PushDeviceTokenRepository } from "../db/repositories/push-device-token-repository.js";
 import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
@@ -55,6 +56,7 @@ import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.j
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
+import { FcmVoicePushDelivery, type VoicePushDelivery } from "../voice/push-delivery.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { attachVoiceOutbound } from "../voice/wiring.js";
@@ -146,6 +148,8 @@ export interface DashboardMeshRefs {
   /** Optional content-free timing recorder, owned by the live start wiring. */
   timings?: DashboardDataDeps["timings"];
   meshChat: MeshChatRepository;
+  /** Principal-bound Android reply-notification registrations. */
+  pushDeviceTokens?: PushDeviceTokenRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
@@ -247,7 +251,7 @@ export interface DashboardServerBaseOptions {
    * voice-SSE / backlog / ack / audio routes and renders reply TTS for actors
    * with walkie presence. Absent → those routes 503 with a clear error.
    */
-  voice?: { service: VoiceService };
+  voice?: { service: VoiceService; rootActorId?: string };
   /** Application logger for request diagnostics. Absent → nothing is logged. */
   logger?: Logger;
 }
@@ -647,6 +651,21 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   const auth =
     options.e2eAuth ??
     (options.auth ? createDashboardAuth(options.auth, options.principals, log) : null);
+  const sender = auth?.getFcmSender();
+  const fcmDelivery =
+    options.voice && options.mesh?.pushDeviceTokens && sender
+      ? new FcmVoicePushDelivery(
+          options.mesh.pushDeviceTokens,
+          sender,
+          log.child({ component: "voice-push" })
+        )
+      : undefined;
+  // The Android assistant is walkie-to-root. The voice wire applies that
+  // eligibility check before delivery, so a transferred session can still use
+  // its own SSE path without creating a notification that the root-only page
+  // would reject.
+  const pushDelivery: VoicePushDelivery | undefined =
+    fcmDelivery && options.voice?.rootActorId ? fcmDelivery : undefined;
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
@@ -720,6 +739,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,
           principals,
+          pushDeviceTokens: options.mesh.pushDeviceTokens,
           logger: log.child({ component: "voice-route" }),
         }
       : null;
@@ -731,7 +751,9 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           options.mesh.emitter,
           options.voice.service,
           sseHub,
-          log.child({ component: "voice-outbound" })
+          log.child({ component: "voice-outbound" }),
+          pushDelivery,
+          options.voice.rootActorId
         )
       : null;
   // The session registry lives in VoiceService while the targeted wire channel
