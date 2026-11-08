@@ -706,6 +706,47 @@ void main() {
     );
 
     test(
+      'tapping one held row opts in: the other pre-selection replies follow it',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('older-a'));
+        walkie.stream.framesCtrl.add(makeAnnouncement('older-b'));
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(
+          controller.nowPlaying.value,
+          isNull,
+          reason: 'both pre-selection replies stay held',
+        );
+        expect(api.ackedIds, ['selected']);
+
+        // An ordinary row tap is the same opt-in it was before held ids:
+        // the tapped reply plays first, then the remaining held queue drains.
+        controller.replayAnnouncement(makeAnnouncement('older-b'));
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'older-b');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'older-a');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/older-b',
+          '/api/mesh/voice/audio/older-a',
+        ]);
+        expect(api.ackedIds, ['selected', 'older-b', 'older-a']);
+      },
+    );
+
+    test(
       'recording and sending a new memo lifts suspension so new replies play',
       () async {
         api.backlogPages = [
