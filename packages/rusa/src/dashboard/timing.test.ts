@@ -182,7 +182,7 @@ describe("dashboard timing recorder", () => {
     });
   });
 
-  it("reads stored browser phases back and rejects a partial set (#990)", () => {
+  it("reads stored browser phases back and drops only a partial set (#990)", () => {
     const recorder = new DashboardTimingRecorder(events);
     const stored = (requestId: string, timing: Record<string, unknown>) => {
       events.record({
@@ -214,12 +214,16 @@ describe("dashboard timing recorder", () => {
     while (timingRows().length < 4) recorder.flush();
 
     const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
-    expect(summary.window.unreadableRecords).toBe(1);
+    // The partial set costs only its phases: the row keeps its requestMs and pair.
+    expect(summary.window).toMatchObject({ unreadableRecords: 0, unreadableClientPhases: 1 });
     expect(summary.pairedRequestDurations).toEqual([
       expect.objectContaining({
-        sampleCount: 1,
+        sampleCount: 2,
         clientPhaseMs: expect.objectContaining({
-          queueMs: expect.objectContaining({ maxMs: 1210 }),
+          queueMs: expect.objectContaining({
+            maxMs: 1210,
+            coverage: expect.objectContaining({ numerator: 1, denominator: 2 }),
+          }),
         }),
       }),
     ]);
@@ -1100,6 +1104,7 @@ describe("dashboard timing recorder", () => {
       retentionLimited: false,
       unreadableRecords: 0,
       unreadableSubstages: 0,
+      unreadableClientPhases: 0,
     });
 
     // Two older in-window rows: the newest-first read stops at the cap.

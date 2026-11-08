@@ -388,6 +388,8 @@ interface ParsedTiming {
   payload: DashboardTimingPayload;
   /** The row carried `substages` that failed validation; only that field was dropped. */
   unreadableSubstages: boolean;
+  /** A request timing carried malformed browser phases; only those phases were dropped. */
+  unreadableClientPhases: boolean;
 }
 
 function parsePayload(event: MeshEvent): ParsedTiming | null {
@@ -431,8 +433,7 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
               typeof timing !== "object" ||
               Array.isArray(timing) ||
               !isUuid((timing as Record<string, unknown>).requestId) ||
-              !isIntegerMilliseconds((timing as Record<string, unknown>).requestMs) ||
-              !parseClientRequestPhases(timing as Record<string, unknown>)
+              !isIntegerMilliseconds((timing as Record<string, unknown>).requestMs)
           ) ||
           new Set(requestTimings.map((timing) => (timing as { requestId: string }).requestId))
             .size !== requestTimings.length ||
@@ -475,7 +476,7 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
             requestTimings: requestTimings.map((timing) => ({
               requestId: (timing as { requestId: string }).requestId,
               requestMs: (timing as { requestMs: number }).requestMs,
-              // Validated above, so this cannot be null here.
+              // Malformed phases cost only themselves, like substages (#990).
               ...parseClientRequestPhases(timing as Record<string, unknown>),
             })),
           }
@@ -490,7 +491,14 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
     };
     // Substages are only written on v2 request rows; anywhere else they are
     // as unreadable as a malformed object, and equally never cost the row.
-    return { payload, unreadableSubstages: rawSubstages !== undefined && !substages };
+    const unreadableClientPhases =
+      Array.isArray(requestTimings) &&
+      requestTimings.some((timing) => !parseClientRequestPhases(timing as Record<string, unknown>));
+    return {
+      payload,
+      unreadableSubstages: rawSubstages !== undefined && !substages,
+      unreadableClientPhases,
+    };
   } catch {
     return null;
   }
@@ -661,6 +669,7 @@ export class DashboardTimingRecorder {
           this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS + RETENTION_BOUNDARY_SLACK_MS,
         unreadableRecords: events.length - allRows.length,
         unreadableSubstages: parsed.filter((timing) => timing.unreadableSubstages).length,
+        unreadableClientPhases: parsed.filter((timing) => timing.unreadableClientPhases).length,
       },
     };
   }
@@ -806,6 +815,8 @@ export interface DashboardTimingWindow {
   unreadableRecords: number;
   /** Rows whose malformed `substages` alone was dropped; each still counts everywhere else. */
   unreadableSubstages: number;
+  /** Rows with a request timing whose malformed browser phases alone were dropped. */
+  unreadableClientPhases: number;
 }
 
 export interface DashboardTimingSummary {

@@ -55,7 +55,7 @@ class _FakeResourceTiming implements DashboardResourceTimingSource {
 
 Future<Map<String, dynamic>> _measureListGet(
   _FakeResourceTiming source, {
-  void Function()? afterInteraction,
+  void Function()? afterBody,
 }) async {
   final receipt = Completer<Map<String, dynamic>>();
   final client = DashboardTimingClient(
@@ -74,11 +74,10 @@ Future<Map<String, dynamic>> _measureListGet(
   );
   addTearDown(client.close);
   final reporter = DashboardTimingReporter(client: client, base: _base);
-  await reporter.measure(
-    DashboardInteraction.primaryNavigation,
-    () => client.get(_listUrl),
-  );
-  afterInteraction?.call();
+  await reporter.measure(DashboardInteraction.primaryNavigation, () async {
+    await client.get(_listUrl);
+    afterBody?.call();
+  });
   return receipt.future.timeout(const Duration(seconds: 2));
 }
 
@@ -171,17 +170,20 @@ void main() {
       expect(encoded, isNot(contains('dashboard.example')));
     });
 
-    test('picks up an entry the browser reports after the body', () async {
-      final source = _FakeResourceTiming();
-      final receipt = await _measureListGet(
-        source,
-        afterInteraction: () => source.entries.add(_entry()),
-      );
+    test(
+      'picks up an entry reported after the body, before the interaction ends',
+      () async {
+        final source = _FakeResourceTiming();
+        final receipt = await _measureListGet(
+          source,
+          afterBody: () => source.entries.add(_entry()),
+        );
 
-      final timing =
-          (receipt['requestTimings'] as List).single as Map<String, dynamic>;
-      expect(timing['firstByteMs'], 3);
-    });
+        final timing =
+            (receipt['requestTimings'] as List).single as Map<String, dynamic>;
+        expect(timing['firstByteMs'], 3);
+      },
+    );
 
     test('keeps the existing timing shape when no entry matches', () async {
       final receipt = await _measureListGet(_FakeResourceTiming());

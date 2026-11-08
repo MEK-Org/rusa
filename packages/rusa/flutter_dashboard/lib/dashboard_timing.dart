@@ -24,9 +24,6 @@ enum DashboardInteraction {
 const _maxRequestIds = 32;
 const _maxDurationMs = 86_400_000;
 
-/// One wait before re-reading phases that were not yet available: a browser
-/// may report a request's Resource Timing entry just after its body ends.
-const _phaseSettle = Duration(milliseconds: 200);
 final _timingContextKey = Object();
 final _uuidPattern = RegExp(
   r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
@@ -40,17 +37,15 @@ class _RequestTiming {
   final DashboardRequestPhases? Function()? phaseLookup;
   DashboardRequestPhases? phases;
 
-  /// True when phases may still arrive from a lookup that has not matched.
-  bool resolvePhases() {
+  /// Looks the phases up unless already matched; a miss may match later.
+  void resolvePhases() {
     final lookup = phaseLookup;
-    if (phases != null || lookup == null) return false;
+    if (phases != null || lookup == null) return;
     try {
       phases = lookup();
     } catch (_) {
       // Timing is diagnostic: a failed lookup leaves the request unphased.
-      return false;
     }
-    return phases == null;
   }
 
   Map<String, Object> toJson(String requestId) => {
@@ -226,15 +221,10 @@ class DashboardTimingReporter {
 
   Future<void> _post(_TimingContext context, String outcome) async {
     try {
-      var phasesPending = false;
+      // The interaction ends after its bodies, so an entry the browser had not
+      // reported at body end gets one more look here, without any wait.
       for (final timing in context.requestTimings.values) {
-        if (timing.resolvePhases()) phasesPending = true;
-      }
-      if (phasesPending) {
-        await Future<void>.delayed(_phaseSettle);
-        for (final timing in context.requestTimings.values) {
-          timing.resolvePhases();
-        }
+        timing.resolvePhases();
       }
       await _client.post(
         _timingUri,

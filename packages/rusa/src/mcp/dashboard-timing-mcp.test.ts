@@ -48,6 +48,7 @@ describe("dashboard timing MCP", () => {
         retentionLimited: false,
         unreadableRecords: 0,
         unreadableSubstages: 0,
+        unreadableClientPhases: 0,
       },
     }));
     const client = await connect(createDashboardTimingMcpServer({ summary }));
