@@ -68,6 +68,12 @@ void main() {
       r'default_notification_icon"\s+android:resource="@drawable/(\w+)"\s*/>',
     ).firstMatch(manifest);
     expect(meta, isNotNull);
+    // The SDK reads application-level meta-data only; inside an activity it
+    // would be ignored and the launcher fallback would return.
+    expect(
+      activities.values.where((a) => a.contains('default_notification_icon')),
+      isEmpty,
+    );
     final icon = File(
       'android/app/src/main/res/drawable/${meta!.group(1)}.xml',
     ).readAsStringSync();

@@ -146,16 +146,19 @@ void main() {
     File('$_res/drawable/ic_stat_rusa.xml').readAsStringSync(),
   );
 
-  for (final s in _surfaces) {
-    for (final (phase, image) in [
-      ('before_unbranded', (double _) => Image.file(launcher)),
-      ('before_branded', (double _) => const ColoredBox(color: Colors.black)),
-      ('after', (double _) => SvgPicture.string(svg)),
-    ]) {
-      testWidgets('captures the $phase small icon on a ${s.name} surface', (
-        tester,
-      ) async {
-        await tester.runAsync(() async {
+  // One widget test renders all six captures; this harness asserts nothing
+  // and exists to regenerate the committed review PNGs.
+  testWidgets('captures the before and after small icons', (tester) async {
+    await tester.runAsync(() async {
+      for (final s in _surfaces) {
+        for (final (phase, image) in [
+          ('before_unbranded', (double _) => Image.file(launcher)),
+          (
+            'before_branded',
+            (double _) => const ColoredBox(color: Colors.black),
+          ),
+          ('after', (double _) => SvgPicture.string(svg)),
+        ]) {
           final key = GlobalKey();
           await tester.pumpWidget(
             _frame(key, s, (size) => _alphaOnly(image(size), s.tint, size)),
@@ -173,8 +176,8 @@ void main() {
             key,
             'screenshots/1252_notification_icon_${s.name}_$phase.png',
           );
-        });
-      });
-    }
-  }
+        }
+      }
+    });
+  });
 }
