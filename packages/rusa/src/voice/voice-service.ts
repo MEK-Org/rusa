@@ -18,6 +18,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
@@ -35,6 +36,21 @@ import { speakableText } from "./tts-text.js";
  * per-charter edits) and tells the actor to answer short and ear-first.
  */
 export const VOICE_MEMO_PREFIX = "🎙️ [voice memo — reply for the ear]: ";
+
+/**
+ * Session ids minted by the Android restricted assistant. The marker survives
+ * in the existing durable `mesh_chat.session_id`, so notification eligibility
+ * follows the conversation even after the transient SSE session/lease ends.
+ */
+export const ANDROID_ASSISTANT_SESSION_PREFIX = "android-assistant:";
+const ANDROID_ASSISTANT_SESSION_ID = new RegExp(
+  `^${ANDROID_ASSISTANT_SESSION_PREFIX}[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+  "i"
+);
+
+export function isAndroidAssistantSessionId(sessionId: string | null): boolean {
+  return sessionId !== null && ANDROID_ASSISTANT_SESSION_ID.test(sessionId);
+}
 
 /**
  * How long after its last `voice` SSE subscription disconnects an actor still
@@ -94,6 +110,13 @@ export interface VoiceAnnouncementFrame {
   createdAt: string;
 }
 
+/** A durable actor reply that may be announced by a device notification. */
+export interface VoicePushTarget {
+  actorId: string;
+  announcementId: string;
+  recipientId: string;
+}
+
 export function toFrame(announcement: VoiceAnnouncement): VoiceAnnouncementFrame {
   return {
     id: announcement.id,
@@ -143,6 +166,8 @@ export interface VoiceServiceOptions {
    * Without this resolver, no messages are synthesized.
    */
   isHumanRecipient?: (principalId: string) => boolean;
+  /** Durable mesh replies, used to recover an announcement after a restart. */
+  meshChat?: Pick<MeshChatRepository, "getById">;
   speechFor?: (actorId: string) => { speech: SpeechClient; voiceName?: string } | undefined;
   /** Injectable clock for presence/grace tests. */
   now?: () => number;
@@ -195,6 +220,7 @@ export class VoiceService {
   private readonly presenceGraceMs: number;
   private readonly sessionLeaseMs: number;
   private readonly isHumanRecipient: (principalId: string) => boolean;
+  private readonly meshChat?: Pick<MeshChatRepository, "getById">;
   private readonly log: Logger;
 
   /** Live `voice` SSE subscription count per actor. */
@@ -211,7 +237,6 @@ export class VoiceService {
   private readonly pendingOutboundRenders = new Map<string, Set<Promise<void>>>();
   /** The source-render barrier captured atomically with a session rebind. */
   private readonly pendingTransferControls = new Map<string, Promise<void>>();
-
   constructor(options: VoiceServiceOptions) {
     this.speechFor = options.speechFor;
     this.home = options.home;
@@ -228,6 +253,7 @@ export class VoiceService {
       throw new Error("sessionLeaseMs must be a positive finite number");
     }
     this.isHumanRecipient = options.isHumanRecipient ?? (() => false);
+    this.meshChat = options.meshChat;
     this.onSessionEnded = options.onSessionEnded;
     this.log = options.logger ?? nullLogger;
   }
@@ -471,6 +497,36 @@ export class VoiceService {
     return lastSeen !== undefined && this.now() - lastSeen < this.presenceGraceMs;
   }
 
+  /**
+   * Extract the durable, principal-scoped identity of a reply eligible for a
+   * device notification. This deliberately does not consult SSE presence or
+   * TTS: either is volatile, while a notification tap recovers from chat.
+   */
+  pushTargetForMeshEvent(event: MeshEvent): VoicePushTarget | null {
+    if (event.kind !== "message_sent" || !event.actorId || !event.payload || !event.body) {
+      return null;
+    }
+    try {
+      const payload = JSON.parse(event.payload) as { to?: unknown; messageId?: unknown };
+      const recipientId = typeof payload.to === "string" ? payload.to : null;
+      const announcementId =
+        typeof payload.messageId === "string" && payload.messageId ? payload.messageId : null;
+      if (
+        !recipientId ||
+        !announcementId ||
+        !isAndroidAssistantSessionId(event.detail) ||
+        this.isHumanRecipient(event.actorId) ||
+        !this.isHumanRecipient(recipientId) ||
+        !speakableText(event.body)
+      ) {
+        return null;
+      }
+      return { actorId: event.actorId, announcementId, recipientId };
+    } catch {
+      return null;
+    }
+  }
+
   // ── Inbound: memos ──────────────────────────────────────────────────────
 
   /** Persist raw memo audio under `voice/inbox/`; returns the stored path. */
@@ -503,12 +559,14 @@ export class VoiceService {
 
     let senderId: string | null = null;
     let recipientId: string | null = null;
+    let messageId: string | null = null;
 
     if (event.payload) {
       try {
         const p = JSON.parse(event.payload);
         senderId = event.actorId ?? null;
         recipientId = p.to ?? null;
+        messageId = typeof p.messageId === "string" && p.messageId ? p.messageId : null;
       } catch (_e) {
         // ignore
       }
@@ -533,36 +591,13 @@ export class VoiceService {
       // — an actor whose voice the operator just changed speaks with the new one
       // on the very next reply. No persisted setting → undefined → the speech
       // client's instance-wide default, which is the pre-existing behavior.
-      const streamRequestedAt = this.now();
-      const selected = this.speechFor?.(senderId);
-      const streamInfo = await (selected?.speech ?? this.speech).streamSynthesize(
-        text,
-        selected?.voiceName
-      );
-      const dir = join(this.home, "voice", "outbox");
-      await mkdir(dir, { recursive: true });
-      const id = randomUUID();
-      const encoded = await this.encodeStream(
-        streamInfo.pcmStream,
-        streamInfo.sampleRate,
-        join(dir, `${streamRequestedAt}-${id}`)
-      );
-
-      const announcement: VoiceAnnouncement = {
-        id,
+      const announcement = await this.renderAnnouncement({
+        id: messageId ?? randomUUID(),
         actorId: senderId,
         recipientId,
         sessionId: event.detail,
         text,
-        audioPath: encoded.path,
-        mime: encoded.mime,
-        createdAt: new Date(this.now()).toISOString(),
-        playedAt: null,
-        subscribeStream: encoded.subscribe,
-        streamRequestedAt,
-      };
-      this.announcements.push(announcement);
-      while (this.announcements.length > this.maxAnnouncements) this.announcements.shift();
+      });
       // The outbound bridge writes the source frame synchronously here. Only
       // then may the transfer barrier release its control frame, preserving
       // the source-frame → control order on the leased SSE connection.
@@ -571,6 +606,94 @@ export class VoiceService {
     } finally {
       finishRender();
     }
+  }
+
+  /**
+   * Rebuild a one-reply announcement from the durable mesh chat row. This is
+   * deliberately a precise principal+actor lookup: a notification identifier
+   * never expands the caller's chat access and a restarted process does not
+   * need the old in-memory announcement ring to honor a tap.
+   */
+  recoverAnnouncement(
+    id: string,
+    actorId: string,
+    principalId: string
+  ): Promise<VoiceAnnouncement | undefined> {
+    const current = this.get(id);
+    if (current) {
+      return Promise.resolve(
+        current.actorId === actorId && current.recipientId === principalId ? current : undefined
+      );
+    }
+    // The row and its complete scope are checked before doing asynchronous
+    // synthesis. Do not coalesce requests: an id-only promise key would let a
+    // concurrent foreign principal receive another user's recovered frame.
+    const message = this.meshChat?.getById(id);
+    if (
+      !message ||
+      message.senderId !== actorId ||
+      message.recipientId !== principalId ||
+      !this.isHumanRecipient(principalId)
+    ) {
+      return Promise.resolve(undefined);
+    }
+    const text = speakableText(message.body);
+    if (!text) return Promise.resolve(undefined);
+    return this.renderAnnouncement({
+      id,
+      actorId,
+      recipientId: principalId,
+      sessionId: message.sessionId,
+      text,
+    }).then((announcement) => {
+      // A recovery is already directed to a specific notification tap. Do not
+      // offer that historical reply again as generic SSE backlog to another
+      // connection before the tapping client finishes playback and acks it.
+      announcement.playedAt = new Date(this.now()).toISOString();
+      return announcement;
+    });
+  }
+
+  private async renderAnnouncement(input: {
+    id: string;
+    actorId: string;
+    recipientId: string;
+    sessionId: string | null;
+    text: string;
+  }): Promise<VoiceAnnouncement> {
+    const streamRequestedAt = this.now();
+    const selected = this.speechFor?.(input.actorId);
+    const streamInfo = await (selected?.speech ?? this.speech).streamSynthesize(
+      input.text,
+      selected?.voiceName
+    );
+    const dir = join(this.home, "voice", "outbox");
+    await mkdir(dir, { recursive: true });
+    const encoded = await this.encodeStream(
+      streamInfo.pcmStream,
+      streamInfo.sampleRate,
+      // The durable message id remains the external announcement id. Keep a
+      // fresh local filename instead, so a caller-controlled lookup string can
+      // never influence an outbox path even before its database lookup fails.
+      join(dir, `${streamRequestedAt}-${randomUUID()}`)
+    );
+    // A notification tap can recover a reply while its live render is still
+    // synthesizing. The id is the durable row, so both renders are one reply: a
+    // second ring entry would survive `ack` and replay as backlog later.
+    const concurrent = this.get(input.id);
+    if (concurrent) return concurrent;
+    const announcement: VoiceAnnouncement = {
+      ...input,
+      audioPath: encoded.path,
+      mime: encoded.mime,
+      createdAt: new Date(this.now()).toISOString(),
+      playedAt: null,
+      subscribeStream: encoded.subscribe,
+      streamRequestedAt,
+    };
+    this.announcements.push(announcement);
+    while (this.announcements.length > this.maxAnnouncements) this.announcements.shift();
+    return announcement;
   }
 
   /** Mark a source render so a same-turn transfer can order its control after it. */

@@ -58,15 +58,19 @@ class AssistantChannel(
 
     fun trigger() = channel.invokeMethod("trigger", null)
 
-    /** Asks Dart to end the session; [done] runs once it has, or failed to. */
-    fun end(done: () -> Unit) = channel.invokeMethod(
-        "end",
-        null,
-        object : MethodChannel.Result {
-            override fun success(result: Any?) = done()
-            override fun error(code: String, message: String?, details: Any?) = done()
-            override fun notImplemented() = done()
-        },
+    /** The assist task stopped but remains returnable. */
+    fun background() = channel.invokeMethod("background", null)
+
+    /** The stopped assist task is visible again. */
+    fun foreground() = channel.invokeMethod("foreground", null)
+
+    /** Begin a fresh restricted capture after a lock-screen assist gesture. */
+    fun lockedAssist() = channel.invokeMethod("lockedAssist", null)
+
+    /** Deliver the two opaque reply lookup keys from an FCM notification tap. */
+    fun reply(actorId: String, announcementId: String) = channel.invokeMethod(
+        "reply",
+        mapOf("actorId" to actorId, "announcementId" to announcementId),
     )
 
     /** Plays a short audible prompt cue once capture is actively listening. */

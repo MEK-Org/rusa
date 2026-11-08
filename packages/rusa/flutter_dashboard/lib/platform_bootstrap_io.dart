@@ -17,6 +17,8 @@ import 'io_sse.dart';
 import 'mesh_stream.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
+import 'reply_notifications.dart';
+import 'reply_notifications_io.dart' show IoReplyNotifications;
 import 'session.dart';
 import 'tree_preferences_cache.dart';
 import 'voice_io.dart';
@@ -94,3 +96,6 @@ final AssistantPlatform? _assistant = Platform.isAndroid
     : null;
 
 AssistantPlatform? platformCreateAssistant() => _assistant;
+
+ReplyNotifications? platformCreateReplyNotifications() =>
+    Platform.isAndroid ? IoReplyNotifications() : null;

@@ -7,9 +7,11 @@
 
 import type { VoiceConfig } from "../config/types.js";
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import { createElevenLabsSpeechClient } from "./elevenlabs-speech.js";
 import { createGeminiSpeechClient } from "./gemini-speech.js";
+import type { VoicePushDelivery } from "./push-delivery.js";
 import { canonicalSupportedVoiceName } from "./tts-voices.js";
 import type { VoiceConfigDocument } from "./voice-config.js";
 import { toFrame, type VoiceAnnouncementFrame, VoiceService } from "./voice-service.js";
@@ -23,6 +25,7 @@ export function createVoiceService(options: {
   voice?: VoiceConfig;
   /** Recognize durable user principals as spoken-to humans (#460). */
   isHumanRecipient?: (principalId: string) => boolean;
+  meshChat?: Pick<MeshChatRepository, "getById">;
   onSessionEnded?: (actorId: string) => void;
   logger?: Logger;
 }): VoiceService {
@@ -47,6 +50,7 @@ export function createVoiceService(options: {
   return new VoiceService({
     home: options.home,
     isHumanRecipient: options.isHumanRecipient,
+    meshChat: options.meshChat,
     // Both transcribe implementations close over factory options rather than this,
     // so detaching transcription.transcribe onto the Google client object is state-safe.
     speech: { ...google, transcribe: transcription.transcribe },
@@ -94,11 +98,21 @@ export function attachVoiceOutbound(
   emitter: MeshEventEmitter,
   service: VoiceService,
   hub: { pushVoice(frame: VoiceAnnouncementFrame): void },
-  logger: Logger = nullLogger
+  logger: Logger = nullLogger,
+  pushDelivery?: VoicePushDelivery,
+  rootActorId?: string
 ): () => void {
   return emitter.onMeshEvent((event) => {
+    const push = service.pushTargetForMeshEvent(event);
+    if (pushDelivery && push && push.actorId === rootActorId) {
+      void pushDelivery
+        .deliver(push)
+        .catch((err) => logger.warn("voice_push_dispatch_failed", { actorId: push.actorId, err }));
+    }
     void service
-      .handleMeshEvent(event, (announcement) => hub.pushVoice(toFrame(announcement)))
+      .handleMeshEvent(event, (announcement) => {
+        hub.pushVoice(toFrame(announcement));
+      })
       .catch((err) => {
         logger.warn("voice_reply_tts_failed", { actorId: event.actorId, err });
       });

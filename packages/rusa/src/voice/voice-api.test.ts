@@ -11,6 +11,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { SseHub } from "../dashboard/sse.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { PushDeviceTokenRepository } from "../db/repositories/push-device-token-repository.js";
 
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -206,6 +207,7 @@ describe("handleVoiceApiRequest", () => {
   let sendMessage: ReturnType<typeof vi.fn>;
   let deps: VoiceApiDeps;
   let transcribe: Mock<(audio: Buffer, mimeType: string) => Promise<string>>;
+  let pushDeviceTokens: Pick<PushDeviceTokenRepository, "register" | "revoke">;
   let now: number;
   /** Local mode's sole active durable user; every memo is attributed to it (#460). */
   const LOCAL_USER = TEST_USER_ID;
@@ -253,12 +255,17 @@ describe("handleVoiceApiRequest", () => {
     emitter = new MeshEventEmitter();
     hub = new SseHub(emitter);
     sendMessage = vi.fn(() => ({ delivered: true }));
+    pushDeviceTokens = {
+      register: vi.fn(),
+      revoke: vi.fn(),
+    };
     deps = {
       actors: actors,
       sseHub: hub,
       mesh: { sendMessage } as unknown as ActorMesh,
       service,
       principals,
+      pushDeviceTokens: pushDeviceTokens as PushDeviceTokenRepository,
     };
   });
 
@@ -281,6 +288,104 @@ describe("handleVoiceApiRequest", () => {
     );
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body).error).toContain("geminiApiKey");
+  });
+
+  describe("PUT/DELETE /api/mesh/voice/push-token", () => {
+    it("binds a refreshed push token to the authenticated principal", async () => {
+      const { res } = call(deps, "PUT", "/api/mesh/voice/push-token", {
+        body: JSON.stringify({ token: "fcm-token" }),
+        contentType: "application/json",
+      });
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+      expect(pushDeviceTokens.register).toHaveBeenCalledWith(LOCAL_USER, "fcm-token");
+    });
+
+    it("revokes only the authenticated principal's registration", async () => {
+      const { res } = call(deps, "DELETE", "/api/mesh/voice/push-token", {
+        body: JSON.stringify({ token: "fcm-token" }),
+        contentType: "application/json",
+      });
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+      expect(pushDeviceTokens.revoke).toHaveBeenCalledWith(LOCAL_USER, "fcm-token");
+    });
+
+    it("never accepts a blank or malformed registration", async () => {
+      const blank = call(deps, "PUT", "/api/mesh/voice/push-token", {
+        body: JSON.stringify({ token: "  " }),
+        contentType: "application/json",
+      });
+      await settled(blank.res);
+      expect(blank.res.statusCode).toBe(400);
+
+      const malformed = call(deps, "PUT", "/api/mesh/voice/push-token", {
+        body: "not-json",
+        contentType: "application/json",
+      });
+      await settled(malformed.res);
+      expect(malformed.res.statusCode).toBe(400);
+      expect(pushDeviceTokens.register).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("GET /api/mesh/actors/:id/voice/replies/:announcementId", () => {
+    it("recovers only the exact durable reply owned by the authenticated principal", async () => {
+      const recoveryService = new VoiceService({
+        isHumanRecipient: (id) => id === TEST_USER_ID,
+        home,
+        speech: fakeStreamSpeech(),
+        meshChat: {
+          getById: (id) =>
+            id === "durable-reply"
+              ? {
+                  id,
+                  ts: "2026-11-06T00:00:00.000Z",
+                  senderId: UUID_A,
+                  recipientId: TEST_USER_ID,
+                  body: "This is the reply.",
+                  sessionId: "ended-session",
+                  responsive: null,
+                }
+              : null,
+        },
+        encodeStream: async (pcmStream, _rate, basePath) => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of pcmStream) chunks.push(chunk);
+          const path = `${basePath}.mp3`;
+          await writeFile(path, Buffer.concat(chunks));
+          return { path, mime: "audio/mpeg", subscribe: () => false };
+        },
+      });
+      const withRecovery = { ...deps, service: recoveryService };
+      const found = call(
+        withRecovery,
+        "GET",
+        `/api/mesh/actors/${UUID_A}/voice/replies/durable-reply`
+      );
+      await settled(found.res);
+
+      expect(found.res.statusCode).toBe(200);
+      expect(JSON.parse(found.res.body).announcement).toMatchObject({
+        id: "durable-reply",
+        actorId: UUID_A,
+        recipientId: TEST_USER_ID,
+        sessionId: "ended-session",
+        text: "This is the reply.",
+      });
+
+      const foreignActor = call(
+        withRecovery,
+        "GET",
+        `/api/mesh/actors/${UUID_B}/voice/replies/durable-reply`
+      );
+      await settled(foreignActor.res);
+      expect(foreignActor.res.statusCode).toBe(404);
+    });
   });
 
   describe("POST /api/mesh/actors/:id/voice-memo", () => {

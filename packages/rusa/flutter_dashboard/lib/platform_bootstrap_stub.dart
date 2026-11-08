@@ -6,6 +6,7 @@ import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
+import 'reply_notifications.dart';
 import 'session.dart';
 import 'tree_preferences_cache.dart';
 import 'voice_platform.dart';
@@ -50,3 +51,5 @@ WalkieDeps? platformCreateWalkieDeps(
 AvatarFilePicker? platformCreateAvatarFilePicker() => null;
 
 AssistantPlatform? platformCreateAssistant() => null;
+
+ReplyNotifications? platformCreateReplyNotifications() => null;

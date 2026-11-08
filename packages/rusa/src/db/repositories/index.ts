@@ -26,6 +26,7 @@ import { ModelScrapeRepository } from "./model-scrape-repository.js";
 import { ObligationRepository } from "./obligation-repository.js";
 import { DbPortableContextStore } from "./portable-context-repository.js";
 import { PrincipalRepository } from "./principal-repository.js";
+import { PushDeviceTokenRepository } from "./push-device-token-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
@@ -108,6 +109,7 @@ export class Repositories {
   readonly obligations: ObligationRepository;
   readonly portableContext: DbPortableContextStore;
   readonly principals: PrincipalRepository;
+  readonly pushDeviceTokens: PushDeviceTokenRepository;
   readonly referenceCache: ReferenceCacheRepository;
 
   constructor(db: Database.Database) {
@@ -116,6 +118,7 @@ export class Repositories {
     // Constructed before the actor repository, which writes an actor's principal
     // in the same transaction as the actor row.
     this.principals = new PrincipalRepository(db);
+    this.pushDeviceTokens = new PushDeviceTokenRepository(db);
     // Constructed before the actor repository, which resolves a class-bound
     // actor's pool from the live class row on every read.
     this.modelClasses = new ModelClassRepository(db);
@@ -227,6 +230,8 @@ export { MAX_OBLIGATION_PAGE_LIMIT, ObligationRepository } from "./obligation-re
 export { DbPortableContextStore } from "./portable-context-repository.js";
 export type { CreateUserInput } from "./principal-repository.js";
 export { normalizeEmail, PrincipalRepository } from "./principal-repository.js";
+export type { PushDeviceToken } from "./push-device-token-repository.js";
+export { PushDeviceTokenRepository } from "./push-device-token-repository.js";
 export { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";
