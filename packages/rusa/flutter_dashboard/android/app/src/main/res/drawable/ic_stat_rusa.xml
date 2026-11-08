@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Notification small icon (#1252): the rusa mark from web/favicon.svg as a
+     one-colour silhouette. Android draws a small icon from its alpha channel
+     alone, so the opaque launcher icon showed as a solid square. The spokes are
+     drawn at 2 rather than 1.6 units so they stay visible at status-bar size.
+     The group scales the mark to fill the 20dp live area of the 24dp icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="32"
+    android:viewportHeight="32">
+    <group
+        android:pivotX="16"
+        android:pivotY="16"
+        android:scaleX="1.2"
+        android:scaleY="1.2"
+        android:translateX="-0.6">
+        <path
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2"
+            android:strokeLineCap="round"
+            android:pathData="M16,16 L8,8 M16,16 L25,9 M16,16 L21,24" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M5.4,8 a2.6,2.6 0 1,0 5.2,0 a2.6,2.6 0 1,0 -5.2,0 M22.4,9 a2.6,2.6 0 1,0 5.2,0 a2.6,2.6 0 1,0 -5.2,0 M18.4,24 a2.6,2.6 0 1,0 5.2,0 a2.6,2.6 0 1,0 -5.2,0 M11.6,16 a4.4,4.4 0 1,0 8.8,0 a4.4,4.4 0 1,0 -8.8,0" />
+    </group>
+</vector>
