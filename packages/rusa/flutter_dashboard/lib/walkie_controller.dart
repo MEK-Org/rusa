@@ -192,7 +192,14 @@ class WalkieController {
   DateTime? _recordStartedAt;
   int _recordGeneration = 0;
   bool _playbackSuspended = false;
-  String? _pauseAfterAnnouncementId;
+
+  /// The notification-selected reply that has not finished playing yet.
+  String? _selectedAnnouncementId;
+
+  /// Audio already queued when a notification selected one reply. It stays
+  /// queued and unacknowledged (replayable from its row) but never plays on
+  /// its own; replies received after the selection play normally.
+  final _heldIds = <String>{};
   bool _disposed = false;
 
   // ── Exposed streams ──
@@ -286,6 +293,7 @@ class WalkieController {
     _teardownStream();
     _deps.player.stop();
     _queue.clear();
+    _heldIds.clear();
     _queueDepth.add(0);
     _nowPlaying.add(null);
     // Clear the session transcript so each mode entry starts fresh.
@@ -493,9 +501,12 @@ class WalkieController {
   /// live/backlog frame, it may predate this fresh activity's SSE session.
   void presentNotificationReply(VoiceAnnouncement announcement) {
     if (!_enabled.value || _disposed || announcement.actorId != actorId) return;
-    // A notification selects exactly one durable reply. Once it has played,
-    // keep pre-existing background audio suspended until the user opts in.
-    _pauseAfterAnnouncementId = announcement.id;
+    // A notification selects exactly one durable reply. Audio queued before
+    // the selection stays held until the user opts in; later replies play.
+    _selectedAnnouncementId = announcement.id;
+    _heldIds.addAll(
+      _queue.map((item) => item.frame.id).where((id) => id != announcement.id),
+    );
     final alreadyReceived = _transcript.value.any(
       (entry) =>
           entry is ActorReplyEntry && entry.announcement.id == announcement.id,
@@ -602,8 +613,12 @@ class WalkieController {
     if (_draining || _playbackSuspended) return;
     _draining = true;
     try {
-      while (_enabled.value && !_playbackSuspended && _queue.isNotEmpty) {
-        final item = _queue.removeAt(0);
+      while (_enabled.value && !_playbackSuspended) {
+        final next = _queue.indexWhere(
+          (queued) => !_heldIds.contains(queued.frame.id),
+        );
+        if (next < 0) break;
+        final item = _queue.removeAt(next);
         _queueDepth.add(_queue.length);
         _nowPlaying.add(item.frame);
         try {
@@ -620,10 +635,10 @@ class WalkieController {
         if (_playbackSuspended) {
           // A concurrently selected notification reply stays ahead of an
           // interrupted older clip when its fetch completed during stop().
-          final selectedIndex = _pauseAfterAnnouncementId == null
+          final selectedIndex = _selectedAnnouncementId == null
               ? -1
               : _queue.indexWhere(
-                  (queued) => queued.frame.id == _pauseAfterAnnouncementId,
+                  (queued) => queued.frame.id == _selectedAnnouncementId,
                 );
           _queue.insert(selectedIndex < 0 ? 0 : selectedIndex + 1, item);
           _queueDepth.add(_queue.length);
@@ -645,10 +660,8 @@ class WalkieController {
             _lastError.add('Ack failed: $e');
           }
         }
-        if (item.frame.id == _pauseAfterAnnouncementId) {
-          _pauseAfterAnnouncementId = null;
-          _playbackSuspended = true;
-          break;
+        if (item.frame.id == _selectedAnnouncementId) {
+          _selectedAnnouncementId = null;
         }
       }
     } finally {
@@ -689,8 +702,10 @@ class WalkieController {
     );
     if (!received) return;
     if (!preserveNotificationBoundary) {
-      _pauseAfterAnnouncementId = null;
+      _selectedAnnouncementId = null;
+      _heldIds.clear();
     }
+    _heldIds.remove(announcement.id);
     // An already-queued target moves rather than plays twice, and keeps its
     // pending first-play ack. A reply that has already started or finished
     // owns its own server acknowledgement, so a replay never acks again.
@@ -808,15 +823,22 @@ class WalkieController {
   Future<void> _stopAndSend() async {
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));
-    // A memo sent past a notification/return boundary lets its reply play
-    // without first releasing the audio that boundary held back; those rows
-    // stay replayable in the transcript. An ordinary walkie never has a
-    // boundary, so its queue keeps playing in order.
-    if (_playbackSuspended || _pauseAfterAnnouncementId != null) {
+    // A memo sent past a return boundary lets its reply play without first
+    // releasing the audio that boundary held back, and a memo after a
+    // notification selection drops only the audio that selection held; replies
+    // received after the selection still play. Dropped rows stay replayable in
+    // the transcript. An ordinary walkie has neither, so its queue keeps
+    // playing in order.
+    _selectedAnnouncementId = null;
+    if (_playbackSuspended) {
       _playbackSuspended = false;
-      _pauseAfterAnnouncementId = null;
+      _heldIds.clear();
       _queue.clear();
       _queueDepth.add(0);
+    } else if (_heldIds.isNotEmpty) {
+      _queue.removeWhere((item) => _heldIds.contains(item.frame.id));
+      _heldIds.clear();
+      _queueDepth.add(_queue.length);
     }
     try {
       final clip = await _deps.recorder.stop();

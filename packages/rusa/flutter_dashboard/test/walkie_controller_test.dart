@@ -669,6 +669,84 @@ void main() {
     );
 
     test(
+      'a reply received after a notification selection plays; older audio stays held',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('older'));
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'selected');
+
+        walkie.stream.framesCtrl.add(makeAnnouncement('later'));
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'later');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/later',
+        ]);
+        expect(api.ackedIds, ['selected', 'later']);
+
+        // The held reply is still unacknowledged; selecting its row is its
+        // first playback and acknowledges it.
+        controller.replayAnnouncement(makeAnnouncement('older'));
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['selected', 'later', 'older']);
+      },
+    );
+
+    test(
+      'tapping one held row opts in: the other pre-selection replies follow it',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('older-a'));
+        walkie.stream.framesCtrl.add(makeAnnouncement('older-b'));
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(
+          controller.nowPlaying.value,
+          isNull,
+          reason: 'both pre-selection replies stay held',
+        );
+        expect(api.ackedIds, ['selected']);
+
+        // An ordinary row tap is the same opt-in it was before held ids:
+        // the tapped reply plays first, then the remaining held queue drains.
+        controller.replayAnnouncement(makeAnnouncement('older-b'));
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'older-b');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'older-a');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/older-b',
+          '/api/mesh/voice/audio/older-a',
+        ]);
+        expect(api.ackedIds, ['selected', 'older-b', 'older-a']);
+      },
+    );
+
+    test(
       'recording and sending a new memo lifts suspension so new replies play',
       () async {
         api.backlogPages = [
@@ -735,34 +813,45 @@ void main() {
       },
     );
 
-    test('a memo sent during the selected reply clears its boundary', () async {
-      await controller.enable();
-      await pumpEventQueue();
-      controller.suspendPlayback();
-      walkie.stream.framesCtrl.add(makeAnnouncement('older'));
-      await pumpEventQueue();
-      controller.presentNotificationReply(makeAnnouncement('selected'));
-      controller.resumePlayback();
-      await pumpEventQueue();
-      expect(controller.nowPlaying.value?.id, 'selected');
+    test(
+      'a memo sent during the selected reply drops only held audio',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('older'));
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'selected');
+        // Received after the selection, so it is not held.
+        walkie.stream.framesCtrl.add(makeAnnouncement('later'));
+        await pumpEventQueue();
 
-      await controller.toggleRecord();
-      await pumpEventQueue();
-      await controller.toggleRecord();
-      await pumpEventQueue();
-      expect(controller.queueDepth.value, 0);
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        expect(controller.queueDepth.value, 1);
 
-      walkie.player.finishCurrent();
-      await pumpEventQueue();
-      walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
-      await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'later');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
+        await pumpEventQueue();
 
-      expect(controller.nowPlaying.value?.id, 'new-reply');
-      expect(
-        walkie.player.playedUrls,
-        isNot(contains('/api/mesh/voice/audio/older')),
-      );
-    });
+        expect(controller.nowPlaying.value?.id, 'new-reply');
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/later',
+          '/api/mesh/voice/audio/new-reply',
+        ]);
+        expect(api.ackedIds, ['selected', 'later']);
+      },
+    );
 
     test('a history and live-frame race promotes one selected reply', () async {
       await controller.enable();
