@@ -669,6 +669,43 @@ void main() {
     );
 
     test(
+      'a reply received after a notification selection plays; older audio stays held',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('older'));
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'selected');
+
+        walkie.stream.framesCtrl.add(makeAnnouncement('later'));
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'later');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/later',
+        ]);
+        expect(api.ackedIds, ['selected', 'later']);
+
+        // The held reply is still unacknowledged; selecting its row is its
+        // first playback and acknowledges it.
+        controller.replayAnnouncement(makeAnnouncement('older'));
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['selected', 'later', 'older']);
+      },
+    );
+
+    test(
       'recording and sending a new memo lifts suspension so new replies play',
       () async {
         api.backlogPages = [
