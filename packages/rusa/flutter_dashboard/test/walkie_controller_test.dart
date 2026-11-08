@@ -813,34 +813,45 @@ void main() {
       },
     );
 
-    test('a memo sent during the selected reply clears its boundary', () async {
-      await controller.enable();
-      await pumpEventQueue();
-      controller.suspendPlayback();
-      walkie.stream.framesCtrl.add(makeAnnouncement('older'));
-      await pumpEventQueue();
-      controller.presentNotificationReply(makeAnnouncement('selected'));
-      controller.resumePlayback();
-      await pumpEventQueue();
-      expect(controller.nowPlaying.value?.id, 'selected');
+    test(
+      'a memo sent during the selected reply drops only held audio',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('older'));
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'selected');
+        // Received after the selection, so it is not held.
+        walkie.stream.framesCtrl.add(makeAnnouncement('later'));
+        await pumpEventQueue();
 
-      await controller.toggleRecord();
-      await pumpEventQueue();
-      await controller.toggleRecord();
-      await pumpEventQueue();
-      expect(controller.queueDepth.value, 0);
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        expect(controller.queueDepth.value, 1);
 
-      walkie.player.finishCurrent();
-      await pumpEventQueue();
-      walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
-      await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'later');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
+        await pumpEventQueue();
 
-      expect(controller.nowPlaying.value?.id, 'new-reply');
-      expect(
-        walkie.player.playedUrls,
-        isNot(contains('/api/mesh/voice/audio/older')),
-      );
-    });
+        expect(controller.nowPlaying.value?.id, 'new-reply');
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/later',
+          '/api/mesh/voice/audio/new-reply',
+        ]);
+        expect(api.ackedIds, ['selected', 'later']);
+      },
+    );
 
     test('a history and live-frame race promotes one selected reply', () async {
       await controller.enable();

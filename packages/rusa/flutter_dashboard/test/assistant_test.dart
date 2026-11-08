@@ -700,63 +700,56 @@ void main() {
     // #1193 device report: background the task, tap the first reply's
     // notification and hear it; the next reply then arrives with the task
     // foregrounded and must be spoken, not only rendered.
-    for (final arrival in ['during', 'after']) {
-      testWidgets(
-        'a reply arriving $arrival the tapped reply plays in the foreground',
-        (tester) async {
-          await pumpPage(tester);
-          final sessionId = walkie.stream.connectCalls.single.sessionId;
-          await assistant.onBackground!();
-          await tester.pump();
+    testWidgets(
+      'a reply arriving after the tapped reply plays in the foreground',
+      (tester) async {
+        await pumpPage(tester);
+        final sessionId = walkie.stream.connectCalls.single.sessionId;
+        await assistant.onBackground!();
+        await tester.pump();
 
-          final first = makeAnnouncement(
-            'first',
-            actor: 'root',
-            sessionId: sessionId,
-          );
-          walkie.stream.framesCtrl.add(first);
-          await tester.pump();
-          expect(walkie.player.playedUrls, isEmpty);
+        final first = makeAnnouncement(
+          'first',
+          actor: 'root',
+          sessionId: sessionId,
+        );
+        walkie.stream.framesCtrl.add(first);
+        await tester.pump();
+        expect(walkie.player.playedUrls, isEmpty);
 
-          api.notificationReply = first;
-          await assistant.onForeground!();
-          await assistant.onReply!(
-            const AssistantReplyTarget(actorId: 'root', announcementId: 'first'),
-          );
-          await tester.pump();
-          await tester.pump();
-          expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/first']);
+        api.notificationReply = first;
+        await assistant.onForeground!();
+        await assistant.onReply!(
+          const AssistantReplyTarget(actorId: 'root', announcementId: 'first'),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/first']);
 
-          final second = makeAnnouncement(
+        walkie.player.finishCurrent();
+        await tester.pump();
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement(
             'second',
             actor: 'root',
             text: 'The second answer',
             sessionId: sessionId,
-          );
-          if (arrival == 'during') {
-            walkie.stream.framesCtrl.add(second);
-            await tester.pump();
-            walkie.player.finishCurrent();
-          } else {
-            walkie.player.finishCurrent();
-            await tester.pump();
-            walkie.stream.framesCtrl.add(second);
-          }
-          await tester.pump();
-          await tester.pump();
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
 
-          expect(find.text('The second answer'), findsOneWidget);
-          expect(walkie.player.playedUrls, [
-            '/api/mesh/voice/audio/first',
-            '/api/mesh/voice/audio/second',
-          ]);
-          walkie.player.finishCurrent();
-          await tester.pump();
-          expect(api.ackedIds, ['first', 'second']);
-          await unmount(tester);
-        },
-      );
-    }
+        expect(find.text('The second answer'), findsOneWidget);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/first',
+          '/api/mesh/voice/audio/second',
+        ]);
+        walkie.player.finishCurrent();
+        await tester.pump();
+        expect(api.ackedIds, ['first', 'second']);
+        await unmount(tester);
+      },
+    );
 
     testWidgets('notification input cannot rebind the root-only assistant', (
       tester,

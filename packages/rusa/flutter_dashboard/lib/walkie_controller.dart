@@ -192,7 +192,9 @@ class WalkieController {
   DateTime? _recordStartedAt;
   int _recordGeneration = 0;
   bool _playbackSuspended = false;
-  String? _pauseAfterAnnouncementId;
+
+  /// The notification-selected reply that has not finished playing yet.
+  String? _selectedAnnouncementId;
 
   /// Audio already queued when a notification selected one reply. It stays
   /// queued and unacknowledged (replayable from its row) but never plays on
@@ -501,7 +503,7 @@ class WalkieController {
     if (!_enabled.value || _disposed || announcement.actorId != actorId) return;
     // A notification selects exactly one durable reply. Audio queued before
     // the selection stays held until the user opts in; later replies play.
-    _pauseAfterAnnouncementId = announcement.id;
+    _selectedAnnouncementId = announcement.id;
     _heldIds.addAll(
       _queue.map((item) => item.frame.id).where((id) => id != announcement.id),
     );
@@ -633,17 +635,12 @@ class WalkieController {
         if (_playbackSuspended) {
           // A concurrently selected notification reply stays ahead of an
           // interrupted older clip when its fetch completed during stop().
-          final selectedIndex = _pauseAfterAnnouncementId == null
+          final selectedIndex = _selectedAnnouncementId == null
               ? -1
               : _queue.indexWhere(
-                  (queued) => queued.frame.id == _pauseAfterAnnouncementId,
+                  (queued) => queued.frame.id == _selectedAnnouncementId,
                 );
           _queue.insert(selectedIndex < 0 ? 0 : selectedIndex + 1, item);
-          // Older audio interrupted around a selection is pre-selection audio.
-          if (_pauseAfterAnnouncementId != null &&
-              item.frame.id != _pauseAfterAnnouncementId) {
-            _heldIds.add(item.frame.id);
-          }
           _queueDepth.add(_queue.length);
           break;
         }
@@ -663,8 +660,8 @@ class WalkieController {
             _lastError.add('Ack failed: $e');
           }
         }
-        if (item.frame.id == _pauseAfterAnnouncementId) {
-          _pauseAfterAnnouncementId = null;
+        if (item.frame.id == _selectedAnnouncementId) {
+          _selectedAnnouncementId = null;
         }
       }
     } finally {
@@ -705,7 +702,7 @@ class WalkieController {
     );
     if (!received) return;
     if (!preserveNotificationBoundary) {
-      _pauseAfterAnnouncementId = null;
+      _selectedAnnouncementId = null;
       _heldIds.clear();
     }
     _heldIds.remove(announcement.id);
@@ -826,13 +823,15 @@ class WalkieController {
   Future<void> _stopAndSend() async {
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));
-    // A memo sent past a notification/return boundary lets its reply play
-    // without first releasing the audio that boundary held back; those rows
-    // stay replayable in the transcript. An ordinary walkie never has a
-    // boundary, so its queue keeps playing in order.
-    if (_playbackSuspended || _pauseAfterAnnouncementId != null) {
+    // A memo sent past a return boundary lets its reply play without first
+    // releasing the audio that boundary held back, and a memo after a
+    // notification selection drops only the audio that selection held; replies
+    // received after the selection still play. Dropped rows stay replayable in
+    // the transcript. An ordinary walkie has neither, so its queue keeps
+    // playing in order.
+    _selectedAnnouncementId = null;
+    if (_playbackSuspended) {
       _playbackSuspended = false;
-      _pauseAfterAnnouncementId = null;
       _heldIds.clear();
       _queue.clear();
       _queueDepth.add(0);
