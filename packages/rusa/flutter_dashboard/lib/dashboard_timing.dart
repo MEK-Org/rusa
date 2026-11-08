@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'dashboard_resource_timing.dart';
+
 /// Fixed client interaction names accepted by the bounded dashboard timing API.
 /// They deliberately carry no route, actor, obligation, or user identity.
 enum DashboardInteraction {
@@ -21,11 +23,42 @@ enum DashboardInteraction {
 
 const _maxRequestIds = 32;
 const _maxDurationMs = 86_400_000;
+
+/// One wait before re-reading phases that were not yet available: a browser
+/// may report a request's Resource Timing entry just after its body ends.
+const _phaseSettle = Duration(milliseconds: 200);
 final _timingContextKey = Object();
 final _uuidPattern = RegExp(
   r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
   caseSensitive: false,
 );
+
+class _RequestTiming {
+  _RequestTiming(this.requestMs, this.phaseLookup);
+
+  final int requestMs;
+  final DashboardRequestPhases? Function()? phaseLookup;
+  DashboardRequestPhases? phases;
+
+  /// True when phases may still arrive from a lookup that has not matched.
+  bool resolvePhases() {
+    final lookup = phaseLookup;
+    if (phases != null || lookup == null) return false;
+    try {
+      phases = lookup();
+    } catch (_) {
+      // Timing is diagnostic: a failed lookup leaves the request unphased.
+      return false;
+    }
+    return phases == null;
+  }
+
+  Map<String, Object> toJson(String requestId) => {
+    'requestId': requestId,
+    'requestMs': requestMs,
+    ...?phases?.toJson(),
+  };
+}
 
 class _TimingContext {
   _TimingContext(this.interaction) : stopwatch = Stopwatch()..start();
@@ -33,7 +66,7 @@ class _TimingContext {
   final DashboardInteraction interaction;
   final Stopwatch stopwatch;
   final Set<String> requestIds = <String>{};
-  final Map<String, int> requestTimings = <String, int>{};
+  final Map<String, _RequestTiming> requestTimings = <String, _RequestTiming>{};
   bool _closed = false;
 
   /// A Zone can outlive the interaction that installed it. Closing makes a
@@ -54,22 +87,35 @@ class _TimingContext {
     return true;
   }
 
-  void addRequestTiming(String requestId, int requestMs) {
-    if (!_closed && requestIds.contains(requestId)) {
-      requestTimings.putIfAbsent(
-        requestId,
-        () => requestMs.clamp(0, _maxDurationMs),
-      );
+  void addRequestTiming(
+    String requestId,
+    int requestMs, {
+    DashboardRequestPhases? Function()? phaseLookup,
+  }) {
+    if (!_closed &&
+        requestIds.contains(requestId) &&
+        !requestTimings.containsKey(requestId)) {
+      // Look up at once, while the entry is among the most recent; the
+      // receipt retries only what had not matched yet.
+      requestTimings[requestId] = _RequestTiming(
+        requestMs.clamp(0, _maxDurationMs),
+        phaseLookup,
+      )..resolvePhases();
     }
   }
 }
 
 /// Captures only a dashboard response's opaque correlation header while an
-/// explicitly named interaction is in flight. The request URL stays local.
+/// explicitly named interaction is in flight. The request URL stays local: it
+/// locates the request's browser Resource Timing entry and is never recorded.
 class DashboardTimingClient extends http.BaseClient {
-  DashboardTimingClient(this._inner);
+  DashboardTimingClient(
+    this._inner, {
+    DashboardResourceTimingSource? resourceTiming,
+  }) : _resourceTiming = resourceTiming;
 
   final http.Client _inner;
+  final DashboardResourceTimingSource? _resourceTiming;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -78,6 +124,8 @@ class DashboardTimingClient extends http.BaseClient {
         context != null && request.url.path != '/api/dashboard/timing'
         ? (Stopwatch()..start())
         : null;
+    final resourceTiming = requestStopwatch == null ? null : _resourceTiming;
+    final dispatchedAt = resourceTiming?.now();
     final response = await _inner.send(request);
     final requestId = response.headers.entries
         .where((entry) => entry.key.toLowerCase() == 'x-rusa-request-id')
@@ -96,7 +144,22 @@ class DashboardTimingClient extends http.BaseClient {
       requestStopwatch.stop();
       // `Stopwatch` is monotonic. Stopping in the response stream's terminal
       // handler deliberately excludes decode/store/render work after the body.
-      context.addRequestTiming(requestId, requestStopwatch.elapsedMilliseconds);
+      final url = request.url;
+      final completedAt = resourceTiming?.now();
+      context.addRequestTiming(
+        requestId,
+        requestStopwatch.elapsedMilliseconds,
+        phaseLookup:
+            resourceTiming == null ||
+                dispatchedAt == null ||
+                completedAt == null
+            ? null
+            : () => resourceTiming.phasesFor(
+                url,
+                dispatchedAt: dispatchedAt,
+                completedAt: completedAt,
+              ),
+      );
     }
 
     final timedStream = response.stream.transform(
@@ -163,6 +226,16 @@ class DashboardTimingReporter {
 
   Future<void> _post(_TimingContext context, String outcome) async {
     try {
+      var phasesPending = false;
+      for (final timing in context.requestTimings.values) {
+        if (timing.resolvePhases()) phasesPending = true;
+      }
+      if (phasesPending) {
+        await Future<void>.delayed(_phaseSettle);
+        for (final timing in context.requestTimings.values) {
+          timing.resolvePhases();
+        }
+      }
       await _client.post(
         _timingUri,
         headers: const {
@@ -178,9 +251,7 @@ class DashboardTimingReporter {
           'requestIds': context.requestIds.toList(growable: false),
           if (context.requestTimings.isNotEmpty)
             'requestTimings': context.requestTimings.entries
-                .map(
-                  (entry) => {'requestId': entry.key, 'requestMs': entry.value},
-                )
+                .map((entry) => entry.value.toJson(entry.key))
                 .toList(growable: false),
           'outcome': outcome,
         }),
