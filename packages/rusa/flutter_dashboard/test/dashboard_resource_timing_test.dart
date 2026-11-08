@@ -100,18 +100,13 @@ void main() {
         'firstByteMs': 293,
         'bodyMs': 8,
       });
-    });
-
-    test('reports a reused connection as zero connect time', () {
+      // A reused connection reports zero connect time.
       expect(phasesFromResourceTiming(_entry())!.connectMs, 0);
     });
 
-    test('invents nothing when the browser withholds detailed timing', () {
+    test('invents nothing from withheld or out-of-order timestamps', () {
       expect(phasesFromResourceTiming(_entry(requestStart: 0)), isNull);
       expect(phasesFromResourceTiming(_entry(responseStart: 0)), isNull);
-    });
-
-    test('rejects an entry whose timestamps are out of order', () {
       expect(
         phasesFromResourceTiming(
           _entry(responseStart: 1009, responseEnd: 1008),

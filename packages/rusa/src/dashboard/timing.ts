@@ -457,6 +457,10 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
     }
     const substages =
       rawSubstages === undefined || !isRequestRow ? undefined : parseSubstages(rawSubstages);
+    // Malformed phases cost only themselves, like substages (#990).
+    const requestPhases = requestTimings?.map((timing) =>
+      parseClientRequestPhases(timing as Record<string, unknown>)
+    );
     // Writers never store an empty object; read one as absent, not as measured.
     const measured = substages && Object.keys(substages).length > 0 ? substages : undefined;
     const payload: DashboardTimingPayload = {
@@ -473,11 +477,10 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
       ...(requestIds ? { requestIds } : {}),
       ...(requestTimings
         ? {
-            requestTimings: requestTimings.map((timing) => ({
+            requestTimings: requestTimings.map((timing, index) => ({
               requestId: (timing as { requestId: string }).requestId,
               requestMs: (timing as { requestMs: number }).requestMs,
-              // Malformed phases cost only themselves, like substages (#990).
-              ...parseClientRequestPhases(timing as Record<string, unknown>),
+              ...requestPhases?.[index],
             })),
           }
         : {}),
@@ -489,15 +492,12 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
       bytes,
       outcome,
     };
-    // Substages are only written on v2 request rows; anywhere else they are
-    // as unreadable as a malformed object, and equally never cost the row.
-    const unreadableClientPhases =
-      Array.isArray(requestTimings) &&
-      requestTimings.some((timing) => !parseClientRequestPhases(timing as Record<string, unknown>));
     return {
       payload,
+      // Substages are only written on v2 request rows; anywhere else they are
+      // as unreadable as a malformed object, and equally never cost the row.
       unreadableSubstages: rawSubstages !== undefined && !substages,
-      unreadableClientPhases,
+      unreadableClientPhases: requestPhases?.includes(null) ?? false,
     };
   } catch {
     return null;
