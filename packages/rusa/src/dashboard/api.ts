@@ -1487,10 +1487,10 @@ export async function handleMeshApiRequest(
         return true;
       }
 
-      const endBody = startDashboardSubstage("actorChatBodyMs");
+      // Closed once the body settles, whether it arrived or the stream failed.
       readBody(req)
+        .finally(startDashboardSubstage("actorChatBodyMs"))
         .then((bodyStr) => {
-          endBody();
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);

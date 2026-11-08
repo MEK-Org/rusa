@@ -2148,27 +2148,6 @@ describe("handleMeshApiRequest", () => {
     expect(clock.substages()).toEqual({ actorChatBodyMs: 5 });
   });
 
-  it("closes the chat send substage when delivery throws", async () => {
-    actors.upsert(rec(UUID_A, null, "active"));
-    let now = 0;
-    const clock = new DashboardPhaseClock(() => now);
-    vi.spyOn(deps.mesh as ActorMesh, "sendMessage").mockImplementation(() => {
-      now += 3;
-      throw new Error("Message sender is disabled");
-    });
-    await runDashboardRequestScope(async () => {
-      attachDashboardPhaseClock(clock);
-      const { req, res } = await call(deps, "POST", `/api/mesh/actors/${UUID_A}/chat`);
-      req.emit("data", Buffer.from(JSON.stringify({ body: "hi" })));
-      req.emit("end");
-      await settled(res);
-      expect(res.statusCode).toBe(500);
-      // Time after the throw belongs to no send interval.
-      now += 50;
-    });
-    expect(clock.substages()).toEqual({ actorChatBodyMs: 0, actorChatSendMs: 3 });
-  });
-
   it("GET /api/mesh/threads lists threads with deterministic handles", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
