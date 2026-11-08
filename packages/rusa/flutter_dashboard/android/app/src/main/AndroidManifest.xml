@@ -44,7 +44,6 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:taskAffinity="org.mek.rusa.dashboard.assist"
-            android:excludeFromRecents="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
             android:theme="@style/LaunchTheme"
@@ -61,6 +60,12 @@
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VOICE_COMMAND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+            <!-- FCM notification tap: the data contains only actor + durable
+                 reply IDs, which AssistActivity resolves after authentication. -->
+            <intent-filter>
+                <action android:name="org.mek.rusa.dashboard.OPEN_REPLY"/>
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
         </activity>

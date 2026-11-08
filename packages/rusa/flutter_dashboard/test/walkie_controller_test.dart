@@ -53,6 +53,30 @@ void main() {
       expect(controller.connection.value, WalkieConnection.connected);
     });
 
+    test(
+      'an Android assistant session carries the durable reply marker',
+      () async {
+        await controller.dispose();
+        controller = WalkieController(
+          actorId: 'a',
+          deps: walkie.deps,
+          androidAssistantSession: true,
+        );
+
+        await controller.enable();
+        await pumpEventQueue();
+
+        expect(
+          walkie.stream.connectCalls.single.sessionId,
+          matches(
+            RegExp(
+              r'^android-assistant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+            ),
+          ),
+        );
+      },
+    );
+
     test('disable closes the stream (presence teardown) and releases the wake '
         'lock', () async {
       await controller.enable();
@@ -271,6 +295,215 @@ void main() {
       },
     );
 
+    test(
+      'history restoration skips a reply already received from the live stream',
+      () async {
+        await controller.enable();
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('durable-reply'));
+        await pumpEventQueue();
+
+        controller.restoreConversation([
+          makeChat('durable-reply', sender: 'a', body: 'The durable answer'),
+        ]);
+
+        expect(
+          controller.transcript.value
+              .where(
+                (entry) => switch (entry) {
+                  ActorReplyEntry(:final announcement) =>
+                    announcement.id == 'durable-reply',
+                  HistoricalChatEntry(:final id) => id == 'durable-reply',
+                  UserMemoEntry() => false,
+                },
+              )
+              .toList(),
+          hasLength(1),
+        );
+      },
+    );
+
+    test(
+      'history restoration skips only its matching retained voice memo',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'same words',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        controller.restoreConversation([
+          makeChat(
+            'memo-1',
+            sender: 'user',
+            body: '🎙️ [voice memo — reply for the ear]: same words',
+          ),
+          makeChat('ordinary-chat', sender: 'user', body: 'same words'),
+        ]);
+
+        expect(
+          controller.transcript.value.whereType<HistoricalChatEntry>().map(
+            (entry) => entry.id,
+          ),
+          ['ordinary-chat'],
+        );
+      },
+    );
+
+    test(
+      'history places a matching local memo in durable chronology',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'middle',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+
+        controller.restoreConversation([
+          MeshChat(
+            id: 'before',
+            ts: DateTime.utc(2026, 1, 1),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Before',
+            sessionId: null,
+          ),
+          MeshChat(
+            id: 'memo',
+            ts: DateTime.utc(2026, 1, 2),
+            senderId: 'user',
+            recipientId: 'a',
+            body: '🎙️ [voice memo — reply for the ear]: middle',
+            sessionId: null,
+          ),
+          MeshChat(
+            id: 'after',
+            ts: DateTime.utc(2026, 1, 3),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'After',
+            sessionId: null,
+          ),
+        ]);
+
+        expect(
+          controller.transcript.value.map(
+            (entry) => switch (entry) {
+              HistoricalChatEntry(:final id) => id,
+              UserMemoEntry() => 'local-memo',
+              ActorReplyEntry(:final announcement) => announcement.id,
+            },
+          ),
+          ['before', 'local-memo', 'after'],
+        );
+      },
+    );
+
+    test(
+      'history orders an unmatched row by durable time, not a late receipt time',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'unmatched memo',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        final memoAt = controller.transcript.value
+            .whereType<UserMemoEntry>()
+            .single
+            .timestamp;
+
+        // A backlog catch-up carries its receipt time, later than the memo,
+        // although the reply itself is older than the memo.
+        await Future<void>.delayed(const Duration(milliseconds: 2));
+        controller.suspendPlayback();
+        walkie.stream.framesCtrl.add(makeAnnouncement('late-receipt'));
+        await pumpEventQueue();
+
+        controller.restoreConversation([
+          MeshChat(
+            id: 'late-receipt',
+            ts: memoAt.subtract(const Duration(minutes: 10)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Older reply',
+            sessionId: null,
+          ),
+          MeshChat(
+            id: 'history',
+            ts: memoAt.subtract(const Duration(minutes: 5)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Older history',
+            sessionId: null,
+          ),
+        ]);
+
+        expect(
+          controller.transcript.value.map(
+            (entry) => switch (entry) {
+              HistoricalChatEntry(:final id) => id,
+              UserMemoEntry() => 'unmatched-memo',
+              ActorReplyEntry(:final announcement) => announcement.id,
+            },
+          ),
+          ['late-receipt', 'history', 'unmatched-memo'],
+        );
+      },
+    );
+
+    test(
+      'history places an unmatched retained old row in chronological position',
+      () async {
+        await controller.enable();
+        api.memoResult = const VoiceMemoResult(
+          transcript: 'old memo',
+          delivered: true,
+        );
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+
+        final baseTime = DateTime.now();
+        controller.restoreConversation([
+          MeshChat(
+            id: 'newer-1',
+            ts: baseTime.add(const Duration(minutes: 5)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Newer 1',
+            sessionId: null,
+          ),
+          MeshChat(
+            id: 'newer-2',
+            ts: baseTime.add(const Duration(minutes: 10)),
+            senderId: 'a',
+            recipientId: 'user',
+            body: 'Newer 2',
+            sessionId: null,
+          ),
+        ]);
+
+        expect(
+          controller.transcript.value.map(
+            (entry) => switch (entry) {
+              HistoricalChatEntry(:final id) => id,
+              UserMemoEntry() => 'old-local-memo',
+              ActorReplyEntry(:final announcement) => announcement.id,
+            },
+          ),
+          ['old-local-memo', 'newer-1', 'newer-2'],
+        );
+      },
+    );
+
     test('frames for another actor are ignored', () async {
       await controller.enable();
       await pumpEventQueue();
@@ -402,6 +635,160 @@ void main() {
         expect(api.ackedIds, ['b', 'c']);
       },
     );
+
+    test(
+      'a notification reply moves ahead of suspended older audio and acks once',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('old-a'), makeAnnouncement('old-b')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'old-a');
+
+        controller.suspendPlayback();
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/old-a',
+          '/api/mesh/voice/audio/selected',
+        ]);
+        expect(controller.nowPlaying.value?.id, 'selected');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['selected']);
+        expect(
+          walkie.player.playedUrls,
+          ['/api/mesh/voice/audio/old-a', '/api/mesh/voice/audio/selected'],
+          reason: 'a notification tap must not drain older suspended audio',
+        );
+      },
+    );
+
+    test(
+      'recording and sending a new memo lifts suspension so new replies play',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('old-a'), makeAnnouncement('old-b')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+        controller.suspendPlayback();
+        await pumpEventQueue();
+        controller.presentNotificationReply(makeAnnouncement('selected'));
+        controller.resumePlayback();
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+
+        walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
+        await pumpEventQueue();
+
+        expect(controller.nowPlaying.value?.id, 'new-reply');
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/old-a',
+          '/api/mesh/voice/audio/selected',
+          '/api/mesh/voice/audio/new-reply',
+        ]);
+      },
+    );
+
+    test('a disposed controller ignores a record tap', () async {
+      await controller.enable();
+      await pumpEventQueue();
+      await controller.dispose();
+
+      await controller.toggleRecord();
+      await pumpEventQueue();
+
+      expect(walkie.recorder.startCalls, 0);
+    });
+
+    test(
+      'an ordinary memo send keeps replies queued behind the current one',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+        walkie.stream.framesCtrl.add(makeAnnouncement('m1'));
+        walkie.stream.framesCtrl.add(makeAnnouncement('m2'));
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'm1');
+        expect(controller.queueDepth.value, 1);
+
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+
+        expect(controller.queueDepth.value, 1);
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'm2');
+      },
+    );
+
+    test('a memo sent during the selected reply clears its boundary', () async {
+      await controller.enable();
+      await pumpEventQueue();
+      controller.suspendPlayback();
+      walkie.stream.framesCtrl.add(makeAnnouncement('older'));
+      await pumpEventQueue();
+      controller.presentNotificationReply(makeAnnouncement('selected'));
+      controller.resumePlayback();
+      await pumpEventQueue();
+      expect(controller.nowPlaying.value?.id, 'selected');
+
+      await controller.toggleRecord();
+      await pumpEventQueue();
+      await controller.toggleRecord();
+      await pumpEventQueue();
+      expect(controller.queueDepth.value, 0);
+
+      walkie.player.finishCurrent();
+      await pumpEventQueue();
+      walkie.stream.framesCtrl.add(makeAnnouncement('new-reply'));
+      await pumpEventQueue();
+
+      expect(controller.nowPlaying.value?.id, 'new-reply');
+      expect(
+        walkie.player.playedUrls,
+        isNot(contains('/api/mesh/voice/audio/older')),
+      );
+    });
+
+    test('a history and live-frame race promotes one selected reply', () async {
+      await controller.enable();
+      controller.suspendPlayback();
+      controller.restoreConversation([
+        makeChat('selected', sender: 'a', body: 'Durable selected reply'),
+      ]);
+
+      controller.presentNotificationReply(makeAnnouncement('selected'));
+      walkie.stream.framesCtrl.add(makeAnnouncement('selected'));
+      controller.resumePlayback();
+      await pumpEventQueue();
+
+      expect(
+        controller.transcript.value.where(
+          (entry) => switch (entry) {
+            HistoricalChatEntry(:final id) => id == 'selected',
+            ActorReplyEntry(:final announcement) =>
+              announcement.id == 'selected',
+            UserMemoEntry() => false,
+          },
+        ),
+        hasLength(1),
+      );
+      expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/selected']);
+    });
 
     test(
       'a playback failure surfaces on lastError and the queue advances',
@@ -619,60 +1006,63 @@ void main() {
       },
     );
 
+    test('a new recording after a cancelled pending start survives when the '
+        'cancelled acquisition resolves first', () async {
+      final cancelledStart = Completer<void>();
+      final newStart = Completer<void>();
+      walkie.recorder.startGates.addAll([cancelledStart, newStart]);
+
+      final firstToggle = controller.toggleRecord();
+      await pumpEventQueue();
+
+      await controller.cancelRecord();
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.idle);
+
+      final secondToggle = controller.toggleRecord();
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.starting);
+
+      // The cancelled acquisition settles first; its rejection must leave
+      // the pending newer capture untouched.
+      cancelledStart.complete();
+      await firstToggle;
+      await pumpEventQueue();
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(controller.record.value.phase, RecordPhase.starting);
+
+      newStart.complete();
+      await secondToggle;
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.record.value.message, isNull);
+
+      await controller.toggleRecord();
+      await pumpEventQueue();
+      expect(api.memoSends, hasLength(1));
+      expect(api.memoSends.single.actorId, 'a');
+      expect(controller.record.value.phase, RecordPhase.delivered);
+    });
+
     test(
-      'a new recording after a cancelled pending start survives when the '
-      'cancelled acquisition resolves first',
+      'adoptRecording enters recording phase with given startedAt',
       () async {
-        final cancelledStart = Completer<void>();
-        final newStart = Completer<void>();
-        walkie.recorder.startGates.addAll([cancelledStart, newStart]);
-
-        final firstToggle = controller.toggleRecord();
-        await pumpEventQueue();
-
-        await controller.cancelRecord();
-        await pumpEventQueue();
-        expect(controller.record.value.phase, RecordPhase.idle);
-
-        final secondToggle = controller.toggleRecord();
-        await pumpEventQueue();
-        expect(controller.record.value.phase, RecordPhase.starting);
-
-        // The cancelled acquisition settles first; its rejection must leave
-        // the pending newer capture untouched.
-        cancelledStart.complete();
-        await firstToggle;
-        await pumpEventQueue();
-        expect(walkie.recorder.cancelCalls, 1);
-        expect(controller.record.value.phase, RecordPhase.starting);
-
-        newStart.complete();
-        await secondToggle;
-        await pumpEventQueue();
+        await controller.enable();
+        final startedAt = DateTime.now().subtract(const Duration(seconds: 2));
+        controller.adoptRecording(startedAt: startedAt);
         expect(controller.record.value.phase, RecordPhase.recording);
-        expect(controller.record.value.message, isNull);
+        expect(
+          controller.record.value.elapsed.inSeconds,
+          greaterThanOrEqualTo(2),
+        );
 
+        // Stopping adopted recording sends the memo
         await controller.toggleRecord();
         await pumpEventQueue();
-        expect(api.memoSends, hasLength(1));
-        expect(api.memoSends.single.actorId, 'a');
+        expect(walkie.recorder.stopCalls, 1);
         expect(controller.record.value.phase, RecordPhase.delivered);
       },
     );
-
-    test('adoptRecording enters recording phase with given startedAt', () async {
-      await controller.enable();
-      final startedAt = DateTime.now().subtract(const Duration(seconds: 2));
-      controller.adoptRecording(startedAt: startedAt);
-      expect(controller.record.value.phase, RecordPhase.recording);
-      expect(controller.record.value.elapsed.inSeconds, greaterThanOrEqualTo(2));
-
-      // Stopping adopted recording sends the memo
-      await controller.toggleRecord();
-      await pumpEventQueue();
-      expect(walkie.recorder.stopCalls, 1);
-      expect(controller.record.value.phase, RecordPhase.delivered);
-    });
 
     test('adoptRecording ignored when disabled or disposed', () async {
       await controller.disable();

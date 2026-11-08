@@ -1,8 +1,8 @@
 package org.mek.rusa.dashboard
 
 import android.content.Intent
-import android.os.Handler
-import android.os.Looper
+import android.app.KeyguardManager
+import android.net.Uri
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 
@@ -11,15 +11,39 @@ import io.flutter.embedding.engine.FlutterEngine
  * gesture, and ACTION_VOICE_COMMAND for a headset's assistant button (HFP
  * AT+BVRA). It runs the `assistMain` Dart entrypoint, which opens walkie
  * recording to root over the lock screen without requiring an unlock. A trigger
- * while it is open reaches Dart as `trigger` and stops and sends. The session
- * ends once it leaves the screen.
+ * while it is open reaches Dart as `trigger` and stops and sends. Leaving the
+ * screen stops capture and playback but retains a returnable conversation.
  */
 class AssistActivity : FlutterActivity() {
     private var assistant: AssistantChannel? = null
-    private val main = Handler(Looper.getMainLooper())
-    private var ending = false
+    private var backgrounded = false
+    private var pendingReply: Pair<String, String>? = null
+    private var restoringFromRecents = false
 
     override fun getDartEntrypointFunctionName(): String = "assistMain"
+
+    override fun getInitialRoute(): String? {
+        if (isRestoringFromRecents(intent)) {
+            restoringFromRecents = true
+            // A process-recreated task must not interpret its historical
+            // launch as a fresh assist gesture or stale notification tap.
+            return Uri.Builder().path("recents").build().toString()
+        }
+        val reply = replyTarget(intent) ?: return super.getInitialRoute()
+        if (isDeviceLocked()) {
+            pendingReply = reply
+            // Do not hand reply identifiers to Dart until the keyguard has
+            // been dismissed. The page waits without starting microphone
+            // capture, then receives the target through the channel.
+            return Uri.Builder().path("reply-pending").build().toString()
+        }
+        return Uri.Builder()
+            .path("reply")
+            .appendQueryParameter("actorId", reply.first)
+            .appendQueryParameter("announcementId", reply.second)
+            .build()
+            .toString()
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -29,44 +53,90 @@ class AssistActivity : FlutterActivity() {
             withHeadset = true,
         )
         assistant = channel
-        answerHeadset(intent, channel)
+        if (!restoringFromRecents) answerHeadset(intent, channel)
+        pendingReply?.let { deferReplyUntilUnlocked(channel, it) }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        // A closing screen has no session left to stop and send.
-        if (ending) return
         val channel = assistant ?: return
+        if (isRestoringFromRecents(intent)) {
+            // Restoring the task may render the retained screen, but it must
+            // not make an old capture or queued reply audible, nor treat the
+            // historical launch as a new assistant gesture or stale notification tap.
+            restoringFromRecents = true
+            pendingReply = null
+            return
+        }
+        val reply = replyTarget(intent)
+        if (reply != null) {
+            restoringFromRecents = false
+            deferReplyUntilUnlocked(channel, reply)
+            return
+        }
+        // An ordinary assist trigger retains the previously approved locked
+        // walkie surface. A reply notification never changes that policy, and
+        // this intent supersedes any reply still waiting on the keyguard.
+        val dormantRoute = pendingReply != null || restoringFromRecents
+        pendingReply = null
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
+        restoringFromRecents = false
+        if (isDeviceLocked()) {
+            if (backgrounded || dormantRoute) {
+                // A lock-screen gesture after a retained, unlocked session
+                // starts a new restricted capture. Never surface that old
+                // chat or queued audio over the keyguard first. A notification
+                // or Recents route started no capture for a trigger to stop.
+                backgrounded = false
+                channel.lockedAssist()
+            } else {
+                // The initial locked capture is already restricted; a second
+                // gesture keeps its existing stop-and-send contract.
+                channel.trigger()
+            }
+            answerHeadset(intent, channel)
+            return
+        }
+        if (backgrounded) {
+            backgrounded = false
+            channel.foreground()
+        }
         answerHeadset(intent, channel)
         channel.trigger()
     }
 
     /**
-     * Leaving the screen ends the session: locking, screen off, Home or another
-     * app. A stopped activity gets no later callback when the phone then locks,
-     * so finishing here is what keeps nothing recording or playing behind the
-     * keyguard. Dart ends the session first, as walkie off does: the recorder
-     * cancels, deleting the partial take, and the server's voice session is
-     * disabled. The deadline bounds a slow server; the record and audioplayers
-     * plugins release whatever is left when the engine detaches.
+     * A stopped task remains returnable. Dart cancels an active capture and
+     * suspends automatic playback, but keeps its authenticated voice session
+     * and reply transcript until the user explicitly exits or Android destroys
+     * the task.
      */
     override fun onStop() {
         super.onStop()
-        if (isChangingConfigurations || ending) return
-        ending = true
-        val close = Runnable { if (!isFinishing) finish() }
-        main.postDelayed(close, END_DEADLINE_MS)
-        val channel = assistant ?: return close.run()
-        channel.end {
-            main.removeCallbacks(close)
-            close.run()
-        }
+        if (isChangingConfigurations || backgrounded) return
+        backgrounded = true
+        assistant?.background()
     }
 
-    override fun onDestroy() {
-        main.removeCallbacksAndMessages(null)
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        if (!backgrounded || pendingReply != null) return
+        if (isDeviceLocked()) {
+            // A retained unlocked task must not render its transcript over the
+            // keyguard merely because Android starts it again. A later locked
+            // assist gesture explicitly re-enables this restricted surface and
+            // requests a fresh capture through onNewIntent().
+            setShowWhenLocked(false)
+            setTurnScreenOn(false)
+            return
+        }
+        backgrounded = false
+        restoringFromRecents = false
+        // Dart restores visibility while retaining the playback suspension;
+        // only an explicit reply interaction can resume queued audio.
+        assistant?.foreground()
     }
 
     /**
@@ -80,6 +150,77 @@ class AssistActivity : FlutterActivity() {
         }
     }
 
+    private fun replyTarget(intent: Intent?): Pair<String, String>? {
+        if (intent?.action != REPLY_ACTION) return null
+        val actorId = intent.getStringExtra("actorId")?.takeIf { it.isNotBlank() } ?: return null
+        val announcementId = intent.getStringExtra("announcementId")?.takeIf { it.isNotBlank() }
+            ?: return null
+        return actorId to announcementId
+    }
+
+    private fun isRestoringFromRecents(intent: Intent?): Boolean =
+        intent != null && (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+
+    private fun deferReplyUntilUnlocked(channel: AssistantChannel, reply: Pair<String, String>) {
+        if (!isDeviceLocked()) {
+            pendingReply = null
+            deliverReply(channel, reply)
+            return
+        }
+        pendingReply = reply
+        val retainBackgroundTask = backgrounded
+        // Keep a generic system notification on the lock screen, but never
+        // show its old conversation or play audio until device authentication.
+        setShowWhenLocked(false)
+        setTurnScreenOn(false)
+        window.decorView.post {
+            if (pendingReply !== reply) return@post
+            val keyguard = getSystemService(KeyguardManager::class.java) ?: return@post
+            keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                override fun onDismissSucceeded() {
+                    val target = pendingReply ?: return
+                    pendingReply = null
+                    deliverReply(channel, target)
+                }
+
+                override fun onDismissCancelled() {
+                    // A cancelled keyguard request has no safe reply handoff. A
+                    // superseded one must not hide or finish the newer surface.
+                    if (pendingReply === reply) abandonReplyHandoff(retainBackgroundTask)
+                }
+
+                override fun onDismissError() {
+                    if (pendingReply === reply) abandonReplyHandoff(retainBackgroundTask)
+                }
+            })
+        }
+    }
+
+    private fun abandonReplyHandoff(retainBackgroundTask: Boolean) {
+        // A warm retained activity belongs back in Android's background after
+        // a cancelled unlock: closing it would discard the session that the
+        // notification never safely handed to Dart. A cold notification task
+        // has no retained session and can finish normally.
+        pendingReply = null
+        if (retainBackgroundTask) {
+            setShowWhenLocked(false)
+            setTurnScreenOn(false)
+            return
+        }
+        finish()
+    }
+
+    private fun deliverReply(channel: AssistantChannel, reply: Pair<String, String>) {
+        // This task is visible for the notification handoff. Mark it foreground
+        // before Dart suspends its old queue and resolves the one selected reply,
+        // so a later onStop() cannot accidentally skip the background boundary.
+        backgrounded = false
+        channel.reply(reply.first, reply.second)
+    }
+
+    private fun isDeviceLocked(): Boolean =
+        getSystemService(KeyguardManager::class.java)?.isDeviceLocked == true
+
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         assistant?.dispose()
         assistant = null
@@ -87,6 +228,6 @@ class AssistActivity : FlutterActivity() {
     }
 
     companion object {
-        private const val END_DEADLINE_MS = 3_000L
+        const val REPLY_ACTION = "org.mek.rusa.dashboard.OPEN_REPLY"
     }
 }
