@@ -2106,6 +2106,69 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("attributes actor chat POST work to request-local server substages", async () => {
+    actors.upsert(rec(UUID_A, null, "active"));
+    let now = 0;
+    const clock = new DashboardPhaseClock(() => now);
+    const mesh = deps.mesh as ActorMesh;
+    const send = mesh.sendMessage.bind(mesh);
+    const sendSpy = vi.spyOn(mesh, "sendMessage").mockImplementation((...args) => {
+      now += 29;
+      return send(...args);
+    });
+    await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(clock);
+      const { req, res } = await call(deps, "POST", `/api/mesh/actors/${UUID_A}/chat`);
+      // The client's bytes arrive 13 ms after the handler starts reading.
+      now += 13;
+      req.emit("data", Buffer.from(JSON.stringify({ body: "hi", sessionId: "s-1" })));
+      req.emit("end");
+      await settled(res);
+      expect(res.statusCode).toBe(200);
+    });
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(clock.substages()).toEqual({ actorChatBodyMs: 13, actorChatSendMs: 29 });
+  });
+
+  it("leaves the chat send substage absent when the body is rejected before delivery", async () => {
+    actors.upsert(rec(UUID_A, null, "active"));
+    let now = 0;
+    const clock = new DashboardPhaseClock(() => now);
+    const sendSpy = vi.spyOn(deps.mesh as ActorMesh, "sendMessage");
+    await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(clock);
+      const { req, res } = await call(deps, "POST", `/api/mesh/actors/${UUID_A}/chat`);
+      now += 5;
+      req.emit("data", Buffer.from("not json"));
+      req.emit("end");
+      await settled(res);
+      expect(res.statusCode).toBe(400);
+    });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(clock.substages()).toEqual({ actorChatBodyMs: 5 });
+  });
+
+  it("closes the chat send substage when delivery throws", async () => {
+    actors.upsert(rec(UUID_A, null, "active"));
+    let now = 0;
+    const clock = new DashboardPhaseClock(() => now);
+    vi.spyOn(deps.mesh as ActorMesh, "sendMessage").mockImplementation(() => {
+      now += 3;
+      throw new Error("Message sender is disabled");
+    });
+    await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(clock);
+      const { req, res } = await call(deps, "POST", `/api/mesh/actors/${UUID_A}/chat`);
+      req.emit("data", Buffer.from(JSON.stringify({ body: "hi" })));
+      req.emit("end");
+      await settled(res);
+      expect(res.statusCode).toBe(500);
+      // Time after the throw belongs to no send interval.
+      now += 50;
+    });
+    expect(clock.substages()).toEqual({ actorChatBodyMs: 0, actorChatSendMs: 3 });
+  });
+
   it("GET /api/mesh/threads lists threads with deterministic handles", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));

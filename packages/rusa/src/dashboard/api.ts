@@ -1487,8 +1487,10 @@ export async function handleMeshApiRequest(
         return true;
       }
 
+      const endBody = startDashboardSubstage("actorChatBodyMs");
       readBody(req)
         .then((bodyStr) => {
+          endBody();
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1517,9 +1519,15 @@ export async function handleMeshApiRequest(
 
           const fromId = requireOperatorPrincipal(req, res, deps);
           if (!fromId) return;
-          const result = deps.mesh.sendMessage(actorId, body, fromId, sessionId, undefined, {
-            voice,
-          });
+          const endSend = startDashboardSubstage("actorChatSendMs");
+          let result: ReturnType<typeof deps.mesh.sendMessage>;
+          try {
+            result = deps.mesh.sendMessage(actorId, body, fromId, sessionId, undefined, {
+              voice,
+            });
+          } finally {
+            endSend();
+          }
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
           } else {

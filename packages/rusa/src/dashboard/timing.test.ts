@@ -810,6 +810,46 @@ describe("dashboard timing recorder", () => {
     expect(summary.serverPhases[0]).not.toHaveProperty("tail");
   });
 
+  it("summarizes actor chat POST substages in the mesh_actor_mutation population (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const post = (durationMs: number, substages?: DashboardServerSubstages) =>
+      recorder.recordServer({
+        label: "mesh_actor_mutation",
+        durationMs,
+        status: 200,
+        bytes: 1,
+        phases: { auth: 5, route: durationMs - 10 },
+        ...(substages ? { substages } : {}),
+        request: { method: "POST", terminal: "finished" },
+      });
+    post(40, { authAdapterMs: 4, finishMs: 1, actorChatBodyMs: 2, actorChatSendMs: 20 });
+    post(2200, { authAdapterMs: 6, finishMs: 1, actorChatBodyMs: 3, actorChatSendMs: 2100 });
+    // Another actor-mutation route reports neither chat substage.
+    post(30, { authAdapterMs: 5, finishMs: 1 });
+    while (timingRows().length < 3) recorder.flush();
+
+    const [population] = recorder.summary({
+      since: new Date(Date.now() - 60_000),
+    }).serverPopulations;
+    const cohort = (numerator: number, denominator: number) =>
+      expect.objectContaining({ numerator, denominator });
+    expect(population).toMatchObject({ label: "mesh_actor_mutation", method: "POST" });
+    expect(population.finishedSuccess).toMatchObject({
+      count: 3,
+      substages: {
+        actorChatBodyMs: { maxMs: 3, coverage: cohort(2, 3) },
+        actorChatSendMs: { maxMs: 2100, coverage: cohort(2, 3) },
+      },
+      tail: {
+        count: 1,
+        substages: {
+          authAdapterMs: { maxMs: 6 },
+          actorChatSendMs: { maxMs: 2100, coverage: cohort(1, 1) },
+        },
+      },
+    });
+  });
+
   it("drops only malformed substages and keeps the row in every population (#990)", () => {
     const recorder = new DashboardTimingRecorder(events);
     const row = (substages: unknown, extra: Record<string, unknown> = {}) => ({
