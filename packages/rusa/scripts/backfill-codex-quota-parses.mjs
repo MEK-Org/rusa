@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
+import { readHostSecret } from "../build/maintenance/config/secrets.js";
 import { inferQuotaState, parseCodexQuota } from "../build/maintenance/mcp/quota-mcp.js";
 import { serializeParsedState } from "../build/maintenance/quota/shared-store.js";
 
@@ -10,9 +11,11 @@ const HOUR_MS = 60 * 60 * 1000;
 function usage() {
   return [
     "Usage:",
-    "  GEMINI_API_KEY=... pnpm --filter rusa run backfill:codex-quota -- \\",
+    "  pnpm --filter rusa run backfill:codex-quota -- \\",
     "    --database /absolute/path/to/quota.db --hours 48 \\",
     "    --report /absolute/path/to/report.md [--concurrency 3] [--attempts 3] [--apply]",
+    "",
+    "Reads GEMINI_API_KEY from $RUSA_HOME/secrets/gemini-api-key or the host environment.",
     "",
     "Without --apply, parses and reports the proposed changes without writing the database.",
     "With --apply, creates an online SQLite backup before atomically replacing parsed_state.",
@@ -191,8 +194,12 @@ async function main() {
     process.stdout.write(`${usage()}\n`);
     return;
   }
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) throw new Error("GEMINI_API_KEY is required");
+  // File takes precedence over environment fallback per #1258 proposal.
+  const apiKey = (readHostSecret("gemini-api-key") ?? process.env.GEMINI_API_KEY)?.trim();
+  if (!apiKey)
+    throw new Error(
+      "GEMINI_API_KEY is required (set in environment or $RUSA_HOME/secrets/gemini-api-key)"
+    );
 
   const through = new Date(args.through ?? Date.now());
   const since = new Date(through.getTime() - args.hours * HOUR_MS);

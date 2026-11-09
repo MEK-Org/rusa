@@ -54,7 +54,6 @@ function sandboxLog(): Logger {
 
 export interface ActorBwrapResult {
   args: string[];
-  commandPrefix: string[];
   tempPaths: string[];
 }
 const THKP_NPM_REGISTRY = "https://registry.npmjs.org/";
@@ -548,17 +547,18 @@ function injectGoogleCredentialShadow(args: string[]): void {
  * real `secrets/<filename>` file is `--ro-bind`-ed back OVER its masked path
  * (the bind must come AFTER the `--tmpfs` of the directory — bwrap applies
  * mounts in argument order), so the grantee reads the key at the same well-known
- * path as on the host. Kebab-case secret names also export an environment
- * variable (e.g. `secret:mistral-api-key` exports `MISTRAL_API_KEY`,
- * `secret:gemini-api-key` exports `GEMINI_API_KEY`). Grants are read straight from
- * the `capability_grants` table in `$RUSA_HOME/data/mesh.db` through a short-lived
- * readonly connection (the sandbox layer never imports the mesh — same discipline
- * as `loadConfig()` in {@link injectWorkerGithubCredential}), keyed by the actor
- * id (= the worker dir's basename, see start.ts `join(workersDir, actorId)`).
- * Evaluated per-spawn, so grant/revoke takes effect on the actor's next run.
- * Fail-closed to MASKED: any open/read error means "no grant", never "leaked",
- * and every granted filename is re-checked for containment (regular file,
- * directly inside the directory, no escaping symlink) right before its bind.
+ * path as on the host (e.g. `$RUSA_HOME/secrets/gemini-api-key`). Secret grants
+ * do not export environment variables into the actor's process tree; a command
+ * that needs an environment variable takes it per-command from the file. Grants
+ * are read straight from the `capability_grants` table in `$RUSA_HOME/data/mesh.db`
+ * through a short-lived readonly connection (the sandbox layer never imports the
+ * mesh — same discipline as `loadConfig()` in {@link injectWorkerGithubCredential}),
+ * keyed by the actor id (= the worker dir's basename, see start.ts
+ * `join(workersDir, actorId)`). Evaluated per-spawn, so grant/revoke takes effect
+ * on the actor's next run. Fail-closed to MASKED: any open/read error means "no
+ * grant", never "leaked", and every granted filename is re-checked for containment
+ * (regular file, directly inside the directory, no escaping symlink) right before
+ * its bind.
  */
 export function deriveSecretEnvVar(filename: string): string {
   if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(filename)) {
@@ -569,12 +569,7 @@ export function deriveSecretEnvVar(filename: string): string {
   return filename.toUpperCase().replace(/-/g, "_");
 }
 
-function injectSecretsMasking(
-  args: string[],
-  commandPrefix: string[],
-  mcHome: string,
-  actorId: string
-): void {
+function injectSecretsMasking(args: string[], mcHome: string, actorId: string): void {
   const secretsDir = join(mcHome, SECRETS_DIRNAME);
   // The tmpfs mount point must exist under the ro-bound `/` — create it (0700)
   // so the mask holds even on a host that has no secrets yet (same discipline as
@@ -618,8 +613,6 @@ function injectSecretsMasking(
     .filter((g) => g.startsWith("secret:"))
     .map((g) => g.slice("secret:".length));
 
-  const grantedSecretPaths: { name: string; path: string; varName: string }[] = [];
-
   for (const secretName of secretGrants) {
     // Re-run the FULL grant-time containment check immediately before the bind
     // (#542 security review): the grant row only proves the file was a regular
@@ -647,34 +640,6 @@ function injectSecretsMasking(
     // canonical path the check just resolved (never the un-resolved entry), so
     // the mount is of the file that passed containment.
     args.push("--ro-bind", realSecretPath, secretPath);
-    if (/^[a-z0-9]+(-[a-z0-9]+)*$/.test(secretName)) {
-      const varName = deriveSecretEnvVar(secretName);
-      grantedSecretPaths.push({ name: secretName, path: secretPath, varName });
-    }
-  }
-
-  if (grantedSecretPaths.length > 0) {
-    const scriptParts: string[] = [];
-    const bindArgs: string[] = [];
-
-    for (let i = 0; i < grantedSecretPaths.length; i++) {
-      const s = grantedSecretPaths[i];
-      const pos = i + 1;
-      scriptParts.push(
-        `${s.varName}=$(/bin/cat -- "$${pos}") || exit $?; [ -n "$${s.varName}" ] || exit 1; export ${s.varName};`
-      );
-      bindArgs.push(s.path);
-    }
-
-    scriptParts.push(`shift ${grantedSecretPaths.length}; exec "$@"`);
-
-    commandPrefix.push(
-      "/bin/sh",
-      "-c",
-      scriptParts.join(" "),
-      "rusa-secrets-entrypoint",
-      ...bindArgs
-    );
   }
 }
 
@@ -884,7 +849,6 @@ function buildMeshActorBwrapArgs(o: {
   const actorParent = dirname(realActorDir);
   const isWorkerActor = basename(actorParent) === "workers";
   const tempPaths: string[] = [];
-  const commandPrefix: string[] = [];
 
   // The sandbox replaces agy's conversation-bearing state below with
   // actor-owned paths, so neither provider scratch nor conversation content can
@@ -941,6 +905,7 @@ function buildMeshActorBwrapArgs(o: {
     const auditArtifactDir = hostJobAuditArtifactDir(mcHome);
     mkdirSync(auditArtifactDir, { recursive: true, mode: 0o700 });
     args.push("--tmpfs", auditArtifactDir);
+    args.push("--setenv", "RUSA_HOME", mcHome);
   }
 
   let ghWrapperDir: string | undefined;
@@ -953,7 +918,7 @@ function buildMeshActorBwrapArgs(o: {
     // Host-secrets masking : same real-workers-only guard as the gh
     // credential split above — root (unsandboxed in production) and the E2E
     // root-agent test double keep host visibility.
-    injectSecretsMasking(args, commandPrefix, mcHome, basename(realActorDir));
+    injectSecretsMasking(args, mcHome, basename(realActorDir));
   }
 
   // Write scope: the actor's own directory, re-bound in place over the ro view.
@@ -1195,16 +1160,16 @@ function buildMeshActorBwrapArgs(o: {
     injectGoogleCredentialShadow(args);
   }
 
-  return { args, commandPrefix, tempPaths };
+  return { args, tempPaths };
 }
 
-/** Assemble the bwrap argv, including any grant-specific in-sandbox entrypoint. */
+/** Assemble the bwrap argv. */
 export function buildActorBwrapCommand(
   result: ActorBwrapResult,
   command: string,
   commandArgs: string[]
 ): string[] {
-  return [...result.args, "--", ...result.commandPrefix, command, ...commandArgs];
+  return [...result.args, "--", command, ...commandArgs];
 }
 
 function injectGitBridgeEnv(args: string[]): void {

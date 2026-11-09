@@ -242,7 +242,7 @@ describe("provider launch boundary — a NUL in assembled actor context", () => 
     // the production wrapper builder. Sanitizing where the prompt enters argv is
     // what makes this vector identical to the unsandboxed one above.
     const wrappedArgs = buildActorBwrapCommand(
-      { args: operands, commandPrefix: [], tempPaths: [] },
+      { args: operands, tempPaths: [] },
       cli.command,
       buildClaudeArgs({ prompt: assembledActorContext() })
     );
@@ -274,7 +274,7 @@ describe("provider launch boundary — a NUL in a configured path", () => {
     // a path that is not the configured one, and under bwrap that path sits in
     // argv, so the substitution would be *launched* rather than reported.
     const wrappedArgs = buildActorBwrapCommand(
-      { args: bwrapOperandsFor(cli.cwd), commandPrefix: [], tempPaths: [] },
+      { args: bwrapOperandsFor(cli.cwd), tempPaths: [] },
       `${cli.command}${NUL}`,
       buildClaudeArgs({ prompt: `${assembledActorContext()}\n${NEVER_DISCLOSE}` })
     );
@@ -295,7 +295,7 @@ describe("provider launch boundary — a NUL in a configured path", () => {
     // The same fault in a host path the wrapper binds: also configuration, also
     // not something to repair by substituting a character into it.
     const wrappedArgs = buildActorBwrapCommand(
-      { args: ["--unshare-all", "--chdir", `${cli.cwd}${NUL}`], commandPrefix: [], tempPaths: [] },
+      { args: ["--unshare-all", "--chdir", `${cli.cwd}${NUL}`], tempPaths: [] },
       cli.command,
       buildClaudeArgs({ prompt: `${assembledActorContext()}\n${NEVER_DISCLOSE}` })
     );
