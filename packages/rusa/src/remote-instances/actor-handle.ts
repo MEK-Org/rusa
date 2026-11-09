@@ -755,7 +755,7 @@ export class ActorHandle implements MeshActor {
   private redispatchDroppedWork(): void {
     this.redispatchOwed = false;
     try {
-      this.opts.context.mesh.reconcileActorInbox(this.id);
+      this.opts.context.mesh?.reconcileActorInbox?.(this.id);
     } catch (error) {
       // A missed nudge over durable state; boot reconciliation still lists it.
       this.log.warn("remote_redispatch_failed", {
@@ -792,6 +792,7 @@ export class ActorHandle implements MeshActor {
 
   private fail(error: Error): void {
     if (this.closed) return;
+    const isUpdateRestart = Boolean(this.channel.isUpdateRestart?.());
     // Termination stays strictly reserved for a genuine actor close() (e.g. thread retirement).
     // A connection error, startup timeout, or transport loss disconnects the handle so attachHost
     // can still recover and rebind on reconnect.
@@ -805,9 +806,17 @@ export class ActorHandle implements MeshActor {
     // a boot timeout books nothing.
     const terminate = () => {
       if (this.runOpen) {
-        void this.endRun({ success: false, output: error.message, exitCode: -1 });
+        if (isUpdateRestart) {
+          void this.endQueuedRun("unreported", true);
+          this.redispatchOwed = true;
+        } else {
+          void this.endRun({ success: false, output: error.message, exitCode: -1 });
+        }
       } else if (this.queuedRunId && !retained) {
         void this.endQueuedRun("start-cancelled", false);
+        if (isUpdateRestart) {
+          this.redispatchOwed = true;
+        }
       }
     };
     if (this.receiveChain) {

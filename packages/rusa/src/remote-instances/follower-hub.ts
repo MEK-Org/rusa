@@ -354,6 +354,19 @@ export class FollowerHub {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
     follower.assertDispatchable();
+    if (follower.isUpdateInProgress()) {
+      throw new Error(
+        `Follower ${followerId} update is in progress (${follower.updateStatus?.status})`
+      );
+    }
+    const trigger = this.triggerStore?.getActiveTrigger();
+    if (trigger && follower.commitSha !== trigger.targetSha) {
+      if (!this.triggerStore?.hasFailed(followerId, trigger.targetSha)) {
+        throw new Error(
+          `Follower ${followerId} is pending update to ${trigger.targetSha} (current: ${follower.commitSha ?? "unknown"})`
+        );
+      }
+    }
     const host = follower.createHost(actorId);
     host.once("exit", () => {
       for (const [key, route] of this.routes)

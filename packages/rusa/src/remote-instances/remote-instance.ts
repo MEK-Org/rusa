@@ -353,10 +353,15 @@ export class RemoteInstance {
   }
 
   private openHost(actorId: string): ActorChannel {
-    const host = new InstanceActorChannel(this.id, this.pid, (message) => {
-      this.commands.push({ actorId, message });
-      this.flush();
-    });
+    const host = new InstanceActorChannel(
+      this.id,
+      this.pid,
+      (message) => {
+        this.commands.push({ actorId, message });
+        this.flush();
+      },
+      () => this.isUpdateInProgress()
+    );
     this.hosts.set(actorId, host);
     host.once("exit", () => this.hosts.delete(actorId));
     return host;
@@ -572,12 +577,19 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
   connected = true;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
+  private updateRestart = false;
+
   constructor(
     readonly nodeId: string,
     readonly pid: number,
-    private readonly enqueue: (message: LeaderCommand) => void
+    private readonly enqueue: (message: LeaderCommand) => void,
+    private readonly isUpdateActive?: () => boolean
   ) {
     super();
+  }
+
+  isUpdateRestart(): boolean {
+    return this.updateRestart;
   }
 
   send(message: LeaderCommand, callback: (error: Error | null) => void): boolean {
@@ -596,6 +608,7 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
       this.connected = false;
       this.exitCode = message.code;
       this.signalCode = message.signal;
+      this.updateRestart = Boolean(this.isUpdateActive?.());
       this.emit("exit", message.code, message.signal);
     } else this.emit("message", message);
   }
