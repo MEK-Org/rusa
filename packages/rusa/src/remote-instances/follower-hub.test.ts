@@ -988,8 +988,8 @@ describe("follower protocol window (#719)", () => {
     expect(h.hub.list()).toEqual([
       expect.objectContaining({ id: "lagging", protocolVersion: V8, commitSha: oldSha }),
     ]);
-    // Full admission: it takes actor placement like any current follower.
-    expect(() => h.hub.createHost("lagging", "actor-1")).not.toThrow();
+    // Under #1272, placement is refused while an update is pending/in-progress.
+    expect(() => h.hub.createHost("lagging", "actor-1")).toThrow(/update/i);
 
     const commands = (await (await h.post("/poll", { id: "lagging", session })).json()) as Array<
       Record<string, unknown>
@@ -1014,6 +1014,8 @@ describe("follower protocol window (#719)", () => {
     expect(h.hub.list()).toEqual([
       expect.objectContaining({ id: "lagging", protocolVersion: N, commitSha: targetSha }),
     ]);
+    // Once updated to targetSha, it takes actor placement normally.
+    expect(() => h.hub.createHost("lagging", "actor-1")).not.toThrow();
   });
 
   it("registers a current-protocol follower normally", async () => {
