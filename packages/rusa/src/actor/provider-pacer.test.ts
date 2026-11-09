@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ComputerUseLock } from "./computer-use-lock.js";
 import { ConcurrencyLimiter } from "./concurrency-limiter.js";
 import {
   ProviderPacer,
@@ -43,11 +44,12 @@ describe("ProviderPacer", () => {
     await expect(second.result).resolves.toBe(2);
   });
 
-  it("promotes a provider-waiting normal run and charges its responsive start", async () => {
+  it("promotes a provider-waiting normal run without charging the pacing clock", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const pacer = new ProviderPacer(10_000, () => Date.now());
     await pacer.submit(async () => 1, { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
 
+    await vi.advanceTimersByTimeAsync(5_000);
     const promoted = pacer.submit(async () => 2, {
       enqueueNormal: (fn) => mesh.enqueue(fn),
     });
@@ -56,7 +58,7 @@ describe("ProviderPacer", () => {
     await expect(promoted.result).resolves.toBe(2);
 
     const next = pacer.submit(async () => 3, { enqueueNormal: (fn) => mesh.enqueue(fn) });
-    await vi.advanceTimersByTimeAsync(9_999);
+    await vi.advanceTimersByTimeAsync(4_999);
     expect(next.started).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     await expect(next.result).resolves.toBe(3);
@@ -1422,5 +1424,264 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     );
     await vi.advanceTimersByTimeAsync(0);
     await expect(handle.result).resolves.toBe("codex");
+  });
+});
+
+describe("responsive starts do not charge or reset ordinary pacing clock (#962)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  it("ordinary queue head advances under sustained responsive traffic with cadence shorter than pacing interval", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const starts: Array<{ id: string; at: number }> = [];
+    const intervalMs = 45 * 60 * 1000;
+    const responsiveCadenceMs = 30 * 60 * 1000;
+    const base = Date.now();
+    const pacer = new ProviderPacer(intervalMs, () => Date.now());
+
+    // Initial normal run starts at t=0
+    await pacer.submit(async () => "initial-normal", {
+      threadId: "initial-normal",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "initial-normal", at: Date.now() - base }),
+    }).result;
+    expect(starts).toEqual([{ id: "initial-normal", at: 0 }]);
+
+    // Queue an ordinary request at t=0
+    const ordinary = pacer.submit(async () => "ordinary-1", {
+      threadId: "ordinary-1",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "ordinary-1", at: Date.now() - base }),
+    });
+
+    // Responsive runs arrive every 30 minutes (shorter than the 45m interval)
+    await vi.advanceTimersByTimeAsync(responsiveCadenceMs);
+    const resp1 = pacer.submit(async () => "resp-1", {
+      responsive: true,
+      threadId: "resp-1",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "resp-1", at: Date.now() - base }),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(resp1.result).resolves.toBe("resp-1");
+    expect(starts).toEqual([
+      { id: "initial-normal", at: 0 },
+      { id: "resp-1", at: 30 * 60 * 1000 },
+    ]);
+    expect(ordinary.started).toBe(false);
+
+    // At t=45m (exactly one pacing interval from t=0), ordinary request must start!
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    expect(ordinary.started).toBe(true);
+    await expect(ordinary.result).resolves.toBe("ordinary-1");
+    expect(starts).toEqual([
+      { id: "initial-normal", at: 0 },
+      { id: "resp-1", at: 30 * 60 * 1000 },
+      { id: "ordinary-1", at: 45 * 60 * 1000 },
+    ]);
+  });
+
+  it("preempted desktop holder in ComputerUseLock.gateAfterProvider re-requests and advances under recurring responsive starts", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const lock = new ComputerUseLock();
+    const base = Date.now();
+    const intervalMs = 45 * 60 * 1000;
+    const pacer = new ProviderPacer(intervalMs, () => Date.now());
+    const starts: Array<{ id: string; at: number }> = [];
+
+    let reRequestHolder: (() => void) | undefined;
+    let holderDeferred = deferred<string>();
+    let holderInterrupted = false;
+
+    const runHolder = () => {
+      return lock.gateAfterProvider(
+        "desktop-holder",
+        false,
+        (start) =>
+          pacer.submit(() => start("desktop-holder"), {
+            responsive: false,
+            threadId: "desktop-holder",
+            enqueueNormal: (fn) => mesh.enqueue(fn),
+          }),
+        async () => {
+          starts.push({ id: "desktop-holder", at: Date.now() - base });
+          return holderDeferred.promise;
+        },
+        () => true,
+        () => {
+          holderInterrupted = true;
+          holderDeferred.resolve("interrupted");
+        },
+        () => {
+          reRequestHolder?.();
+        }
+      );
+    };
+
+    let holderHandle = runHolder();
+    reRequestHolder = () => {
+      holderDeferred = deferred<string>();
+      holderInterrupted = false;
+      holderHandle = runHolder();
+    };
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(starts).toEqual([{ id: "desktop-holder", at: 0 }]);
+
+    // At t=10m, a responsive desktop user arrives and preempts holder
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    const respDesktopDeferred = deferred<string>();
+    const resp1 = lock.gateAfterProvider(
+      "resp-reader",
+      true,
+      (start) =>
+        pacer.submit(() => start("resp-reader"), {
+          responsive: true,
+          threadId: "resp-reader",
+          enqueueNormal: (fn) => mesh.enqueue(fn),
+        }),
+      async () => {
+        starts.push({ id: "resp-reader", at: Date.now() - base });
+        return respDesktopDeferred.promise;
+      },
+      () => true
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(holderInterrupted).toBe(true);
+    await expect(
+      holderHandle instanceof Promise ? holderHandle : holderHandle.result
+    ).resolves.toBe("interrupted");
+
+    // Responsive user finishes at t=10.5m and releases lock
+    await vi.advanceTimersByTimeAsync(30 * 1000);
+    respDesktopDeferred.resolve("resp-done");
+    await expect(resp1 instanceof Promise ? resp1 : resp1.result).resolves.toBe("resp-done");
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Holder has re-requested and is queued in pacer.
+    // At t=30m, another responsive run starts
+    await vi.advanceTimersByTimeAsync(19.5 * 60 * 1000);
+    const resp2 = pacer.submit(async () => "resp-2", {
+      responsive: true,
+      threadId: "resp-2",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "resp-2", at: Date.now() - base }),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(resp2.result).resolves.toBe("resp-2");
+
+    // At t=45m, preempted holder's re-request starts!
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    expect(starts).toEqual([
+      { id: "desktop-holder", at: 0 },
+      { id: "resp-reader", at: 10 * 60 * 1000 },
+      { id: "resp-2", at: 30 * 60 * 1000 },
+      { id: "desktop-holder", at: 45 * 60 * 1000 },
+    ]);
+  });
+
+  it("linked model lane responsive starts do not charge or reset linked provider clock", async () => {
+    const mesh = new ConcurrencyLimiter(2);
+    const base = Date.now();
+    const providerPacer = new ProviderPacer(45 * 60 * 1000, () => Date.now());
+    const modelPacer = new ProviderPacer(20 * 60 * 1000, () => Date.now(), providerPacer);
+    const starts: Array<{ id: string; at: number }> = [];
+
+    await modelPacer.submit(async () => "model-ord-1", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "model-ord-1", at: Date.now() - base }),
+    }).result;
+    expect(starts).toEqual([{ id: "model-ord-1", at: 0 }]);
+
+    const ord2 = modelPacer.submit(async () => "model-ord-2", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "model-ord-2", at: Date.now() - base }),
+    });
+
+    // At t=15m and t=30m, responsive runs start on model lane
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    const resp1 = modelPacer.submit(async () => "resp-1", {
+      responsive: true,
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "resp-1", at: Date.now() - base }),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(resp1.result).resolves.toBe("resp-1");
+
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    const resp2 = modelPacer.submit(async () => "resp-2", {
+      responsive: true,
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "resp-2", at: Date.now() - base }),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(resp2.result).resolves.toBe("resp-2");
+
+    // At t=45m, ordinary run on model lane starts on time
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    expect(ord2.started).toBe(true);
+    await expect(ord2.result).resolves.toBe("model-ord-2");
+    expect(starts).toEqual([
+      { id: "model-ord-1", at: 0 },
+      { id: "resp-1", at: 15 * 60 * 1000 },
+      { id: "resp-2", at: 30 * 60 * 1000 },
+      { id: "model-ord-2", at: 45 * 60 * 1000 },
+    ]);
+  });
+
+  it("setInterval updates apply against the last ordinary start, ignoring intermediate responsive starts", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const base = Date.now();
+    const pacer = new ProviderPacer(40 * 60 * 1000, () => Date.now());
+    const starts: Array<{ id: string; at: number }> = [];
+
+    await pacer.submit(async () => "ord-1", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "ord-1", at: Date.now() - base }),
+    }).result;
+
+    const ord2 = pacer.submit(async () => "ord-2", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "ord-2", at: Date.now() - base }),
+    });
+
+    // Responsive start at t=10m
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    const resp = pacer.submit(async () => "resp", {
+      responsive: true,
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      onStarted: () => starts.push({ id: "resp", at: Date.now() - base }),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(resp.result).resolves.toBe("resp");
+
+    // At t=20m, interval increases to 50m (relative to ord-1 at t=0, next start is at t=50m)
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    pacer.setInterval(50 * 60 * 1000);
+
+    // At t=49m59s, ord2 should still be waiting
+    await vi.advanceTimersByTimeAsync(29 * 60 * 1000 + 59 * 1000);
+    expect(ord2.started).toBe(false);
+
+    // At t=50m, ord2 starts!
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ord2.started).toBe(true);
+    await expect(ord2.result).resolves.toBe("ord-2");
+    expect(starts).toEqual([
+      { id: "ord-1", at: 0 },
+      { id: "resp", at: 10 * 60 * 1000 },
+      { id: "ord-2", at: 50 * 60 * 1000 },
+    ]);
   });
 });

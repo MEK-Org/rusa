@@ -251,9 +251,10 @@ under v1:
 - **The clock is stamped at the actual start.** `start()` sets `lastStartedAt`
   and `nextAvailableAt` at the moment the run really begins
   (`provider-pacer.ts:285-292`), not when the request was admitted.
-- **Responsive runs bypass pacing but still charge the clock.** A responsive
-  request skips the queue entirely (`provider-pacer.ts:173-175`) and lands in
-  `start()`, which advances the clock like any other start.
+- **Responsive runs bypass pacing without charging the ordinary clock.** A responsive
+  request skips the queue entirely (`provider-pacer.ts`) and lands in
+  `start()`, which leaves `lastStartedAt` and `nextAvailableAt` unchanged so
+  recurring responsive starts do not starve queued ordinary work (#962).
 - **Admission order is one leader-local list, not one FIFO per lane.** An
   idle provider lane (nothing queued or staged, no pacing delay left)
   synchronously claims the first compatible unclaimed actor, then the

@@ -38,11 +38,14 @@ interface PacerRequest<T> {
 /**
  * A FIFO, start-to-start provider governor. Normal runs wait for the adaptive
  * interval and then for mesh concurrency; responsive runs bypass both queues.
- * The next interval starts only when the provider invocation actually starts.
+ * Only ordinary runs charge or reset the pacing clock; responsive starts leave
+ * the ordinary pacing clock unchanged so recurring responsive traffic cannot
+ * starve queued ordinary work (#962). The next interval starts only when an
+ * ordinary provider invocation actually starts.
  *
  * A pacer may be linked to a provider-wide pacer (#588): it then paces one
  * model's own quota windows on top of the provider's. It is available only
- * when both clocks allow a start, each of its starts is charged to the
+ * when both clocks allow a start, each of its normal starts is charged to the
  * provider clock as well, and the two lanes hold at most one pending request
  * between them, so a model start can neither skip the provider-wide interval
  * nor stage beside a provider-lane start.
@@ -350,9 +353,11 @@ export class ProviderPacer {
     if (request.state === "started" || request.state === "settled") return;
     request.state = "started";
     const startedAt = this.now();
-    this.lastStartedAt = startedAt;
-    this.nextAvailableAt = startedAt + this.intervalMs;
-    this.linked?.charge(startedAt);
+    if (!request.responsive) {
+      this.lastStartedAt = startedAt;
+      this.nextAvailableAt = startedAt + this.intervalMs;
+      this.linked?.charge(startedAt);
+    }
     request.opts.onStarted?.();
     this.schedule();
     try {
