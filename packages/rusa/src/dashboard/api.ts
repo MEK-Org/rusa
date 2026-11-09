@@ -1487,7 +1487,9 @@ export async function handleMeshApiRequest(
         return true;
       }
 
+      // Closed once the body settles, whether it arrived or the stream failed.
       readBody(req)
+        .finally(startDashboardSubstage("actorChatBodyMs"))
         .then((bodyStr) => {
           let parsed: unknown;
           try {
@@ -1517,9 +1519,15 @@ export async function handleMeshApiRequest(
 
           const fromId = requireOperatorPrincipal(req, res, deps);
           if (!fromId) return;
-          const result = deps.mesh.sendMessage(actorId, body, fromId, sessionId, undefined, {
-            voice,
-          });
+          const endSend = startDashboardSubstage("actorChatSendMs");
+          let result: ReturnType<typeof deps.mesh.sendMessage>;
+          try {
+            result = deps.mesh.sendMessage(actorId, body, fromId, sessionId, undefined, {
+              voice,
+            });
+          } finally {
+            endSend();
+          }
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
           } else {
