@@ -56,8 +56,8 @@ export type DashboardServerPhaseDurations = Partial<Record<DashboardServerPhase,
  * - `actorMetadataMs`: scheduler health, viewer identity and response metadata.
  *
  * - `actorChatBodyMs`: actor chat POST, from starting to read the request body
- *   until the handler resumes with it, including any wait for the client's
- *   bytes.
+ *   until the read settles, whether the body arrived or the stream failed,
+ *   including any wait for the client's bytes.
  * - `actorChatSendMs`: the actor chat POST's synchronous mesh delivery call,
  *   from call until it returns or throws. Present only for a request that
  *   passed body validation and operator resolution.
