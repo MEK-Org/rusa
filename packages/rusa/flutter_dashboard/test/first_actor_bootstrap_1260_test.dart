@@ -115,42 +115,29 @@ void main() {
     });
   });
 
-  testWidgets(
-    'cancelling dismisses the modal until actors exist, and an emptied mesh is offered again',
-    (tester) async {
-      await tester.runAsync(() async {
-        final api = FakeApi();
-        final store = await _startedStore(api);
+  testWidgets('cancelling dismisses the modal for the session', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi();
+      final store = await _startedStore(api);
 
-        await tester.pumpWidget(_harness(store));
-        await tester.pump(const Duration(milliseconds: 100));
-        expect(find.text('Create your first actor'), findsOneWidget);
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.text('Create your first actor'), findsOneWidget);
 
-        await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
-        await tester.pump(const Duration(milliseconds: 100));
-        expect(find.text('Create your first actor'), findsNothing);
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.text('Create your first actor'), findsNothing);
 
-        // The mesh is still empty, but the dismissal holds: no re-offer.
-        await tester.pump(const Duration(milliseconds: 300));
-        expect(find.text('Create your first actor'), findsNothing);
-
-        // An actor appears (e.g. created elsewhere) and is then retired:
-        // the gate re-arms and the emptied mesh is offered again.
-        api.threadsResult = [makeThread('actor-1', created: 't0')];
-        await store.refreshThreads();
-        await tester.pump(const Duration(milliseconds: 100));
-        expect(find.text('Create your first actor'), findsNothing);
-
-        api.threadsResult = [];
-        await store.refreshThreads();
-        // The offer runs on the store's async stream delivery; give the real
-        // async zone a second turn before expecting the dialog.
-        await tester.pump(const Duration(milliseconds: 100));
-        await tester.pump(const Duration(milliseconds: 100));
-        expect(find.text('Create your first actor'), findsOneWidget);
-      });
-    },
-  );
+      // The mesh is still empty, and subsequent snapshots do not re-offer:
+      // dismissal holds for the session.
+      await store.refreshThreads();
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.text('Create your first actor'), findsNothing);
+    });
+  });
 
   testWidgets('a retired-only mesh counts as non-empty and sees no modal', (
     tester,

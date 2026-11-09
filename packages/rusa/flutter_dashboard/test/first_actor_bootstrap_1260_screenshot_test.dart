@@ -76,8 +76,10 @@ void main() {
             ),
           ),
         );
+        // Allow the dialog route transition (entrance fade) to settle fully
+        // before capturing, so the opaque dialog surface is rendered.
         await tester.pump(const Duration(milliseconds: 100));
-        await tester.pump(const Duration(milliseconds: 100));
+        await tester.pump(const Duration(milliseconds: 500));
 
         // Empty mesh: the first-actor modal is up over the dashboard.
         expect(find.text('Create your first actor'), findsOneWidget);

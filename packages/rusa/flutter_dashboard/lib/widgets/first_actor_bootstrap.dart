@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:flutter/widgets.dart';
 
-import '../models.dart';
 import '../store.dart';
 import 'actor_tree.dart';
 
@@ -22,8 +21,8 @@ const String kFirstActorDialogIntro =
 ///
 /// Once the first authoritative actor snapshot has landed and the mesh has no
 /// actors at all, offer the shared spawn dialog automatically. A non-empty
-/// mesh — including one whose only actors are retired — never sees it, and a
-/// mesh that empties after actors existed offers it again.
+/// mesh — including one whose only actors are retired — never sees it, and
+/// cancel dismisses for the session.
 ///
 /// Lives below [DashboardBody]'s views so every destination (Overview, Actors,
 /// …) gets the same behaviour, and only in the authenticated tree: the
@@ -56,20 +55,11 @@ class _FirstActorBootstrapState extends State<FirstActorBootstrap> {
     // post-frame callback because a dialog cannot be shown during build.
     _subs
       ..add(widget.store.actorsLoaded.listen((_) => _maybeOffer()))
-      ..add(widget.store.actorStates.listen(_onActors));
+      ..add(widget.store.actorStates.listen((_) => _maybeOffer()));
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _framePainted = true;
       _maybeOffer();
     });
-  }
-
-  void _onActors(ActorStateSnapshot snapshot) {
-    // Any actor at all re-arms the gate: retiring the last actor later brings
-    // the modal back.
-    if (snapshot.actors.isNotEmpty && _dismissed) {
-      setState(() => _dismissed = false);
-    }
-    _maybeOffer();
   }
 
   Future<void> _maybeOffer() async {
@@ -87,9 +77,8 @@ class _FirstActorBootstrapState extends State<FirstActorBootstrap> {
         submitLabel: 'Create',
       );
       // A dismissal — cancel, barrier tap, or a failed spawn already reported
-      // as a snackbar — does not nag again while the mesh stays empty. The
-      // tree's spawn control remains available, and the gate re-arms once any
-      // actor exists.
+      // as a snackbar — does not nag again; cancel dismisses for the session.
+      // The tree's spawn control remains available.
       if (!created && mounted) setState(() => _dismissed = true);
     } finally {
       _offering = false;
