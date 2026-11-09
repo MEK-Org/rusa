@@ -1595,8 +1595,7 @@ async function composeStart(
 
   // The configured actor's display handle: what every root-identity surface
   // (signing byline, dashboard, avatar, commitment ledger) routes through.
-  // Stored on its row by the import, so a later `rootActor.handle` edit does
-  // not rename it.
+  // Stored on its row in the database.
   const rootHandle =
     rootId === undefined ? undefined : (importedRoot?.displayHandle ?? generateHandle(rootId));
   // The root's durable pool lives on its actor record, where `set_actor_model`

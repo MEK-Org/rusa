@@ -548,7 +548,7 @@ export function generateHandle(uuid: string): string {
 }
 
 /**
- * Default standing charter for the root actor when `rootActor.charter` is not explicitly set.
+ * Default standing charter for the root actor.
  */
 export const DEFAULT_ROOT_CHARTER =
   "Root Orchestrator: Coordinates worker subagents, triages incoming events, maintains project goals, and oversees codebase tasks.";

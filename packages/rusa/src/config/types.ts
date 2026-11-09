@@ -2,7 +2,6 @@
  * Configuration types for rusa.
  */
 
-import type { ContextConfig } from "../actor/actor-record.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
@@ -399,53 +398,6 @@ export interface LoggingConfig {
    * The `RUSA_LOG_FORMAT` environment variable overrides it.
    */
   format?: string;
-}
-
-export interface RootActorConfig {
-  /**
-   * Which configured provider the root actor runs on — a key in `providers`
-   * (e.g. "antigravity", "claude"). The root model is config-driven and
-   * intentionally independent of persona/quota model routing.
-   */
-  provider: string;
-  /**
-   * Exact model id for the root provider, passed to the CLI. Root launches are
-   * always pinned so their durable launch record is auditable.
-   */
-  model: string;
-  /**
-   * Optional provider-native reasoning level, independent of `model`.
-   * Omit to preserve the provider/model default.
-   */
-  effort?: string;
-  /**
-   * Working-memory ownership and policy for the root. Omit for the native,
-   * provider-session-backed default; portable roots run stateless and receive
-   * mesh-managed context using the same ledger/tail modes as spawned actors.
-   */
-  context?: ContextConfig;
-  /**
-   * The root actor's standing charter (its identity + how it should behave),
-   * prepended to every wake. Per-instance customization — the identity is the
-   * specific instance, not the "rusa" system. Omit to use the built-in
-   * default (`ROOT_ACTOR_CHARTER`).
-   */
-  charter?: string;
-  /**
-   * Optional display handle for this instance's root actor, overriding the
-   * default derived from `generateHandle("root")` (`root-actor`). Lets a
-   * secondary instance (e.g. a staging deploy sharing the same bot account)
-   * present under its own identity — GitHub signing byline, dashboard display,
-   * avatar — instead of the default persona. Omit to leave every root-identity
-   * surface unchanged.
-   */
-  handle?: string;
-  /**
-   * Optional path to a root avatar image, overriding the bundled default
-   * (`assets/silicon-familiar.jpg`). Falls back to the bundled image when
-   * unset or when the path doesn't resolve to an existing file.
-   */
-  avatar?: string;
 }
 
 /** Walkie-talkie provider and model settings. No secrets live here. */

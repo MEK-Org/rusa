@@ -177,9 +177,8 @@ brands its tab and PWA: the root handle becomes the launcher name
 from the dashboard) becomes the launcher icon. Each
 falls back on its own to the built-in "Rusa" name and dashboard icon. The
 application id is derived only: `com.<handle>.dashboard` with every character
-outside `[A-Za-z0-9_]` stripped, or `org.mek.rusa.dashboard` when no handle is
-configured. A root handle of `root-actor`, the default handle, keeps the "Rusa"
-name but still derives `com.rootactor.dashboard`. There is no config override; a handle that leaves a segment not
+outside `[A-Za-z0-9_]` stripped, or `org.mek.rusa.dashboard` when no root actor is
+imported or when its handle is the default `root-actor`. There is no config override; a handle that leaves a segment not
 starting with a letter (empty, or digit- or underscore-leading) fails the
 build. The build prints what it resolved. A new application id
 installs as a separate app (uninstall the old one by hand) and needs its own
