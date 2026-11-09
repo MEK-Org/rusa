@@ -867,6 +867,15 @@ export interface DashboardPairedRequestDurationGroup {
    * the two are never added; absent when no pair carried phases.
    */
   clientPhaseMs?: DashboardClientPhaseDistributions;
+  /**
+   * Per pair, requestMs minus (queueMs + firstByteMs + bodyMs): the part of
+   * the client's dispatch-to-body time outside the browser's fetchStart to
+   * responseEnd span (#990). Computed pair by pair, because percentiles of
+   * different requests cannot be subtracted. Phases are rounded to whole
+   * milliseconds separately, so a value can be a millisecond or two below
+   * zero. Coverage counts pairs that carried phases; absent when none did.
+   */
+  clientRemainderMs?: DashboardPhaseDistribution;
 }
 
 export type DashboardClientPhaseDistributions = Partial<
@@ -974,6 +983,7 @@ function pairedPhases(cohort: Array<DashboardServerPhaseDurations | undefined>):
 
 function pairedClientPhases(cohort: DashboardClientRequestTiming[]): {
   clientPhaseMs?: DashboardClientPhaseDistributions;
+  clientRemainderMs?: DashboardPhaseDistribution;
 } {
   const clientPhaseMs: DashboardClientPhaseDistributions = {};
   for (const phase of DASHBOARD_CLIENT_REQUEST_PHASES) {
@@ -984,7 +994,24 @@ function pairedClientPhases(cohort: DashboardClientRequestTiming[]): {
       coverage: coverage(values.length, cohort.length),
     };
   }
-  return Object.keys(clientPhaseMs).length > 0 ? { clientPhaseMs } : {};
+  // Stored phases are all-or-none (a partial set is dropped on read), so a
+  // pair with queueMs also has firstByteMs and bodyMs.
+  const remainders = cohort.flatMap(({ requestMs, queueMs, firstByteMs, bodyMs }) =>
+    queueMs === undefined || firstByteMs === undefined || bodyMs === undefined
+      ? []
+      : [requestMs - (queueMs + firstByteMs + bodyMs)]
+  );
+  return {
+    ...(Object.keys(clientPhaseMs).length > 0 ? { clientPhaseMs } : {}),
+    ...(remainders.length > 0
+      ? {
+          clientRemainderMs: {
+            ...distribution(remainders),
+            coverage: coverage(remainders.length, cohort.length),
+          },
+        }
+      : {}),
+  };
 }
 
 function serverPhaseGroups(
