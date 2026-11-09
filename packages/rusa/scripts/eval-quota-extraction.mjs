@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import Database from "better-sqlite3";
+import { readHostSecret } from "../build/maintenance/config/secrets.js";
 import {
   parseAgyQuota,
   parseClaudeQuota,
@@ -13,10 +14,12 @@ const PROVIDERS = ["codex", "claude", "agy", "kimi"];
 function usage() {
   return [
     "Usage:",
-    "  GEMINI_API_KEY=... pnpm --filter rusa run eval:quota -- \\",
+    "  pnpm --filter rusa run eval:quota -- \\",
     "    --database /absolute/path/to/quota.db \\",
     "    --labels /absolute/path/to/quota-labels.json \\",
     "    --report /absolute/path/to/quota-eval.md [--repeat 3]",
+    "",
+    "Reads GEMINI_API_KEY from $RUSA_HOME/secrets/gemini-api-key or the host environment.",
     "",
     "The label file is a JSON array of {id, provider, configuredModels?, expected:{status, limits}} records.",
     "configuredModels is the provider's canonical catalog ({identifier, displayLabel?, passable?}); it is supplied to the production parser for model-window classification.",
@@ -203,8 +206,12 @@ async function main() {
     process.stdout.write(`${usage()}\n`);
     return;
   }
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) throw new Error("GEMINI_API_KEY is required");
+  // File takes precedence over environment fallback per #1258 proposal.
+  const apiKey = (readHostSecret("gemini-api-key") ?? process.env.GEMINI_API_KEY)?.trim();
+  if (!apiKey)
+    throw new Error(
+      "GEMINI_API_KEY is required (set in environment or $RUSA_HOME/secrets/gemini-api-key)"
+    );
   const labels = JSON.parse(await readFile(args.labels, "utf8"));
   validateLabels(labels);
 

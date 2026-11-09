@@ -15,6 +15,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import type { Logger } from "../observability/logger.js";
+import type { ActorBwrapResult } from "./sandbox.js";
 
 const execSyncMock = vi.fn();
 const execFileSyncMock = vi.fn();
@@ -24,6 +25,21 @@ function expectSetenv(args: string[], name: string, value: string) {
   expect(index).toBeGreaterThan(-1);
   expect(args[index - 1]).toBe("--setenv");
   expect(args[index + 1]).toBe(value);
+}
+
+function expectBareCommand(
+  spawnArgs: string[],
+  command: string,
+  secretValues: string | string[] = []
+) {
+  const sep = spawnArgs.indexOf("--");
+  expect(spawnArgs.slice(sep + 1)).toEqual([command]);
+  const joined = spawnArgs.join("\0");
+  const values = Array.isArray(secretValues) ? secretValues : [secretValues];
+  for (const value of values) {
+    expect(joined).not.toContain(value);
+  }
+  expect(spawnArgs).not.toContain("rusa-secrets-entrypoint");
 }
 
 function defaultExecSyncResponse(command: string): string | null {
@@ -588,6 +604,7 @@ describe("sandbox bwrap args", () => {
     const { args } = buildActorBwrapArgs(actorDir, "antigravity");
 
     expect(args.filter((_, i) => args[i - 1] === "--tmpfs")).toContain(auditDir);
+    expectSetenv(args, "RUSA_HOME", mcHome);
     for (let i = 0; i < args.length; i += 1) {
       if (args[i] === "--bind" || args[i] === "--ro-bind") {
         expect(args[i + 1]).not.toBe(auditDir);
@@ -1203,8 +1220,9 @@ describe("sandbox bwrap args", () => {
       writeFileSync(join(secretsDir, "webhook-secret"), "hook_SECRET\n", { mode: 0o600 });
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-      const { buildActorBwrapArgs } = await import("./sandbox.js");
-      const { args, commandPrefix } = buildActorBwrapArgs(actorDir, "antigravity");
+      const { buildActorBwrapArgs, buildActorBwrapCommand } = await import("./sandbox.js");
+      const result = buildActorBwrapArgs(actorDir, "antigravity");
+      const { args } = result;
 
       expect(args.filter((_, i) => args[i - 1] === "--tmpfs")).toContain(secretsDir);
       const unsets = args.filter((_, i) => args[i - 1] === "--unsetenv");
@@ -1214,7 +1232,10 @@ describe("sandbox bwrap args", () => {
       expect(args.some((a, i) => a === "--setenv" && args[i + 1] === "MISTRAL_API_KEY")).toBe(
         false
       );
-      expect(commandPrefix).toEqual([]);
+      expectBareCommand(buildActorBwrapCommand(result, "/bin/true", []), "/bin/true", [
+        "AIza_SECRET",
+        "hook_SECRET",
+      ]);
       // No grant → nothing from the secrets dir is bound back through the mask.
       for (let i = 0; i < args.length; i += 1) {
         if (args[i] === "--bind" || args[i] === "--ro-bind") {
@@ -1237,7 +1258,35 @@ describe("sandbox bwrap args", () => {
       warnSpy.mockRestore();
     });
 
-    it("ro-binds the real gemini-api-key back over its masked path — AFTER the tmpfs — when the actor holds an active secret:gemini-api-key grant and exports it", async () => {
+    it("ro-binds glass-goals-password when granted and unsets GLASS_GOALS_PASSWORD without entrypoint re-export", async () => {
+      const { mcHome, actorDir, secretsDir } = makeWorkerHome();
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      const passwordPath = join(secretsDir, "glass-goals-password");
+      writeFileSync(passwordPath, "secret-pass-12345\n", { mode: 0o600 });
+      seedGrant(mcHome, ACTOR_ID, "secret:glass-goals-password");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs, buildActorBwrapCommand } = await import("./sandbox.js");
+      const result = buildActorBwrapArgs(actorDir, "antigravity");
+      const { args } = result;
+
+      const tmpfsIndex = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === secretsDir);
+      expect(tmpfsIndex).toBeGreaterThan(-1);
+      const bindIndex = args.findIndex(
+        (a, i) => a === "--ro-bind" && args[i + 1] === passwordPath && args[i + 2] === passwordPath
+      );
+      expect(bindIndex).toBeGreaterThan(tmpfsIndex);
+      const unsets = args.filter((_, i) => args[i - 1] === "--unsetenv");
+      expect(unsets).toContain("GLASS_GOALS_PASSWORD");
+      expectBareCommand(
+        buildActorBwrapCommand(result, "/bin/true", []),
+        "/bin/true",
+        "secret-pass-12345"
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("ro-binds the real gemini-api-key back over its masked path — AFTER the tmpfs — when the actor holds an active secret:gemini-api-key grant, without exporting it", async () => {
       const { mcHome, actorDir, secretsDir } = makeWorkerHome();
       mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
       const geminiKeyPath = join(secretsDir, "gemini-api-key");
@@ -1246,8 +1295,9 @@ describe("sandbox bwrap args", () => {
       seedGrant(mcHome, ACTOR_ID, "secret:gemini-api-key");
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-      const { buildActorBwrapArgs } = await import("./sandbox.js");
-      const { args, commandPrefix } = buildActorBwrapArgs(actorDir, "antigravity");
+      const { buildActorBwrapArgs, buildActorBwrapCommand } = await import("./sandbox.js");
+      const result = buildActorBwrapArgs(actorDir, "antigravity");
+      const { args } = result;
 
       const tmpfsIndex = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === secretsDir);
       expect(tmpfsIndex).toBeGreaterThan(-1);
@@ -1255,7 +1305,6 @@ describe("sandbox bwrap args", () => {
         (a, i) =>
           a === "--ro-bind" && args[i + 1] === geminiKeyPath && args[i + 2] === geminiKeyPath
       );
-      expect(keyBindIndex).toBeGreaterThan(-1);
       // bwrap applies mounts in argument order: the single-file re-bind must come
       // AFTER the directory tmpfs, or the mask would swallow it.
       expect(keyBindIndex).toBeGreaterThan(tmpfsIndex);
@@ -1266,18 +1315,16 @@ describe("sandbox bwrap args", () => {
           expect(args[i + 2]).not.toBe(join(secretsDir, "glass-goals-password"));
         }
       }
-      // With the generic mechanism, the gemini key is also exported.
-      expect(commandPrefix).toEqual([
-        "/bin/sh",
-        "-c",
-        expect.stringContaining('GEMINI_API_KEY=$(/bin/cat -- "$1")'),
-        "rusa-secrets-entrypoint",
-        geminiKeyPath,
-      ]);
+      expectBareCommand(
+        buildActorBwrapCommand(result, "/bin/true", []),
+        "/bin/true",
+        "AIza_SECRET"
+      );
+      expect(args.some((a, i) => a === "--setenv" && args[i + 1] === "GEMINI_API_KEY")).toBe(false);
       warnSpy.mockRestore();
     });
 
-    it("ro-binds mistral-api-key after the mask and defers MISTRAL_API_KEY resolution to an in-sandbox entrypoint", async () => {
+    it("ro-binds mistral-api-key after the mask without exporting MISTRAL_API_KEY or wrapping with an entrypoint", async () => {
       const { mcHome, actorDir, secretsDir } = makeWorkerHome();
       mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
       const mistralKeyPath = `${secretsDir}/mistral-api-key`;
@@ -1288,7 +1335,7 @@ describe("sandbox bwrap args", () => {
 
       const { buildActorBwrapArgs, buildActorBwrapCommand } = await import("./sandbox.js");
       const result = buildActorBwrapArgs(actorDir, "antigravity");
-      const { args, commandPrefix } = result;
+      const { args } = result;
 
       const tmpfsIndex = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === secretsDir);
       const keyBindIndex = args.findIndex(
@@ -1299,19 +1346,14 @@ describe("sandbox bwrap args", () => {
       expect(args.some((a, i) => a === "--setenv" && args[i + 1] === "MISTRAL_API_KEY")).toBe(
         false
       );
-      expect(commandPrefix).toEqual([
-        "/bin/sh",
-        "-c",
-        expect.stringContaining('MISTRAL_API_KEY=$(/bin/cat -- "$1")'),
-        "rusa-secrets-entrypoint",
-        mistralKeyPath,
-      ]);
 
       // This is the complete host-side bwrap/spawn argv. The fixture plaintext
       // must not appear anywhere on it; only the well-known bound filename may.
-      const spawnArgs = buildActorBwrapCommand(result, "/usr/bin/env", []);
-      expect(spawnArgs).not.toContain(fixtureValue);
-      expect(spawnArgs.join("\0")).not.toContain(fixtureValue);
+      expectBareCommand(
+        buildActorBwrapCommand(result, "/usr/bin/env", []),
+        "/usr/bin/env",
+        fixtureValue
+      );
       warnSpy.mockRestore();
     });
 
@@ -1375,9 +1417,13 @@ describe("sandbox bwrap args", () => {
       // granted". The recorder is installed on the same module instance the
       // spawn uses (vi.resetModules gives every test a fresh one).
       type SkipRecord = { level: string; event: string; fields?: Record<string, unknown> };
-      async function spawnArgs(actorDir: string) {
+      async function spawnArgs(
+        actorDir: string
+      ): Promise<ActorBwrapResult & { records: SkipRecord[]; argv: string[] }> {
         const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-        const { buildActorBwrapArgs, setSandboxLogger } = await import("./sandbox.js");
+        const { buildActorBwrapArgs, buildActorBwrapCommand, setSandboxLogger } = await import(
+          "./sandbox.js"
+        );
         const records: SkipRecord[] = [];
         const record = (level: string) => (event: string, fields?: Record<string, unknown>) =>
           void records.push({ level, event, fields });
@@ -1390,7 +1436,9 @@ describe("sandbox bwrap args", () => {
         };
         setSandboxLogger(recorder);
         try {
-          return { ...buildActorBwrapArgs(actorDir, "antigravity"), records };
+          const res = buildActorBwrapArgs(actorDir, "antigravity");
+          const argv = buildActorBwrapCommand(res, "/bin/true", []);
+          return { ...res, records, argv };
         } finally {
           setSandboxLogger(undefined);
           warnSpy.mockRestore();
@@ -1410,11 +1458,11 @@ describe("sandbox bwrap args", () => {
       }
 
       function expectMaskedOnly(
-        args: string[],
-        commandPrefix: string[],
+        result: ActorBwrapResult & { argv: string[] },
         secretsDir: string,
         geminiKeyPath: string
       ) {
+        const { args, argv } = result;
         expect(args.filter((_, i) => args[i - 1] === "--tmpfs")).toContain(secretsDir);
         for (let i = 0; i < args.length; i += 1) {
           if (args[i] === "--bind" || args[i] === "--ro-bind") {
@@ -1422,7 +1470,7 @@ describe("sandbox bwrap args", () => {
             expect(args[i + 2]).not.toContain(secretsDir);
           }
         }
-        expect(commandPrefix).not.toContain("rusa-secrets-entrypoint");
+        expectBareCommand(argv, "/bin/true", "synthetic-gemini-value");
       }
 
       it("file → symlink escaping the secrets dir: not bound, mask holds", async () => {
@@ -1434,15 +1482,15 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         symlinkSync(outsideFile, geminiKeyPath);
 
-        const { args, commandPrefix, records } = await spawnArgs(actorDir);
-        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        const res = await spawnArgs(actorDir);
+        expectMaskedOnly(res, secretsDir, geminiKeyPath);
         // The escape target must not be bound anywhere either.
-        for (let i = 0; i < args.length; i += 1) {
-          if (args[i] === "--bind" || args[i] === "--ro-bind") {
-            expect(args[i + 1]).not.toBe(outsideFile);
+        for (let i = 0; i < res.args.length; i += 1) {
+          if (res.args[i] === "--bind" || res.args[i] === "--ro-bind") {
+            expect(res.args[i + 1]).not.toBe(outsideFile);
           }
         }
-        expectSkipRecorded(records, "gemini-api-key", /symlink escapes secrets directory/);
+        expectSkipRecorded(res.records, "gemini-api-key", /symlink escapes secrets directory/);
       });
 
       it("file → directory: not bound, mask holds", async () => {
@@ -1451,9 +1499,9 @@ describe("sandbox bwrap args", () => {
         mkdirSync(geminiKeyPath);
         writeFileSync(join(geminiKeyPath, "nested"), "nested-content\n");
 
-        const { args, commandPrefix, records } = await spawnArgs(actorDir);
-        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
-        expectSkipRecorded(records, "gemini-api-key", /must resolve to a regular file/);
+        const res = await spawnArgs(actorDir);
+        expectMaskedOnly(res, secretsDir, geminiKeyPath);
+        expectSkipRecorded(res.records, "gemini-api-key", /must resolve to a regular file/);
       });
 
       it("file → dangling symlink: not bound, mask holds", async () => {
@@ -1461,18 +1509,18 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         symlinkSync(join(secretsDir, "does-not-exist"), geminiKeyPath);
 
-        const { args, commandPrefix, records } = await spawnArgs(actorDir);
-        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
-        expectSkipRecorded(records, "gemini-api-key", /broken symlink/);
+        const res = await spawnArgs(actorDir);
+        expectMaskedOnly(res, secretsDir, geminiKeyPath);
+        expectSkipRecorded(res.records, "gemini-api-key", /broken symlink/);
       });
 
       it("file deleted after the grant: not bound, and the refusal is recorded (unlike a revoke, which has no grant row)", async () => {
         const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
         rmSync(geminiKeyPath);
 
-        const { args, commandPrefix, records } = await spawnArgs(actorDir);
-        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
-        expectSkipRecorded(records, "gemini-api-key", /secret file does not exist/);
+        const res = await spawnArgs(actorDir);
+        expectMaskedOnly(res, secretsDir, geminiKeyPath);
+        expectSkipRecorded(res.records, "gemini-api-key", /secret file does not exist/);
       });
 
       it("file → symlink to a sibling regular file INSIDE the secrets dir: bound from the resolved path", async () => {
@@ -1482,7 +1530,8 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         symlinkSync(siblingPath, geminiKeyPath);
 
-        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        const res = await spawnArgs(actorDir);
+        const { args, records } = res;
         const bind = args.findIndex(
           (a, i) =>
             a === "--ro-bind" &&
@@ -1490,7 +1539,7 @@ describe("sandbox bwrap args", () => {
             args[i + 2] === geminiKeyPath
         );
         expect(bind).toBeGreaterThan(-1);
-        expect(commandPrefix).toContain("rusa-secrets-entrypoint");
+        expectBareCommand(res.argv, "/bin/true", "synthetic-rotated-value");
         expect(records.filter((r) => r.event === "secret_grant_skipped_at_spawn")).toEqual([]);
       });
 
@@ -1509,7 +1558,8 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         mkdirSync(geminiKeyPath);
 
-        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        const res = await spawnArgs(actorDir);
+        const { args, records } = res;
         for (let i = 0; i < args.length; i += 1) {
           if (args[i] === "--bind" || args[i] === "--ro-bind") {
             expect(args[i + 2]).not.toBe(geminiKeyPath);
@@ -1525,14 +1575,7 @@ describe("sandbox bwrap args", () => {
               args[i + 2] === mistralKeyPath
           )
         ).toBeGreaterThan(-1);
-        expect(commandPrefix).toEqual([
-          "/bin/sh",
-          "-c",
-          expect.stringContaining('MISTRAL_API_KEY=$(/bin/cat -- "$1")'),
-          "rusa-secrets-entrypoint",
-          mistralKeyPath,
-        ]);
-        expect(commandPrefix.join("\0")).not.toContain("GEMINI_API_KEY");
+        expectBareCommand(res.argv, "/bin/true", "synthetic-mistral-value");
       });
     });
 

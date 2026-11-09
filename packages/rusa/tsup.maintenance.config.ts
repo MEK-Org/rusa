@@ -24,6 +24,8 @@ export default defineConfig({
     "commands/coordinator-path-check": "src/commands/coordinator-path-check.ts",
     // `scripts/build-android.mjs` resolves the APK's branding from config.yaml.
     "dashboard/android-branding": "src/dashboard/android-branding.ts",
+    // Maintenance scripts read secrets via readHostSecret.
+    "config/secrets": "src/config/secrets.ts",
   },
   format: ["esm"],
   target: "node20",

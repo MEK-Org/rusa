@@ -515,7 +515,7 @@ export interface RusaConfig {
   geminiApiKey?: string;
   /** Host-only ElevenLabs key; secrets/elevenlabs-api-key takes precedence. */
   elevenlabsApiKey?: string;
-  /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
+  /** Mistral API key. Optional; grantable to sandboxed actors as secret:mistral-api-key ($RUSA_HOME/secrets/mistral-api-key). */
   mistralApiKey?: string;
   /**
    * Optional basename of the host-plane JEV credential file directly under

@@ -1,6 +1,9 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { GeminiRecording } from "./gemini.mjs";
@@ -169,12 +172,24 @@ export function createSpike({
   };
 }
 
+function readHostSecret(name) {
+  try {
+    const rusaHome = process.env.RUSA_HOME || join(homedir(), ".rusa");
+    return readFileSync(join(rusaHome, "secrets", name), "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  if (!process.env.GEMINI_API_KEY) {
-    console.error("GEMINI_API_KEY is required in the server environment");
+  const apiKey = (readHostSecret("gemini-api-key") ?? process.env.GEMINI_API_KEY)?.trim();
+  if (!apiKey) {
+    console.error(
+      "GEMINI_API_KEY is required in the server environment or $RUSA_HOME/secrets/gemini-api-key"
+    );
     process.exitCode = 1;
   } else {
-    const spike = createSpike({ apiKey: process.env.GEMINI_API_KEY });
+    const spike = createSpike({ apiKey });
     spike.server.listen(8771, "127.0.0.1", () => {
       console.log(`Open http://localhost:8771/#${spike.token}`);
       console.log(
