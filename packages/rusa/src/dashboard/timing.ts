@@ -30,6 +30,25 @@ export const DASHBOARD_TIMING_PRUNE_BATCH_RECORDS = 512;
 
 type TimingSource = "server" | "client";
 
+/**
+ * Browser Resource Timing phases a client may attach to one paired request
+ * (#990): queue (fetchStart→requestStart, which contains connect), connect
+ * (TLS included), first byte (requestStart→responseStart) and body
+ * (responseStart→responseEnd). All four or none, as integer milliseconds.
+ */
+export const DASHBOARD_CLIENT_REQUEST_PHASES = [
+  "queueMs",
+  "connectMs",
+  "firstByteMs",
+  "bodyMs",
+] as const;
+export type DashboardClientRequestPhase = (typeof DASHBOARD_CLIENT_REQUEST_PHASES)[number];
+
+export type DashboardClientRequestTiming = {
+  requestId: string;
+  requestMs: number;
+} & Partial<Record<DashboardClientRequestPhase, number>>;
+
 const SERVER_LABELS = [
   "dashboard_config",
   "mesh_threads",
@@ -124,9 +143,10 @@ export interface DashboardTimingPayload {
   /**
    * Client-observed dispatch-through-body-consumption durations. These are
    * optional so existing v1 client records remain readable without invented
-   * measurements.
+   * measurements. Browser phases ride on an entry without a version bump: a
+   * reader that predates them ignores the extra keys and keeps the row.
    */
-  requestTimings?: Array<{ requestId: string; requestMs: number }>;
+  requestTimings?: DashboardClientRequestTiming[];
   /** Server-only fixed sub-operation; absent on records that predate it. */
   operation?: DashboardTimingOperation;
   /**
@@ -155,7 +175,7 @@ export interface DashboardClientTimingInput {
   interaction: (typeof CLIENT_LABELS)[number];
   durationMs: number;
   requestIds: string[];
-  requestTimings?: Array<{ requestId: string; requestMs: number }>;
+  requestTimings?: DashboardClientRequestTiming[];
   outcome?: "success" | "failure";
 }
 
@@ -186,6 +206,25 @@ function isUuid(value: unknown): value is string {
     typeof value === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
   );
+}
+
+/**
+ * The browser phases of one stored or posted request timing: `{}` when none
+ * were sent, null when they are malformed or only some of the four are present.
+ */
+function parseClientRequestPhases(
+  entry: Record<string, unknown>
+): Partial<Record<DashboardClientRequestPhase, number>> | null {
+  const present = DASHBOARD_CLIENT_REQUEST_PHASES.filter((phase) => entry[phase] !== undefined);
+  if (present.length === 0) return {};
+  if (present.length !== DASHBOARD_CLIENT_REQUEST_PHASES.length) return null;
+  const phases: Partial<Record<DashboardClientRequestPhase, number>> = {};
+  for (const phase of DASHBOARD_CLIENT_REQUEST_PHASES) {
+    const value = entry[phase];
+    if (!isIntegerMilliseconds(value)) return null;
+    phases[phase] = value;
+  }
+  return phases;
 }
 
 function hasLabel(value: unknown, labels: readonly string[]): value is DashboardTimingLabel {
@@ -297,7 +336,7 @@ export function parseDashboardClientTiming(input: unknown): DashboardClientTimin
   if (value.outcome !== undefined && value.outcome !== "success" && value.outcome !== "failure")
     return null;
   const requestIds = [...new Set(value.requestIds)];
-  let requestTimings: Array<{ requestId: string; requestMs: number }> | undefined;
+  let requestTimings: DashboardClientRequestTiming[] | undefined;
   if (value.requestTimings !== undefined) {
     if (
       !Array.isArray(value.requestTimings) ||
@@ -312,21 +351,28 @@ export function parseDashboardClientTiming(input: unknown): DashboardClientTimin
         !timing ||
         typeof timing !== "object" ||
         Array.isArray(timing) ||
-        !Object.keys(timing).every((key) => ["requestId", "requestMs"].includes(key))
+        !Object.keys(timing).every(
+          (key) =>
+            key === "requestId" ||
+            key === "requestMs" ||
+            (DASHBOARD_CLIENT_REQUEST_PHASES as readonly string[]).includes(key)
+        )
       ) {
         return null;
       }
       const entry = timing as Record<string, unknown>;
+      const phases = parseClientRequestPhases(entry);
       if (
         !isUuid(entry.requestId) ||
         !requestIds.includes(entry.requestId) ||
         !isIntegerMilliseconds(entry.requestMs) ||
-        seen.has(entry.requestId)
+        seen.has(entry.requestId) ||
+        !phases
       ) {
         return null;
       }
       seen.add(entry.requestId);
-      requestTimings.push({ requestId: entry.requestId, requestMs: entry.requestMs });
+      requestTimings.push({ requestId: entry.requestId, requestMs: entry.requestMs, ...phases });
     }
   }
   return {
@@ -342,6 +388,8 @@ interface ParsedTiming {
   payload: DashboardTimingPayload;
   /** The row carried `substages` that failed validation; only that field was dropped. */
   unreadableSubstages: boolean;
+  /** A request timing carried malformed browser phases; only those phases were dropped. */
+  unreadableClientPhases: boolean;
 }
 
 function parsePayload(event: MeshEvent): ParsedTiming | null {
@@ -409,6 +457,10 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
     }
     const substages =
       rawSubstages === undefined || !isRequestRow ? undefined : parseSubstages(rawSubstages);
+    // Malformed phases cost only themselves, like substages (#990).
+    const requestPhases = requestTimings?.map((timing) =>
+      parseClientRequestPhases(timing as Record<string, unknown>)
+    );
     // Writers never store an empty object; read one as absent, not as measured.
     const measured = substages && Object.keys(substages).length > 0 ? substages : undefined;
     const payload: DashboardTimingPayload = {
@@ -425,9 +477,10 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
       ...(requestIds ? { requestIds } : {}),
       ...(requestTimings
         ? {
-            requestTimings: requestTimings.map((timing) => ({
+            requestTimings: requestTimings.map((timing, index) => ({
               requestId: (timing as { requestId: string }).requestId,
               requestMs: (timing as { requestMs: number }).requestMs,
+              ...requestPhases?.[index],
             })),
           }
         : {}),
@@ -439,9 +492,13 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
       bytes,
       outcome,
     };
-    // Substages are only written on v2 request rows; anywhere else they are
-    // as unreadable as a malformed object, and equally never cost the row.
-    return { payload, unreadableSubstages: rawSubstages !== undefined && !substages };
+    return {
+      payload,
+      // Substages are only written on v2 request rows; anywhere else they are
+      // as unreadable as a malformed object, and equally never cost the row.
+      unreadableSubstages: rawSubstages !== undefined && !substages,
+      unreadableClientPhases: requestPhases?.includes(null) ?? false,
+    };
   } catch {
     return null;
   }
@@ -612,6 +669,7 @@ export class DashboardTimingRecorder {
           this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS + RETENTION_BOUNDARY_SLACK_MS,
         unreadableRecords: events.length - allRows.length,
         unreadableSubstages: parsed.filter((timing) => timing.unreadableSubstages).length,
+        unreadableClientPhases: parsed.filter((timing) => timing.unreadableClientPhases).length,
       },
     };
   }
@@ -757,6 +815,8 @@ export interface DashboardTimingWindow {
   unreadableRecords: number;
   /** Rows whose malformed `substages` alone was dropped; each still counts everywhere else. */
   unreadableSubstages: number;
+  /** Rows with a request timing whose malformed browser phases alone were dropped. */
+  unreadableClientPhases: number;
 }
 
 export interface DashboardTimingSummary {
@@ -801,7 +861,17 @@ export interface DashboardPairedRequestDurationGroup {
    * omitted, and the field itself is absent when no pair measured any phase.
    */
   serverPhaseMs?: DashboardPhaseDistributions;
+  /**
+   * Browser Resource Timing phases of the client side of exactly these pairs
+   * (#990), with coverage over the group's pairs. Queue contains connect, so
+   * the two are never added; absent when no pair carried phases.
+   */
+  clientPhaseMs?: DashboardClientPhaseDistributions;
 }
+
+export type DashboardClientPhaseDistributions = Partial<
+  Record<DashboardClientRequestPhase, DashboardPhaseDistribution>
+>;
 
 export interface DashboardServerPhaseGroup {
   label: (typeof SERVER_LABELS)[number];
@@ -900,6 +970,21 @@ function pairedPhases(cohort: Array<DashboardServerPhaseDurations | undefined>):
 } {
   const serverPhaseMs = phaseDistributions(cohort);
   return Object.keys(serverPhaseMs).length > 0 ? { serverPhaseMs } : {};
+}
+
+function pairedClientPhases(cohort: DashboardClientRequestTiming[]): {
+  clientPhaseMs?: DashboardClientPhaseDistributions;
+} {
+  const clientPhaseMs: DashboardClientPhaseDistributions = {};
+  for (const phase of DASHBOARD_CLIENT_REQUEST_PHASES) {
+    const values = cohort.flatMap((timing) => (timing[phase] === undefined ? [] : [timing[phase]]));
+    if (values.length === 0) continue;
+    clientPhaseMs[phase] = {
+      ...distribution(values),
+      coverage: coverage(values.length, cohort.length),
+    };
+  }
+  return Object.keys(clientPhaseMs).length > 0 ? { clientPhaseMs } : {};
 }
 
 function serverPhaseGroups(
@@ -1052,7 +1137,7 @@ function summarize(
   const serverRowsByRequestId = new Map<string, DashboardTimingPayload[]>();
   const clientMeasurementsByRequestId = new Map<
     string,
-    Array<{ interaction: (typeof CLIENT_LABELS)[number]; requestMs: number }>
+    Array<{ interaction: (typeof CLIENT_LABELS)[number]; timing: DashboardClientRequestTiming }>
   >();
   for (const { payload } of finishedRows) {
     const key = `${payload.source}:${payload.label}`;
@@ -1086,10 +1171,7 @@ function summarize(
       for (const id of payload.requestIds ?? []) clientRequestIds.add(id);
       for (const timing of payload.requestTimings ?? []) {
         const values = clientMeasurementsByRequestId.get(timing.requestId) ?? [];
-        values.push({
-          interaction: payload.label as (typeof CLIENT_LABELS)[number],
-          requestMs: timing.requestMs,
-        });
+        values.push({ interaction: payload.label as (typeof CLIENT_LABELS)[number], timing });
         clientMeasurementsByRequestId.set(timing.requestId, values);
       }
     }
@@ -1106,7 +1188,8 @@ function summarize(
     return [
       {
         interaction: clientMeasurements[0].interaction,
-        requestMs: clientMeasurements[0].requestMs,
+        requestMs: clientMeasurements[0].timing.requestMs,
+        clientTiming: clientMeasurements[0].timing,
         serverDurationMs: server.durationMs,
         serverLabel: server.label as (typeof SERVER_LABELS)[number],
         serverOperation: server.operation,
@@ -1144,6 +1227,7 @@ function summarize(
         clientRequestMs: distribution(pairs.map((pair) => pair.requestMs)),
         serverDurationMs: distribution(pairs.map((pair) => pair.serverDurationMs)),
         ...pairedPhases(pairs.map((pair) => pair.serverPhases)),
+        ...pairedClientPhases(pairs.map((pair) => pair.clientTiming)),
       }))
       .sort(
         (a, b) =>
