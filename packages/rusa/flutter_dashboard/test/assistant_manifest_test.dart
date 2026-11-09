@@ -60,6 +60,33 @@ void main() {
     expect(main, isNot(contains('turnScreenOn')));
   });
 
+  test('FCM notifications use the monochrome rusa small icon (#1252)', () {
+    // Without this meta-data the Firebase SDK falls back to the launcher
+    // icon, which Android reduces to its alpha channel: an opaque square.
+    final meta = RegExp(
+      r'<meta-data\s+android:name="com\.google\.firebase\.messaging\.'
+      r'default_notification_icon"\s+android:resource="@drawable/(\w+)"\s*/>',
+    ).firstMatch(manifest);
+    expect(meta, isNotNull);
+    // The SDK reads application-level meta-data only; inside an activity it
+    // would be ignored and the launcher fallback would return.
+    expect(
+      activities.values.where((a) => a.contains('default_notification_icon')),
+      isEmpty,
+    );
+    final icon = File(
+      'android/app/src/main/res/drawable/${meta!.group(1)}.xml',
+    ).readAsStringSync();
+    expect(icon, contains('<vector '));
+    // Only the alpha channel is drawn: every paint is opaque white, and
+    // nothing paints a background.
+    final paints = RegExp(
+      r'android:(?:fill|stroke)Color="([^"]+)"',
+    ).allMatches(icon).map((m) => m.group(1)).toList();
+    expect(paints, isNotEmpty);
+    expect(paints.toSet(), {'#FFFFFFFF'});
+  });
+
   test('locked re-entry resets retained state and Recents stays dormant', () {
     // This is an Android source-boundary test, not device lifecycle proof.
     // The physical lock-screen flow remains a release/device acceptance gate.

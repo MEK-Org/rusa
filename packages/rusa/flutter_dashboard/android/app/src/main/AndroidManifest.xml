@@ -69,6 +69,12 @@
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
         </activity>
+        <!-- Small icon for FCM notifications the SDK displays itself. Without
+             it the SDK falls back to the launcher icon, which the status bar
+             reduces to its alpha channel: a solid square (#1252). -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_stat_rusa" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

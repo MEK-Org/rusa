@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
+import 'dashboard_resource_timing.dart';
 import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
@@ -71,7 +72,10 @@ class DashboardApi {
     Map<String, String> Function(Uri url)? imageHeaders,
   }) : _base = base ?? Uri.base,
        _imageHeaders = imageHeaders ?? _noImageHeaders {
-    _client = DashboardTimingClient(SessionClient(client, session));
+    _client = DashboardTimingClient(
+      SessionClient(client, session),
+      resourceTiming: defaultDashboardResourceTimingSource(),
+    );
     _timings = DashboardTimingReporter(client: _client, base: _base);
   }
 
@@ -125,20 +129,6 @@ class DashboardApi {
         .map((participant) => participant['actorId'])
         .whereType<String>()
         .toList();
-  }
-
-  /// Announces this authenticated dashboard's deliberate entry to the Chat
-  /// Room. The server, rather than the browser, binds the human principal and
-  /// applies the local cooldown before notifying current participants.
-  Future<void> enterChatRoom() async {
-    final uri = _u('/api/mesh/chat-room/entry');
-    final res = await _client.post(
-      uri,
-      headers: {'Accept': 'application/json'},
-    );
-    if (res.statusCode != 200) {
-      throw DashboardApiException(uri, res.statusCode, res.body);
-    }
   }
 
   /// `GET /api/mesh/recent-activity` → newest-first activity items (#664).

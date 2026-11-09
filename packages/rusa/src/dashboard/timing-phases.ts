@@ -55,7 +55,15 @@ export type DashboardServerPhaseDurations = Partial<Record<DashboardServerPhase,
  *   not a sum of per-actor times; it overlaps the enrichment phase.
  * - `actorMetadataMs`: scheduler health, viewer identity and response metadata.
  *
- * Actor substages occur only on the actor-list route and sit inside `route`.
+ * - `actorChatBodyMs`: actor chat POST, from starting to read the request body
+ *   until the read settles, whether the body arrived or the stream failed,
+ *   including any wait for the client's bytes.
+ * - `actorChatSendMs`: the actor chat POST's synchronous mesh delivery call,
+ *   from call until it returns or throws. Present only for a request that
+ *   passed body validation and operator resolution.
+ *
+ * Actor-list substages occur only on the actor-list route and actor chat
+ * substages only on the actor chat POST; both sit inside `route`.
  * Like phases they measure elapsed time, including scheduling delays, not CPU
  * cost; do not add them to their enclosing phases. Existing loopBusyPct is
  * request-wide context, not attribution to a particular actor operation.
@@ -75,6 +83,8 @@ export const DASHBOARD_SERVER_SUBSTAGE_INTERVALS = [
   "actorActivityMs",
   "actorSummariesMs",
   "actorMetadataMs",
+  "actorChatBodyMs",
+  "actorChatSendMs",
 ] as const;
 
 export type DashboardServerSubstageInterval = (typeof DASHBOARD_SERVER_SUBSTAGE_INTERVALS)[number];

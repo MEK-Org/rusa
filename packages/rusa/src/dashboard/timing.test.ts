@@ -87,6 +87,191 @@ describe("dashboard timing recorder", () => {
     ).toBeNull();
   });
 
+  it("accepts all four browser phases on a request timing, or none (#990)", () => {
+    const id = randomUUID();
+    const phases = { queueMs: 930, connectMs: 0, firstByteMs: 290, bodyMs: 6 };
+    const envelope = (timing: Record<string, unknown>) => ({
+      interaction: "primary_navigation",
+      durationMs: 1300,
+      requestIds: [id],
+      requestTimings: [{ requestId: id, requestMs: 1251, ...timing }],
+    });
+    expect(parseDashboardClientTiming(envelope(phases))?.requestTimings).toEqual([
+      { requestId: id, requestMs: 1251, ...phases },
+    ]);
+    expect(parseDashboardClientTiming(envelope({}))?.requestTimings).toEqual([
+      { requestId: id, requestMs: 1251 },
+    ]);
+    for (const invalid of [
+      { queueMs: 930, firstByteMs: 290, bodyMs: 6 },
+      { ...phases, bodyMs: 6.5 },
+      { ...phases, queueMs: -1 },
+      { ...phases, queueMs: "930" },
+      { ...phases, dnsMs: 1 },
+      { ...phases, url: "/api/mesh/obligations?owner=private" },
+    ]) {
+      expect(parseDashboardClientTiming(envelope(invalid))).toBeNull();
+    }
+  });
+
+  it("summarizes paired browser phases beside server phases, with coverage (#990)", () => {
+    const recorder = new DashboardTimingRecorder(
+      events,
+      () => new Date("2026-10-05T12:00:00.000Z")
+    );
+    const phased = randomUUID();
+    const slow = randomUUID();
+    const unphased = randomUUID();
+    for (const [requestId, durationMs] of [
+      [phased, 6],
+      [slow, 293],
+      [unphased, 293],
+    ] as const) {
+      recorder.recordServer({
+        label: "mesh_obligations",
+        requestId,
+        durationMs,
+        status: 200,
+        bytes: 1,
+        phases: { route: durationMs },
+      });
+    }
+    recorder.recordClient({
+      interaction: "primary_navigation",
+      durationMs: 1400,
+      requestIds: [phased, slow, unphased],
+      requestTimings: [
+        {
+          requestId: phased,
+          requestMs: 1226,
+          queueMs: 1210,
+          connectMs: 0,
+          firstByteMs: 8,
+          bodyMs: 1,
+        },
+        {
+          requestId: slow,
+          requestMs: 1251,
+          queueMs: 940,
+          connectMs: 35,
+          firstByteMs: 296,
+          bodyMs: 4,
+        },
+        { requestId: unphased, requestMs: 1251 },
+      ],
+      outcome: "success",
+    });
+    while (timingRows().length < 4) recorder.flush();
+
+    const [group] = recorder.summary({
+      since: new Date("2026-10-05T11:00:00.000Z"),
+    }).pairedRequestDurations;
+    const partial = { numerator: 2, denominator: 3, state: "partial" };
+    expect(group).toMatchObject({
+      interaction: "primary_navigation",
+      serverLabel: "mesh_obligations",
+      sampleCount: 3,
+      clientRequestMs: { p50Ms: 1251, maxMs: 1251 },
+      serverPhaseMs: { route: { maxMs: 293 } },
+      clientPhaseMs: {
+        queueMs: { p50Ms: 940, p95Ms: 1210, p99Ms: 1210, maxMs: 1210, coverage: partial },
+        connectMs: { p50Ms: 0, maxMs: 35, coverage: partial },
+        firstByteMs: { p50Ms: 8, maxMs: 296, coverage: partial },
+        bodyMs: { p50Ms: 1, maxMs: 4, coverage: partial },
+      },
+      // Per pair: 1226 - (1210 + 8 + 1) = 7 and 1251 - (940 + 296 + 4) = 11.
+      // Subtracting the percentiles above would give 1251 - (940 + 8 + 1) = 302.
+      clientRemainderMs: { p50Ms: 7, p95Ms: 11, maxMs: 11, coverage: partial },
+    });
+  });
+
+  it("reports a rounding-negative clientRemainderMs without clamping (#990)", () => {
+    const recorder = new DashboardTimingRecorder(
+      events,
+      () => new Date("2026-10-05T12:00:00.000Z")
+    );
+    const phased = randomUUID();
+    recorder.recordServer({
+      label: "mesh_obligations",
+      requestId: phased,
+      durationMs: 6,
+      status: 200,
+      bytes: 1,
+      phases: { route: 6 },
+    });
+    // The client rounds each phase to whole milliseconds on its own, so a
+    // pair whose true remainder is near zero can land a millisecond below it.
+    recorder.recordClient({
+      interaction: "primary_navigation",
+      durationMs: 1400,
+      requestIds: [phased],
+      requestTimings: [
+        { requestId: phased, requestMs: 5, queueMs: 2, connectMs: 0, firstByteMs: 2, bodyMs: 2 },
+      ],
+      outcome: "success",
+    });
+    while (timingRows().length < 2) recorder.flush();
+
+    const [group] = recorder.summary({
+      since: new Date("2026-10-05T11:00:00.000Z"),
+    }).pairedRequestDurations;
+    // 5 - (2 + 2 + 2) = -1: reported as measured, not clamped at zero.
+    expect(group.clientRemainderMs).toEqual({
+      p50Ms: -1,
+      p95Ms: -1,
+      p99Ms: -1,
+      maxMs: -1,
+      coverage: { numerator: 1, denominator: 1, state: "full" },
+    });
+  });
+
+  it("reads stored browser phases back and drops only a partial set (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const stored = (requestId: string, timing: Record<string, unknown>) => {
+      events.record({
+        kind: DASHBOARD_TIMING_EVENT_KIND,
+        actorId: null,
+        detail: "synthetic",
+        payload: JSON.stringify({
+          v: 1,
+          source: "client",
+          label: "primary_navigation",
+          requestIds: [requestId],
+          requestTimings: [{ requestId, requestMs: 1226, ...timing }],
+          durationMs: 1300,
+          status: null,
+          bytes: null,
+          outcome: "success",
+        }),
+      });
+      recorder.recordServer({
+        label: "mesh_obligations",
+        requestId,
+        durationMs: 6,
+        status: 200,
+        bytes: 1,
+      });
+    };
+    stored(randomUUID(), { queueMs: 1210, connectMs: 0, firstByteMs: 8, bodyMs: 1 });
+    stored(randomUUID(), { queueMs: 1210 });
+    while (timingRows().length < 4) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    // The partial set costs only its phases: the row keeps its requestMs and pair.
+    expect(summary.window).toMatchObject({ unreadableRecords: 0, unreadableClientPhases: 1 });
+    expect(summary.pairedRequestDurations).toEqual([
+      expect.objectContaining({
+        sampleCount: 2,
+        clientPhaseMs: expect.objectContaining({
+          queueMs: expect.objectContaining({
+            maxMs: 1210,
+            coverage: expect.objectContaining({ numerator: 1, denominator: 2 }),
+          }),
+        }),
+      }),
+    ]);
+  });
+
   it("uses unfiltered server request IDs for a filtered client coverage result", () => {
     const recorder = new DashboardTimingRecorder(
       events,
@@ -252,6 +437,11 @@ describe("dashboard timing recorder", () => {
       expect.objectContaining({ interaction: "actor_detail", serverLabel: "mesh_events" }),
       expect.objectContaining({ interaction: "initial_load", serverLabel: "mesh_threads" }),
     ]);
+    for (const group of recorder.summary({ since: new Date("2026-10-05T11:00:00.000Z") })
+      .pairedRequestDurations) {
+      expect(group).not.toHaveProperty("clientPhaseMs");
+      expect(group).not.toHaveProperty("clientRemainderMs");
+    }
   });
 
   it("takes paired phases only from the exact unambiguous cohort, with phase coverage", () => {
@@ -958,6 +1148,7 @@ describe("dashboard timing recorder", () => {
       retentionLimited: false,
       unreadableRecords: 0,
       unreadableSubstages: 0,
+      unreadableClientPhases: 0,
     });
 
     // Two older in-window rows: the newest-first read stops at the cap.
