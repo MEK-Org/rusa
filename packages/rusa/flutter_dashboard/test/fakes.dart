@@ -491,9 +491,16 @@ class FakeApi extends DashboardApi {
       provider: provider,
       model: model,
     ));
+    final hasRoot = threadsResult.any((t) => t.id == 'root');
     threadsResult = [
       ...threadsResult,
-      makeThread(spawnedRootChildId, parent: 'root', title: title),
+      makeThread(
+        spawnedRootChildId,
+        parent: hasRoot ? 'root' : null,
+        title: title,
+        charterPreview: charters[spawnedRootChildId] ?? charter,
+        runState: RunState.idle,
+      ),
     ];
     return spawnedRootChildId;
   }

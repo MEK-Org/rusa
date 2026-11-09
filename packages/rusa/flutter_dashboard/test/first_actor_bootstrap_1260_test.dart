@@ -5,7 +5,7 @@
 // actors at all, the shared spawn dialog is offered with the first-actor
 // framing; creating the actor goes through the ordinary spawn path
 // (store.spawnRootChild → POST /api/mesh/actors). A non-empty mesh never sees
-// the modal, and a mesh that empties after actors existed offers it again.
+// the modal, and closing or dismissing it never re-offers it in the same session.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -76,6 +76,14 @@ void main() {
         ));
         expect(find.text('Create your first actor'), findsNothing);
         expect(store.primary.value, 'spawned-child');
+
+        // The dismissal latch holds for the session even if the actor set
+        // becomes empty again: the bootstrap modal is never re-offered.
+        api.threadsResult = [];
+        await store.refreshThreads();
+        await tester.pump(const Duration(milliseconds: 100));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(find.text('Create your first actor'), findsNothing);
       });
     },
   );

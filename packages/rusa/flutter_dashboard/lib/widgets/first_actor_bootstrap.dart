@@ -14,8 +14,9 @@ const String kFirstActorDialogTitle = 'Create your first actor';
 /// position (#465: top-level, unsandboxed and authorized are separate facts).
 const String kFirstActorDialogIntro =
     "This mesh doesn't have any actors yet. The first one starts as a "
-    'top-level actor through the same spawn path as any other; nothing about '
-    'being first or top-level grants it extra authority.';
+    'top-level actor through the same spawn path as any other. It receives '
+    'no extra capability grants and is sandboxed, but serves as the fallback '
+    'recipient for unrouted root events and dashboard spawns.';
 
 /// Empty-mesh first-actor bootstrap (#1260).
 ///
@@ -50,12 +51,10 @@ class _FirstActorBootstrapState extends State<FirstActorBootstrap> {
   @override
   void initState() {
     super.initState();
-    // Both streams are seeded BehaviorSubjects, so these replay their current
-    // values synchronously; the first evaluation is deferred to the first
+    // actorsLoaded is a seeded BehaviorSubject, so this replays its current
+    // value synchronously; the first evaluation is deferred to the first
     // post-frame callback because a dialog cannot be shown during build.
-    _subs
-      ..add(widget.store.actorsLoaded.listen((_) => _maybeOffer()))
-      ..add(widget.store.actorStates.listen((_) => _maybeOffer()));
+    _subs.add(widget.store.actorsLoaded.listen((_) => _maybeOffer()));
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _framePainted = true;
       _maybeOffer();
@@ -69,17 +68,18 @@ class _FirstActorBootstrapState extends State<FirstActorBootstrap> {
     if (!mounted) return;
     _offering = true;
     try {
-      final created = await showSpawnActorDialog(
+      await showSpawnActorDialog(
         context,
         widget.store,
         dialogTitle: kFirstActorDialogTitle,
         intro: kFirstActorDialogIntro,
         submitLabel: 'Create',
       );
-      // A dismissal — cancel, barrier tap, or a failed spawn already reported
-      // as a snackbar — does not nag again; cancel dismisses for the session.
-      // The tree's spawn control remains available.
-      if (!created && mounted) setState(() => _dismissed = true);
+      // Once the bootstrap dialog has closed — whether created, cancelled,
+      // barrier-tapped, or failed — dismiss it unconditionally for the
+      // session so it is never re-offered. The tree's spawn control remains
+      // available.
+      if (mounted) setState(() => _dismissed = true);
     } finally {
       _offering = false;
     }

@@ -16,7 +16,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/dashboard_url.dart';
-import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
@@ -89,26 +88,22 @@ void main() {
           '$_outDir/1260_first_actor_modal_$viewport.png',
         );
 
-        // Close the modal as the real submit does (the submit flow itself is
-        // covered in first_actor_bootstrap_1260_test.dart against this same
-        // harness), then put the store into exactly the state that flow
-        // leaves — the created actor present and selected, no modal — by
-        // feeding the created thread through the ordinary refresh path.
-        await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+        // Submit the form through the real Create path: enter Charter and
+        // Title, tap Create, and let showSpawnActorDialog invoke
+        // store.spawnRootChild, which refreshes threads and selects the new actor.
+        await tester.enterText(
+          find.widgetWithText(TextFormField, 'Charter'),
+          'Bootstraps the mesh',
+        );
+        await tester.enterText(
+          find.widgetWithText(TextFormField, 'Title'),
+          'Bootstrapper',
+        );
+        await tester.tap(find.widgetWithText(FilledButton, 'Create'));
+        await tester.pump(const Duration(milliseconds: 100));
         await tester.pump(const Duration(milliseconds: 500));
         await tester.pump(const Duration(milliseconds: 500));
         expect(find.text('Create your first actor'), findsNothing);
-
-        api.threadsResult = [
-          makeThread(
-            spawnedId,
-            title: 'Bootstrapper',
-            charterPreview: 'Bootstraps the mesh',
-            runState: RunState.idle,
-          ),
-        ];
-        await store.refreshThreads();
-        store.clickActor(spawnedId);
         await tester.pump(const Duration(milliseconds: 100));
         await tester.pump(const Duration(milliseconds: 100));
 
