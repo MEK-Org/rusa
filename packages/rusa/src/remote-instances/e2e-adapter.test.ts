@@ -13,15 +13,13 @@ const ACTOR_ID = "placed-actor";
 const TARGET = "test-follower";
 
 /**
- * The adapter reads only `providers` and `rootActor`, but it takes the whole
- * config, so the fixture is a real one rather than a cast off a fragment.
+ * The adapter reads `providers`, taking the whole config.
  */
 function configWith(providers: RusaConfig["providers"]): RusaConfig {
   return {
     github: { account: "test-bot" },
     webhook: { port: 0, secret: "test-secret" },
     providers,
-    rootActor: { provider: "codex", model: "gpt-5.6-sol" },
   };
 }
 

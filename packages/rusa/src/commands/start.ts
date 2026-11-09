@@ -89,7 +89,7 @@ import {
   RESUME_SYNTAX_HELP,
   type ResumeCommand,
 } from "../actor/halt-switch.js";
-import { generateHandle, resolveRootHandle } from "../actor/handle-generator.js";
+import { generateHandle } from "../actor/handle-generator.js";
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
@@ -130,7 +130,6 @@ import { RootControlService } from "../actor/root-control.js";
 import {
   RootModelConfigStartupError,
   resolveRootBootModelConfig,
-  seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
@@ -151,7 +150,6 @@ import {
   sweepOrphanedWorkspaces,
   unattributedCheckouts,
 } from "../actor/workspace-sweep.js";
-import { avatarCachePath } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
 import { GchatOAuth } from "../chat/gchat-oauth.js";
@@ -182,9 +180,7 @@ import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import {
   ConfiguredActorImportError,
-  type ConfiguredActorImportResult,
-  importConfiguredActor,
-  planConfiguredActorImport,
+  resolveConfiguredActor,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
@@ -829,12 +825,6 @@ export interface RunStartOptions {
   noDashboardServer?: boolean;
   /** Raw `--profile` CLI flag; validated into a {@link ConfigProfile} by loadConfig. */
   profile?: string;
-  /**
-   * Raw `--import-actor` CLI flag: the operator's explicit choice of which
-   * existing actor `rootActor` describes, consulted only while the one-time
-   * configured-actor import has not completed (#1002).
-   */
-  importActor?: string;
   e2e?: RunStartE2EHooks;
   /** Raw `--leader` CLI flag: shorthand for the single `leader` peer entry's url. */
   leader?: string;
@@ -1163,7 +1153,6 @@ async function composeStart(
     await composeFollowerStart(config, opts, resources, bootLog);
     return;
   }
-  const rootActor = config.rootActor;
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
@@ -1509,44 +1498,16 @@ async function composeStart(
     log.warn("inbox_listener_failed", { err: error });
   });
   const workersDir = join(mcHome, "workers");
-  const rootBootstrapTuple: RawProviderModelConfig | undefined = rootActor
-    ? {
-        provider: rootActor.provider,
-        model: rootActor.model,
-        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
-      }
-    : undefined;
   const rootPreflight = (entry: ProviderModelConfig) => {
     resolveProvider(config, entry.provider, entry.model, entry.effort);
   };
-  const rootIntent = rootExecutionIntent({ e2eMode: Boolean(opts?.e2e) });
-  // ── Configured-actor import (#1002) ── `rootActor` describes one actor, and
-  // it is read for that actor exactly once: the import resolves which actor it
-  // is (refusing ambiguous state unless the operator names one), fills only
-  // what that actor genuinely lacks, and records the binding in a receipt. Every
-  // later boot finds the actor through the receipt and runs it from its own
-  // row; config edits or removal never reach it again. Resolved before any
-  // server is bound so a refusal stops boot with nothing to unwind.
-  let configuredImport: ConfiguredActorImportResult;
+  let importedRoot: ActorRecord | undefined;
   try {
-    const configuredPlan = planConfiguredActorImport({
-      hasConfiguration: rootActor !== undefined,
-      actors,
+    importedRoot = resolveConfiguredActor({
       receipts: getRepositories().legacyImportReceipts,
-      workersDir,
-      selectedActorId: opts?.importActor,
-      legacyRootSession: legacyActorImport.deferredRootSessionId !== undefined,
+      actors,
     });
-    // Import retired JSON against the old identity first; the configured import
-    // then moves all durable state together. Receipt-backed importers archive
-    // a stale source unread on subsequent boots.
-    // An empty store has no root, so no config-implied legacy row can match.
-    const legacyRootId =
-      configuredPlan.kind === "adopt"
-        ? (configuredPlan.previousActorId ?? configuredPlan.actorId)
-        : configuredPlan.kind === "none"
-          ? ""
-          : configuredPlan.actorId;
+    const legacyRootId = importedRoot?.id ?? "";
     const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
       mcHome,
       db: database,
@@ -1604,40 +1565,6 @@ async function composeStart(
         backups: legacyPortableContextImport.backupFiles,
       });
     }
-    configuredImport = importConfiguredActor({
-      db: database,
-      actors,
-      receipts: getRepositories().legacyImportReceipts,
-      seed:
-        rootActor && rootBootstrapTuple
-          ? {
-              charter: rootActor.charter,
-              context: rootActor.context,
-              handle: resolveRootHandle(config),
-              avatarPath: rootActor.avatar,
-              executionConfig: rootIntent.executionConfig,
-              sessionId: legacyActorImport.deferredRootSessionId,
-              modelConfig: (portable, actorId) =>
-                seedRootModelConfig({
-                  config,
-                  rootId: actorId,
-                  bootstrap: rootBootstrapTuple,
-                  portable,
-                  preflight: rootPreflight,
-                }),
-            }
-          : undefined,
-      workersDir,
-      avatarCachePath: avatarCachePath("root"),
-      selectedActorId: opts?.importActor,
-      legacyRootSession: legacyActorImport.deferredRootSessionId !== undefined,
-      idgen: () => {
-        if (configuredPlan.kind === "none") {
-          throw new Error("an empty store mints no configured actor");
-        }
-        return configuredPlan.actorId;
-      },
-    });
   } catch (err) {
     if (err instanceof ConfiguredActorImportError) {
       log.error("configured_actor_import_refused", {
@@ -1655,7 +1582,8 @@ async function composeStart(
     }
     throw err;
   }
-  const rootId = configuredImport.actorId;
+  const rootId = importedRoot?.id;
+
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
   // the subscription store is constructed; tests and multi-instance shutdowns
@@ -1664,34 +1592,7 @@ async function composeStart(
     ["event_source_subscribed", "event_source_unsubscribed"],
     { bodyKinds: [] }
   );
-  if (configuredImport.plan.kind === "none") {
-    // Q1 of #1003: an empty store boots the service and dashboard with no
-    // actor; the first actor is the operator's to create, never config's.
-    if (!configuredImport.plan.recorded) {
-      log.info("configured_actor_import_empty", {
-        action: "no actor was synthesized; config.yaml's rootActor is not read again",
-      });
-    }
-  } else if (configuredImport.plan.kind !== "completed") {
-    log.info("configured_actor_imported", {
-      actorId: rootId,
-      plan: configuredImport.plan.kind,
-      selected: configuredImport.plan.kind === "adopt" && configuredImport.plan.selected,
-      filled: configuredImport.filled,
-      avatarImported: configuredImport.avatarImported,
-    });
-  }
-  if (configuredImport.avatarMissing !== undefined) {
-    log.warn("configured_actor_avatar_missing", {
-      actorId: rootId,
-      path: configuredImport.avatarMissing,
-      action: `rootActor.avatar named no file, and the import does not read it again; copy the image to ${avatarCachePath("root")} or upload one from the dashboard`,
-    });
-  }
-  const importedRoot = rootId === undefined ? undefined : actors.get(rootId);
-  if (rootId !== undefined && !importedRoot) {
-    throw new Error(`configured actor ${rootId} has no actor record after its import`);
-  }
+
   // The configured actor's display handle: what every root-identity surface
   // (signing byline, dashboard, avatar, commitment ledger) routes through.
   // Stored on its row by the import, so a later `rootActor.handle` edit does
@@ -1699,14 +1600,24 @@ async function composeStart(
   const rootHandle =
     rootId === undefined ? undefined : (importedRoot?.displayHandle ?? generateHandle(rootId));
   // The root's durable pool lives on its actor record, where `set_actor_model`
-  // writes it. The import seeded it from the `rootActor` tuple if the record
-  // had none; from here on the file never steers it. Resolved before any
-  // server is bound so an unrunnable persisted pool stops boot with nothing to
-  // unwind. What is checked here is the pool root will actually run on,
-  // instantiated entry by entry the way worker spawn preflights its own pool.
+  // writes it. Resolved before any server is bound so an unrunnable persisted
+  // pool stops boot with nothing to unwind.
   let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig> | undefined;
   let rootModelConfigDescription: string | undefined;
   if (rootId !== undefined && importedRoot?.status === "active") {
+    try {
+      assertSpawnContextSupported(
+        { context: importedRoot.context },
+        { ledgerCompactionAvailable: portableContextApiKey !== null }
+      );
+    } catch (err) {
+      log.error("root_context_unsupported", {
+        rootId,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      process.exit(1);
+      return;
+    }
     try {
       rootBootModelConfig = resolveRootBootModelConfig({
         config,
@@ -1726,32 +1637,12 @@ async function composeStart(
       }
       throw err;
     }
-    const rootModelConfigSeeded = configuredImport.filled.includes("modelConfig");
     rootModelConfigDescription = describeModelConfigPool(rootBootModelConfig.modelConfig);
     log.info("root_model_config_resolved", {
       rootId,
-      source: rootModelConfigSeeded ? "bootstrap" : rootBootModelConfig.source,
+      source: rootBootModelConfig.source,
       modelConfig: rootModelConfigDescription,
     });
-    // The file tuple stops steering root once its pool is durable. Say so
-    // whenever the two differ: a healthy boot on a model the operator just
-    // edited away from would otherwise be the only signal.
-    const configuredRootDescription = rootBootstrapTuple
-      ? describeModelConfigPool([rootBootstrapTuple])
-      : undefined;
-    if (
-      configuredRootDescription &&
-      !rootModelConfigSeeded &&
-      rootModelConfigDescription !== configuredRootDescription
-    ) {
-      log.warn("root_model_config_file_ignored", {
-        rootId,
-        configured: configuredRootDescription,
-        persisted: rootModelConfigDescription,
-        action:
-          "root's model is durable on its actor record; change it with set_actor_model. config.yaml's rootActor tuple is read only by the one-time configured-actor import",
-      });
-    }
   }
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
@@ -5435,7 +5326,11 @@ async function composeStart(
     process.off("SIGTERM", onShutdownSignal);
   });
 
-  console.log("\n✓ Root actor live. Waiting for events...\n");
+  console.log(
+    rootId !== undefined && importedRoot?.status === "active"
+      ? "\n✓ Root actor live. Waiting for events...\n"
+      : "\n✓ Mesh live. Waiting for events...\n"
+  );
 
   // Every successful boot creates durable root work. The file records the boot
   // before this append; if this process dies between them, the next boot retries

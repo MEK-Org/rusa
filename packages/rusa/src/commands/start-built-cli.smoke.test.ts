@@ -76,7 +76,10 @@ function waitForReady(child: ChildProcess, output: () => string): Promise<void> 
       reject(new Error(`built CLI did not become ready\n--- built CLI output ---\n${output()}`));
     }, READY_TIMEOUT_MS);
     const onOutput = () => {
-      if (output().includes("✓ Root actor live. Waiting for events...")) {
+      if (
+        output().includes("✓ Root actor live. Waiting for events...") ||
+        output().includes("✓ Mesh live. Waiting for events...")
+      ) {
         cleanup();
         resolve();
       }
@@ -117,7 +120,7 @@ const builtCliSmoke =
 
 describe("built CLI startup", () => {
   builtCliSmoke(
-    "loads a Codex effort pin and reaches readiness without config_load_failed",
+    "reaches readiness on empty store without config_load_failed",
     async () => {
       const packageRoot = process.cwd();
       // Keep the temporary dist below the package so the built ESM can resolve
@@ -137,10 +140,6 @@ describe("built CLI startup", () => {
           "providers:",
           "  codex:",
           "    cliCommand: codex",
-          "rootActor:",
-          "  provider: codex",
-          "  model: gpt-5.6-sol",
-          "  effort: high",
           "sandbox: container-boundary",
           "webhook:",
           "  port: 0",
@@ -197,9 +196,9 @@ describe("built CLI startup", () => {
       try {
         await waitForReady(child, () => output);
         expect(output).not.toContain("config_load_failed");
-        expect(output.split(/\r?\n/).find((line) => line.includes("Root actor live"))).toContain(
-          "✓ Root actor live. Waiting for events..."
-        );
+        expect(
+          output.split(/\r?\n/).find((line) => line.includes("Waiting for events..."))
+        ).toContain("✓ Mesh live. Waiting for events...");
 
         child.kill("SIGTERM");
         await expect(waitForExit(child, EXIT_TIMEOUT_MS)).resolves.toEqual({

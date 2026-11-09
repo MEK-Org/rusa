@@ -1,8 +1,12 @@
-import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { resolveRootHandle } from "../actor/handle-generator.js";
+import Database from "better-sqlite3";
+import { generateHandle } from "../actor/handle-generator.js";
 import { rootBrandingImage } from "../avatar/avatars.js";
-import { loadConfig } from "../config/loader.js";
+import { resolveHome } from "../config/index.js";
+import { resolveConfiguredActor } from "../db/configured-actor-import.js";
+import { LegacyImportReceiptRepository } from "../db/repositories/legacy-import-receipt-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { resolveDashboardBranding } from "./branding.js";
 
 /**
@@ -43,7 +47,7 @@ export function deriveAndroidApplicationId(handle: string): string {
   const id = `com.${segment}.dashboard`;
   if (!/^[A-Za-z]/.test(segment)) {
     throw new Error(
-      `rootActor.handle "${handle}" does not yield a legal Android application id (${id}): ` +
+      `root handle "${handle}" does not yield a legal Android application id (${id}): ` +
         `"${segment}" must start with a letter`
     );
   }
@@ -53,46 +57,63 @@ export function deriveAndroidApplicationId(handle: string): string {
 /** Built-in names per `RUSA_INSTANCE`, as `scripts/build-dashboard-ui.mjs` bakes them. */
 const BUILT_IN_NAMES: Record<string, string> = { prod: "Rusa", staging: "Rusa Staging" };
 
-/** Options for {@link resolveAndroidBranding}, which reads `config.yaml` and any uploaded root image from `$RUSA_HOME`. */
+/** Options for {@link resolveAndroidBranding}, which reads the durable root identity from `mesh.db` and any uploaded root image from `$RUSA_HOME`. */
 export interface ResolveAndroidBrandingOptions {
   /** `RUSA_INSTANCE`, choosing the built-in name and bundled icon (default: prod). */
   instance?: string;
   /** The Flutter app whose bundled web icons are the fallback launcher image. */
   flutterAppDir: string;
+  /** Explicit Rusa home directory override. */
+  home?: string;
 }
 
 export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): AndroidBranding {
-  const config = loadConfig();
+  const mcHome = options.home ?? resolveHome();
   const instance =
     options.instance && options.instance in BUILT_IN_NAMES ? options.instance : "prod";
-  const configuredHandle = config.rootActor?.handle;
-  const rootIdentity = { handle: resolveRootHandle(config), avatarPath: config.rootActor?.avatar };
+  const dbPath = join(mcHome, "data", "mesh.db");
 
+  let rootHandle: string | undefined;
+
+  if (existsSync(dbPath)) {
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const hasReceipts =
+        db
+          .prepare(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_import_receipts'"
+          )
+          .get() !== undefined;
+      const hasActors =
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='actors'").get() !==
+        undefined;
+      if (hasReceipts && hasActors) {
+        const receiptRepo = new LegacyImportReceiptRepository(db);
+        const actorRepo = new SqliteActorRepository(db);
+        const rootActor = resolveConfiguredActor({ receipts: receiptRepo, actors: actorRepo });
+        rootHandle = rootActor?.displayHandle;
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  const rootIdentity = rootHandle ? { handle: rootHandle } : undefined;
   const { name } = resolveDashboardBranding(rootIdentity);
   const label = name ?? BUILT_IN_NAMES[instance];
   const labelSource =
-    name === null ? `built-in ${instance} name` : `rootActor.handle "${configuredHandle}"`;
+    name === null ? `built-in ${instance} name` : `imported root handle "${rootHandle}"`;
 
-  // The id follows the configured handle alone. The label's fallback also treats
-  // a handle of `root-actor` as unbranded, but that is a display rule; a
-  // configured `root-actor` still derives `com.rootactor.dashboard`.
-  const applicationId = configuredHandle
-    ? deriveAndroidApplicationId(configuredHandle)
-    : LEGACY_ANDROID_APPLICATION_ID;
-  const applicationIdSource = configuredHandle
-    ? "derived from rootActor.handle"
-    : "built-in default (no rootActor.handle)";
+  const isCustomHandle = Boolean(rootHandle && rootHandle !== generateHandle("root"));
+  const applicationId =
+    isCustomHandle && rootHandle
+      ? deriveAndroidApplicationId(rootHandle)
+      : LEGACY_ANDROID_APPLICATION_ID;
+  const applicationIdSource = isCustomHandle
+    ? "derived from imported root handle"
+    : "built-in default (no root handle)";
 
   const image = rootBrandingImage(rootIdentity);
-  // The server resolves a relative avatar against its own cwd, which this build
-  // does not share: a configured image that is not found here fails the build
-  // rather than baking the bundled icon into an APK meant to show the root's.
-  if (!image && config.rootActor?.avatar) {
-    throw new Error(
-      `rootActor.avatar "${config.rootActor.avatar}" is not a file from ${process.cwd()}; ` +
-        "configure an absolute path or upload the root image from the dashboard"
-    );
-  }
   const iconPath =
     image?.path ?? resolve(options.flutterAppDir, "web/icons", instance, "Icon-maskable-512.png");
   const iconType = image?.contentType ?? "image/png";

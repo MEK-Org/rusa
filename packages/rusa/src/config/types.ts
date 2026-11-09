@@ -436,9 +436,8 @@ export interface RootActorConfig {
    * default derived from `generateHandle("root")` (`root-actor`). Lets a
    * secondary instance (e.g. a staging deploy sharing the same bot account)
    * present under its own identity — GitHub signing byline, dashboard display,
-   * avatar — instead of the default persona. Resolve via `resolveRootHandle`
-   * rather than reading this field directly; omit to leave every root-identity
-   * surface unchanged .
+   * avatar — instead of the default persona. Omit to leave every root-identity
+   * surface unchanged.
    */
   handle?: string;
   /**
@@ -528,8 +527,6 @@ export interface RusaConfig {
    */
   jevMode?: "shadow" | "active";
   webhook: WebhookConfig;
-  /** Optional legacy configured-actor import; fresh instances create actors through the dashboard. */
-  rootActor?: RootActorConfig;
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */
   chat?: ChatConfig;
   slack?: SlackConfig;

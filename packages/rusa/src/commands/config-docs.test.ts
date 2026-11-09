@@ -12,10 +12,8 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("209715200");
   });
 
-  it("documents the configured root identity fields ", () => {
-    expect(CONFIG_DOCS).toContain("rootActor:");
-    expect(CONFIG_DOCS).toContain("handle");
-    expect(CONFIG_DOCS).toContain("ember-familiar");
+  it("omits the removed rootActor section", () => {
+    expect(CONFIG_DOCS).not.toContain("rootActor:");
   });
 
   it("documents the application log level and where to read the log", () => {

@@ -376,7 +376,7 @@ describe("resolveAbQuotaSocketPath", () => {
     try {
       writeFileSync(
         join(configDir, "config.yaml"),
-        "profile: quickstart\nproviders:\n  codex:\n    cliCommand: codex\nrootActor:\n  provider: codex\n  model: gpt-5.6-sol\nquota:\n  coordinator:\n    socketPath: /tmp/test-coordinator.sock\n",
+        "profile: quickstart\nproviders:\n  codex:\n    cliCommand: codex\nquota:\n  coordinator:\n    socketPath: /tmp/test-coordinator.sock\n",
         "utf8"
       );
       const socket = resolveAbQuotaSocketPath({ baseConfigHome: configDir });
@@ -393,7 +393,7 @@ describe("resolveAbQuotaSocketPath", () => {
       process.env.RUSA_HOME = rusaHomeDir;
       writeFileSync(
         join(rusaHomeDir, "config.yaml"),
-        "profile: quickstart\nproviders:\n  codex:\n    cliCommand: codex\nrootActor:\n  provider: codex\n  model: gpt-5.6-sol\nquota:\n  coordinator:\n    socketPath: /tmp/rusa-home.sock\n",
+        "profile: quickstart\nproviders:\n  codex:\n    cliCommand: codex\nquota:\n  coordinator:\n    socketPath: /tmp/rusa-home.sock\n",
         "utf8"
       );
       const socket = resolveAbQuotaSocketPath({});
@@ -413,7 +413,7 @@ describe("resolveAbQuotaSocketPath", () => {
     try {
       writeFileSync(
         join(configDir, "config.yaml"),
-        "profile: quickstart\nproviders:\n  codex:\n    cliCommand: codex\nrootActor:\n  provider: codex\n  model: gpt-5.6-sol\nquota:\n  coordinator:\n    socketPath: /tmp/base.sock\n",
+        "profile: quickstart\nproviders:\n  codex:\n    cliCommand: codex\nquota:\n  coordinator:\n    socketPath: /tmp/base.sock\n",
         "utf8"
       );
       const socket = resolveAbQuotaSocketPath({

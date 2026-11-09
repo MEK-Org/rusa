@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { providerThrottleKey } from "../providers/registry.js";
-import { followerAllowlistOf, instanceRoleOf, leaderPeerOf, loadConfig } from "./loader.js";
+import {
+  followerAllowlistOf,
+  instanceRoleOf,
+  leaderPeerOf,
+  loadConfig,
+  ROOT_ACTOR_REMOVAL_ERROR,
+} from "./loader.js";
 import { ELEVENLABS_API_KEY_SECRET_FILENAME } from "./secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "./types.js";
 
@@ -15,7 +21,6 @@ function writeConfig(overrides: Record<string, unknown> = {}): string {
     toYaml({
       github: { account: "CodeChopsBot" },
       providers: { codex: { cliCommand: "codex" } },
-      rootActor: { provider: "codex", model: "gpt-5.6-sol" },
       geminiApiKey: "test-key",
       webhook: { port: 9742, secret: "secret" },
       ...overrides,
@@ -25,21 +30,47 @@ function writeConfig(overrides: Record<string, unknown> = {}): string {
   return home;
 }
 
-describe("loadConfig deployBranch", () => {
-  it("allows boot configuration with no rootActor", () => {
+describe("loadConfig rootActor removal", () => {
+  it("rejects rootActor configuration and names all three required parts", () => {
     const home = mkdtempSync(join(tmpdir(), "rusa-config-"));
     writeFileSync(
       join(home, "config.yaml"),
       toYaml({
         github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
-        webhook: { port: 9742, secret: "secret" },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
       }),
       "utf8"
     );
-    expect(loadConfig(home).rootActor).toBeUndefined();
+    expect(() => loadConfig(home)).toThrow(ROOT_ACTOR_REMOVAL_ERROR);
+    let thrownError: Error | undefined;
+    try {
+      loadConfig(home);
+    } catch (err) {
+      thrownError = err as Error;
+    }
+    expect(thrownError).toBeDefined();
+    const msg = thrownError?.message ?? "";
+    // 1. Delete the block
+    expect(msg).toContain("Delete the rootActor block from config.yaml");
+    // 2. Identity now in DB / dashboard / POST /api/mesh/actors
+    expect(msg).toContain(
+      "Actor identity now lives in the mesh database; create a first actor from the dashboard or POST /api/mesh/actors"
+    );
+    // 3. Never-imported install instruction
+    expect(msg).toContain(
+      "If this installation never completed the one-time configured-actor import, boot the last release that carries the import once, then upgrade"
+    );
   });
 
+  it("loads config with no rootActor key", () => {
+    const config = loadConfig(writeConfig());
+    expect(config).toBeDefined();
+    expect(config).not.toHaveProperty("rootActor");
+  });
+});
+
+describe("loadConfig deployBranch", () => {
   it("defaults deployBranch to master when omitted", () => {
     const config = loadConfig(writeConfig());
     expect(config.deployBranch).toBe(DEFAULT_DEPLOY_BRANCH);
@@ -173,7 +204,6 @@ describe("loadConfig geminiApiKey (optional)", () => {
       toYaml({
         github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
-        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "secret" },
       }),
       "utf8"
@@ -222,100 +252,6 @@ describe("loadConfig jevMode (optional)", () => {
     expect(() => loadConfig(writeConfig({ jevMode: "invalid" }))).toThrow(
       /jevMode must be "shadow" or "active"/
     );
-  });
-});
-
-describe("loadConfig rootActor.context", () => {
-  it("normalizes a valid portable ledger context", () => {
-    const config = loadConfig(
-      writeConfig({
-        rootActor: {
-          provider: "codex",
-          model: "gpt-5.6-sol",
-          context: {
-            type: "portable",
-            mode: "brief",
-          },
-        },
-      })
-    );
-
-    expect(config.rootActor?.context).toEqual({
-      type: "portable",
-      mode: "brief",
-    });
-  });
-
-  it.each([
-    [{ type: "portible", mode: "tail" }, /unknown context type/],
-    [{ type: "portable", mode: "typo" }, /unknown context selection/],
-    [
-      { type: "portable", mode: "tail", compactionModel: "gemini-test" },
-      /compactionModel is not supported; portable ledger mode has been retired/,
-    ],
-    [{ type: "native", mode: "tail" }, /mode is meaningless for native context/],
-  ])("rejects malformed or meaningless context %#", (context, message) => {
-    expect(() =>
-      loadConfig(writeConfig({ rootActor: { provider: "codex", model: "gpt-5.6-sol", context } }))
-    ).toThrow(message);
-  });
-
-  it("rejects retired ledger mode", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          rootActor: {
-            provider: "codex",
-            model: "gpt-5.6-sol",
-            context: { type: "portable", mode: "ledger" },
-          },
-        })
-      )
-    ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
-  });
-});
-
-describe("loadConfig rootActor effort", () => {
-  it("normalizes first-class effort and legacy Codex model qualifiers", () => {
-    const explicit = loadConfig(
-      writeConfig({
-        rootActor: { provider: "codex", model: "gpt-5.6-sol", effort: "HIGH" },
-      })
-    );
-    expect(explicit.rootActor).toMatchObject({
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "high",
-    });
-
-    const legacy = loadConfig(
-      writeConfig({ rootActor: { provider: "codex", model: "gpt-5.6-sol extra-high" } })
-    );
-    expect(legacy.rootActor).toMatchObject({
-      model: "gpt-5.6-sol",
-      effort: "xhigh",
-    });
-  });
-
-  it("rejects an effort unsupported by the selected provider", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          providers: { kimi: { cliCommand: "kimi" } },
-          rootActor: { provider: "kimi", model: "kimi-code", effort: "high" },
-        })
-      )
-    ).toThrow(/does not expose a reasoning-effort control/);
-  });
-
-  it("validates effort against the CLI behind a logical provider name", () => {
-    const config = loadConfig(
-      writeConfig({
-        providers: { strong: { cliCommand: "claude" } },
-        rootActor: { provider: "strong", model: "claude-opus-4-8", effort: "MAX" },
-      })
-    );
-    expect(config.rootActor).toMatchObject({ provider: "strong", effort: "max" });
   });
 });
 
@@ -402,7 +338,6 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
       toYaml({
         github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
-        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "" },
       }),
       "utf8"
@@ -410,16 +345,11 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     writeSecret(home, "gemini-api-key", "file-key\n");
     writeSecret(home, "mistral-api-key", "mistral-file-key\n");
     writeSecret(home, "webhook-secret", "file-hook\n");
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     const config = loadConfig(home);
     expect(config.geminiApiKey).toBe("file-key");
     expect(config.mistralApiKey).toBe("mistral-file-key");
     expect(config.webhook.secret).toBe("file-hook");
-    expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
-    );
-    warnSpy.mockRestore();
   });
 
   it("keeps the inline values when the secrets files are missing", () => {
@@ -436,7 +366,6 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
       toYaml({
         github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
-        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "secret" },
       }),
       "utf8"
@@ -898,7 +827,6 @@ describe("loadConfig shared quota store", () => {
     const config = loadConfig(
       writeConfig({
         providers: { antigravity: { cliCommand: " Antigravity " } },
-        rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
       })
     );
 
@@ -1053,30 +981,6 @@ describe("loadConfig providers.codex.authBroker", () => {
   });
 });
 
-describe("loadConfig providers.<name>.openrouterPoc is rejected", () => {
-  it("accepts OpenRouter as an ordinary pi provider", () => {
-    const providers = { codex: { cliCommand: "codex" }, openrouter: { cliCommand: "pi" } };
-    expect(loadConfig(writeConfig({ providers })).providers).toEqual(providers);
-  });
-
-  it("fails load naming the removed block, including its nested piCommand", () => {
-    for (const openrouterPoc of [{}, { piCommand: "/opt/pi/bin/pi" }]) {
-      expect(() =>
-        loadConfig(
-          writeConfig({
-            providers: {
-              codex: { cliCommand: "codex" },
-              openrouter: { cliCommand: "openrouter", openrouterPoc },
-            },
-          })
-        )
-      ).toThrow(
-        /providers\.openrouter\.openrouterPoc has been removed.*Delete the key and set cliCommand: pi/
-      );
-    }
-  });
-});
-
 describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   it("throws naming the ruling and issue when a provider carries fallbackModel", () => {
     expect(() =>
@@ -1089,20 +993,6 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
         })
       )
     ).toThrow(/providers\.claude\.fallbackModel is no longer supported/);
-  });
-
-  it("rejects the removed rootActor.fallbackModel with the pool migration path", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          rootActor: {
-            provider: "codex",
-            model: "gpt-5.6-sol",
-            fallbackModel: "codex-fallback",
-          },
-        })
-      )
-    ).toThrow(/rootActor\.fallbackModel has been removed.*portable.*set_actor_model/);
   });
 });
 
@@ -1468,75 +1358,6 @@ describe("loadConfig chat.excludedSpaces ", () => {
   });
 });
 
-describe("loadConfig antigravity effort", () => {
-  it("migrates a legacy antigravity config with no effort to high with a warning log", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const config = loadConfig(
-      writeConfig({
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
-      })
-    );
-    expect(config.rootActor?.provider).toBe("antigravity");
-    expect(config.rootActor?.effort).toBe("high");
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(
-        '[migration] defaulting omitted config rootActor effort to "high" for antigravity model "gemini-3.7-flash"'
-      )
-    );
-    warnSpy.mockRestore();
-  });
-
-  it("extracts effort from omitted-effort tiered slug without defaulting to high", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const config = loadConfig(
-      writeConfig({
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "gemini-3.7-flash-medium" },
-      })
-    );
-    expect(config.rootActor?.provider).toBe("antigravity");
-    expect(config.rootActor?.model).toBe("gemini-3.7-flash");
-    expect(config.rootActor?.effort).toBe("medium");
-    expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
-    );
-    warnSpy.mockRestore();
-  });
-
-  it("extracts effort from omitted-effort tiered display label without defaulting to high", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const config = loadConfig(
-      writeConfig({
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.1 Pro (Medium)" },
-      })
-    );
-    expect(config.rootActor?.provider).toBe("antigravity");
-    expect(config.rootActor?.model).toBe("Gemini 3.1 Pro");
-    expect(config.rootActor?.effort).toBe("medium");
-    expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
-    );
-    warnSpy.mockRestore();
-  });
-
-  it("retains explicit-conflict rejection when embedded tier conflicts with explicit effort", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const home = writeConfig({
-      providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", model: "gemini-3.7-flash-medium", effort: "high" },
-    });
-    expect(() => loadConfig(home)).toThrow(
-      /conflicting reasoning efforts for provider "agy": model pin carries "medium" but effort is "high"/
-    );
-    expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
-    );
-    warnSpy.mockRestore();
-  });
-});
-
 describe("loadConfig observability.logging", () => {
   it("loads a configured log level", () => {
     const config = loadConfig(writeConfig({ observability: { logging: { level: "debug" } } }));
@@ -1763,7 +1584,7 @@ describe("loadConfig observability.logging", () => {
       );
       const config = loadConfig(home);
       expect(instanceRoleOf(config)).toBe("follower");
-      expect(config.rootActor).toBeUndefined();
+      expect(config).not.toHaveProperty("rootActor");
       expect(leaderPeerOf(config)).toEqual({
         type: "leader",
         url: "http://127.0.0.1:8190",

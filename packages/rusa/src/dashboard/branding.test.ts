@@ -105,7 +105,7 @@ describe("resolveDashboardBranding", () => {
   });
 
   it("treats the default root-actor handle as 'no name configured'", () => {
-    // `resolveRootHandle` returns `root-actor` when `rootActor.handle` is unset,
+    // Default root handle is `root-actor` when unset,
     // so an unconfigured instance must keep the built-in "Rusa" branding.
     expect(resolveDashboardBranding({ handle: "root-actor" }).name).toBeNull();
   });

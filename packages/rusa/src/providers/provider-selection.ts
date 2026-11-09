@@ -33,7 +33,7 @@ export function isProviderCommand(command: string): command is ProviderCommand {
   return command in PROVIDER_CAPABILITIES;
 }
 
-/** Default root provider when `config.rootActor` is unset — `agy` (Antigravity). */
+/** Default root provider — `agy` (Antigravity). */
 export const DEFAULT_ROOT_PROVIDER = "antigravity";
 export const DEFAULT_ROOT_EFFORT = "high";
 

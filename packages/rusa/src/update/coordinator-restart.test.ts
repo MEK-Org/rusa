@@ -218,9 +218,6 @@ function syntheticHost(opts: { socketPath?: string } = {}) {
   const coordinatorConfig = [
     "github:",
     "  account: synthetic-bot",
-    "rootActor:",
-    "  provider: claude",
-    "  model: synthetic-model",
     "providers:",
     "  claude:",
     "    cliCommand: claude",

@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { RootActorConfig } from "../config/types.js";
 
 export const ADJECTIVES = [
   "active",
@@ -546,18 +545,6 @@ export function generateHandle(uuid: string): string {
   const animal = ANIMALS[animIndex];
 
   return `${adjective}-${animal}`;
-}
-
-/**
- * Resolve the root actor's display handle: the configured override
- * (`rootActor.handle`) if set, else default `generateHandle("root")`
- * (`root-actor`). An empty override is unset: there is no empty handle to
- * sign, show or store (#1002).
- */
-export function resolveRootHandle(config?: {
-  rootActor?: Pick<RootActorConfig, "handle">;
-}): string {
-  return config?.rootActor?.handle || generateHandle("root");
 }
 
 /**

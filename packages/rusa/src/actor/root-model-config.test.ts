@@ -14,8 +14,6 @@ const bothProviders = configWith({
   claude: { cliCommand: "claude" },
 });
 
-const bootstrap = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
-
 const pool: ProviderModelConfig[] = [
   { provider: "claude", model: "claude-sonnet-5", effort: "high" },
   { provider: "antigravity", model: "Gemini 4.1 Ultra", effort: "low" },
@@ -40,7 +38,7 @@ function repositoryWith(record?: ActorRecord): InMemoryActorRepository {
 }
 
 describe("resolveRootBootModelConfig", () => {
-  it("preserves a persisted ordered pool over the configured tuple, preflighting every entry in order", () => {
+  it("preserves a persisted ordered pool, preflighting every entry in order", () => {
     const actors = repositoryWith(rootRecord({ modelConfig: pool, modelClass: "frontier" }));
     const preflighted: ProviderModelConfig[] = [];
 
@@ -48,7 +46,6 @@ describe("resolveRootBootModelConfig", () => {
       config: bothProviders,
       actors,
       rootId: "root",
-      bootstrap,
       portable: true,
       preflight: (entry) => preflighted.push(entry),
     });
@@ -61,8 +58,7 @@ describe("resolveRootBootModelConfig", () => {
 
   it("refuses a class-bound root whose class cannot be resolved instead of seeding from the file", () => {
     // What the repository hands back for a deleted/empty/invalid class: the
-    // binding is intact, the pool is gone. Seeding from `bootstrap` here would
-    // boot root on a tuple nobody selected (#626).
+    // binding is intact, the pool is gone.
     const actors = repositoryWith(
       rootRecord({ modelClass: "frontier", modelClassError: 'unknown model class "frontier"' })
     );
@@ -73,7 +69,6 @@ describe("resolveRootBootModelConfig", () => {
         config: bothProviders,
         actors,
         rootId: "root",
-        bootstrap,
         portable: true,
         preflight: (entry) => preflighted.push(entry),
       });
@@ -85,30 +80,28 @@ describe("resolveRootBootModelConfig", () => {
     expect(preflighted).toEqual([]);
   });
 
-  it("seeds from the configured tuple when the record has no persisted pool", () => {
+  it("refuses when root actor has no persisted model_config", () => {
     const actors = repositoryWith(rootRecord());
 
-    const resolved = resolveRootBootModelConfig({
-      config: bothProviders,
-      actors,
-      rootId: "root",
-      bootstrap,
-      portable: false,
-    });
-
-    expect(resolved).toEqual({ source: "bootstrap", modelConfig: [bootstrap] });
+    expect(() =>
+      resolveRootBootModelConfig({
+        config: bothProviders,
+        actors,
+        rootId: "root",
+        portable: false,
+      })
+    ).toThrow(RootModelConfigStartupError);
   });
 
-  it("seeds from the configured tuple when there is no root record at all", () => {
-    const resolved = resolveRootBootModelConfig({
-      config: bothProviders,
-      actors: repositoryWith(),
-      rootId: "minted-root",
-      bootstrap,
-      portable: false,
-    });
-
-    expect(resolved).toEqual({ source: "bootstrap", modelConfig: [bootstrap] });
+  it("refuses when there is no root record at all", () => {
+    expect(() =>
+      resolveRootBootModelConfig({
+        config: bothProviders,
+        actors: repositoryWith(),
+        rootId: "minted-root",
+        portable: false,
+      })
+    ).toThrow(RootModelConfigStartupError);
   });
 
   it("fails by name when the persisted pool names a provider the config no longer declares", () => {
@@ -119,7 +112,6 @@ describe("resolveRootBootModelConfig", () => {
         config: configWith({ antigravity: { cliCommand: "agy" } }),
         actors,
         rootId: "root",
-        bootstrap,
         portable: true,
       });
 
@@ -150,7 +142,6 @@ describe("resolveRootBootModelConfig", () => {
         config: bothProviders,
         actors,
         rootId: "root",
-        bootstrap,
         portable: false,
       })
     ).toThrow(RootModelConfigStartupError);
@@ -164,7 +155,6 @@ describe("resolveRootBootModelConfig", () => {
         config: bothProviders,
         actors,
         rootId: "root",
-        bootstrap,
         portable: true,
         preflight: (entry) => {
           if (entry.provider === "antigravity") throw new Error("no adapter for agy in this build");
@@ -175,19 +165,5 @@ describe("resolveRootBootModelConfig", () => {
     expect(attempt).toThrow(
       /persisted model_config that is not valid under the current configuration: no adapter for agy in this build/
     );
-  });
-
-  it("fails by name when the configured tuple cannot seed an empty record", () => {
-    const attempt = () =>
-      resolveRootBootModelConfig({
-        config: bothProviders,
-        actors: repositoryWith(rootRecord()),
-        rootId: "root",
-        bootstrap: { provider: "codex", model: "gpt-5.6" },
-        portable: false,
-      });
-
-    expect(attempt).toThrow(RootModelConfigStartupError);
-    expect(attempt).toThrow(/has no persisted model_config and the configured rootActor tuple/);
   });
 });
