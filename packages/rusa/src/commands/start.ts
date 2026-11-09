@@ -408,7 +408,6 @@ import {
 } from "../update/runner.js";
 import { ChatRoomService } from "../voice/chat-room.js";
 import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
-import { RoomEntryService } from "../voice/room-entry.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -3239,14 +3238,6 @@ async function composeStart(
     ),
     isHumanPrincipal: (id) => getRepositories().principals.getUser(id) !== undefined,
   });
-  // Human entry notifier for the Chat Room (#829): sends noninterrupting inbox
-  // notices to active chat room actors with an in-memory 5-minute cooldown.
-  const roomEntry = new RoomEntryService({
-    inbox: getRepositories().inbox,
-    roster: () => chatRoom.participants().map((participant) => participant.actorId),
-    log: (message) => log.warn("room_entry", { message }),
-  });
-
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
   // for the root, which has no parent — to the statically configured error chat.
   // The raw delivery to the human's error chat.
@@ -4897,7 +4888,6 @@ async function composeStart(
           geminiApiKey,
           supportedVoices: supportedVoiceCatalog,
           chatRoom,
-          roomEntry,
           getFollowers: () => (followerHub ? followerHub.list() : []),
           updateFollower: (id, opts) => {
             if (!followerHub) throw new Error("Follower gateway not enabled");

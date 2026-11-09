@@ -11,7 +11,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import type { RoomEntryEnterResult } from "../voice/room-entry.js";
 
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
@@ -101,13 +100,6 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   let server: ReturnType<typeof createServer>;
   let origin: string;
   const interrupt = vi.fn(() => ({ interrupted: true, status: "interrupted" }));
-  const roomEntry = {
-    enter: vi.fn<() => RoomEntryEnterResult>(() => ({
-      status: "entered",
-      notified: true,
-      episodeId: "ep",
-    })),
-  };
   beforeEach(async () => {
     now = Date.now();
     serial = 0;
@@ -146,7 +138,6 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
           meshEvents,
           principals,
           mesh: { interrupt },
-          roomEntry,
         } as unknown as DashboardDataDeps,
         null,
         auth
@@ -921,26 +912,14 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
   });
 
-  it("binds Room entry routes to the verified principal without a caller-supplied identity (#829)", async () => {
+  it("disables room-entry notifications for authenticated older dashboard clients", async () => {
     expect((await post("/api/mesh/chat-room/entry")).status).toBe(401);
     const cookie = await login();
-    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
-    if (!user) throw new Error("Expected durable user");
-    const entered = await post("/api/mesh/chat-room/entry", cookie, {}, "not a JSON payload");
-    expect(entered.status).toBe(200);
-    expect(await entered.json()).toMatchObject({ status: "entered", episodeId: "ep" });
-    expect(roomEntry.enter).toHaveBeenCalledExactlyOnceWith({ principalId: user.id });
-
-    roomEntry.enter.mockReturnValueOnce({
-      status: "unavailable",
-      reason: "notice delivery failed",
-    });
-    const unavailable = await post("/api/mesh/chat-room/entry", cookie, {}, "");
-    expect(unavailable.status).toBe(503);
-    expect(await unavailable.json()).toEqual({
-      status: "unavailable",
-      reason: "notice delivery failed",
-    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const entered = await post("/api/mesh/chat-room/entry", cookie, {}, "not a JSON payload");
+      expect(entered.status).toBe(200);
+      expect(await entered.json()).toEqual({ status: "disabled" });
+    }
   });
 
   it.each([
