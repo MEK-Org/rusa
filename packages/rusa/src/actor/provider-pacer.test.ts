@@ -1491,6 +1491,10 @@ describe("responsive starts do not charge or reset ordinary pacing clock (#962)"
     ]);
   });
 
+  // Records the commissioned acceptance path (#962): the holder's re-request
+  // reaches the same pacer.submit queue covered above, so this fails on the
+  // old code for the same single reason — it does not localize lock-side
+  // behavior, which this change does not touch.
   it("preempted desktop holder in ComputerUseLock.gateAfterProvider re-requests and advances under recurring responsive starts", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const lock = new ComputerUseLock();

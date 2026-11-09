@@ -263,8 +263,9 @@ under v1:
   stay unclaimed in the list. An actor only ever claims one of its own
   declared candidates. A model with its own published quota windows (Fable
   under #588) paces on a model pacer linked to its provider pacer: it is
-  available only when both clocks allow a start, each start is charged to
-  both, and the linked lanes hold at most one claim between them. Other
+  available only when both clocks allow a start, each ordinary start is
+  charged to both, and the linked lanes hold at most one claim between them.
+  Other
   models of the provider stay on the provider pacer and never see the
   model's windows.
   Responsive work never waits in the list: it claims a healthy lane at once
@@ -2133,7 +2134,11 @@ prerequisites, and all land in v1.
   policy: responsive launches keep working in every degraded state, and a
   responsive start can land arbitrarily close to a normal one. One decision
   closes both — make responsive runs take a hold, and accept that an urgent wake
-  can be made to wait.
+  can be made to wait. Settled in part by #962 in code: responsive starts no
+  longer charge or reset the ordinary pacing clock, so recurring responsive
+  traffic cannot starve queued ordinary work. Whether the remaining unbounded
+  spacing — an ordinary start landing arbitrarily soon after a responsive one —
+  needs a bound is still the open question here.
 - **Reserve after mesh admission, or before?** Short holds and arrival-order
   fairness, against long heartbeated holds and submission-order fairness.
 - **How long should an instance wait for an absent coordinator before it fails
