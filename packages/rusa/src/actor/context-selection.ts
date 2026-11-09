@@ -6,9 +6,6 @@ import type { ContextConfig } from "./actor-record.js";
  * there is exactly one spelling of each choice across the system.
  *
  * - `native` — the provider owns the session (the default; unchanged behaviour).
- * - `ledger` — the mesh owns the context as a rolling digest plus a verbatim
- *   recent-message journal, compacted after each run. This is the mode the
- *   feature is *for*, and what to reach for unless you have a reason not to.
  * - `tail` — the mesh owns the context as a bounded raw window with no
  *   compaction and no LLM in the loop; useful for experiments that want the
  *   aging boundary without a compactor.
@@ -16,12 +13,14 @@ import type { ContextConfig } from "./actor-record.js";
  *   it reads and replaces itself through the brief MCP tools; no LLM rewrites
  *   it, so it needs no Gemini key.
  *
- * There is deliberately no bare `portable` selection. `ledger` and `tail` ARE
+ * `ledger` mode was retired in favor of actor-maintained `brief` mode.
+ *
+ * There is deliberately no bare `portable` selection. `tail` and `brief` ARE
  * the portable modes, so a fourth word naming their family would sit at a
- * different level than the other three and leave "portable vs ledger" reading
+ * different level than the other two and leave "portable vs tail" reading
  * as a real choice when it is not one. One field, one level: name the mode.
  */
-export const CONTEXT_SELECTIONS = ["native", "ledger", "tail", "brief"] as const;
+export const CONTEXT_SELECTIONS = ["native", "tail", "brief"] as const;
 export type ContextSelection = (typeof CONTEXT_SELECTIONS)[number];
 
 export function isContextSelection(value: unknown): value is ContextSelection {
@@ -53,9 +52,15 @@ export function resolveContextSelection(
 
   if (raw === undefined || raw === null || raw === "") {
     if (compactionModel) {
-      throw new Error("compactionModel requires a portable context selection (ledger)");
+      throw new Error("compactionModel is not supported; portable ledger mode has been retired");
     }
     return undefined;
+  }
+  if (raw === "ledger") {
+    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+  }
+  if (compactionModel) {
+    throw new Error("compactionModel is not supported; portable ledger mode has been retired");
   }
   if (!isContextSelection(raw)) {
     throw new Error(
@@ -63,30 +68,15 @@ export function resolveContextSelection(
     );
   }
   if (raw === "native") {
-    if (compactionModel) {
-      throw new Error("compactionModel is meaningless for native context");
-    }
     return { type: "native" };
   }
   if (raw === "tail") {
-    if (compactionModel) {
-      // Tail is the raw window: nothing ever compacts it, so a model here would
-      // be accepted, stored, and never consulted.
-      throw new Error("compactionModel is meaningless for tail mode, which never compacts");
-    }
     return { type: "portable", mode: "tail" };
   }
   if (raw === "brief") {
-    if (compactionModel) {
-      // The actor writes its own brief and nothing compacts it, so a model
-      // here would be accepted, stored, and never consulted.
-      throw new Error(
-        "compactionModel is meaningless for brief mode, which the actor writes itself"
-      );
-    }
     return { type: "portable", mode: "brief" };
   }
-  return { type: "portable", mode: "ledger", compactionModel };
+  throw new Error(`unknown context selection: ${String(raw)}`);
 }
 
 /**
@@ -120,19 +110,17 @@ export function resolveContextConfig(value: unknown): ContextConfig | undefined 
  * choke point so every caller — MCP tool, root control, dashboard, the A/B rig —
  * passes through it.
  *
- * Both refusals exist because the alternative is a silent lie:
+ * Refusals exist because the alternative is a silent lie:
  *
  * - A portable actor is invoked STATELESS, so `loadSessionId` returns undefined
  *   and a seeded `conversationId` would be written to the record and then never
  *   resumed. The caller would believe it promoted a conversation into an actor
  *   and get a blank one.
- * - Ledger compaction needs an API key. Without it `buildPrompt` throws on every
- *   run, so the actor is born unable to run at all. Failing at spawn — once,
- *   where the operator is looking — beats a thread that exists and fails forever.
+ * - Portable ledger mode has been retired; brief and tail modes are supported.
  */
 export function assertSpawnContextSupported(
   req: { context?: ContextConfig; conversationId?: string },
-  caps: { ledgerCompactionAvailable: boolean }
+  _caps?: unknown
 ): void {
   const context = req.context;
   if (context?.type !== "portable") return;
@@ -142,10 +130,7 @@ export function assertSpawnContextSupported(
         "drop conversationId or spawn it with native context"
     );
   }
-  if (context.mode === "ledger" && !caps.ledgerCompactionAvailable) {
-    throw new Error(
-      "portable ledger mode needs a Gemini API key for compaction (config geminiApiKey); " +
-        "set it, or spawn with tail mode which never compacts"
-    );
+  if (context.mode === "ledger") {
+    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
   }
 }

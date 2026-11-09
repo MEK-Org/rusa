@@ -5,7 +5,6 @@ import {
   assemblePortableContext,
   assemblePortableContextV2,
   composeHostContextIntoPrompt,
-  PORTABLE_CONTEXT_LEDGER_MAX_BYTES,
   PORTABLE_CONTEXT_MAX_BYTES,
   PORTABLE_CONTEXT_MAX_MESSAGES,
   PORTABLE_CONTEXT_MAX_RUNS,
@@ -16,7 +15,7 @@ import {
   portableContextMaxRuns,
   portableReadWindow,
 } from "./portable-context.js";
-import { emptyPortableContextState } from "./portable-context-state.js";
+import { emptyPortableContextState, type PortableBrief } from "./portable-context-state.js";
 
 const run = (id: string, body: string | null, ts = "2026-07-08T00:00:00.000Z"): PriorRun => ({
   id,
@@ -139,200 +138,49 @@ describe("portableContextMaxMessages", () => {
 });
 
 describe("assemblePortableContextV2", () => {
-  it("injects durable intent even when its source message and run have aged out", () => {
-    const state = emptyPortableContextState("actor-a");
-    state.generation = 3;
-    state.items = [
-      {
-        id: "mem-airgap",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: "Run air-gapped with no new dependencies.",
-        evidence: [
-          {
-            eventId: "old-message",
-            sender: "root",
-            ts: "2026-07-01T00:00:00.000Z",
-            quote: "air-gapped with no new dependencies",
-          },
-        ],
-        updatedAt: "2026-07-01T00:00:00.000Z",
-      },
-    ];
+  it("injects brief when provided and omits when null/undefined", () => {
+    const brief: PortableBrief = {
+      text: "WHAT: Build foo\nHOW: Using bar",
+      generation: 2,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+    };
     const portable = assemblePortableContextV2({
-      state,
-      messages: [
-        {
-          id: "new-message",
-          ts: "2026-07-21T00:00:00.000Z",
-          sender: "root",
-          body: "Add fuzzy search.",
-        },
-      ],
-      runs: [run("new-run", "Added a health endpoint.")],
-    });
-    if (!portable) throw new Error("expected v2 portable context");
-    expect(portable.section).toContain("air-gapped with no new dependencies");
-    expect(portable.record.stateGeneration).toBe(3);
-    expect(portable.record.sourceMessageEventIds).toEqual(["new-message"]);
-    expect(portable.record.sourceEventIds).toEqual(["new-run"]);
-  });
-
-  it("does not inject superseded durable items", () => {
-    const state = emptyPortableContextState("actor-a");
-    state.items = [
-      {
-        id: "old",
-        kind: "constraint",
-        priority: "must",
-        status: "superseded",
-        statement: "Never use dependencies.",
-        evidence: [
-          {
-            eventId: "m1",
-            sender: "root",
-            ts: "2026-07-01T00:00:00.000Z",
-            quote: "Never use dependencies",
-          },
-        ],
-        updatedAt: "2026-07-02T00:00:00.000Z",
-      },
-    ];
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).toBeNull();
-  });
-
-  it("does not inject active items of a retired kind, but still injects active authorable ones (ISSUE_NUM leg 3)", () => {
-    // Both items are `active`, so status is not what separates them — the kind
-    // filter is. This is what retirement actually means for the prompt: the
-    // retired item stays on disk and stays loadable, it just stops carrying
-    // authority. Deleting it, or narrowing the persisted enum so it cannot be
-    // read back, is the thing this design exists to avoid.
-    const state = emptyPortableContextState("actor-a");
-    const evidence = [
-      { eventId: "m1", sender: "root", ts: "2026-07-01T00:00:00.000Z", quote: "either way" },
-    ];
-    state.items = [
-      {
-        id: "mem-commitment",
-        kind: "commitment",
-        priority: "must",
-        status: "active",
-        statement: "RETIRED-KIND-STATEMENT",
-        evidence,
-        updatedAt: "2026-07-01T00:00:00.000Z",
-      },
-      {
-        id: "mem-question",
-        kind: "open_question",
-        priority: "must",
-        status: "active",
-        statement: "RETIRED-QUESTION-STATEMENT",
-        evidence,
-        updatedAt: "2026-07-01T00:00:00.000Z",
-      },
-      {
-        id: "mem-constraint",
-        kind: "constraint",
-        priority: "should",
-        status: "active",
-        statement: "AUTHORABLE-KIND-STATEMENT",
-        evidence,
-        updatedAt: "2026-07-01T00:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    if (!portable) throw new Error("expected v2 portable context");
-    expect(portable.section).toContain("AUTHORABLE-KIND-STATEMENT");
-    expect(portable.section).not.toContain("RETIRED-KIND-STATEMENT");
-    expect(portable.section).not.toContain("RETIRED-QUESTION-STATEMENT");
-    // The retired items are still in the loaded state that produced this
-    // section — they were filtered out of the render, not absent from the data.
-    expect(state.items).toHaveLength(3);
-  });
-
-  it("emits no durable-intent section at all when every active item is a retired kind (ISSUE_NUM leg 3)", () => {
-    // The largest live exposure is an actor whose active items are almost all
-    // retired kinds. It must degrade to "no ledger section", not to an empty
-    // heading with nothing under it and not to a throw.
-    const state = emptyPortableContextState("actor-a");
-    state.items = [
-      {
-        id: "mem-commitment",
-        kind: "commitment",
-        priority: "must",
-        status: "active",
-        statement: "Ship the thing.",
-        evidence: [
-          { eventId: "m1", sender: "root", ts: "2026-07-01T00:00:00.000Z", quote: "Ship the" },
-        ],
-        updatedAt: "2026-07-01T00:00:00.000Z",
-      },
-    ];
-
-    expect(assemblePortableContextV2({ state, messages: [], runs: [] })).toBeNull();
-
-    // Counter-assertion: the actor is not silenced, only its retired items are.
-    // A live message alongside them still assembles a section, with no stray
-    // heading for the ledger that rendered nothing.
-    const withMessage = assemblePortableContextV2({
-      state,
-      messages: [
-        { id: "m2", ts: "2026-07-21T00:00:00.000Z", sender: "root", body: "Add fuzzy search." },
-      ],
+      state: emptyPortableContextState("actor-a"),
+      brief,
+      messages: [{ id: "m1", ts: "2026-10-01T01:00:00.000Z", sender: "root", body: "Hello" }],
       runs: [],
     });
-    if (!withMessage) throw new Error("expected v2 portable context");
-    expect(withMessage.section).toContain("Add fuzzy search.");
-    expect(withMessage.section).not.toContain("Durable intent");
+    expect(portable).not.toBeNull();
+    expect(portable?.section).toContain("### Durable brief");
+    expect(portable?.section).toContain("WHAT: Build foo");
+    expect(portable?.section).toContain("HOW: Using bar");
   });
 
-  it("bounds the whole rendered ledger line, not just the statement inside it", () => {
-    // The evidence quote is appended after the statement by `renderItem` and has
-    // no length cap of its own — it only has to be a verbatim substring of a mesh
-    // event body. Truncating the statement to a fixed `budget - 200` reserve
-    // therefore bounds nothing here: the section overruns, and at this size it
-    // takes the whole prompt past PORTABLE_CONTEXT_MAX_BYTES, which
-    // `assemblePortableContextV2` raises as a throw inside `buildPrompt` — the
-    // owning actor cannot start. Same shape as ISSUE_NUM, one renderer over.
-    const state = emptyPortableContextState("actor-a");
-    state.items = [
-      {
-        id: "mem-1",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: "s".repeat(PORTABLE_CONTEXT_LEDGER_MAX_BYTES),
-        evidence: [
-          {
-            eventId: "m1",
-            sender: "root",
-            ts: "2026-07-01T00:00:00.000Z",
-            quote: "q".repeat(PORTABLE_CONTEXT_MAX_BYTES + 5_000),
-          },
-        ],
-        updatedAt: "2026-07-01T00:00:00.000Z",
-      },
-    ];
+  it("omits durable brief section in tail mode (brief omitted)", () => {
+    const portable = assemblePortableContextV2({
+      state: emptyPortableContextState("actor-a"),
+      messages: [{ id: "m1", ts: "2026-10-01T01:00:00.000Z", sender: "root", body: "Hello" }],
+      runs: [],
+    });
+    expect(portable).not.toBeNull();
+    expect(portable?.section).not.toContain("### Durable brief");
+    expect(portable?.section).not.toContain("### Durable intent");
+    expect(portable?.section).toContain("Hello");
+  });
 
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    if (!portable) throw new Error("expected v2 portable context");
-    const start = portable.section.indexOf("### Durable intent");
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(Buffer.byteLength(portable.section.slice(start), "utf8")).toBeLessThanOrEqual(
-      PORTABLE_CONTEXT_LEDGER_MAX_BYTES
-    );
-    // Bounding the assembled line keeps the cut visible: `headToBytes` appends
-    // its marker after cutting, so the actor can still tell its memory was
-    // truncated rather than quietly rewritten.
-    expect(portable.section).toContain("[MUST] [constraint]");
+  it("returns null when no sections have content", () => {
+    const portable = assemblePortableContextV2({
+      state: emptyPortableContextState("actor-a"),
+      messages: [],
+      runs: [],
+    });
+    expect(portable).toBeNull();
   });
 
   it("keeps the combined v2 prompt under the existing byte ceiling", () => {
     const portable = assemblePortableContextV2({
       state: emptyPortableContextState("actor-a"),
+      brief: { text: "b".repeat(10_000), generation: 1, updatedAt: "2026-10-01T00:00:00.000Z" },
       messages: [
         { id: "m1", ts: "2026-07-21T00:00:00.000Z", sender: "root", body: "m".repeat(20_000) },
       ],
@@ -340,460 +188,6 @@ describe("assemblePortableContextV2", () => {
     });
     if (!portable) throw new Error("expected v2 portable context");
     expect(portable.record.bytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_MAX_BYTES);
-  });
-
-  it("degrades gracefully rather than throwing when active ledger exceeds 16,000B ceiling ", () => {
-    const state = emptyPortableContextState("actor-a");
-    // Create items exceeding 16,000 bytes
-    state.items = [
-      {
-        id: "c-must",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: "M".repeat(5_000),
-        evidence: [
-          { eventId: "m1", sender: "root", ts: "2026-08-01T00:00:00.000Z", quote: "quote" },
-        ],
-        updatedAt: "2026-08-01T00:00:00.000Z",
-      },
-      {
-        id: "c-should",
-        kind: "constraint",
-        priority: "should",
-        status: "active",
-        statement: "S".repeat(7_000),
-        evidence: [
-          { eventId: "m2", sender: "root", ts: "2026-08-01T00:00:00.000Z", quote: "quote" },
-        ],
-        updatedAt: "2026-08-01T00:00:00.000Z",
-      },
-      {
-        id: "c-background",
-        kind: "constraint",
-        priority: "background",
-        status: "active",
-        statement: "B".repeat(8_000),
-        evidence: [
-          { eventId: "m3", sender: "root", ts: "2026-08-01T00:00:00.000Z", quote: "quote" },
-        ],
-        updatedAt: "2026-08-01T00:00:00.000Z",
-      },
-    ];
-
-    // Previously this would throw: `portable context durable ledger exceeds 16000 bytes`
-    // Now it should degrade gracefully by dropping lowest-priority items to fit.
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-    expect(portable.record.sections?.ledger).toBeLessThanOrEqual(16_000);
-    expect(portable.section).toContain("M".repeat(5_000));
-    expect(portable.section).not.toContain("B".repeat(8_000));
-  });
-
-  it("retains newest-first rulings when an overflowing must tier exceeds the byte budget (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    // Create several active must items dated across time that together exceed 16,000 bytes.
-    // The oldest item was recorded earlier; the newest item is recorded recently.
-    state.items = [
-      {
-        id: "must-old-1",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Old ruling 1 from August: ${"1".repeat(6_000)}`,
-        evidence: [
-          { eventId: "e1", sender: "root", ts: "2026-08-25T10:00:00.000Z", quote: "old 1" },
-        ],
-        updatedAt: "2026-08-25T10:00:00.000Z",
-      },
-      {
-        id: "must-old-2",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Old ruling 2 from August: ${"2".repeat(6_000)}`,
-        evidence: [
-          { eventId: "e2", sender: "root", ts: "2026-08-26T10:00:00.000Z", quote: "old 2" },
-        ],
-        updatedAt: "2026-08-26T10:00:00.000Z",
-      },
-      {
-        id: "must-recent-3",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Recent ruling 3 from September: ${"3".repeat(6_000)}`,
-        evidence: [
-          { eventId: "e3", sender: "root", ts: "2026-09-07T12:00:00.000Z", quote: "recent 3" },
-        ],
-        updatedAt: "2026-09-07T12:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    // Under #328, newest-first within the must tier ensures the September ruling is retained,
-    // and older rulings that overflow the 16KB budget are dropped.
-    // The pre-fix bug keeps a fixed slab of the oldest items (must-old-1 and must-old-2), dropping must-recent-3.
-    expect(portable.section).toContain("Recent ruling 3 from September");
-    expect(portable.section).not.toContain("Old ruling 1 from August");
-
-    // Omission marker and overflow metrics are observable via canonical record.ledger
-    expect(portable.section).toContain("… [1 active item omitted due to budget]");
-    const metrics = portable.record.ledger;
-    expect(metrics).toBeDefined();
-    if (!metrics) throw new Error("expected ledger metrics");
-
-    expect(metrics.active).toBe(3);
-    expect(metrics.selected).toBe(2);
-    expect(metrics.dropped).toBe(1);
-    expect(metrics.droppedByPriority).toEqual({ must: 1, should: 0, background: 0 });
-    expect(metrics.minSelectedEvidenceTs).toBe("2026-08-26T10:00:00.000Z");
-    expect(metrics.maxSelectedEvidenceTs).toBe("2026-09-07T12:00:00.000Z");
-    expect(metrics.minDroppedEvidenceTs).toBe("2026-08-25T10:00:00.000Z");
-    expect(metrics.maxDroppedEvidenceTs).toBe("2026-08-25T10:00:00.000Z");
-  });
-
-  it("preserves priority tier dominance so older must items precede newer should items (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    state.items = [
-      {
-        id: "must-old",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Old must item from August: ${"M".repeat(9_000)}`,
-        evidence: [
-          { eventId: "e1", sender: "root", ts: "2026-08-01T10:00:00.000Z", quote: "must" },
-        ],
-        updatedAt: "2026-08-01T10:00:00.000Z",
-      },
-      {
-        id: "should-recent",
-        kind: "constraint",
-        priority: "should",
-        status: "active",
-        statement: `Recent should item from September: ${"S".repeat(9_000)}`,
-        evidence: [
-          { eventId: "e2", sender: "root", ts: "2026-09-15T10:00:00.000Z", quote: "should" },
-        ],
-        updatedAt: "2026-09-15T10:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    // Priority tier dominance: 'must' > 'should' regardless of timestamp
-    expect(portable.section).toContain("Old must item from August");
-    expect(portable.section).not.toContain("Recent should item from September");
-    expect(portable.section).toContain("… [1 active item omitted due to budget]");
-
-    const metrics = portable.record.ledger;
-    expect(metrics).toBeDefined();
-    if (!metrics) throw new Error("expected ledger metrics");
-
-    expect(metrics.active).toBe(2);
-    expect(metrics.selected).toBe(1);
-    expect(metrics.dropped).toBe(1);
-    expect(metrics.droppedByPriority).toEqual({ must: 0, should: 1, background: 0 });
-    expect(metrics.minSelectedEvidenceTs).toBe("2026-08-01T10:00:00.000Z");
-    expect(metrics.maxSelectedEvidenceTs).toBe("2026-08-01T10:00:00.000Z");
-    expect(metrics.minDroppedEvidenceTs).toBe("2026-09-15T10:00:00.000Z");
-    expect(metrics.maxDroppedEvidenceTs).toBe("2026-09-15T10:00:00.000Z");
-  });
-
-  it("evaluates recency using newest evidence timestamp when item is re-evidenced (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    // Item A was created early August, but re-evidenced in late September.
-    // Item B was created late August with no newer evidence.
-    state.items = [
-      {
-        id: "item-a-re-evidenced",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Item A re-evidenced: ${"A".repeat(8_500)}`,
-        evidence: [
-          { eventId: "e1", sender: "root", ts: "2026-08-01T10:00:00.000Z", quote: "orig" },
-          { eventId: "e3", sender: "root", ts: "2026-09-25T10:00:00.000Z", quote: "re-affirmed" },
-        ],
-        updatedAt: "2026-08-01T10:00:00.000Z",
-      },
-      {
-        id: "item-b-intermediate",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Item B intermediate: ${"B".repeat(8_500)}`,
-        evidence: [
-          { eventId: "e2", sender: "root", ts: "2026-08-20T10:00:00.000Z", quote: "intermediate" },
-        ],
-        updatedAt: "2026-08-20T10:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    // Item A's newest evidence timestamp (2026-09-25) is newer than Item B (2026-08-20)
-    expect(portable.section).toContain("Item A re-evidenced");
-    expect(portable.section).not.toContain("Item B intermediate");
-    expect(portable.section).toContain("… [1 active item omitted due to budget]");
-  });
-
-  it("breaks recency ties deterministically using original index descending (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    // Both items have identical evidence timestamps and same priority
-    state.items = [
-      {
-        id: "item-first",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Item first in array: ${"1".repeat(9_000)}`,
-        evidence: [{ eventId: "e1", sender: "root", ts: "2026-09-01T12:00:00.000Z", quote: "q" }],
-        updatedAt: "2026-09-01T12:00:00.000Z",
-      },
-      {
-        id: "item-second",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Item second in array: ${"2".repeat(9_000)}`,
-        evidence: [{ eventId: "e2", sender: "root", ts: "2026-09-01T12:00:00.000Z", quote: "q" }],
-        updatedAt: "2026-09-01T12:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    // On tie, later originalIndex (item-second) is selected first
-    expect(portable.section).toContain("Item second in array");
-    expect(portable.section).not.toContain("Item first in array");
-  });
-
-  it("ignores non-ISO 8601 evidence timestamps and falls back to valid updatedAt (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    // Item 1 has a non-ISO date string ("09/01/2026") in evidence that Date.parse would loosely parse as Sept 1,
-    // but strict ISO 8601 rejects it, falling back to updatedAt: Aug 10.
-    // Item 2 has a valid ISO 8601 timestamp in evidence: Aug 20.
-    state.items = [
-      {
-        id: "item-non-iso",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Item non-ISO: ${"1".repeat(9_000)}`,
-        evidence: [{ eventId: "e1", sender: "root", ts: "09/01/2026", quote: "loose" }],
-        updatedAt: "2026-08-10T12:00:00.000Z",
-      },
-      {
-        id: "item-valid-iso",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Item valid-ISO: ${"2".repeat(9_000)}`,
-        evidence: [
-          { eventId: "e2", sender: "root", ts: "2026-08-20T12:00:00.000Z", quote: "strict" },
-        ],
-        updatedAt: "2026-08-20T12:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    // Because "09/01/2026" is rejected as non-ISO, item-non-iso uses updatedAt (Aug 10),
-    // and item-valid-iso (Aug 20) is correctly selected as the newer ruling.
-    expect(portable.section).toContain("Item valid-ISO");
-    expect(portable.section).not.toContain("Item non-ISO");
-  });
-
-  it("strictly enforces 16,000B ledger limit with omission marker and renders stable original order (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    // 20 items of ~1,000 bytes each (total ~20KB) across various dates
-    state.items = Array.from({ length: 20 }, (_, idx) => ({
-      id: `item-${idx}`,
-      kind: "constraint" as const,
-      priority: "must" as const,
-      status: "active" as const,
-      statement: `Ruling index ${idx} with content: ${"x".repeat(900)}`,
-      evidence: [
-        {
-          eventId: `e-${idx}`,
-          sender: "root",
-          ts: `2026-08-${String(idx + 1).padStart(2, "0")}T00:00:00.000Z`,
-          quote: `q-${idx}`,
-        },
-      ],
-      updatedAt: `2026-08-${String(idx + 1).padStart(2, "0")}T00:00:00.000Z`,
-    }));
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    const ledgerBytes = portable.record.sections?.ledger;
-    expect(ledgerBytes).toBeDefined();
-    expect(ledgerBytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_LEDGER_MAX_BYTES);
-
-    const metrics = portable.record.ledger;
-    expect(metrics).toBeDefined();
-    if (!metrics) throw new Error("expected ledger metrics");
-
-    // Invariants
-    expect(metrics.active).toBe(20);
-    expect(metrics.selected + metrics.dropped).toBe(metrics.active);
-    expect(
-      metrics.droppedByPriority.must +
-        metrics.droppedByPriority.should +
-        metrics.droppedByPriority.background
-    ).toBe(metrics.dropped);
-    expect(metrics.dropped).toBeGreaterThan(0);
-
-    // Omission marker matches dropped count exactly
-    expect(portable.section).toContain(`… [${metrics.dropped} active items omitted due to budget]`);
-
-    // Selected items are observed directly in their rendered order in section
-    const lines = portable.section.split("\n");
-    const indicesInOutput = lines
-      .map((line) => {
-        const match = line.match(/Ruling index (\d+) with content/);
-        return match ? Number(match[1]) : null;
-      })
-      .filter((n): n is number => n !== null);
-
-    expect(indicesInOutput.length).toBe(metrics.selected);
-    const sortedIndices = [...indicesInOutput].sort((a, b) => a - b);
-    expect(indicesInOutput).toEqual(sortedIndices);
-  });
-
-  it("bounds multibyte oversized truncation and omission marker within 16,000 bytes (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    // One oversized item with multibyte characters (>16KB alone) plus a second active item
-    state.items = [
-      {
-        id: "must-multibyte-oversized",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: `Oversized ruling: ${"🚀".repeat(5_000)}`,
-        evidence: [{ eventId: "e1", sender: "root", ts: "2026-09-01T00:00:00.000Z", quote: "🚀" }],
-        updatedAt: "2026-09-01T00:00:00.000Z",
-      },
-      {
-        id: "must-dropped",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: "Second ruling dropped",
-        evidence: [
-          { eventId: "e2", sender: "root", ts: "2026-08-01T00:00:00.000Z", quote: "drop" },
-        ],
-        updatedAt: "2026-08-01T00:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    const ledgerBytes = portable.record.sections?.ledger;
-    expect(ledgerBytes).toBeDefined();
-    expect(ledgerBytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_LEDGER_MAX_BYTES);
-
-    const metrics = portable.record.ledger;
-    expect(metrics).toBeDefined();
-    if (!metrics) throw new Error("expected ledger metrics");
-
-    expect(metrics.active).toBe(2);
-    expect(metrics.selected).toBe(1);
-    expect(metrics.dropped).toBe(1);
-    expect(portable.section).toContain("… [1 active item omitted due to budget]");
-  });
-
-  it("reports zero dropped metrics and null dropped evidence timestamps when ledger fits budget (#328)", () => {
-    const state = emptyPortableContextState("actor-a");
-    state.items = [
-      {
-        id: "small-1",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: "Small ruling 1",
-        evidence: [{ eventId: "e1", sender: "root", ts: "2026-09-01T00:00:00.000Z", quote: "q1" }],
-        updatedAt: "2026-09-01T00:00:00.000Z",
-      },
-      {
-        id: "small-2",
-        kind: "constraint",
-        priority: "should",
-        status: "active",
-        statement: "Small ruling 2",
-        evidence: [{ eventId: "e2", sender: "root", ts: "2026-09-02T00:00:00.000Z", quote: "q2" }],
-        updatedAt: "2026-09-02T00:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    expect(portable).not.toBeNull();
-    if (!portable) throw new Error("expected portable context");
-
-    const metrics = portable.record.ledger;
-    expect(metrics).toBeDefined();
-    if (!metrics) throw new Error("expected ledger metrics");
-
-    expect(metrics.active).toBe(2);
-    expect(metrics.selected).toBe(2);
-    expect(metrics.dropped).toBe(0);
-    expect(metrics.droppedByPriority).toEqual({ must: 0, should: 0, background: 0 });
-    expect(metrics.minSelectedEvidenceTs).toBe("2026-09-01T00:00:00.000Z");
-    expect(metrics.maxSelectedEvidenceTs).toBe("2026-09-02T00:00:00.000Z");
-    expect(metrics.minDroppedEvidenceTs).toBeNull();
-    expect(metrics.maxDroppedEvidenceTs).toBeNull();
-    expect(portable.section).not.toContain("omitted due to budget");
-  });
-
-  it("renders originating evidence (evidence[0]) as Source so re-evidencing does not misattribute issuer (§4 / ISSUE_NUM)", () => {
-    const state = emptyPortableContextState("actor-a");
-    state.items = [
-      {
-        id: "c1",
-        kind: "constraint",
-        priority: "must",
-        status: "active",
-        statement: "Must operate in read-only mode.",
-        evidence: [
-          {
-            eventId: "m1",
-            sender: "root-authority",
-            ts: "2026-08-01T00:00:00.000Z",
-            quote: "Must operate in read-only mode",
-          },
-          {
-            eventId: "y1",
-            sender: "actor-a",
-            ts: "2026-08-01T01:00:00.000Z",
-            quote: "read-only mode observed",
-          },
-        ],
-        updatedAt: "2026-08-01T01:00:00.000Z",
-      },
-    ];
-
-    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
-    if (!portable) throw new Error("expected portable context");
-    expect(portable.section).toContain("Source root-authority at 2026-08-01T00:00:00.000Z");
-    expect(portable.section).not.toContain("Source actor-a");
   });
 });
 
@@ -1261,23 +655,16 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
 
       it("appends nothing when the leader's fixed sections leave its run tail little room", () => {
         const state = emptyPortableContextState("actor-a");
-        state.items = [
-          {
-            id: "mem-1",
-            kind: "constraint",
-            priority: "must",
-            status: "active",
-            statement: "s".repeat(PORTABLE_CONTEXT_LEDGER_MAX_BYTES),
-            evidence: [
-              { eventId: "m0", sender: "root", ts: "2026-10-01T00:00:00.000Z", quote: "s" },
-            ],
-            updatedAt: "2026-10-01T00:00:00.000Z",
-          },
-        ];
+        const brief = {
+          text: "s".repeat(16_000),
+          generation: 1,
+          updatedAt: "2026-10-01T00:00:00.000Z",
+        };
         const newest = sized("run-newest", "2026-10-18T08:00:00.000Z", 6_000);
         const older = sized("run-older", "2026-10-18T07:00:00.000Z", 1_000);
         const leaderBuild = assemblePortableContextV2({
           state,
+          brief,
           messages: [
             { id: "m1", ts: "2026-10-18T06:00:00.000Z", sender: "root", body: "m".repeat(20_000) },
           ],

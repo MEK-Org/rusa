@@ -26,12 +26,7 @@ import {
   type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
-import type {
-  ActorRecord,
-  ContextConfig,
-  ExecutionConfig,
-  PortableContextConfig,
-} from "../actor/actor-record.js";
+import type { ActorRecord, ExecutionConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   defaultActorBootstrapCapabilities,
@@ -116,27 +111,12 @@ import {
   assemblePortableContext,
   assemblePortableContextV2,
   type InjectRecord,
-  PORTABLE_CONTEXT_FOLD_MAX_BYTES,
-  PORTABLE_CONTEXT_FOLD_MAX_PAGES,
   portableContextMaxMessages,
   portableContextMaxRuns,
   portableReadWindow,
 } from "../actor/portable-context.js";
 import { seedPortableBriefState } from "../actor/portable-context-brief.js";
-import {
-  describeCompaction,
-  GeminiPortableContextCompactor,
-  type PortableContextCompactionSummary,
-  type PortableContextCompactor,
-  type QuarantinedOperation,
-  quarantineCountsByClass,
-  resolvePortableContextCompactorModel,
-} from "../actor/portable-context-compactor.js";
-import {
-  type PortableJournalMode,
-  type PortableJournalRecord,
-  selectDeltaJournal,
-} from "../actor/portable-context-delta.js";
+import type { PortableJournalMode } from "../actor/portable-context-delta.js";
 import type { PortableContextStore } from "../actor/portable-context-state.js";
 import {
   type PoolLaneCandidate,
@@ -211,7 +191,6 @@ import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
-import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
 import type {
   AvailabilityHold,
   AvailabilityHoldOrigin,
@@ -988,22 +967,6 @@ export const PORTABLE_CONTEXT_DELTA_MAX_PAGES = 4;
  * the page ceiling; the sources kept are the OLDEST, so a truncated read must
  * fall back to the recent window to keep the newest messages visible.
  */
-export function readUnfoldedLedgerSources(
-  actorId: string,
-  afterSourceId: string | null,
-  maxPages = PORTABLE_CONTEXT_DELTA_MAX_PAGES
-): { sources: PortableLedgerSource[]; truncated: boolean } {
-  const sources: PortableLedgerSource[] = [];
-  let cursor = afterSourceId;
-  for (let page = 0; page < maxPages; page++) {
-    const result = getRepositories().actorRuns.listLedgerSourcesAfter(actorId, cursor, 50);
-    sources.push(...result.sources);
-    if (!result.hasMore) return { sources, truncated: false };
-    cursor = result.sources.at(-1)?.id ?? cursor;
-  }
-  return { sources, truncated: true };
-}
-
 interface PortableInjection {
   /** The rendered prefix; absent when there is nothing to inject (e.g. a first run). */
   priorContext?: string;
@@ -1028,10 +991,13 @@ function assemblePortableInjection(
   id: string,
   mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
-  journal: PortableJournalMode = "window",
-  onDeltaFallback: (error: unknown) => void = () => {},
+  _journal: PortableJournalMode = "window",
+  _onDeltaFallback: (error: unknown) => void = () => {},
   repositories: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = getRepositories()
 ): PortableInjection {
+  if (mode === "ledger") {
+    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+  }
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
@@ -1057,61 +1023,20 @@ function assemblePortableInjection(
   // Read-through only. The prompt shows work state; it never authors it
   // — the obligation store stays the sole lifecycle authority.
   const obligations = repositories.obligations.listOwned(id);
-  const windowJournal = () => ({
-    messages: repositories.meshChat
-      .listReceivedForActor(id, { limit: portableContextMaxMessages() })
-      .map((message) => ({
-        id: message.id,
-        ts: message.ts,
-        sender: message.senderId,
-        body: message.body,
-      })),
-    runs,
-    journal: undefined as PortableJournalRecord | undefined,
-  });
-  // Compacted memory plus delta (#1062): verbatim messages after the fold cursor
-  // plus the unchanged runs window. A failed or truncated read falls back to the
-  // recent window, so the actor starts with its newest messages still visible.
-  const selectJournal = () => {
-    // Brief writes do not advance the ledger fold cursor; keep their recent window.
-    if (mode !== "ledger" || journal !== "delta") return windowJournal();
-    try {
-      const unfolded = readUnfoldedLedgerSources(id, state.lastFoldedSourceId);
-      const delta = selectDeltaJournal({
-        unfolded: unfolded.sources,
-        recentRuns: runs,
-        maxMessages: portableContextMaxMessages(),
-      });
-      const journalRecord: PortableJournalRecord = {
-        mode: unfolded.truncated ? "window" : "delta",
-        foldCursor: state.lastFoldedSourceId,
-        unfoldedSources: delta.unfoldedSources,
-        unfoldedMessages: delta.unfoldedMessages,
-        unfoldedYields: delta.unfoldedYields,
-        truncated: unfolded.truncated,
-      };
-      if (unfolded.truncated) {
-        onDeltaFallback(new Error("unfolded source tail exceeds the delta journal page ceiling"));
-        return { ...windowJournal(), journal: journalRecord };
-      }
-      return {
-        messages: delta.messages,
-        runs: delta.runs,
-        journal: journalRecord,
-      };
-    } catch (error) {
-      onDeltaFallback(error);
-      return windowJournal();
-    }
-  };
-  const selected = selectJournal();
+  const messages = repositories.meshChat
+    .listReceivedForActor(id, { limit: portableContextMaxMessages() })
+    .map((message) => ({
+      id: message.id,
+      ts: message.ts,
+      sender: message.senderId,
+      body: message.body,
+    }));
   const portable = assemblePortableContextV2({
     state,
-    messages: selected.messages,
-    runs: selected.runs,
+    messages,
+    runs,
     obligations,
-    journal: selected.journal,
-    ...(mode === "brief" ? { brief: state.brief } : {}),
+    brief: state.brief,
   });
   return portable
     ? { priorContext: portable.section, injectRecord: portable.record, readRunIds }
@@ -1120,16 +1045,20 @@ function assemblePortableInjection(
 
 export function assembleConfiguredPortableInjection(
   record: ActorRecord,
-  apiKey: string | null,
+  _apiKey: string | null,
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback?: (error: unknown) => void,
   repositories?: Pick<Repositories, "actorRuns" | "obligations" | "meshChat">
 ): PortableInjection | undefined {
-  if (record.context?.type !== "portable") return undefined;
-  if (record.context.mode === "ledger" && !apiKey) {
-    throw new Error("portable context ledger mode requires geminiApiKey");
+  if (
+    (record.context?.type === "portable" && record.context.mode === "ledger") ||
+    (record.desiredContextConfig?.type === "portable" &&
+      record.desiredContextConfig.mode === "ledger")
+  ) {
+    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
   }
+  if (record.context?.type !== "portable") return undefined;
   return assemblePortableInjection(
     record.id,
     record.context.mode,
@@ -1138,76 +1067,6 @@ export function assembleConfiguredPortableInjection(
     onDeltaFallback,
     repositories
   );
-}
-
-export async function compactPortableContext(input: {
-  actorId: string;
-  runId?: string;
-  store: PortableContextStore;
-  compactor: PortableContextCompactor;
-  now?: () => string;
-}): Promise<PortableContextCompactionSummary | null> {
-  let state = input.store.load(input.actorId);
-  const itemsBefore = state.items.length;
-  let folded = 0;
-  let foldedSelf = 0;
-  let operations = 0;
-  let bytes = 0;
-  let pages = 0;
-  let foldStop: PortableContextCompactionSummary["foldStop"] = "drained";
-  const quarantinedOperations: QuarantinedOperation[] = [];
-  while (true) {
-    const page = getRepositories().actorRuns.listLedgerSourcesAfter(
-      input.actorId,
-      state.lastFoldedSourceId,
-      50
-    );
-    if (page.sources.length === 0) break;
-    const result = await input.compactor.compact({
-      actorId: input.actorId,
-      runId: input.runId,
-      state,
-      messages: page.sources,
-      now: (input.now ?? (() => new Date().toISOString()))(),
-    });
-    // A brief may have committed while the fold awaited the model, including
-    // through another connection. Preserve it inside the store's write lock.
-    state = input.store.saveFolded(result.state);
-    quarantinedOperations.push(...result.quarantined);
-    operations += result.operations;
-    folded += page.sources.length;
-    foldedSelf += page.sources.filter((source) => source.kind === "run_yielded").length;
-    bytes += page.sources.reduce(
-      (sum, source) => sum + Buffer.byteLength(source.body ?? "", "utf8"),
-      0
-    );
-    pages += 1;
-    if (!page.hasMore) break;
-    // Both caps are checked AFTER a page lands, so a fold always makes progress
-    // and the watermark always advances — the remainder is the next run's work.
-    if (pages >= PORTABLE_CONTEXT_FOLD_MAX_PAGES) {
-      foldStop = "page-cap";
-      break;
-    }
-    if (bytes >= PORTABLE_CONTEXT_FOLD_MAX_BYTES) {
-      foldStop = "byte-cap";
-      break;
-    }
-  }
-  return folded > 0
-    ? {
-        generation: state.generation,
-        items: state.items.length,
-        itemsAdded: state.items.length - itemsBefore,
-        folded,
-        foldedSelf,
-        operations,
-        quarantined: quarantinedOperations.length,
-        quarantinedByClass: quarantineCountsByClass(quarantinedOperations),
-        quarantinedOperations,
-        foldStop,
-      }
-    : null;
 }
 
 /**
@@ -1395,16 +1254,6 @@ async function composeStart(
     });
   }
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
-  const portableContextCompactors = new Map<string, PortableContextCompactor>();
-  const compactorFor = (context: PortableContextConfig): PortableContextCompactor | null => {
-    if (!portableContextApiKey) return null;
-    const model = resolvePortableContextCompactorModel(context.compactionModel);
-    const existing = portableContextCompactors.get(model);
-    if (existing) return existing;
-    const compactor = new GeminiPortableContextCompactor(portableContextApiKey, model);
-    portableContextCompactors.set(model, compactor);
-    return compactor;
-  };
 
   if (config.sandbox !== "container-boundary") {
     // bubblewrap is required for sandboxed worker runs. The root itself is
@@ -3091,31 +2940,6 @@ async function composeStart(
       impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
     });
   };
-  const compactPortableActorAfterRun = async (
-    actorId: string,
-    runId: string,
-    runContext?: ContextConfig
-  ): Promise<PortableContextCompactionSummary | null> => {
-    const current = runContext ?? actors.get(actorId)?.context;
-    const context = current?.type === "portable" ? current : undefined;
-    const compactor = context?.mode === "ledger" ? compactorFor(context) : null;
-    if (context?.mode !== "ledger" || !compactor) return null;
-    try {
-      return await compactPortableContext({
-        actorId,
-        runId,
-        store: portableContextStore,
-        compactor,
-      });
-    } catch (err) {
-      // Keep the previous state and watermark. The exact message remains in the
-      // recent raw journal and will be retried after the next run.
-      console.warn(
-        `[portable-context] compaction failed for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
-      );
-      return null;
-    }
-  };
 
   // ── Follower gateway: persistent remote execution nodes ──
   let followerHub: FollowerHub | undefined;
@@ -3278,7 +3102,6 @@ async function composeStart(
     // Which entry actually ran, for the failure-notice label. A declared pool
     // can move while idle, so this is captured at lifecycle start.
     let lastSelected = firstSelected;
-    let launchContext = actors.get(id)?.context;
     // A run bound to its execution host keeps its originals there; only an
     // unbound run's prompt goes to `run_prompts` (#1020).
     lifecycle.add(
@@ -3292,7 +3115,6 @@ async function composeStart(
     lifecycle.add({
       onStart: (event) => {
         lastSelected = event.selected;
-        launchContext = actors.get(id)?.context;
         mesh.clearSelection(id);
         const launchConfig = projectActorRunLaunchConfig(event.selected);
         runAccounting.begin(id, event.runId, launchConfig);
@@ -3383,38 +3205,6 @@ async function composeStart(
       onEnd: async (event) => {
         if (event.terminal.kind === "abandoned") return;
         const { result } = event.terminal;
-        // Deferred interruption compaction (#1062): an enrolled ledger actor
-        // whose run was interrupted skips the fold here, so the responsive
-        // successor — which is what interrupted it — starts without waiting on
-        // the compactor. The cursor is untouched; the sources stay in mesh_chat
-        // and actor_runs, and the next ordinary run end folds them once.
-        const isLedgerRun = launchContext?.type === "portable" && launchContext.mode === "ledger";
-        const deferred =
-          result.interrupted === true && isLedgerRun && portableJournalModeFor(id) === "delta";
-        if (deferred) {
-          mesh.recordEvent({
-            kind: "portable_context_compaction_deferred",
-            actorId: id,
-            detail: `interrupted by ${result.interruptSource ?? "unknown"}`,
-            payload: JSON.stringify({
-              runId: event.runId,
-              interruptSource: result.interruptSource ?? null,
-              foldCursor: portableContextStore.load(id).lastFoldedSourceId,
-            }),
-          });
-        }
-        const compacted =
-          deferred || !isLedgerRun
-            ? null
-            : await compactPortableActorAfterRun(id, event.runId, launchContext);
-        if (compacted) {
-          mesh.recordEvent({
-            kind: "portable_context_compacted",
-            actorId: id,
-            detail: describeCompaction(compacted),
-            body: JSON.stringify(compacted),
-          });
-        }
         if (!result.success) {
           await routeRunFailure(
             failureSink,
@@ -3480,12 +3270,10 @@ async function composeStart(
         ? (target: string) => followerHub.list().some((f) => f.id === target)
         : undefined,
     validateSpawn: (req) => {
-      // Portable-context refusals  live here, at the mesh's single spawn
+      // Portable-context refusals live here, at the mesh's single spawn
       // choke point, so the MCP tool, root control, the dashboard and the A/B rig
       // are all gated by construction rather than each remembering to check.
-      assertSpawnContextSupported(req, {
-        ledgerCompactionAvailable: portableContextApiKey !== null,
-      });
+      assertSpawnContextSupported(req);
       // Named model classes resolve from the current committed database row
       // here, before validation. Spawns arriving via root control retain their
       // original declaration so the mesh can derive class provenance directly,
@@ -3505,10 +3293,7 @@ async function composeStart(
       });
     },
     validateContext: (record, context) => {
-      assertSpawnContextSupported(
-        { context },
-        { ledgerCompactionAvailable: portableContextApiKey !== null }
-      );
+      assertSpawnContextSupported({ context });
       const effectivePool =
         (record.desiredModelConfig as ProviderModelConfig[] | undefined) ?? record.modelConfig;
       if (effectivePool && effectivePool.length > 0) {

@@ -551,13 +551,7 @@ export function startRootControlServer(opts: {
           // Echo back what was actually stored on the record, read out of the
           // resolved config rather than off the request, so the rig asserts on
           // the spawn's real shape instead of on its own input.
-          send(
-            res,
-            201,
-            context?.type === "portable"
-              ? { id, contextMode: context.mode, compactionModel: context.compactionModel }
-              : { id }
-          );
+          send(res, 201, context?.type === "portable" ? { id, contextMode: context.mode } : { id });
           return;
         }
         if (url.pathname === "/root/wakes/ack") {

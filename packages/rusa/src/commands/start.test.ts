@@ -27,6 +27,7 @@ import {
   type MeshActor,
   RetirementBlockedError,
 } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import {
   CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES,
   CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
@@ -41,7 +42,6 @@ import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { type InjectRecord, PORTABLE_CONTEXT_MAX_BYTES } from "../actor/portable-context.js";
 import { seedPortableBriefState } from "../actor/portable-context-brief.js";
-import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import {
   emptyPortableContextState,
   PORTABLE_CONTEXT_SCHEMA_VERSION,
@@ -6629,7 +6629,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).toContainEqual(expect.objectContaining({ name: "brief" }));
   });
 
-  it("applies the existing ledger API-key requirement to a portable root", async () => {
+  it("rejects retired ledger mode on rootActor at startup", async () => {
     let ready = false;
     writeFileSync(
       join(homeDir, "config.yaml"),
@@ -6658,38 +6658,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(process.exit).toHaveBeenCalledWith(1);
   });
 
-  it("compacts root ledger state and records the lifecycle event after a run", async () => {
+  it("rejects an actor persisted with retired ledger mode at run launch before provider invocation", async () => {
     let mesh: ActorMesh | undefined;
-    const compactSpy = vi
-      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
-      .mockImplementation(async ({ state, messages, now }) => ({
-        state: {
-          ...state,
-          generation: state.generation + 1,
-          updatedAt: now,
-          lastFoldedSourceId: messages.at(-1)?.id ?? null,
-          items: [
-            {
-              id: "mem-root-instruction",
-              kind: "decision" as const,
-              priority: "must" as const,
-              status: "active" as const,
-              statement: "The root instruction remains durable.",
-              evidence: [
-                {
-                  eventId: messages[0]?.id ?? "missing-source",
-                  sender: "operator",
-                  ts: messages[0]?.ts ?? now,
-                  quote: "Remember this root instruction.",
-                },
-              ],
-              updatedAt: now,
-            },
-          ],
-        },
-        quarantined: [],
-        operations: 0,
-      }));
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -6699,9 +6669,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
           provider: "antigravity",
           model: "Gemini 3.7 Flash",
           effort: "high",
-          context: { type: "portable", mode: "ledger" },
+          context: { type: "portable", mode: "tail" },
         },
-        geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
     );
@@ -6719,11 +6688,90 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     if (!mesh) throw new Error("mesh not ready");
-    getRepositories().meshChat.record({
-      senderId: "operator",
-      recipientId: rootId,
-      body: "Remember this root instruction.",
+    const workerId = "persisted-ledger-worker";
+    const workerRecord: ActorRecord = {
+      id: workerId,
+      charter: "legacy ledger worker",
+      parentId: rootId,
+      status: "active",
+      createdAt: new Date().toISOString(),
+      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+      context: { type: "portable", mode: "ledger" },
+    };
+    getRepositories().actors.upsert(workerRecord);
+    mesh.rehydrate(workerRecord);
+
+    const worker = mesh.get(workerId);
+    if (!worker) throw new Error("worker not found");
+    const actorOpts = (
+      worker as unknown as {
+        opts: {
+          buildPrompt: () => { prompt: string };
+        };
+      }
+    ).opts;
+
+    expect(() => actorOpts.buildPrompt()).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
+
+    const stagedRecord: ActorRecord = {
+      id: "worker-staged-ledger",
+      charter: "staged ledger worker",
+      parentId: rootId,
+      status: "active",
+      createdAt: new Date().toISOString(),
+      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+      context: { type: "portable", mode: "tail" },
+      desiredContextConfig: { type: "portable", mode: "ledger" },
+    };
+    getRepositories().actors.upsert(stagedRecord);
+    mesh.rehydrate(stagedRecord);
+
+    const stagedWorker = mesh.get("worker-staged-ledger");
+    if (!stagedWorker) throw new Error("staged worker not found");
+    const stagedOpts = (
+      stagedWorker as unknown as {
+        opts: {
+          buildPrompt: () => { prompt: string };
+        };
+      }
+    ).opts;
+    expect(() => stagedOpts.buildPrompt()).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
+  });
+
+  it("runs portable brief and tail mode actors cleanly without compaction", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "brief" },
+        },
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
     });
+
+    if (!mesh) throw new Error("mesh not ready");
     const rootActor = mesh.get(rootId);
     if (!rootActor) throw new Error("root actor not ready");
     const actorOpts = (
@@ -6733,436 +6781,26 @@ describe("runStart webhook event routing (Phase 4)", () => {
         };
       }
     ).opts;
-    const firstRunId = await startLifecycleRun(rootActor as Actor, {
+
+    const promptObj = actorOpts.buildPrompt();
+    expect(promptObj.prompt).toBeDefined();
+
+    const runId = await startLifecycleRun(rootActor as Actor, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
       effort: "high",
     });
-    await endLifecycleRun(rootActor as Actor, firstRunId, {
+    await endLifecycleRun(rootActor as Actor, runId, {
       success: true,
-      output: "root completed",
+      output: "run completed cleanly",
       exitCode: 0,
     });
 
-    expect(compactSpy).toHaveBeenCalledOnce();
-    // Read back through the durable store, not a file: the snapshot is a row in
-    // mesh.db, committed with the run that folded it.
-    const state = getRepositories().portableContext.load(rootId);
-    expect(state.generation).toBe(1);
-    expect(existsSync(join(homeDir, "portable-context"))).toBe(false);
-    expect(state.lastFoldedSourceId).toBeTruthy();
-    const compacted = getRepositories().meshEvents.listEventsByActors([rootId], {
-      kinds: ["portable_context_compacted"],
+    const compactionEvents = getRepositories().meshEvents.listEventsByActors([rootId], {
+      kinds: ["portable_context_compacted", "portable_context_compaction_deferred"],
       limit: 10,
     }).events;
-    expect(compacted).toHaveLength(1);
-    expect(compacted[0]?.detail).toContain("generation 1");
-
-    // mesh_events is an analytics stream, so pruning it must not remove live
-    // prompt state. Recent output comes from actor_runs, recent messages from
-    // mesh_chat, and compacted memory from portable_context_snapshots.
-    getDb().exec("DELETE FROM mesh_events");
-    const built = actorOpts.buildPrompt();
-    expect(built.prompt).toContain("root completed");
-    expect(built.prompt).toContain("Remember this root instruction.");
-    expect(built.prompt).toContain("The root instruction remains durable.");
-
-    // The durable cursor must also advance after truncation, not merely render
-    // the already-materialized state.
-    getRepositories().meshChat.record({
-      senderId: "operator",
-      recipientId: rootId,
-      body: "Fold this after truncation.",
-    });
-    const secondRunId = await startLifecycleRun(rootActor as Actor, {
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash",
-      effort: "high",
-    });
-    await endLifecycleRun(rootActor as Actor, secondRunId, {
-      success: true,
-      output: "second run",
-      exitCode: 0,
-    });
-    expect(compactSpy).toHaveBeenCalledTimes(2);
-    const advancedState = getRepositories().portableContext.load(rootId);
-    expect(advancedState.generation).toBe(2);
-    expect(advancedState.lastFoldedSourceId).not.toBe(state.lastFoldedSourceId);
-    compactSpy.mockRestore();
-  });
-
-  it("compacts ledger state using launch context when a different context mode is staged mid-run", async () => {
-    let mesh: ActorMesh | undefined;
-    const compactSpy = vi
-      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
-      .mockImplementation(async ({ state, messages, now }) => ({
-        state: {
-          ...state,
-          generation: state.generation + 1,
-          updatedAt: now,
-          lastFoldedSourceId: messages.at(-1)?.id ?? null,
-          items: [
-            {
-              id: "mem-staged-instruction",
-              kind: "decision" as const,
-              priority: "must" as const,
-              status: "active" as const,
-              statement: "The ledger instruction was folded using launch context.",
-              evidence: [
-                {
-                  eventId: messages[0]?.id ?? "missing-source",
-                  sender: "operator",
-                  ts: messages[0]?.ts ?? now,
-                  quote: "Fold this ledger message.",
-                },
-              ],
-              updatedAt: now,
-            },
-          ],
-        },
-        quarantined: [],
-        operations: 0,
-      }));
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot" },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-        },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    await new Promise<void>((resolve) => {
-      runStart({
-        e2e: {
-          onReady: (handles) => {
-            mesh = handles.mesh;
-            shutdownFn = handles.shutdown;
-            resolve();
-          },
-        },
-      });
-    });
-
-    if (!mesh) throw new Error("mesh not ready");
-    const activeMesh = mesh;
-
-    const workerId = activeMesh.spawn({
-      charter: "ledger worker staging context change",
-      parentId: rootId,
-      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-      context: { type: "portable", mode: "ledger" },
-    });
-    const worker = activeMesh.get(workerId);
-    if (!worker) throw new Error("worker not found");
-
-    getRepositories().meshChat.record({
-      senderId: "operator",
-      recipientId: workerId,
-      body: "Fold this ledger message.",
-    });
-
-    // 1. Launch the run in ledger mode: captures launchContext = { type: "portable", mode: "ledger" }
-    const runId = await startLifecycleRun(worker as Actor, {
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash",
-      effort: "high",
-    });
-
-    // 2. Stage a different context mode (tail) while the worker is running
-    const runningSpy = vi.spyOn(worker as Actor, "isRunning", "get").mockReturnValue(true);
-    const stageOutcome = activeMesh.setActorContext(workerId, "tail", rootId);
-    expect(stageOutcome).toBe("staged");
-    expect(activeMesh.actors.get(workerId)?.context).toEqual({ type: "portable", mode: "ledger" });
-    expect(activeMesh.actors.get(workerId)?.desiredContextConfig).toEqual({
-      type: "portable",
-      mode: "tail",
-    });
-
-    // 3. Complete the run: mesh finishInboxRun applies pending context (to tail),
-    // but the lifecycle listener must use the captured launchContext to fold the completed ledger run
-    runningSpy.mockReturnValue(false);
-    await endLifecycleRun(worker as Actor, runId, {
-      success: true,
-      output: "ledger worker run completed",
-      exitCode: 0,
-    });
-
-    // Observe that compaction executed using the launch configuration
-    expect(compactSpy).toHaveBeenCalledOnce();
-    const state = getRepositories().portableContext.load(workerId);
-    expect(state.generation).toBe(1);
-    expect(state.lastFoldedSourceId).toBeTruthy();
-
-    const compactedEvents = getRepositories().meshEvents.listEventsByActors([workerId], {
-      kinds: ["portable_context_compacted"],
-      limit: 10,
-    }).events;
-    expect(compactedEvents).toHaveLength(1);
-    expect(compactedEvents[0]?.detail).toContain("generation 1");
-
-    // And verify the pending context is now applied for the next run
-    expect(activeMesh.actors.get(workerId)?.context).toEqual({ type: "portable", mode: "tail" });
-    expect(activeMesh.actors.get(workerId)?.desiredContextConfig).toBeUndefined();
-
-    compactSpy.mockRestore();
-  });
-
-  it("defers an interrupted run's fold under compacted_memory_delta and folds the delta once later (#1062)", async () => {
-    let mesh: ActorMesh | undefined;
-    const COMPACTOR_DELAY_MS = 300;
-    const batches: string[][] = [];
-    let enterFirstFold!: () => void;
-    let releaseFirstFold!: () => void;
-    const firstFoldEntered = new Promise<void>((resolve) => {
-      enterFirstFold = resolve;
-    });
-    const firstFoldGate = new Promise<void>((resolve) => {
-      releaseFirstFold = resolve;
-    });
-    onTestFinished(() => releaseFirstFold());
-    const compactSpy = vi
-      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
-      .mockImplementation(async ({ state, messages, now }) => {
-        batches.push(messages.map((message) => message.id));
-        if (batches.length === 1) {
-          enterFirstFold();
-          await firstFoldGate;
-        }
-        await new Promise((resolve) => setTimeout(resolve, COMPACTOR_DELAY_MS));
-        const first = messages[0];
-        return {
-          state: {
-            ...state,
-            generation: state.generation + 1,
-            updatedAt: now,
-            lastFoldedSourceId: messages.at(-1)?.id ?? state.lastFoldedSourceId,
-            items: [
-              ...state.items,
-              {
-                id: `mem-${state.generation + 1}`,
-                kind: "decision" as const,
-                priority: "must" as const,
-                status: "active" as const,
-                statement: `Folded generation ${state.generation + 1}.`,
-                evidence: [
-                  {
-                    eventId: first?.id ?? "missing-source",
-                    sender: "operator",
-                    ts: first?.ts ?? now,
-                    quote: (first?.body ?? "missing").slice(0, 40),
-                  },
-                ],
-                updatedAt: now,
-              },
-            ],
-          },
-          quarantined: [],
-          operations: 1,
-        };
-      });
-    onTestFinished(() => compactSpy.mockRestore());
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot" },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "ledger" },
-        },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    await new Promise<void>((resolve) => {
-      runStart({
-        e2e: {
-          onReady: (handles) => {
-            mesh = handles.mesh;
-            shutdownFn = handles.shutdown;
-            resolve();
-          },
-        },
-      });
-    });
-    if (!mesh) throw new Error("mesh not ready");
-    const rootActor = mesh.get(rootId);
-    if (!rootActor) throw new Error("root actor not ready");
-    const actorOpts = (
-      rootActor as unknown as {
-        opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
-      }
-    ).opts;
-    const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
-    const inbound = (body: string): string =>
-      getRepositories().meshChat.record({ senderId: "operator", recipientId: rootId, body });
-    const interruptedRun = async (): Promise<number> => {
-      const runId = await startLifecycleRun(rootActor as Actor, selected);
-      const started = Date.now();
-      await endLifecycleRun(rootActor as Actor, runId, {
-        success: false,
-        output: "partial\n[Task interrupted by operator]",
-        exitCode: 143,
-        cancelled: true,
-        interrupted: true,
-        interruptSource: "operator",
-      });
-      return Date.now() - started;
-    };
-    const ordinaryRun = async (output: string): Promise<void> => {
-      const runId = await startLifecycleRun(rootActor as Actor, selected);
-      await endLifecycleRun(rootActor as Actor, runId, { success: true, output, exitCode: 0 });
-    };
-    const deferredEvents = () =>
-      getRepositories().meshEvents.listEventsByActors([rootId], {
-        kinds: ["portable_context_compaction_deferred"],
-        limit: 10,
-      }).events;
-
-    // Flag off: an interrupted run still folds synchronously, as today.
-    const a = inbound("Message A, folded while unenrolled.");
-    let offSettled = false;
-    const offRun = interruptedRun().then((elapsed) => {
-      offSettled = true;
-      return elapsed;
-    });
-    await firstFoldEntered;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(offSettled).toBe(false);
-    expect(getRepositories().portableContext.load(rootId).lastFoldedSourceId).toBeNull();
-    releaseFirstFold();
-    const offElapsed = await offRun;
-    expect(batches).toEqual([[a]]);
-    expect(deferredEvents()).toHaveLength(0);
-    const folded = getRepositories().portableContext.load(rootId);
-    expect(folded.lastFoldedSourceId).toBe(a);
-
-    // Flag on: the interrupted run defers; the successor would not have waited.
-    expect(mesh.enrollActorInExperiment(rootId, COMPACTED_MEMORY_DELTA_EXPERIMENT, rootId)).toEqual(
-      {
-        actorId: rootId,
-        changed: true,
-      }
-    );
-    const b = inbound("Message B, arrives before an interrupted run.");
-    const onElapsed = await interruptedRun();
-    // Call order proves the barrier is absent regardless of runner load.
-    // Elapsed times remain fixture measurements, not a host-speed assertion.
-    expect(compactSpy).toHaveBeenCalledTimes(1);
-    console.info(
-      `[portable-context-interrupt-fixture] compactorDelayMs=${COMPACTOR_DELAY_MS} ` +
-        `windowEndMs=${offElapsed} deltaEndMs=${onElapsed}`
-    );
-    expect(batches).toEqual([[a]]);
-    expect(getRepositories().portableContext.load(rootId)).toEqual(folded);
-    const deferred = deferredEvents();
-    expect(deferred).toHaveLength(1);
-    expect(deferred[0]?.detail).toBe("interrupted by operator");
-    expect(JSON.parse(deferred[0]?.payload ?? "{}")).toMatchObject({
-      interruptSource: "operator",
-      foldCursor: a,
-    });
-
-    // The successor's prompt: compacted memory plus only the unfolded delta.
-    const deltaPrompt = actorOpts.buildPrompt();
-    expect(deltaPrompt.injectRecord?.journal).toMatchObject({
-      mode: "delta",
-      foldCursor: a,
-      unfoldedSources: 1,
-      unfoldedMessages: 1,
-      truncated: false,
-    });
-    expect(deltaPrompt.injectRecord?.sourceMessageEventIds).toEqual([b]);
-    expect(deltaPrompt.prompt).toContain("Message B, arrives before an interrupted run.");
-    expect(deltaPrompt.prompt).toContain("Folded generation 1.");
-    // Message A is represented by its ledger item (and its evidence quote), not
-    // re-sent verbatim: exactly one verbatim message block, and it is B's.
-    expect(deltaPrompt.prompt.split("#### Message from operator").length - 1).toBe(1);
-
-    // A second interruption accumulates; the next ordinary run end folds both once.
-    const c = inbound("Message C, arrives before a second interrupted run.");
-    await interruptedRun();
-    expect(batches).toEqual([[a]]);
-    expect(deferredEvents()).toHaveLength(2);
-    await ordinaryRun("ordinary run output");
-    expect(batches).toEqual([[a], [b, c]]);
-    const advanced = getRepositories().portableContext.load(rootId);
-    expect(advanced.generation).toBe(2);
-    expect(advanced.lastFoldedSourceId).toBe(c);
-    expect(actorOpts.buildPrompt().injectRecord?.sourceMessageEventIds).toEqual([]);
-
-    // Flag off again: the window journal and synchronous fold return on the
-    // next run, and nothing accumulated while enrolled is lost.
-    expect(
-      mesh.unenrollActorFromExperiment(rootId, COMPACTED_MEMORY_DELTA_EXPERIMENT, rootId)
-    ).toEqual({
-      actorId: rootId,
-      changed: true,
-    });
-    const d = inbound("Message D, after unenrolling.");
-    const windowPrompt = actorOpts.buildPrompt();
-    expect(windowPrompt.injectRecord?.journal).toBeUndefined();
-    expect(windowPrompt.injectRecord?.sourceMessageEventIds).toEqual([a, b, c, d]);
-    await interruptedRun();
-    expect(batches).toEqual([[a], [b, c], [d]]);
-    expect(deferredEvents()).toHaveLength(2);
-
-    // A compactor outage or repeated interruptions can grow the unfolded tail
-    // past its read ceiling. Show the newest window, not the oldest 200 sources.
-    mesh.enrollActorInExperiment(rootId, COMPACTED_MEMORY_DELTA_EXPERIMENT, rootId);
-    // The reader keeps only sources stamped later than the cursor (d, recorded
-    // on the real clock moments ago), so the backlog starts at a fixed horizon
-    // ahead of it. The backlog stamps repeat across runs; the cursor is still
-    // real-clock, so this assumes the test runs before 3026.
-    const backlogStart = Date.UTC(3026, 0, 1);
-    const backlog: string[] = [];
-    for (let i = 0; i < 205; i++) {
-      backlog.push(
-        getRepositories().meshChat.record({
-          ts: new Date(backlogStart + i * 1_000).toISOString(),
-          senderId: "operator",
-          recipientId: rootId,
-          body: `Backlog instruction ${i}`,
-        })
-      );
-    }
-    const fallbackPrompt = actorOpts.buildPrompt();
-    expect(fallbackPrompt.injectRecord?.journal).toMatchObject({
-      mode: "window",
-      foldCursor: d,
-      unfoldedSources: 200,
-      unfoldedMessages: 200,
-      truncated: true,
-    });
-    expect(fallbackPrompt.injectRecord?.sourceMessageEventIds).toEqual(backlog.slice(-10));
-    expect(fallbackPrompt.prompt).toContain("Backlog instruction 204");
-    expect(fallbackPrompt.prompt).not.toContain("Backlog instruction 194");
-    expect(fallbackPrompt.injectRecord?.sourceEventIds).toEqual(
-      getRepositories()
-        .actorRuns.listRecentCompleted(rootId, 10)
-        .map((run) => run.id)
-        .reverse()
-    );
-    expect(getRepositories().portableContext.load(rootId).lastFoldedSourceId).toBe(d);
-    expect(
-      logCapture.lines
-        .map((line) => JSON.parse(line))
-        .some(
-          (entry) =>
-            entry.msg === "portable_context_delta_fallback" &&
-            entry.error === "unfolded source tail exceeds the delta journal page ceiling"
-        )
-    ).toBe(true);
+    expect(compactionEvents).toHaveLength(0);
   });
 
   it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {
@@ -8398,7 +8036,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       charter: "portable worker",
       parentId: rootId,
       modelConfig: { provider: "claude", model: "Claude 3.5 Sonnet" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.provider).toBe("claude");
     expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
@@ -8651,7 +8289,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         provider: "antigravity",
         model: "Gemini 3.7 Flash",
         effort: "high",
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       },
       geminiApiKey: "fake-gemini-key",
     };
@@ -8745,7 +8383,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         provider: "claude",
         model: "claude-sonnet-5",
         effort: "high",
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       },
       geminiApiKey: "fake-gemini-key",
     };
@@ -10849,7 +10487,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     mkdirSync(legacyDir, { recursive: true });
     const legacyBytes = JSON.stringify(
       {
-        schemaVersion: 3,
+        schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
         actorId: rootId,
         generation: 5,
         updatedAt: "2026-07-01T00:00:00.000Z",
@@ -10873,6 +10511,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
             updatedAt: "2026-07-01T00:00:00.000Z",
           },
         ],
+        brief: {
+          text: "Memory folded before the cutover survives it.",
+          generation: 1,
+          updatedAt: "2026-07-01T00:00:00.000Z",
+        },
       },
       null,
       2
@@ -10887,7 +10530,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           provider: "antigravity",
           model: "Gemini 3.7 Flash",
           effort: "high",
-          context: { type: "portable", mode: "ledger" },
+          context: { type: "portable", mode: "brief" },
         },
         geminiApiKey: "fake-gemini-key",
       }),
@@ -10942,7 +10585,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // connection. A store that read the file once at startup cannot see this.
       probe.prepare("UPDATE portable_context_snapshots SET snapshot = ? WHERE actor_id = ?").run(
         JSON.stringify({
-          schemaVersion: 3,
+          schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
           actorId: rootId,
           generation: 6,
           updatedAt: "2026-07-02T00:00:00.000Z",
@@ -10966,6 +10609,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
               updatedAt: "2026-07-02T00:00:00.000Z",
             },
           ],
+          brief: {
+            text: "A fold committed by another connection is read straight back.",
+            generation: 2,
+            updatedAt: "2026-07-02T00:00:00.000Z",
+          },
         }),
         rootId
       );
@@ -11952,15 +11600,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
     });
 
-    it("lets every context mode prepare a shadow brief while ledger prompts stay active", async () => {
+    it("lets supported context modes prepare a shadow brief and rejects ledger mode", async () => {
       const { mesh, root } = await boot();
       expect(mcpServersOf(root).filter((server) => server.name === "brief")).toHaveLength(1);
 
-      let ledgerId = "";
+      // Ledger mode is rejected at spawn
+      expect(() =>
+        mesh.spawn({
+          charter: "Synthetic shadow brief worker",
+          parentId: rootId,
+          modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          context: { type: "portable", mode: "ledger" },
+        })
+      ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
+
+      let tailId = "";
       for (const context of [
         { type: "native" },
         { type: "portable", mode: "tail" },
-        { type: "portable", mode: "ledger" },
         { type: "portable", mode: "brief" },
       ] as const) {
         const id = mesh.spawn({
@@ -11987,42 +11644,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
         } finally {
           await client.close();
         }
-        if (context.type === "portable" && context.mode === "ledger") ledgerId = id;
+        if (context.type === "portable" && context.mode === "tail") tailId = id;
       }
 
       const messageId = getRepositories().meshChat.record({
         senderId: rootId,
-        recipientId: ledgerId,
+        recipientId: tailId,
         body: "Keep the palette small.",
       });
       const store = getRepositories().portableContext;
-      const ledger = {
-        ...store.load(ledgerId),
-        generation: 7,
-        lastFoldedSourceId: messageId,
-        items: [
-          {
-            id: "ledger-rule",
-            kind: "decision" as const,
-            priority: "must" as const,
-            status: "active" as const,
-            statement: "The existing ledger remains active.",
-            evidence: [
-              {
-                eventId: messageId,
-                sender: rootId,
-                ts: "2026-10-20T00:00:00Z",
-                quote: "Keep the palette small.",
-              },
-            ],
-            updatedAt: "2026-10-20T00:00:00Z",
-          },
-        ],
-      };
-      store.save(ledger);
-      let actor = workerOf(mesh, ledgerId);
+      let actor = workerOf(mesh, tailId);
       const buildPrompt = () => (actor as unknown as { opts: ActorOptions }).opts.buildPrompt();
       const beforePrompt = buildPrompt().prompt;
+      expect(beforePrompt).not.toContain("Keep the palette small.");
+
       const briefUrl = mcpServersOf(actor).find((server) => server.name === "brief")?.url;
       if (!briefUrl) throw new Error("brief MCP missing");
       const client = new Client({ name: "shadow-write", version: "0.0.0" });
@@ -12037,35 +11672,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
       } finally {
         await client.close();
       }
-      const written = store.load(ledgerId);
-      expect(written).toEqual({
-        ...ledger,
-        brief: { text, generation: 1, updatedAt: expect.any(String) },
-      });
-      expect(store.listBriefRevisions(ledgerId, 10)).toEqual([
-        expect.objectContaining({ generation: 1, actingPrincipal: ledgerId, after: text }),
+      const written = store.load(tailId);
+      expect(written.brief).toEqual({ text, generation: 1, updatedAt: expect.any(String) });
+      expect(store.listBriefRevisions(tailId, 10)).toEqual([
+        expect.objectContaining({ generation: 1, actingPrincipal: tailId, after: text }),
       ]);
-      expect(mesh.actors.get(ledgerId)?.context).toEqual({ type: "portable", mode: "ledger" });
-      expect(beforePrompt).toContain("The existing ledger remains active.");
-      expect(buildPrompt().prompt).toBe(beforePrompt);
+      expect(mesh.actors.get(tailId)?.context).toEqual({ type: "portable", mode: "tail" });
+      // In tail mode, brief is not injected into the prompt
+      expect(buildPrompt().prompt).not.toContain("Keep the palette small.");
 
       await shutdownFn?.();
       shutdownFn = undefined;
       const restarted = await boot();
-      actor = workerOf(restarted.mesh, ledgerId);
-      expect(getRepositories().portableContext.load(ledgerId)).toEqual(written);
-      expect(getRepositories().portableContext.listBriefRevisions(ledgerId, 10)).toHaveLength(1);
-      expect(restarted.mesh.actors.get(ledgerId)?.context).toEqual({
+      actor = workerOf(restarted.mesh, tailId);
+      expect(getRepositories().portableContext.load(tailId).brief).toEqual(written.brief);
+      expect(getRepositories().portableContext.listBriefRevisions(tailId, 10)).toHaveLength(1);
+      expect(restarted.mesh.actors.get(tailId)?.context).toEqual({
         type: "portable",
-        mode: "ledger",
+        mode: "tail",
       });
-      expect(buildPrompt().prompt).toBe(beforePrompt);
 
       // A later explicit mode switch uses the prepared brief, without reseeding it.
-      restarted.mesh.actors.patch(ledgerId, { context: { type: "portable", mode: "brief" } });
+      restarted.mesh.actors.patch(tailId, { context: { type: "portable", mode: "brief" } });
       expect(buildPrompt().prompt).toContain(text.trim());
-      expect(buildPrompt().prompt).not.toContain("The existing ledger remains active.");
-      expect(getRepositories().portableContext.load(ledgerId)).toEqual(written);
+      expect(getRepositories().portableContext.load(tailId).brief).toEqual(written.brief);
     });
 
     it("rehydrates ordinary actors with their baseline and implicit default permissions", async () => {

@@ -610,11 +610,6 @@ export interface ActorMeshOptions {
    * Synchronous validator before staging or applying an actor's context mode change.
    */
   validateContext?: (record: ActorRecord, context: ContextConfig) => void;
-  /**
-   * Whether ledger compaction is available (Gemini API key present).
-   * Defaults to true when omitted and validateContext is unset.
-   */
-  ledgerCompactionAvailable?: boolean;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -928,7 +923,6 @@ export class ActorMesh {
     modelConfig: ModelConfigInput
   ) => ProviderModelConfig[];
   private readonly validateContext?: (record: ActorRecord, context: ContextConfig) => void;
-  private readonly ledgerCompactionAvailable: boolean;
   /** The execution coordinator: live actors, construction, dispatch, admission. */
   private readonly runs: RunManager;
   private readonly isHalted: (provider?: string, model?: string) => boolean;
@@ -1089,7 +1083,6 @@ export class ActorMesh {
     this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
     this.validateContext = opts.validateContext;
-    this.ledgerCompactionAvailable = opts.ledgerCompactionAvailable ?? true;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
     this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
@@ -3297,6 +3290,9 @@ export class ActorMesh {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
     this.assertPlacementSupported(req.executionTarget);
+    if (req.context?.type === "portable" && req.context.mode === "ledger") {
+      throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+    }
     const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
     if (modelConfig.length === 0) {
       throw new Error("modelConfig must declare at least one provider/model entry");
@@ -5339,7 +5335,7 @@ export class ActorMesh {
     const portable = effectiveContext?.type === "portable";
     if (validated.length > 1 && !portable) {
       throw new Error(
-        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (tail/brief) actors can use a multi-candidate pool.`
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
@@ -5359,7 +5355,7 @@ export class ActorMesh {
       validated[0].provider !== currentProvider
     ) {
       throw new Error(
-        `Cannot change provider on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
+        `Cannot change provider on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (tail/brief) actors can be moved across providers.`
       );
     }
     if (isModelClassReference(modelConfig) && record.desiredContextConfig?.type === "native") {
@@ -5617,10 +5613,7 @@ export class ActorMesh {
     if (this.validateContext) {
       this.validateContext(record, validated);
     } else {
-      assertSpawnContextSupported(
-        { context: validated },
-        { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
-      );
+      assertSpawnContextSupported({ context: validated });
     }
 
     if (validated.type === "native") {
@@ -5984,10 +5977,7 @@ export class ActorMesh {
         }
       } else if (targetContext.type === "portable") {
         try {
-          assertSpawnContextSupported(
-            { context: targetContext },
-            { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
-          );
+          assertSpawnContextSupported({ context: targetContext });
         } catch {
           return false;
         }

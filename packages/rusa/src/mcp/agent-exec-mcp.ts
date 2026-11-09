@@ -9,7 +9,7 @@ import {
   ROOM_ADMIN_CAPABILITY,
 } from "../actor/administrative-capabilities.js";
 import type { AvailabilityHolds } from "../actor/availability-holds.js";
-import { CONTEXT_SELECTIONS, resolveContextSelection } from "../actor/context-selection.js";
+import { resolveContextSelection } from "../actor/context-selection.js";
 import {
   type EventResource,
   normalizeEventResource,
@@ -282,7 +282,7 @@ export function createAgentExecMcpServer(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
         model_config: modelConfigSchema.describe(
-          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires a portable context_mode ('ledger', 'tail' or 'brief'), since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires a portable context_mode ('tail' or 'brief'), since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
         ),
         conversation_id: z
           .string()
@@ -297,10 +297,10 @@ export function createAgentExecMcpServer(
             "A brief one-line description of what this actor is tasked with, shown under its name in the dashboard."
           ),
         context_mode: z
-          .enum(CONTEXT_SELECTIONS)
+          .string()
           .optional()
           .describe(
-            "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. 'brief' instead injects a WHAT/HOW/DOMAIN brief that the child maintains itself, with every claim citing its source, plus its recent journal; nothing writes the brief for it, so it starts from the charter and grows only by the child's own cited edits. Incompatible with conversation_id."
+            "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'tail' and 'brief' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'tail' is a raw window that never compacts. 'brief' instead injects a WHAT/HOW/DOMAIN brief that the child maintains itself, with every claim citing its source, plus its recent journal; nothing writes the brief for it, so it starts from the charter and grows only by the child's own cited edits. Incompatible with conversation_id."
           ),
         target: z
           .string()
@@ -1141,18 +1141,16 @@ export function createAgentExecMcpServer(
         "Allowed for an ancestor of the target, or subtree admin. The configured root may change its own mode; other actors cannot change their own mode or the root's mode. Retired actors are refused. " +
         "If a run is in flight, it finishes on its current mode and the change applies and persists when that run ends; an idle or queued actor has the change applied and persisted immediately. " +
         "Switching to native requires the actor to hold exactly one declared model entry and no class reference. " +
-        "Portable modes (ledger, tail, brief) preserve accumulated portable state; native-to-portable resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content; portable-to-native starts a fresh provider session while retaining portable state in the store.",
+        "Portable modes (tail, brief) preserve accumulated portable state; native-to-portable resumes retained brief when present, starts empty only when no portable state exists, and never imports provider-session content; portable-to-native starts a fresh provider session while retaining portable state in the store.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id (or direct child handle) to update."),
         context_mode: z
           .string()
-          .describe("The context mode to assign: one of 'native', 'ledger', 'tail', 'brief'."),
+          .describe("The context mode to assign: one of 'native', 'tail', 'brief'."),
         compaction_model: z
           .string()
           .optional()
-          .describe(
-            "Gemini model used to compact ledger context; only permitted when context_mode is ledger."
-          ),
+          .describe("No longer supported; portable ledger mode has been retired."),
       },
     },
     async ({ actor_id, context_mode, compaction_model }) => {
@@ -1173,7 +1171,7 @@ export function createAgentExecMcpServer(
           let carryoverDetail = "";
           if (oldMode === "native" && newMode !== "native") {
             carryoverDetail =
-              "resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content";
+              "resumes retained brief when present, starts empty only when no portable state exists, and never imports provider-session content";
           } else if (oldMode !== "native" && newMode === "native") {
             carryoverDetail =
               "starts a fresh native provider session; retained portable state is preserved in the store";
