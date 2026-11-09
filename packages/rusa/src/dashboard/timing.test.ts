@@ -179,6 +179,49 @@ describe("dashboard timing recorder", () => {
         firstByteMs: { p50Ms: 8, maxMs: 296, coverage: partial },
         bodyMs: { p50Ms: 1, maxMs: 4, coverage: partial },
       },
+      // Per pair: 1226 - (1210 + 8 + 1) = 7 and 1251 - (940 + 296 + 4) = 11.
+      // Subtracting the percentiles above would give 1251 - (940 + 8 + 1) = 302.
+      clientRemainderMs: { p50Ms: 7, p95Ms: 11, maxMs: 11, coverage: partial },
+    });
+  });
+
+  it("reports a rounding-negative clientRemainderMs without clamping (#990)", () => {
+    const recorder = new DashboardTimingRecorder(
+      events,
+      () => new Date("2026-10-05T12:00:00.000Z")
+    );
+    const phased = randomUUID();
+    recorder.recordServer({
+      label: "mesh_obligations",
+      requestId: phased,
+      durationMs: 6,
+      status: 200,
+      bytes: 1,
+      phases: { route: 6 },
+    });
+    // The client rounds each phase to whole milliseconds on its own, so a
+    // pair whose true remainder is near zero can land a millisecond below it.
+    recorder.recordClient({
+      interaction: "primary_navigation",
+      durationMs: 1400,
+      requestIds: [phased],
+      requestTimings: [
+        { requestId: phased, requestMs: 5, queueMs: 2, connectMs: 0, firstByteMs: 2, bodyMs: 2 },
+      ],
+      outcome: "success",
+    });
+    while (timingRows().length < 2) recorder.flush();
+
+    const [group] = recorder.summary({
+      since: new Date("2026-10-05T11:00:00.000Z"),
+    }).pairedRequestDurations;
+    // 5 - (2 + 2 + 2) = -1: reported as measured, not clamped at zero.
+    expect(group.clientRemainderMs).toEqual({
+      p50Ms: -1,
+      p95Ms: -1,
+      p99Ms: -1,
+      maxMs: -1,
+      coverage: { numerator: 1, denominator: 1, state: "full" },
     });
   });
 
@@ -397,6 +440,7 @@ describe("dashboard timing recorder", () => {
     for (const group of recorder.summary({ since: new Date("2026-10-05T11:00:00.000Z") })
       .pairedRequestDurations) {
       expect(group).not.toHaveProperty("clientPhaseMs");
+      expect(group).not.toHaveProperty("clientRemainderMs");
     }
   });
 
