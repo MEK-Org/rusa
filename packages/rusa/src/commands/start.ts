@@ -66,7 +66,6 @@ import {
   reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
-import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
   FailureEscalationBackoff,
@@ -116,7 +115,6 @@ import {
   portableReadWindow,
 } from "../actor/portable-context.js";
 import { seedPortableBriefState } from "../actor/portable-context-brief.js";
-import type { PortableJournalMode } from "../actor/portable-context-delta.js";
 import type { PortableContextStore } from "../actor/portable-context-state.js";
 import {
   type PoolLaneCandidate,
@@ -954,19 +952,7 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
   return missing;
 }
 
-/**
- * Page ceiling on the unfolded tail a delta-mode prompt reads (#1062). Fifty
- * sources a page; the journal's own count and byte budgets apply after this,
- * so the ceiling only bounds the read, never what the ledger will fold.
- */
-export const PORTABLE_CONTEXT_DELTA_MAX_PAGES = 4;
-
-/**
- * The durable sources after the ledger's fold cursor, oldest first — exactly
- * what the next fold will consume. `truncated` reports that the tail ran past
- * the page ceiling; the sources kept are the OLDEST, so a truncated read must
- * fall back to the recent window to keep the newest messages visible.
- */
+/** What a portable-context prompt build needs from the actor's durable history. */
 interface PortableInjection {
   /** The rendered prefix; absent when there is nothing to inject (e.g. a first run). */
   priorContext?: string;
@@ -991,8 +977,6 @@ function assemblePortableInjection(
   id: string,
   mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
-  _journal: PortableJournalMode = "window",
-  _onDeltaFallback: (error: unknown) => void = () => {},
   repositories: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = getRepositories()
 ): PortableInjection {
   if (mode === "ledger") {
@@ -1047,8 +1031,6 @@ export function assembleConfiguredPortableInjection(
   record: ActorRecord,
   _apiKey: string | null,
   store: PortableContextStore,
-  journal: PortableJournalMode = "window",
-  onDeltaFallback?: (error: unknown) => void,
   repositories?: Pick<Repositories, "actorRuns" | "obligations" | "meshChat">
 ): PortableInjection | undefined {
   if (
@@ -1059,14 +1041,7 @@ export function assembleConfiguredPortableInjection(
     throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
   }
   if (record.context?.type !== "portable") return undefined;
-  return assemblePortableInjection(
-    record.id,
-    record.context.mode,
-    store,
-    journal,
-    onDeltaFallback,
-    repositories
-  );
+  return assemblePortableInjection(record.id, record.context.mode, store, repositories);
 }
 
 /**
@@ -2928,19 +2903,6 @@ async function composeStart(
     }
   };
 
-  // Compacted memory plus delta (#1062) is an enrollment, evaluated at every
-  // prompt build and run end so unenrolling takes effect on the next run with
-  // nothing else to flip. `mesh` is assigned below; both readers run later.
-  const portableJournalModeFor = (actorId: string): PortableJournalMode =>
-    mesh.isEnrolledInExperiment(actorId, COMPACTED_MEMORY_DELTA_EXPERIMENT) ? "delta" : "window";
-  const warnDeltaFallback = (actorId: string, error: unknown): void => {
-    log.warn("portable_context_delta_fallback", {
-      actorId,
-      error: error instanceof Error ? error.message : String(error),
-      impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
-    });
-  };
-
   // ── Follower gateway: persistent remote execution nodes ──
   let followerHub: FollowerHub | undefined;
   if (config.followers) {
@@ -3860,9 +3822,7 @@ async function composeStart(
             const injection = assembleConfiguredPortableInjection(
               r,
               portableContextApiKey,
-              portableContextStore,
-              portableJournalModeFor(id),
-              (error) => warnDeltaFallback(id, error)
+              portableContextStore
             );
             return {
               prompt: buildWorkerPrompt(

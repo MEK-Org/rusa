@@ -36,7 +36,6 @@ import {
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
-import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
@@ -2084,12 +2083,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       effort: "high",
     });
 
-    // The retired experiment is gone from the live surface: only the live
-    // registry (#1062) is listed, and the retired name can no longer be
-    // enrolled. Strict closure needs neither.
+    // The retired experiments are gone from the live surface: the registry
+    // (#1266) is empty, and a retired name can no longer be enrolled. Strict
+    // closure needs neither.
     expect(
       payloadOf(await call(urlOf(root, "mesh"), "list_actor_experiments", {})).experiments
-    ).toEqual([expect.objectContaining({ name: "compacted_memory_delta" })]);
+    ).toEqual([]);
     expect(
       (
         await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
@@ -6414,24 +6413,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const rootActor = mesh.get(rootId);
     if (!rootActor) throw new Error("root actor not ready");
-    for (const deltaEnrolled of [false, true]) {
-      if (deltaEnrolled)
-        mesh.enrollActorInExperiment(rootId, COMPACTED_MEMORY_DELTA_EXPERIMENT, rootId);
-      const built = (
-        rootActor as unknown as {
-          opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
-        }
-      ).opts.buildPrompt();
-      const prompt = built.prompt;
-      expect(prompt).toContain("## WHAT\n\n## HOW\n\n## DOMAIN\n");
-      expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
-      expect(prompt).toContain("Message before the preserved ledger cursor.");
-      expect(prompt).toContain("Message after the preserved ledger cursor.");
-      expect(built.injectRecord?.journal).toBeUndefined();
-      expect(built.injectRecord?.ledger).toBeUndefined();
-      expect(getRepositories().portableContext.load(rootId).lastFoldedSourceId).toBe(foldedMessage);
-      expect(getRepositories().portableContext.load(rootId).brief?.generation).toBe(0);
-    }
+    const built = (
+      rootActor as unknown as {
+        opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
+      }
+    ).opts.buildPrompt();
+    const prompt = built.prompt;
+    expect(prompt).toContain("## WHAT\n\n## HOW\n\n## DOMAIN\n");
+    expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
+    expect(prompt).toContain("Message before the preserved ledger cursor.");
+    expect(prompt).toContain("Message after the preserved ledger cursor.");
+    expect(built.injectRecord?.ledger).toBeUndefined();
+    expect(getRepositories().portableContext.load(rootId).lastFoldedSourceId).toBe(foldedMessage);
+    expect(getRepositories().portableContext.load(rootId).brief?.generation).toBe(0);
     // A brief mount must disappear with its actor, including live HTTP access.
     const workerId = mesh.spawn({
       charter: "Synthetic brief worker",

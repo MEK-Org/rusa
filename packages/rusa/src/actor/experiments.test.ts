@@ -6,7 +6,6 @@ import {
 } from "./experiment-enrollment-store.contract.js";
 import {
   assertKnownExperiment,
-  COMPACTED_MEMORY_DELTA_EXPERIMENT,
   EXPERIMENTS,
   type ExperimentRegistry,
   experimentNames,
@@ -20,11 +19,11 @@ const FIXTURE_REGISTRY: ExperimentRegistry = {
 };
 
 describe("the experiment registry", () => {
-  it("registers compacted memory plus delta (#1062) and nothing retired (#917)", () => {
-    expect(experimentNames()).toEqual([COMPACTED_MEMORY_DELTA_EXPERIMENT]);
-    expect(Object.keys(EXPERIMENTS)).toEqual(["compacted_memory_delta"]);
-    expect(EXPERIMENTS[COMPACTED_MEMORY_DELTA_EXPERIMENT]?.intent).toContain("#1062");
+  it("registers nothing — both rollouts retired (#917, #1266)", () => {
+    expect(experimentNames()).toEqual([]);
+    expect(Object.keys(EXPERIMENTS)).toEqual([]);
     expect(isKnownExperiment("strict_obligation_handling")).toBe(false);
+    expect(isKnownExperiment("compacted_memory_delta")).toBe(false);
   });
 
   it("lists names in a stable order, and every fixture entry has an intent", () => {
@@ -52,7 +51,7 @@ describe("the experiment registry", () => {
       "unknown experiment: not_an_experiment (known: another_rollout, fixture_rollout)"
     );
     expect(() => assertKnownExperiment("not_an_experiment")).toThrow(
-      "unknown experiment: not_an_experiment (known: compacted_memory_delta)"
+      "unknown experiment: not_an_experiment (known: none)"
     );
   });
 });

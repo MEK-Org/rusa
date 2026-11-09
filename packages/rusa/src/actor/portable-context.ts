@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import type { Obligation } from "../obligations/obligation.js";
-import type { PortableJournalRecord } from "./portable-context-delta.js";
 import type {
   PortableBrief,
   PortableContextState,
@@ -70,12 +69,6 @@ export interface InjectRecord {
   sections?: { ledger: number; messages: number; runs: number };
   /** Aggregate content-free metrics on active durable ledger items and overflow (#328). */
   ledger?: LedgerMetrics;
-  /**
-   * How the verbatim journal was selected (#1062). Absent means the fixed
-   * recent window, the behavior every ledger actor has outside the
-   * `compacted_memory_delta` experiment; present means the delta journal.
-   */
-  journal?: PortableJournalRecord;
 }
 
 export interface PortableContext {
@@ -409,11 +402,12 @@ function renderBrief(brief: PortableBrief): string {
  * v2 assembly: active source-backed memory, recent inbound messages, then the
  * recent run tail. Inputs are newest-first, matching repository reads.
  *
- * In `brief` mode (`input.brief` set) the durable-intent ledger section is
- * replaced by the rendered brief: the three sections verbatim under a heading
- * naming the mode, generation and last update. Everything else — obligations
- * projection, verbatim recent-message journal, run tail — renders unchanged,
- * and the ledger stays untouched in the snapshot so switching back is free.
+ * In `brief` mode (`input.brief` set) the durable-intent memory section is the
+ * rendered brief: the three sections verbatim under a heading naming the mode,
+ * generation and last update. Everything else — obligations projection,
+ * verbatim recent-message journal, run tail — renders unchanged, and the
+ * legacy ledger snapshot stays untouched in the store so its data is preserved
+ * (#1267).
  */
 export function assemblePortableContextV2(input: {
   state: PortableContextState;
@@ -421,10 +415,8 @@ export function assemblePortableContextV2(input: {
   runs: PriorRun[];
   /** The actor's own obligations in store queue order; omit when unavailable. */
   obligations?: Obligation[];
-  /** Brief-mode document; omit in ledger mode. */
+  /** Brief-mode document; omit in tail mode. */
   brief?: PortableBrief | null;
-  /** Journal provenance for the inject record (#1062); omit for the fixed window. */
-  journal?: PortableJournalRecord;
 }): PortableContext | null {
   const memorySection = input.brief ? renderBrief(input.brief) : "";
   const obligations = renderObligations(input.obligations ?? []);
@@ -473,7 +465,6 @@ export function assemblePortableContextV2(input: {
         messages: byteLen(recentMessages.section),
         runs: byteLen(runsSection),
       },
-      ...(input.journal ? { journal: input.journal } : {}),
     },
   };
 }

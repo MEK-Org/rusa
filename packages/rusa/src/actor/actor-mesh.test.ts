@@ -7943,14 +7943,7 @@ describe("ActorMesh", () => {
         createdAt: "2026-10-01T00:00:00.000Z",
       };
       expect(() =>
-        assembleConfiguredPortableInjection(
-          legacyActor,
-          "dummy-api-key",
-          contextStore,
-          "window",
-          undefined,
-          mockRepos
-        )
+        assembleConfiguredPortableInjection(legacyActor, "dummy-api-key", contextStore, mockRepos)
       ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
 
       // 1. Initial portable brief mode: prompt injection includes brief
@@ -7961,8 +7954,6 @@ describe("ActorMesh", () => {
             workerBefore,
             "dummy-api-key",
             contextStore,
-            "window",
-            undefined,
             mockRepos
           )
         : undefined;
@@ -7998,8 +7989,6 @@ describe("ActorMesh", () => {
             workerInNative,
             "dummy-api-key",
             contextStore,
-            "window",
-            undefined,
             mockRepos
           )
         : undefined;
@@ -8033,8 +8022,6 @@ describe("ActorMesh", () => {
             workerInBrief,
             "dummy-api-key",
             contextStore,
-            "window",
-            undefined,
             mockRepos
           )
         : undefined;
@@ -8099,8 +8086,6 @@ describe("ActorMesh", () => {
             workerNative,
             "dummy-api-key",
             contextStore,
-            "window",
-            undefined,
             mockRepos
           )
         : undefined;
@@ -8117,14 +8102,7 @@ describe("ActorMesh", () => {
       const workerTail = actorRepo.get(worker);
       expect(workerTail).toBeDefined();
       const tailInj = workerTail
-        ? assembleConfiguredPortableInjection(
-            workerTail,
-            "dummy-api-key",
-            contextStore,
-            "window",
-            undefined,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerTail, "dummy-api-key", contextStore, mockRepos)
         : undefined;
       expect(tailInj?.priorContext).toBeUndefined();
     });
