@@ -124,26 +124,6 @@ void main() {
     });
   });
 
-  test('Room entry posts through the authenticated CSRF boundary', () async {
-    final client = _Client([
-      http.Response('{"token":"csrf-token"}', 200),
-      http.Response('{"status":"entered"}', 200),
-    ]);
-    final api = DashboardApi(
-      base: Uri.parse('http://localhost:3000'),
-      client: client,
-      session: _AuthenticatedSession(),
-    );
-
-    await api.enterChatRoom();
-
-    expect(client.paths, ['/api/auth/csrf', '/api/mesh/chat-room/entry']);
-    expect(client.methods, ['GET', 'POST']);
-    expect(client.requestHeaders[0]['X-Rusa-CSRF-Bootstrap'], '1');
-    expect(client.requestHeaders[1]['X-Rusa-CSRF'], 'csrf-token');
-    expect(client.requestBodies.last, '');
-  });
-
   test(
     'push-token registration and revocation use the authenticated CSRF boundary',
     () async {
