@@ -25,7 +25,8 @@ export {
 // "antigravity". OpenRouter runs through Pi the same way: "pi" here, while the
 // configured provider name stays "openrouter". The Pi adapter is OpenRouter-only
 // (it passes `--provider openrouter`), so `cliCommand: pi` means Pi via OpenRouter.
-// Its throttle lane is therefore `pi`, as Antigravity's is `agy`.
+// Quota and pacing identity follows the configured provider ("openrouter"),
+// rather than `cliCommand` ("pi"), because Pi is only a harness and has no quota.
 interface ProviderAdapter {
   create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
 }
@@ -77,12 +78,20 @@ function resolveThrottleLaneAlias(raw: string): string {
 /**
  * The canonical provider-pacing lane key for a configured provider name — the
  * shared identity used to fan multiple config keys aliasing the same CLI (or
- * modelConfig pool entries) onto one pacer/quota lane. Antigravity's binary is
+ * modelConfig pool entries) onto one pacer/quota lane.
+ *
+ * Quota and pacing identity follows the configured provider identity when the
+ * underlying capability is a harness without its own quota (e.g. Pi is only a
+ * harness and has no quota of its own; changing the executable to `pi` retains
+ * OpenRouter's provider identity and queue text). Antigravity's binary is
  * `agy`, so it canonicalizes there even when `cliCommand` is left unset.
  */
-export function providerThrottleKey(providerName: string, config: RusaConfig): string {
-  const cliCommand = config.providers[providerName]?.cliCommand;
-  const key = cliCommand ?? providerName;
+export function providerThrottleKey(providerName: string, config?: RusaConfig): string {
+  const cliCommand = config?.providers?.[providerName]?.cliCommand?.trim();
+  if (cliCommand && cliCommand.toLowerCase() === "pi") {
+    return resolveThrottleLaneAlias(providerName);
+  }
+  const key = cliCommand || providerName;
   return resolveThrottleLaneAlias(key);
 }
 

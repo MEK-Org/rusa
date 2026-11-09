@@ -1,5 +1,9 @@
 import type { RusaConfig } from "../config/types.js";
-import { providerCapabilityName, validateProviderSelection } from "./registry.js";
+import {
+  providerCapabilityName,
+  providerThrottleKey,
+  validateProviderSelection,
+} from "./registry.js";
 
 /**
  * One declared provider/model/effort choice — the atomic unit of the
@@ -261,7 +265,7 @@ export function validateModelConfigPool(
     }
     const selection = validateProviderSelection(config, providerName, requestedModel, entry.effort);
     const identity = JSON.stringify([
-      providerCapabilityName(providerName, config),
+      providerThrottleKey(providerName, config),
       selection.model ?? "",
       selection.effort ?? "",
     ]);
