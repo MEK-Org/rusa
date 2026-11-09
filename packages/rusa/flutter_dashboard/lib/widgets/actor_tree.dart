@@ -264,26 +264,7 @@ class ActorTreeControls extends StatelessWidget {
   final bool compact;
 
   Future<void> _showSpawnDialog(BuildContext context) async {
-    try {
-      final providers = await store.fetchRootControlProviders();
-      if (!context.mounted) return;
-      final request = await showDialog<_SpawnRequest>(
-        context: context,
-        builder: (_) => _SpawnActorDialog(providers: providers),
-      );
-      if (request == null || !context.mounted) return;
-      await store.spawnRootChild(
-        charter: request.charter,
-        title: request.title,
-        provider: request.provider,
-        model: request.model,
-      );
-    } catch (err) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Could not spawn actor: $err')));
-    }
+    await showSpawnActorDialog(context, store);
   }
 
   Future<void> _showAvailabilityHoldClearDialog(BuildContext context) async {
@@ -514,16 +495,77 @@ class _SpawnRequest {
   final String? model;
 }
 
-class _SpawnActorDialog extends StatefulWidget {
-  const _SpawnActorDialog({required this.providers});
-
-  final List<String> providers;
-
-  @override
-  State<_SpawnActorDialog> createState() => _SpawnActorDialogState();
+/// Shows [SpawnActorDialog] and, on submit, creates the actor through the
+/// ordinary path ([DashboardStore.spawnRootChild] → `POST /api/mesh/actors`).
+/// Shared by the tree's spawn control and the empty-mesh first-actor
+/// bootstrap (#1260) so both go through one form and one API call.
+///
+/// Returns true when an actor was created; false when the dialog was closed
+/// without one (cancel, barrier tap, or a failed spawn — the failure is
+/// already surfaced as a snackbar, matching the spawn control's behaviour).
+Future<bool> showSpawnActorDialog(
+  BuildContext context,
+  DashboardStore store, {
+  String dialogTitle = 'Spawn actor',
+  String? intro,
+  String submitLabel = 'Spawn',
+}) async {
+  try {
+    final providers = await store.fetchRootControlProviders();
+    if (!context.mounted) return false;
+    final request = await showDialog<_SpawnRequest>(
+      context: context,
+      builder: (_) => SpawnActorDialog(
+        providers: providers,
+        title: dialogTitle,
+        intro: intro,
+        submitLabel: submitLabel,
+      ),
+    );
+    if (request == null || !context.mounted) return false;
+    await store.spawnRootChild(
+      charter: request.charter,
+      title: request.title,
+      provider: request.provider,
+      model: request.model,
+    );
+    return true;
+  } catch (err) {
+    if (!context.mounted) return false;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Could not spawn actor: $err')));
+    return false;
+  }
 }
 
-class _SpawnActorDialogState extends State<_SpawnActorDialog> {
+/// The create-actor form, shared by the tree's spawn control (default title
+/// and submit label) and the empty-mesh first-actor bootstrap (#1260), which
+/// passes its own [title], [intro] paragraph and [submitLabel]. The fields
+/// and the submit path are identical in both cases.
+class SpawnActorDialog extends StatefulWidget {
+  const SpawnActorDialog({
+    super.key,
+    required this.providers,
+    this.title = 'Spawn actor',
+    this.intro,
+    this.submitLabel = 'Spawn',
+  });
+
+  final List<String> providers;
+  final String title;
+
+  /// Optional paragraph shown above the form; null renders no extra text.
+  final String? intro;
+
+  /// The confirm action's label; the bootstrap says "Create".
+  final String submitLabel;
+
+  @override
+  State<SpawnActorDialog> createState() => _SpawnActorDialogState();
+}
+
+class _SpawnActorDialogState extends State<SpawnActorDialog> {
   final _formKey = GlobalKey<FormState>();
   final _title = TextEditingController();
   final _charter = TextEditingController();
@@ -552,7 +594,7 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Spawn actor'),
+      title: Text(widget.title),
       content: SizedBox(
         width: 440,
         child: Form(
@@ -560,7 +602,12 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
           child: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if (widget.intro != null) ...[
+                  Text(widget.intro!, style: const TextStyle(fontSize: 13)),
+                  const SizedBox(height: 12),
+                ],
                 TextFormField(
                   controller: _title,
                   decoration: const InputDecoration(labelText: 'Title'),
@@ -617,7 +664,7 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
               ),
             );
           },
-          child: const Text('Spawn'),
+          child: Text(widget.submitLabel),
         ),
       ],
     );

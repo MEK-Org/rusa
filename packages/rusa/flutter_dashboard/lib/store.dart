@@ -413,6 +413,11 @@ class DashboardStore {
   /// a later failed revalidation leaves the last *authoritative* snapshot on
   /// screen, which is not the same kind of stale.
   final _actorsStale = BehaviorSubject<bool>.seeded(false);
+
+  /// True once the first authoritative thread snapshot has landed (#1260).
+  /// Until then "the actor list is empty" describes only the seeded (or cached)
+  /// paint, not the mesh, so the first-actor bootstrap must not read it.
+  final _actorsLoaded = BehaviorSubject<bool>.seeded(false);
   final _quotaHistoryStale = BehaviorSubject<bool>.seeded(false);
   final _inboxMetricsStale = BehaviorSubject<bool>.seeded(false);
   Timer? _inboxMetricsCooldown;
@@ -493,6 +498,11 @@ class DashboardStore {
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
   ValueStream<bool> get quotaStale => _quotaStale.stream;
   ValueStream<bool> get actorsStale => _actorsStale.stream;
+
+  /// True once the first authoritative thread snapshot has landed. An empty
+  /// [actorStates] before this is "not loaded yet" (or a cache paint), not an
+  /// empty mesh (#1260).
+  ValueStream<bool> get actorsLoaded => _actorsLoaded.stream;
   ValueStream<bool> get quotaHistoryStale => _quotaHistoryStale.stream;
   ValueStream<DashboardConfigDto?> get dashboardConfig =>
       _dashboardConfig.stream;
@@ -2063,6 +2073,7 @@ class DashboardStore {
       _persistActorHierarchy(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
       _authoritativeThreadSnapshots += 1;
+      if (!_actorsLoaded.value) _actorsLoaded.add(true);
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
@@ -2258,6 +2269,7 @@ class DashboardStore {
       _quotaRefreshing.close(),
       _quotaStale.close(),
       _actorsStale.close(),
+      _actorsLoaded.close(),
       _quotaHistoryStale.close(),
       _inboxMetricsStale.close(),
       _avatarEpoch.close(),
