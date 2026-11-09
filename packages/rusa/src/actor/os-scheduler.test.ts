@@ -839,6 +839,13 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
         return id;
       },
       list: () => jobs.map((job) => ({ ...job })),
+      readJob(id) {
+        const job = this.list().find((j) => j.id === id);
+        return job ? { ...job } : null;
+      },
+      listJobIds() {
+        return this.list().map((job) => job.id);
+      },
       remove: (id) => {
         const index = jobs.findIndex((job) => job.id === id);
         if (index >= 0) jobs.splice(index, 1);

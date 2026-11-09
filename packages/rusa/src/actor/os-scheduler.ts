@@ -350,6 +350,7 @@ export class DefaultOsScheduler implements OsScheduler {
   readonly instanceId: string;
   private readonly log: Logger;
   private readonly now: () => number;
+  private readonly knownAtJobsByTag = new Map<string, Set<string>>();
 
   constructor(
     private readonly mutator: CrontabMutator,
@@ -674,9 +675,31 @@ export class DefaultOsScheduler implements OsScheduler {
     return null;
   }
 
-  /** Ids of the queued `at` jobs whose script carries exactly `tag`, from a fresh read of the queue. */
+  private trackAtJob(tag: string, id: string): void {
+    let set = this.knownAtJobsByTag.get(tag);
+    if (!set) {
+      set = new Set();
+      this.knownAtJobsByTag.set(tag, set);
+    }
+    set.add(id);
+  }
+
+  private untrackAtJob(tag: string, id: string): void {
+    const set = this.knownAtJobsByTag.get(tag);
+    if (set) {
+      set.delete(id);
+      if (set.size === 0) {
+        this.knownAtJobsByTag.delete(tag);
+      }
+    }
+  }
+
+  /** Ids of the queued `at` jobs whose script carries exactly `tag`. */
   private staleAtIds(tag: string): string[] {
-    return this.atJobIdsFor(this.atIo.list(), tag);
+    if (!this.atIo.readJob) {
+      return this.atJobIdsFor(this.atIo.list(), tag);
+    }
+    return Array.from(this.knownAtJobsByTag.get(tag) ?? []);
   }
 
   private atJobIdsFor(jobs: { id: string; script: string }[], tag: string): string[] {
@@ -699,6 +722,7 @@ export class DefaultOsScheduler implements OsScheduler {
     date: Date
   ) {
     const atJobId = this.atIo.schedule(script, date);
+    this.trackAtJob(tag, atJobId);
     this.log.info("at_job_scheduled", { family, id, tag, atJobId, runAt: date.toISOString() });
     return atJobId;
   }
@@ -713,6 +737,7 @@ export class DefaultOsScheduler implements OsScheduler {
   ) {
     for (const atJobId of ids) {
       this.atIo.remove(atJobId);
+      this.untrackAtJob(tag, atJobId);
       this.log.info("at_job_removed", { family, id, tag, atJobId, ...(reason ? { reason } : {}) });
     }
   }
@@ -732,6 +757,30 @@ export class DefaultOsScheduler implements OsScheduler {
     atJobId: string,
     date: Date
   ) {
+    if (this.atIo.readJob) {
+      const job = this.atIo.readJob(atJobId);
+      const queueSize = this.atIo.listJobIds ? this.atIo.listJobIds().length : 1;
+      const fields = { family, id, tag, atJobId, queueSize };
+      if (job?.script.split("\n").some((line) => line.trim() === tag)) {
+        this.log.info("at_enqueue_confirmed", fields);
+        return;
+      }
+      if (atRunInstant(date) <= this.now()) {
+        this.log.warn("at_enqueue_unconfirmed", {
+          ...fields,
+          reason: "job run minute has begun; may already have run",
+        });
+        return;
+      }
+      this.log.error("at_enqueue_unconfirmed", { ...fields, reason: "job missing from queue" });
+      try {
+        this.removeAtIds(family, id, tag, [atJobId], "unconfirmed enqueue");
+      } catch (err) {
+        this.log.warn("at_job_remove_failed", { ...fields, err });
+      }
+      throw new AtEnqueueUnconfirmedError(tag, atJobId);
+    }
+
     const queue = this.atIo.list();
     const fields = { family, id, tag, atJobId, queueSize: queue.length };
     if (this.atJobIdsFor(queue, tag).includes(atJobId)) {
@@ -844,9 +893,14 @@ export class DefaultOsScheduler implements OsScheduler {
 
   listObligationActivations(): ObligationActivationRecord[] {
     const entries = new Map<string, ObligationActivationRecord>();
-    const add = (line: string): void => {
+    const add = (line: string, jobId?: string): void => {
       const record = parseObligationActivationTag(line);
-      if (record) entries.set(activationRecordKey(record), record);
+      if (record) {
+        entries.set(activationRecordKey(record), record);
+        if (jobId && record.instanceId === this.instanceId) {
+          this.trackAtJob(line.trim(), jobId);
+        }
+      }
     };
 
     const current = this.mutator.read();
@@ -855,7 +909,7 @@ export class DefaultOsScheduler implements OsScheduler {
     }
     for (const job of this.atIo.list()) {
       for (const line of job.script.split("\n")) {
-        add(line);
+        add(line, job.id);
       }
     }
     return Array.from(entries.values());
@@ -920,6 +974,11 @@ export class DefaultOsScheduler implements OsScheduler {
         .map((line) => line.trim())
         .filter((line) => line.startsWith(instanceTagPrefix("message-delivery")));
       if (!tagLines.some((line) => this.ownedId("message-delivery", line) !== null)) continue;
+      for (const tagLine of tagLines) {
+        if (this.ownedId("message-delivery", tagLine) !== null) {
+          this.trackAtJob(tagLine, job.id);
+        }
+      }
       let message: ScheduledMessage;
       try {
         message = decodeScheduledMessage(job.script);
