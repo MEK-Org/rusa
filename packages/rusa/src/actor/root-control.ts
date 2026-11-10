@@ -28,6 +28,12 @@ export interface RootChildRequest {
   context?: ContextConfig;
   conversationId?: string;
   title?: string;
+  /**
+   * Record the child as unsandboxed. Honoured only for the first-actor
+   * bootstrap (an empty mesh, operator-signed); refused on any mesh that
+   * already has actors, for every caller.
+   */
+  unsandboxed?: boolean;
 }
 
 export interface RootControlMesh {
@@ -39,6 +45,7 @@ export interface RootControlMesh {
     context?: ContextConfig;
     conversationId?: string;
     title?: string;
+    unsandboxed?: boolean;
   }): string;
   sendMessage(
     toId: string,
@@ -110,6 +117,11 @@ export class RootControlService {
     }
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
+    if (request.unsandboxed === true && this.options.mesh.list().length > 0) {
+      throw new Error(
+        "unsandboxed is only available when creating the first actor on an empty mesh"
+      );
+    }
     // Resolve named model classes first: the provider allowlist below, the
     // audit record, and the mesh all have to see the same concrete pool.
     const requested = this.options.resolveModelConfig
@@ -141,6 +153,7 @@ export class RootControlService {
       ...(request.executionTarget !== undefined
         ? { executionTarget: request.executionTarget }
         : {}),
+      ...(request.unsandboxed === true ? { unsandboxed: true } : {}),
       charter,
       parentId: rootId ?? null,
       // Keep the original declaration for mesh.spawn. Root control uses the
@@ -159,6 +172,7 @@ export class RootControlService {
       {
         modelConfig: pool,
         context: normalizeContext(request.context),
+        ...(request.unsandboxed === true ? { unsandboxed: true } : {}),
       },
       rootId ?? id
     );

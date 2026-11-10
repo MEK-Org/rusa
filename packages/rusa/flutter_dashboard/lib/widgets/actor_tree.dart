@@ -487,12 +487,18 @@ class _SpawnRequest {
     this.title,
     this.provider,
     this.model,
+    this.unsandboxed,
   });
 
   final String charter;
   final String? title;
   final String? provider;
   final String? model;
+
+  /// First-actor bootstrap only: the operator's sandbox choice (true =
+  /// unsandboxed). Null for the ordinary spawn dialog, which keeps the
+  /// server-side sandboxed default.
+  final bool? unsandboxed;
 }
 
 /// Shows [SpawnActorDialog] and, on submit, creates the actor through the
@@ -509,6 +515,7 @@ Future<bool> showSpawnActorDialog(
   String dialogTitle = 'Spawn actor',
   String? intro,
   String submitLabel = 'Spawn',
+  bool offerUnsandboxedChoice = false,
 }) async {
   try {
     final providers = await store.fetchRootControlProviders();
@@ -520,6 +527,7 @@ Future<bool> showSpawnActorDialog(
         title: dialogTitle,
         intro: intro,
         submitLabel: submitLabel,
+        offerUnsandboxedChoice: offerUnsandboxedChoice,
       ),
     );
     if (request == null || !context.mounted) return false;
@@ -528,6 +536,7 @@ Future<bool> showSpawnActorDialog(
       title: request.title,
       provider: request.provider,
       model: request.model,
+      unsandboxed: request.unsandboxed,
     );
     return true;
   } catch (err) {
@@ -550,6 +559,7 @@ class SpawnActorDialog extends StatefulWidget {
     this.title = 'Spawn actor',
     this.intro,
     this.submitLabel = 'Spawn',
+    this.offerUnsandboxedChoice = false,
   });
 
   final List<String> providers;
@@ -561,6 +571,11 @@ class SpawnActorDialog extends StatefulWidget {
   /// The confirm action's label; the bootstrap says "Create".
   final String submitLabel;
 
+  /// First-actor bootstrap only (#1260): show an execution-isolation choice
+  /// defaulting to unsandboxed. The ordinary spawn control leaves this false
+  /// and never sends the field, keeping the server-side sandboxed default.
+  final bool offerUnsandboxedChoice;
+
   @override
   State<SpawnActorDialog> createState() => _SpawnActorDialogState();
 }
@@ -571,6 +586,7 @@ class _SpawnActorDialogState extends State<SpawnActorDialog> {
   final _charter = TextEditingController();
   final _model = TextEditingController();
   String? _provider;
+  bool _unsandboxed = true;
 
   @override
   void initState() {
@@ -641,6 +657,23 @@ class _SpawnActorDialogState extends State<SpawnActorDialog> {
                   controller: _model,
                   decoration: const InputDecoration(labelText: 'Model'),
                 ),
+                if (widget.offerUnsandboxedChoice) ...[
+                  const SizedBox(height: 12),
+                  const Text('Execution isolation', style: TextStyle(fontSize: 12)),
+                  const SizedBox(height: 4),
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(
+                        value: true,
+                        label: Text('Unsandboxed'),
+                      ),
+                      ButtonSegment(value: false, label: Text('Sandboxed')),
+                    ],
+                    selected: {_unsandboxed},
+                    onSelectionChanged: (selection) =>
+                        setState(() => _unsandboxed = selection.first),
+                  ),
+                ],
               ],
             ),
           ),
@@ -661,6 +694,7 @@ class _SpawnActorDialogState extends State<SpawnActorDialog> {
                 title: _optional(_title.text),
                 provider: _provider,
                 model: _optional(_model.text),
+                unsandboxed: widget.offerUnsandboxedChoice ? _unsandboxed : null,
               ),
             );
           },

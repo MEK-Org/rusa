@@ -10,13 +10,20 @@ import 'actor_tree.dart';
 const String kFirstActorDialogTitle = 'Create your first actor';
 
 /// What the first actor is, in operator terms: the ordinary spawn path,
-/// parentless because there is no parent to attach to — not a privileged
-/// position (#465: top-level, unsandboxed and authorized are separate facts).
+/// parentless because there is no parent to attach to. On an empty mesh the
+/// first actor is also the oldest active parentless actor, which is the
+/// criterion for the default actor — so it receives the default capability
+/// grants and serves as the fallback recipient for unrouted root events and
+/// dashboard spawns (#465 separates topology from authorization; here the
+/// default-actor role, not the parentlessness, carries the capabilities).
+/// Isolation is the operator's choice in the dialog, defaulting unsandboxed.
 const String kFirstActorDialogIntro =
     "This mesh doesn't have any actors yet. The first one starts as a "
-    'top-level actor through the same spawn path as any other. It receives '
-    'no extra capability grants and is sandboxed, but serves as the fallback '
-    'recipient for unrouted root events and dashboard spawns.';
+    'top-level actor through the same spawn path as any other. As the '
+    'oldest active parentless actor it becomes the default actor: it '
+    'receives the default capability grants and serves as the fallback '
+    'recipient for unrouted root events and dashboard spawns. It runs '
+    'unsandboxed unless you choose sandboxed below.';
 
 /// Empty-mesh first-actor bootstrap (#1260).
 ///
@@ -74,6 +81,7 @@ class _FirstActorBootstrapState extends State<FirstActorBootstrap> {
         dialogTitle: kFirstActorDialogTitle,
         intro: kFirstActorDialogIntro,
         submitLabel: 'Create',
+        offerUnsandboxedChoice: true,
       );
       // Once the bootstrap dialog has closed — whether created, cancelled,
       // barrier-tapped, or failed — dismiss it unconditionally for the

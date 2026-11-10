@@ -73,6 +73,7 @@ void main() {
           title: 'First actor',
           provider: 'agy',
           model: null,
+          unsandboxed: true,
         ));
         expect(find.text('Create your first actor'), findsNothing);
         expect(store.primary.value, 'spawned-child');
@@ -84,6 +85,53 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
         await tester.pump(const Duration(milliseconds: 300));
         expect(find.text('Create your first actor'), findsNothing);
+      });
+    },
+  );
+
+  testWidgets(
+    'choosing sandboxed in the modal submits unsandboxed false',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()..rootControlProviders = ['agy'];
+        final store = await _startedStore(api);
+
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 100));
+
+        expect(find.text('Execution isolation'), findsOneWidget);
+        // Unsandboxed is the offered default (#1260 amendment).
+        expect(
+          tester
+              .widget<SegmentedButton<bool>>(
+                find.byWidgetPredicate(
+                  (w) => w is SegmentedButton<bool>,
+                ),
+              )
+              .selected,
+          {true},
+        );
+
+        await tester.enterText(
+          find.widgetWithText(TextFormField, 'Charter'),
+          'Bootstrap the mesh sandboxed',
+        );
+        // The dialog body scrolls: bring the segment on-screen before tapping.
+        await tester.ensureVisible(find.text('Sandboxed'));
+        await tester.pump(const Duration(milliseconds: 100));
+        await tester.tap(find.text('Sandboxed'));
+        await tester.pump(const Duration(milliseconds: 100));
+        await tester.tap(find.widgetWithText(FilledButton, 'Create'));
+        await tester.pump(const Duration(milliseconds: 100));
+        await tester.pump(const Duration(milliseconds: 100));
+
+        expect(api.rootSpawnCalls.single, (
+          charter: 'Bootstrap the mesh sandboxed',
+          title: null,
+          provider: 'agy',
+          model: null,
+          unsandboxed: false,
+        ));
       });
     },
   );

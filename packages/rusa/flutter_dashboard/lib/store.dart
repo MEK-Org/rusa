@@ -910,12 +910,14 @@ class DashboardStore {
     String? title,
     String? provider,
     String? model,
+    bool? unsandboxed,
   }) async {
     final id = await _api.spawnRootChild(
       charter: charter,
       title: title,
       provider: provider,
       model: model,
+      unsandboxed: unsandboxed,
     );
     await refreshThreads();
     clickActor(id);
