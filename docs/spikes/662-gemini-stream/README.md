@@ -16,8 +16,9 @@ No Send/review stage is added. **All actor delivery is disabled.**
 ## Run
 
 Requires Node 20+ and a Gemini API key authorized for
-`gemini-3.5-transcribe-live`. Set `GEMINI_API_KEY` in the server environment using
-an existing secret-management mechanism; keep it out of source and command history.
+`gemini-3.5-transcribe-live`. Read from `$RUSA_HOME/secrets/gemini-api-key` (or pass per-command:
+`GEMINI_API_KEY="$(cat "$RUSA_HOME/secrets/gemini-api-key")" npm start`), or set `GEMINI_API_KEY` in the
+server environment using an existing secret-management mechanism; keep it out of source and command history.
 
 ```sh
 cd docs/spikes/662-gemini-stream

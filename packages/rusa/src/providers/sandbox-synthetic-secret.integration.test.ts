@@ -27,7 +27,7 @@ function probeBwrapCapable(): boolean {
 
 const BWRAP_CAPABLE = probeBwrapCapable();
 
-describe.skipIf(!BWRAP_CAPABLE)("Generic synthetic secret grant entrypoint (real bwrap)", () => {
+describe.skipIf(!BWRAP_CAPABLE)("Generic synthetic secret grant (real bwrap)", () => {
   const originalHome = process.env.HOME;
   const fixtureRoots: string[] = [];
 
@@ -90,12 +90,13 @@ describe.skipIf(!BWRAP_CAPABLE)("Generic synthetic secret grant entrypoint (real
     const out1 = execFileSync("bwrap", argv1, { encoding: "utf8" });
     expect(out1.trim()).toBe(syntheticValue);
 
-    // Also check derived env var
+    // Check that derived env var is NOT exported
     const argvEnv = buildActorBwrapCommand(result1, "/bin/sh", [
       "-c",
       'printf "%s" "$SYNTHETIC_TEST_SECRET"',
     ]);
-    expect(execFileSync("bwrap", argvEnv, { encoding: "utf8" })).toBe(syntheticValue);
+    expect(argvEnv.join("\0")).not.toContain("rusa-secrets-entrypoint");
+    expect(execFileSync("bwrap", argvEnv, { encoding: "utf8" })).toBe("");
 
     // 2. Revoke grant in DB
     db.prepare(

@@ -1,5 +1,6 @@
 import type { QuotaLimit } from "../mcp/quota-mcp.js";
 import type { ModelEntry } from "../providers/model-catalog.js";
+import { isModelPattern, modelEntryCovers } from "./model-matchers.js";
 import { isModelScopedWindow } from "./window-scope.js";
 
 /**
@@ -49,6 +50,12 @@ export function configuredModelRefs(entries: readonly ModelEntry[]): readonly Co
  * spelling. A label that names no configured model — including a model from
  * another provider, a reserve pool, or a family name with no configured
  * member — simply matches nothing and is excluded by the intersection.
+ *
+ * A wildcard entry such as `claude-fable-*` (`./model-matchers.js`) is kept as
+ * written when it covers at least one configured model, and stands in for
+ * every model it covers: the result lists the kept patterns first, sorted,
+ * then the models no kept pattern covers. A window read as `claude-fable-*`
+ * therefore has one model list however many Fable models the catalog holds.
  */
 export function resolveWindowModels(
   rawModels: readonly string[],
@@ -75,20 +82,32 @@ export function resolveWindowModels(
     const label = ref.displayLabel?.trim();
     if (label) addKey(label.toLowerCase(), identifier);
   }
+  const identifiers = configured.map((ref) => ref.identifier.trim()).filter(Boolean);
   const matched = new Set<string>();
+  const patterns = new Set<string>();
   for (const raw of rawModels) {
-    const key = raw.trim().toLowerCase();
-    if (!key) continue;
-    const identifier = byKey.get(key);
+    const entry = raw.trim();
+    if (!entry) continue;
+    if (isModelPattern(entry)) {
+      if (identifiers.some((identifier) => modelEntryCovers(entry, identifier))) {
+        patterns.add(entry);
+      }
+      continue;
+    }
+    const identifier = byKey.get(entry.toLowerCase());
     if (identifier !== undefined && identifier !== null) matched.add(identifier);
   }
+  const covered = (identifier: string) =>
+    [...patterns].some((pattern) => modelEntryCovers(pattern, identifier));
   // Return the canonical set in catalog order. Apart from making snapshots
   // stable across equivalent LLM ordering, this means every persisted scope
   // has one representation for dedupe/restart/read comparisons.
-  return configured
-    .map((ref) => ref.identifier.trim())
-    .filter((identifier, index, all) => Boolean(identifier) && all.indexOf(identifier) === index)
-    .filter((identifier) => matched.has(identifier));
+  return [
+    ...[...patterns].sort(),
+    ...identifiers
+      .filter((identifier, index, all) => all.indexOf(identifier) === index)
+      .filter((identifier) => matched.has(identifier) && !covered(identifier)),
+  ];
 }
 
 /**

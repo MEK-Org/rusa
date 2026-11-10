@@ -190,22 +190,6 @@ export interface QuotaControllerResetResult {
   observations: number;
 }
 
-export interface QuotaThrottleElectionOptions {
-  /**
-   * One bucket whose ordinary decision enters the governing election as zero
-   * delay (#861): an armed sprint's target. Every other bucket, the published
-   * per-bucket decisions and the exhaustion gate are unchanged.
-   */
-  relax?: { modelScope: string; kind: QuotaWindowKind };
-}
-
-/** The newest observation of one lane, as the sprint policy reads it (#861). */
-export interface QuotaLaneObservation extends CanonicalQuotaObservation {
-  modelScope: string;
-  models: string[];
-  key: string;
-}
-
 export interface PersistedQuotaBucketStatus {
   key: string;
   percentLeft: number;
@@ -1487,65 +1471,14 @@ export class SharedQuotaStore {
   }
 
   /**
-   * The newest observation of every lane of `kind` for a provider, one per
-   * model scope, provider scope first. A row whose stored scope does not
-   * decode is not evidence for any lane and is left out.
-   */
-  listLatestLaneObservations(provider: string, kind: QuotaWindowKind): QuotaLaneObservation[] {
-    const rows = this.db
-      .prepare(
-        `SELECT provider, model_scope AS modelScope, kind, label,
-                observed_at AS observedAt, percent_left AS percentLeft,
-                reset_at_iso AS resetAtIso, window_ms AS windowMs
-         FROM quota_observations o
-         WHERE provider = ? AND kind = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM quota_observations newer
-             WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
-               AND newer.kind = o.kind
-               AND (newer.observed_at > o.observed_at OR
-                    (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
-           )
-         ORDER BY model_scope ASC`
-      )
-      .all(provider, kind) as Array<CanonicalQuotaObservation & { modelScope: string }>;
-    return rows.flatMap((row): QuotaLaneObservation[] => {
-      const models = parseModelScopeKey(row.modelScope);
-      if (models === null) return [];
-      return [{ ...row, models, key: bucketKey(provider, models, row.kind) }];
-    });
-  }
-
-  /** Observations of one lane at or after `sinceIso`, oldest first. */
-  listLaneObservationsSince(
-    provider: string,
-    modelScope: string,
-    kind: QuotaWindowKind,
-    sinceIso: string
-  ): CanonicalQuotaObservation[] {
-    return this.db
-      .prepare(
-        `SELECT provider, kind, label, observed_at AS observedAt,
-                percent_left AS percentLeft, reset_at_iso AS resetAtIso, window_ms AS windowMs
-         FROM quota_observations
-         WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_at >= ?
-         ORDER BY observed_at ASC, rowid ASC`
-      )
-      .all(provider, modelScope, kind, sinceIso) as CanonicalQuotaObservation[];
-  }
-
-  /**
    * The provider-wide lane's persisted status, with one `modelLanes` entry per
    * model scope that has reasoned evidence (#588). Each lane is elected from
    * its own rows only: a model-scoped reading never enters the provider
    * lane's governing election, and the provider's rows never enter a model
    * lane's. Combining them for a concrete candidate is the client's job.
    */
-  getProviderThrottle(
-    provider: string,
-    options: QuotaThrottleElectionOptions = {}
-  ): PersistedQuotaProviderStatus | null {
-    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY, [], options.relax);
+  getProviderThrottle(provider: string): PersistedQuotaProviderStatus | null {
+    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY, []);
     if (!status) return null;
     const scopes = this.db
       .prepare(
@@ -1558,7 +1491,7 @@ export class SharedQuotaStore {
     for (const { modelScope } of scopes) {
       const models = parseModelScopeKey(modelScope);
       if (!models || models.length === 0) continue;
-      const lane = this.scopeThrottle(provider, modelScope, models, options.relax);
+      const lane = this.scopeThrottle(provider, modelScope, models);
       if (lane) modelLanes.push({ ...lane, models });
     }
     return modelLanes.length > 0 ? { ...status, modelLanes } : status;
@@ -1567,8 +1500,7 @@ export class SharedQuotaStore {
   private scopeThrottle(
     provider: string,
     modelScope: string,
-    models: readonly string[] = [],
-    relax?: QuotaThrottleElectionOptions["relax"]
+    models: readonly string[] = []
   ): Omit<PersistedQuotaProviderStatus, "modelLanes"> | null {
     const reasoned = this.db
       .prepare(
@@ -1637,16 +1569,9 @@ export class SharedQuotaStore {
     // then ages the lane by that bucket (it is governing), which is the slower
     // direction (§5.7) and lasts until the controller reasons the newest rows or
     // the next scrape lands.
-    //
-    // A relaxed bucket (#861) enters the election with zero even-spread delay.
-    // Only the election sees that: `buckets` below keeps the ordinary decision.
-    const eligibleReasoned = (
-      currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned
-    ).map((row) =>
-      relax && relax.modelScope === modelScope && relax.kind === row.kind
-        ? { ...row, intervalSeconds: 0, uncappedIntervalSeconds: 0 }
-        : row
-    );
+    const eligibleReasoned = [
+      ...(currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned),
+    ];
     // Ties break on kind so one set of rows always elects the same bucket.
     eligibleReasoned.sort(
       (a, b) =>

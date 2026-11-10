@@ -27,7 +27,7 @@ function probeBwrapCapable(): boolean {
 
 const BWRAP_CAPABLE = probeBwrapCapable();
 
-describe.skipIf(!BWRAP_CAPABLE)("Mistral grant entrypoint (real bwrap)", () => {
+describe.skipIf(!BWRAP_CAPABLE)("Mistral secret grant (real bwrap)", () => {
   const originalHome = process.env.HOME;
   const fixtureRoots: string[] = [];
 
@@ -40,7 +40,7 @@ describe.skipIf(!BWRAP_CAPABLE)("Mistral grant entrypoint (real bwrap)", () => {
     }
   });
 
-  it("reads the bound dummy key inside the sandbox and exports it to the real command", () => {
+  it("reads the bound dummy key inside the sandbox without exporting to the environment", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "mc-mistral-bwrap-"));
     fixtureRoots.push(fixtureRoot);
     process.env.HOME = fixtureRoot;
@@ -77,11 +77,12 @@ describe.skipIf(!BWRAP_CAPABLE)("Mistral grant entrypoint (real bwrap)", () => {
     const result = buildActorBwrapArgs(actorDir, "antigravity");
     const argv = buildActorBwrapCommand(result, "/bin/sh", [
       "-c",
-      'printf "%s" "$MISTRAL_API_KEY"',
+      'test -f "$RUSA_HOME/secrets/mistral-api-key" && [ -z "$MISTRAL_API_KEY" ] && cat "$RUSA_HOME/secrets/mistral-api-key"',
     ]);
 
     expect(argv.join("\0")).not.toContain(fixtureValue);
-    expect(execFileSync("bwrap", argv, { encoding: "utf8" })).toBe(fixtureValue);
+    expect(argv.join("\0")).not.toContain("rusa-secrets-entrypoint");
+    expect(execFileSync("bwrap", argv, { encoding: "utf8" }).trim()).toBe(fixtureValue);
     // Real bwrap setup runs SQLite migrations, mounts fuse-overlayfs, and launches bwrap;
     // 15s tolerates full-suite scheduling and I/O contention; a slower run still fails.
   }, 15_000);

@@ -26,7 +26,7 @@ export default defineConfig({
     // retention/expiry-owning files run shifted.
     include: [
       // Quota retention (30d raw + observations, 7d weekly, 3d history,
-      // 30m probe TTL, sprint expiry), pacing, and missed-window logic.
+      // 30m probe TTL), pacing, and missed-window logic.
       "src/quota/**/*.test.ts",
       // Quota probe TTL and pacing; 15-minute stamp expiry; 7-day timing
       // retention boundary.

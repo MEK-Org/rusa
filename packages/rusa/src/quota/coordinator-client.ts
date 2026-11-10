@@ -21,10 +21,7 @@ import {
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleProviderStatus,
   type PublishedThrottleResponse,
-  QUOTA_SPRINT_PATH,
   type QuotaFreshness,
-  type QuotaSprintArmRequest,
-  type QuotaSprintCancelRequest,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
 
@@ -852,31 +849,6 @@ export class QuotaCoordinatorClient {
       "POST",
       payload,
       { "idempotency-key": request.idempotencyKey }
-    );
-  }
-
-  /**
-   * Read one provider's sprint status (#861). Like the manual write, the answer
-   * comes back verbatim so the operator command can check the protocol minor
-   * and report the service's own envelope.
-   */
-  getSprintStatus(provider: string): Promise<ManualReadingResult> {
-    return this.operatorRequest(
-      "sprint status read",
-      `${QUOTA_SPRINT_PATH}?provider=${encodeURIComponent(provider)}`,
-      "GET"
-    );
-  }
-
-  /** Arm or cancel one provider's sprint (#861); the answer comes back verbatim. */
-  postSprintAction(
-    request: QuotaSprintArmRequest | QuotaSprintCancelRequest
-  ): Promise<ManualReadingResult> {
-    return this.operatorRequest(
-      `sprint ${request.action}`,
-      QUOTA_SPRINT_PATH,
-      "POST",
-      JSON.stringify(request)
     );
   }
 
