@@ -34,11 +34,55 @@ export function isProviderScopedWindow(limit: Pick<QuotaLimit, "scope">): boolea
   return limit.scope !== "model" && !isModelScopedWindow(limit);
 }
 
+/** A model ID segment that is only a version number, such as `5` or `3.1`. */
+const VERSION_SEGMENT = /^\d+(?:[._]\d+)*$/;
+
 /**
- * True only when two model-scoped windows carry the same canonical scope, or
+ * The stable name of a model-scoped quota window (#1282): the model family its
+ * models share, e.g. `claude-fable` for `claude-fable-5`, `claude-fable-5-1`
+ * and `claude-fable-5-2`. The name, never the model list, is the window's lane
+ * identity, so a model joining, leaving or being re-ordered in the window
+ * keeps its lane, pacing history and period start.
+ *
+ * Each model ID is split on hyphens and whitespace and its version segments
+ * are dropped; the name is the segments every model shares, from the start.
+ * The input is the catalog-validated model list (`resolveWindowModels`), so
+ * the name never depends on how the parser spelled the panel line. Models
+ * that share no leading segment name the window by their sorted families
+ * instead, so two unrelated allocations still never share a lane.
+ */
+export function quotaWindowName(models: readonly string[]): string {
+  const families = [
+    ...new Set(
+      models
+        .map((model) =>
+          model
+            .trim()
+            .toLowerCase()
+            .split(/[\s-]+/)
+            .filter((segment) => segment.length > 0 && !VERSION_SEGMENT.test(segment))
+            .join("-")
+        )
+        .filter((family) => family.length > 0)
+    ),
+  ].sort();
+  if (families.length <= 1) return families[0] ?? "";
+  const split = families.map((family) => family.split("-"));
+  const shared: string[] = [];
+  for (const [index, segment] of split[0].entries()) {
+    if (!split.every((segments) => segments[index] === segment)) break;
+    shared.push(segment);
+  }
+  return shared.length > 0 ? shared.join("-") : families.join(",");
+}
+
+/**
+ * True only when two model-scoped windows carry the same window name, or
  * when both are provider-scoped. This is deliberately stricter than comparing
  * model-vs-provider shape: inference must not borrow a reset from one named
- * model allocation for another allocation with the same window kind.
+ * model allocation for another allocation with the same window kind. Two
+ * readings of one window whose model lists differ are the same window
+ * ({@link quotaWindowName}).
  */
 export function hasSameQuotaWindowScope(
   left: Pick<QuotaLimit, "scope">,
@@ -67,8 +111,7 @@ export function hasSameQuotaWindowScope(
       leftModelScope !== null &&
       rightModelScope !== null &&
       leftModelScope.provider === rightModelScope.provider &&
-      leftModelScope.models.length === rightModelScope.models.length &&
-      leftModelScope.models.every((model, index) => model === rightModelScope.models[index])
+      quotaWindowName(leftModelScope.models) === quotaWindowName(rightModelScope.models)
     );
   }
   return isProviderScopedWindow(left) && isProviderScopedWindow(right);

@@ -382,9 +382,13 @@ actor that takes readings is a separate operator or root step.
 A provider panel can report a window that applies only to some models, such as
 a Fable-only weekly allowance beside the provider-wide Claude windows. When the
 parser's model list survives the catalog check, the coordinator stores that
-window as its own lane and runs a separate controller for it. The lane key is a
-versioned model-scope value in `quota_observations.model_scope`, and the
-provider-wide lane keeps the empty key. `/v1/throttle` publishes such lanes
+window as its own lane and runs a separate controller for it. The lane key in
+`quota_observations.model_scope` is the window's name, such as `claude-fable`,
+and the provider-wide lane keeps the empty key (#1282). The name is the models'
+shared family: version segments are dropped and the common leading segments
+kept, so a window keeps its lane, period start and controller memory when the
+provider adds a model to it. The models a lane applies to are read from the
+provider's latest parsed reading that shows the window, scraped or manual. `/v1/throttle` publishes such lanes
 under `modelLanes`, each with its own `models`, interval, exhaustion and
 freshness (protocol minor 2). A Fable start then waits for both the
 provider-wide lane and the Fable lane, and every other Claude model waits for
@@ -487,6 +491,16 @@ then refuses every pre-v3 binary, `rusa quota-pacing-reset` included, so
 upgrade every process that opens `quota.db` together. A binary rollback means
 restoring the pre-deploy backup, which loses the model-lane history recorded
 since then.
+
+Before #1282 the key was the window's sorted model list, so a provider adding a
+model to a window opened a new lane with a fresh period start and controller.
+A #1282 build carries such rows onto the window's name each time it opens the
+database, with no schema change: a window's first lane is renamed with its
+controller memory, and a later lane's rows newer than that lane's newest are
+re-derived and reasoned again on top of it. A pre-#1282 binary that opens the
+carried database reads the named lanes as unusable, so it paces only the
+provider-wide lanes, and the rows it writes are carried again on the next #1282
+open. Upgrade every process that opens `quota.db` together.
 
 ### Stage-0 probe-off and the #499 staging proof
 

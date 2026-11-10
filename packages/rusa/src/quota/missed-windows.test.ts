@@ -48,7 +48,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     expect(detector.observe("claude", history)).toEqual([
       {
         provider: "claude",
-        lane: "model:claude-fable-5-1:weekly",
+        lane: "model:claude-fable:weekly",
         label: "Current week (Fable)",
         lastReadingAt: at(0),
         missedAt: at(15),
@@ -74,7 +74,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     expect(detector.observe("claude", history)).toEqual([]);
     history.push(weekly(at(45)));
     expect(detector.observe("claude", history)).toEqual([
-      expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", lastReadingAt: at(30) }),
+      expect.objectContaining({ lane: "model:claude-fable:weekly", lastReadingAt: at(30) }),
     ]);
   });
 
@@ -84,7 +84,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     detector.observe("claude", history);
     history.push(weekly(at(15)), weekly(at(30)), fable(at(30)));
     expect(detector.observe("claude", history)).toEqual([
-      expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(15) }),
+      expect.objectContaining({ lane: "model:claude-fable:weekly", missedAt: at(15) }),
     ]);
   });
 
@@ -103,7 +103,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     // The store keeps one row per window per slot: a second scrape at 12:02
     // overwrites the rows it carried and leaves the rest stamped 12:00.
     expect(detector.observe("claude", [weekly(at(2)), fable(at(0))])).toEqual([
-      expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(2) }),
+      expect.objectContaining({ lane: "model:claude-fable:weekly", missedAt: at(2) }),
     ]);
     expect(detector.observe("claude", [weekly(at(2)), fable(at(0)), weekly(at(15))])).toEqual([]);
   });
@@ -113,7 +113,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     detector.observe("claude", [weekly(at(0))]);
     expect(detector.observe("claude", [weekly(at(0)), fable(at(15)), weekly(at(17))])).toEqual([
       expect.objectContaining({
-        lane: "model:claude-fable-5-1:weekly",
+        lane: "model:claude-fable:weekly",
         lastReadingAt: at(15),
         missedAt: at(17),
       }),
@@ -125,7 +125,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     detector.observe("claude", [weekly(at(0))]);
     expect(detector.observe("claude", [weekly(at(0)), fable(at(0))])).toEqual([]);
     expect(detector.observe("claude", [weekly(at(0)), fable(at(0)), weekly(at(15))])).toEqual([
-      expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(15) }),
+      expect.objectContaining({ lane: "model:claude-fable:weekly", missedAt: at(15) }),
     ]);
   });
 
@@ -156,7 +156,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
           scrapeFailed: false,
         },
         expect.objectContaining({
-          lane: "model:claude-fable-5-1:weekly",
+          lane: "model:claude-fable:weekly",
           lastReadingAt: at(0),
           missedAt: at(15),
           scrapeFailed: false,
@@ -204,7 +204,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
       detector.observe("claude", history, [parsed(at(0))]);
       expect(detector.observe("claude", history, [parsed(at(0)), parsed(at(2))])).toEqual([
         expect.objectContaining({ lane: "provider:weekly", missedAt: at(2) }),
-        expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(2) }),
+        expect.objectContaining({ lane: "model:claude-fable:weekly", missedAt: at(2) }),
       ]);
     });
 
@@ -272,7 +272,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
       scrape(at(15), [providerWeekly, { ...fableWeekly, scrapedAt: at(0) }]);
       expect(observe()).toEqual([
         expect.objectContaining({
-          lane: "model:claude-fable-5-1:weekly",
+          lane: "model:claude-fable:weekly",
           lastReadingAt: at(0),
           missedAt: at(15),
           scrapeFailed: false,

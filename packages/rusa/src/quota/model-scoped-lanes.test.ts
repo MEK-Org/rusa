@@ -17,7 +17,7 @@ import {
   publishedThrottle,
 } from "./coordinator-protocol.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
-import { modelScopeKey, parseModelScopeKey, SharedQuotaStore } from "./shared-store.js";
+import { modelScopeKey, parseLegacyModelListKey, SharedQuotaStore } from "./shared-store.js";
 
 // #588: a provider-wide Claude window and a Fable-only window are paced as
 // independent lanes that a Fable candidate must both honour.
@@ -161,7 +161,7 @@ describe("model-scoped quota lanes: store (#588)", () => {
       expect(rows).toEqual(reasonedRows(control));
       const scopes = [...new Set(rows.map((row) => row.modelScope))];
       expect(scopes).toEqual(["", modelScopeKey([FABLE])]);
-      expect(parseModelScopeKey(scopes[1] as string)).toEqual([FABLE]);
+      expect(scopes[1]).toBe("claude-fable");
       const provider = rows.filter((row) => row.modelScope === "");
       const fable = rows.filter((row) => row.modelScope !== "");
       expect(provider).toHaveLength(12);
@@ -180,7 +180,7 @@ describe("model-scoped quota lanes: store (#588)", () => {
       expect(status?.modelLanes).toHaveLength(1);
       expect(status?.modelLanes?.[0]).toMatchObject({
         models: [FABLE],
-        governingBucketKey: `claude[${FABLE}]:weekly`,
+        governingBucketKey: "claude[claude-fable]:weekly",
         intervalSeconds: (fable.at(-1) as ScopedRow).interval,
       });
       expect(status?.intervalSeconds).toBe((provider.at(-1) as ScopedRow).interval);
@@ -198,15 +198,96 @@ describe("model-scoped quota lanes: store (#588)", () => {
     }
   });
 
-  it("gives one allocation one identity whatever order its models arrive in", () => {
+  it("carries list-keyed lanes onto their window at open, as if the key had always been stable (#1282)", () => {
+    const two = ["claude-fable-5", FABLE];
+    const three = [...two, "claude-fable-5-2"];
+    const feed = (store: SharedQuotaStore) => {
+      recordStandingErrors(store, 0, 6, 2, 12, recordScrape, two);
+      recordStandingErrors(store, 6, 6, 2, 12, recordScrape, three);
+    };
+    const fableRows = (store: SharedQuotaStore) =>
+      store.db
+        .prepare(
+          `SELECT model_scope AS modelScope, observed_at AS observedAt, window_ms AS windowMs,
+                  processed, controller_error AS error, controller_integral AS integral,
+                  interval_seconds AS interval
+           FROM quota_observations WHERE provider = 'claude' AND model_scope <> ''
+           ORDER BY observed_at, rowid`
+        )
+        .all();
+    const control = new SharedQuotaStore(tempDb("rusa-1282-control-"));
+    control.configureController({ maxIntervalSeconds: 36000 });
+    feed(control);
+
+    // The same readings as a pre-#1282 store kept them: one lane per model
+    // list, the three-model lane started afresh at its first reading.
+    const path = tempDb("rusa-1282-carry-");
+    const legacy = new SharedQuotaStore(path);
+    legacy.configureController({ maxIntervalSeconds: 36000 });
+    feed(legacy);
+    const listKey = (models: string[]) =>
+      JSON.stringify({ models: [...models].sort(), version: 1 });
+    const grownAt = new Date(STARTED_MS + 6 * 5 * 60 * 1000).toISOString();
+    legacy.db
+      .prepare(
+        `UPDATE quota_observations SET model_scope = ?
+         WHERE model_scope = 'claude-fable' AND observed_at < ?`
+      )
+      .run(listKey(two), grownAt);
+    legacy.db
+      .prepare(
+        `UPDATE quota_observations
+         SET model_scope = ?, window_ms = ?, controller_error = 0, controller_derivative = 0,
+             controller_integral = 0, uncapped_interval_seconds = 1, interval_seconds = 1
+         WHERE model_scope = 'claude-fable' AND observed_at >= ?`
+      )
+      .run(listKey(three), Date.parse(RESET) - Date.parse(grownAt), grownAt);
+    expect(
+      new Set(fableRows(legacy).map((row) => (row as { modelScope: string }).modelScope))
+    ).toEqual(new Set([listKey(two), listKey(three)]));
+    legacy.close();
+
+    const reopened = new SharedQuotaStore(path);
+    try {
+      // Before the controller runs: the older lane is renamed with its state,
+      // the newer lane's rows wait to be reasoned on top of it.
+      const carried = fableRows(reopened) as Array<{ modelScope: string; processed: number }>;
+      expect(new Set(carried.map((row) => row.modelScope))).toEqual(new Set(["claude-fable"]));
+      expect(carried.map((row) => row.processed)).toEqual([1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
+      reopened.configureController({ maxIntervalSeconds: 36000 });
+      expect(fableRows(reopened)).toEqual(fableRows(control));
+      expect(reopened.getProviderThrottle("claude")).toEqual(control.getProviderThrottle("claude"));
+      expect(
+        [...(reopened.getProviderThrottle("claude")?.modelLanes?.[0]?.models ?? [])].sort()
+      ).toEqual([...three].sort());
+    } finally {
+      reopened.close();
+    }
+    // Carrying is a one-off: a second open changes nothing.
+    const again = new SharedQuotaStore(path);
+    try {
+      again.configureController({ maxIntervalSeconds: 36000 });
+      expect(fableRows(again)).toEqual(fableRows(control));
+    } finally {
+      again.close();
+      control.close();
+    }
+  });
+
+  it("gives one window one identity whatever models it lists, in any order (#1282)", () => {
     expect(modelScopeKey(["b", "a", "a"])).toBe(modelScopeKey(["a", "b"]));
-    expect(parseModelScopeKey(modelScopeKey(["b", "a"]))).toEqual(["a", "b"]);
-    expect(parseModelScopeKey("")).toEqual([]);
-    // Non-canonical or unversioned blobs are unusable, never provider-wide.
-    expect(parseModelScopeKey('{"models":["a"]}')).toBeNull();
-    expect(parseModelScopeKey('{"models":["b","a"],"version":1}')).toBeNull();
-    expect(parseModelScopeKey('{"models":[],"version":1}')).toBeNull();
-    expect(parseModelScopeKey("not json")).toBeNull();
+    expect(modelScopeKey([FABLE])).toBe("claude-fable");
+    expect(modelScopeKey(["claude-fable-5", FABLE, "claude-fable-5-2"])).toBe("claude-fable");
+    expect(modelScopeKey([SONNET])).toBe("claude-sonnet");
+    // The pre-#1282 model-list key still decodes, so a row a pre-#1282 writer
+    // adds is read by its models; non-canonical or unversioned blobs are not.
+    expect(parseLegacyModelListKey('{"models":["a","b"],"version":1}')).toEqual(["a", "b"]);
+    expect(parseLegacyModelListKey("")).toBeNull();
+    expect(parseLegacyModelListKey("claude-fable")).toBeNull();
+    expect(parseLegacyModelListKey('{"models":["a"]}')).toBeNull();
+    expect(parseLegacyModelListKey('{"models":["b","a"],"version":1}')).toBeNull();
+    expect(parseLegacyModelListKey('{"models":[],"version":1}')).toBeNull();
+    expect(parseLegacyModelListKey("not json")).toBeNull();
   });
 
   it("rejects unknown or ambiguous model scope so it reaches no lane", () => {
@@ -288,7 +369,7 @@ describe("model-scoped quota lanes: store (#588)", () => {
       const lanes = store.getProviderThrottle("claude")?.modelLanes;
       expect(lanes?.[0]).toMatchObject({
         models: [FABLE],
-        governingBucketKey: `claude[${FABLE}]:weekly`,
+        governingBucketKey: "claude[claude-fable]:weekly",
       });
       expect(lanes).toEqual(control.getProviderThrottle("claude")?.modelLanes);
       // The stored snapshot carries the canonical scope, not the reader's spelling.
@@ -803,7 +884,7 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       expect(published?.modelLanes).toEqual([
         expect.objectContaining({
           models: [FABLE],
-          governingBucketKey: `claude[${FABLE}]:weekly`,
+          governingBucketKey: "claude[claude-fable]:weekly",
           intervalSeconds: store.getProviderThrottle("claude")?.modelLanes?.[0]?.intervalSeconds,
         }),
       ]);

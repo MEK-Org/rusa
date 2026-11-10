@@ -819,7 +819,7 @@ describe("quota sprint: the ordinary controller is untouched (#861)", () => {
     scrape(h.store, T0 - HOUR, readings(T0 - HOUR, 60, 60));
     scrape(h.store, T0, readings(T0, 58, 58));
     const status = await h.status();
-    const fableKey = `claude[${FABLE}]:weekly`;
+    const fableKey = "claude[claude-fable]:weekly";
     expect(status.buckets.map((bucket: { key: string }) => bucket.key).sort()).toEqual(
       ["claude:weekly", fableKey].sort()
     );

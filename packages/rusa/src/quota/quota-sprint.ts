@@ -461,14 +461,15 @@ export class QuotaSprintRegistry {
     latest: QuotaCycleObservation
   ): boolean {
     const latestMs = Date.parse(latest.observedAt);
-    return this.options.store
-      .listLatestLaneObservations(provider, WEEKLY)
-      .some(
-        (lane) =>
-          lane.key !== policy.bucketKey &&
-          lane.models.some((model) => policy.models.includes(model)) &&
+    const armedMs = Date.parse(policy.cycleAnchor.observedAt);
+    return this.options.store.listLatestLaneObservations(provider, WEEKLY).some((lane) =>
+      lane.key === policy.bucketKey
+        ? // Since #1282 a window keeps its key when its models change, so the
+          // arm's own lane read with another member list since arming is a move too.
+          !sameModels(lane.models, policy.models) && Date.parse(lane.observedAt) > armedMs
+        : lane.models.some((model) => policy.models.includes(model)) &&
           Date.parse(lane.observedAt) > latestMs
-      );
+    );
   }
 
   private end(entry: ProviderSprint, reason: QuotaSprintEndReason, endedAt: string): void {
@@ -481,4 +482,10 @@ export class QuotaSprintRegistry {
       fingerprint: current.fingerprint,
     };
   }
+}
+
+function sameModels(left: readonly string[], right: readonly string[]): boolean {
+  const a = [...new Set(left)].sort();
+  const b = [...new Set(right)].sort();
+  return a.length === b.length && a.every((model, index) => model === b[index]);
 }

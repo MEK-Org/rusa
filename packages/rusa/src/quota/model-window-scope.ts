@@ -92,13 +92,14 @@ export function resolveWindowModels(
 }
 
 /**
- * Keep a model window on the lane its earlier reading established when the
- * parser names only some of that lane's models (#1078). The model list is the
- * lane's durable identity — stored scope, pacing, history, and missed-window
- * detection all key on it — but the parser maps one panel line to model IDs
- * with occasional variance, e.g. "Current week (Fable)" read as both Fable IDs
- * on most scrapes and as one of them on a few. Read literally, each such
- * reading opens a new lane and reports the established one missed.
+ * Keep a model window's members as its earlier reading established when the
+ * parser names only some of them (#1078). Since #1282 a lane is keyed by the
+ * window's name, not its model list, so an omission no longer opens a new
+ * lane; but the lane's members are still read from the latest parsed reading
+ * and decide which candidate models the lane paces. The parser maps one panel
+ * line to model IDs with occasional variance, e.g. "Current week (Fable)" read
+ * as both Fable IDs on most scrapes and as one of them on a few. Read
+ * literally, each such reading would stop pacing the omitted model.
  *
  * A window keeps `previous`'s models when exactly one previous and exactly
  * one current model window have its label and kind, the current models are a

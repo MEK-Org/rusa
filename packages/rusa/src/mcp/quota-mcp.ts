@@ -1426,8 +1426,9 @@ export class QuotaService {
   }
 
   /**
-   * The lane an earlier reading established keeps a Claude model window the
-   * parser mapped to fewer of its models this time (#1078). Bounded to Claude,
+   * A Claude model window the parser mapped to fewer of its models this time
+   * keeps the members an earlier reading established (#1078); its lane key is
+   * the window's name either way (#1282). Bounded to Claude,
    * where the alias flap was observed; other providers' readings stand as read.
    */
   private keepClaudeLaneModels(

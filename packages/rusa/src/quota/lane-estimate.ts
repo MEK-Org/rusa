@@ -1,4 +1,5 @@
 import { quotaCycleChanged } from "./quota-cycle.js";
+import { quotaWindowName } from "./window-scope.js";
 
 /**
  * How recent a lane's last real reading must be when its window ends for the
@@ -26,11 +27,12 @@ export interface LaneEstimate {
   lastReadingAt: string;
 }
 
-/** The identity a lane's readings share across scrapes, from scope, models, and window kind. */
+/**
+ * The identity a lane's readings share across scrapes: scope, the window's
+ * stable name (never its model list, #1282), and window kind.
+ */
 export function quotaLaneKey(scope: "provider" | "model", models: readonly string[], kind: string) {
-  return scope === "provider"
-    ? `provider:${kind}`
-    : `model:${[...models].sort().join(",")}:${kind}`;
+  return scope === "provider" ? `provider:${kind}` : `model:${quotaWindowName(models)}:${kind}`;
 }
 
 /**

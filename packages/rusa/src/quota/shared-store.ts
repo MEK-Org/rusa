@@ -30,7 +30,7 @@ import {
   QUOTA_SCHEMA_VERSION,
   SchemaVersionRefusalError,
 } from "./schema-guard.js";
-import { isProviderScopedWindow } from "./window-scope.js";
+import { isModelScopedWindow, isProviderScopedWindow, quotaWindowName } from "./window-scope.js";
 
 export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError };
 // Maintenance scripts consume this bundled shared-store artifact, so expose
@@ -330,36 +330,39 @@ export function manualObservationFingerprint(snapshot: ProviderQuotaSnapshot): s
 export const PROVIDER_SCOPE_KEY = "";
 
 /**
- * Versioned `model_scope` blob of a model-scoped observation. The models are
- * the catalog-validated canonical IDs, sorted so one allocation has exactly
- * one durable identity whatever order the catalog or parser listed them in.
+ * `model_scope` of a model-scoped observation: the window's stable name
+ * ({@link quotaWindowName}, e.g. `claude-fable`), never its model list
+ * (#1282). The models a lane paces are an attribute of its readings, kept in
+ * each reading's `quota_scrapes.parsed_state`, and resolved from the latest
+ * one by {@link SharedQuotaStore.laneModelsResolver}.
  */
-interface ModelScopeBlob {
+export function modelScopeKey(models: readonly string[]): string {
+  return quotaWindowName(models);
+}
+
+/**
+ * The `model_scope` written before #1282: a version-1 JSON blob of the sorted
+ * model list. The store carries such rows onto their window's name when it
+ * opens ({@link SharedQuotaStore.carryModelListLanesInTransaction}); a row a
+ * pre-#1282 writer adds after that is still read by its model list until the
+ * next open carries it.
+ */
+interface LegacyModelListScope {
   version: 1;
   models: string[];
 }
 
-export function modelScopeKey(models: readonly string[]): string {
-  const blob: ModelScopeBlob = { version: 1, models: [...new Set(models)].sort() };
-  return canonicalJson(blob);
-}
-
-/**
- * Decode a stored `model_scope`: `[]` for the provider-wide key, the model IDs
- * for a well-formed version-1 blob, and `null` for anything else. The column
- * carries no SQLite validator, so every reader treats `null` as unusable
- * evidence rather than widening it to provider scope.
- */
-export function parseModelScopeKey(key: string): string[] | null {
-  if (key === PROVIDER_SCOPE_KEY) return [];
+/** The models of a well-formed pre-#1282 model-list key, or `null`. */
+export function parseLegacyModelListKey(key: string): string[] | null {
+  if (!key.startsWith("{")) return null;
   try {
-    const blob = JSON.parse(key) as Partial<ModelScopeBlob> | null;
+    const blob = JSON.parse(key) as Partial<LegacyModelListScope> | null;
     if (
       blob?.version !== 1 ||
       !Array.isArray(blob.models) ||
       blob.models.length === 0 ||
       !blob.models.every((model) => typeof model === "string" && model.length > 0) ||
-      modelScopeKey(blob.models) !== key
+      canonicalJson({ version: 1, models: [...new Set(blob.models)].sort() }) !== key
     ) {
       return null;
     }
@@ -390,7 +393,8 @@ function observationScopeKey(limit: Pick<QuotaLimit, "scope">, provider: string)
   ) {
     return null;
   }
-  return modelScopeKey(models.map((model) => model.trim()));
+  const window = modelScopeKey(models.map((model) => model.trim()));
+  return window === PROVIDER_SCOPE_KEY ? null : window;
 }
 
 /**
@@ -430,8 +434,39 @@ function resolveManualModelScopes(
   return { limits: kept, dropped };
 }
 
+/** Outcome of carrying one model-list lane onto its window's name (#1282). */
+export interface CarriedModelListLane {
+  provider: string;
+  kind: string;
+  from: string;
+  to: string;
+  /** Rows renamed in place (the window's first lane). */
+  renamed: number;
+  /** Rows at or before the merged lane's newest reading, kept as recorded. */
+  kept: number;
+  /** Rows after it, re-derived and left for the controller to reason again. */
+  replayed: number;
+  /** Rows whose observation slot the merged lane already held. */
+  dropped: number;
+}
+
+/** Controller columns a carried row clears so the controller reasons it again. */
+const CONTROLLER_COLUMNS = [
+  "controller_error",
+  "controller_derivative",
+  "controller_integral",
+  "uncapped_interval_seconds",
+  "interval_seconds",
+] as const;
+
+/** Parsed readings scanned per page while resolving a window's models. */
+const LANE_MODELS_PAGE = 64;
+
+/** A lane's published bucket identity: provider, window name (#1282) and kind. */
 export function bucketKey(provider: string, models: readonly string[], kind: string): string {
-  return models.length === 0 ? `${provider}:${kind}` : `${provider}[${models.join(",")}]:${kind}`;
+  return models.length === 0
+    ? `${provider}:${kind}`
+    : `${provider}[${quotaWindowName(models)}]:${kind}`;
 }
 
 /**
@@ -638,6 +673,7 @@ export class SharedQuotaStore {
       );
     `);
       this.ensureColumnsInTransaction();
+      this.carryModelListLanesInTransaction();
       if (currentVersion < QUOTA_SCHEMA_VERSION) {
         this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
       }
@@ -709,6 +745,170 @@ export class SharedQuotaStore {
     if (!columns.has("controller_integral")) {
       this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
     }
+  }
+
+  /**
+   * Carry lanes keyed by their model list (the pre-#1282 `model_scope` blob)
+   * onto their window's stable name, as a data rewrite when the store opens;
+   * no table, column or key changes. Every lane of one window becomes one
+   * lane, taken oldest first:
+   *
+   * - When the window has no row under its name yet, its first-observed lane
+   *   is renamed in place, so its rows, period start and controller memory
+   *   carry unchanged.
+   * - A later lane's rows observed after the merged lane's newest reading are
+   *   re-inserted in observation order, as if the key had always been stable:
+   *   the window duration (period start) is derived again from the merged
+   *   history, and the controller columns are cleared so the next controller
+   *   advance reasons them on top of the older lane's state.
+   * - A later lane's rows at or before that reading are history, kept as
+   *   recorded under the name.
+   * - A row whose observation slot the merged lane already holds is dropped:
+   *   the older lane's reading wins.
+   *
+   * A pre-#1282 writer sharing the file can add model-list rows after this
+   * runs; the next open carries them the same way.
+   */
+  carryModelListLanesInTransaction(): CarriedModelListLane[] {
+    const lanes = this.db
+      .prepare(
+        `SELECT provider, model_scope AS modelScope, kind, MIN(observed_at) AS firstObservedAt
+         FROM quota_observations WHERE model_scope LIKE '{%'
+         GROUP BY provider, model_scope, kind
+         ORDER BY provider, kind, firstObservedAt, model_scope`
+      )
+      .all() as Array<{ provider: string; modelScope: string; kind: string }>;
+    const carried: CarriedModelListLane[] = [];
+    for (const lane of lanes) {
+      const models = parseLegacyModelListKey(lane.modelScope);
+      if (!models) continue;
+      const window = modelScopeKey(models);
+      const result: CarriedModelListLane = {
+        provider: lane.provider,
+        kind: lane.kind,
+        from: lane.modelScope,
+        to: window,
+        renamed: 0,
+        kept: 0,
+        replayed: 0,
+        dropped: 0,
+      };
+      carried.push(result);
+      const newest = this.db
+        .prepare(
+          `SELECT observed_at AS observedAt FROM quota_observations
+           WHERE provider = ? AND model_scope = ? AND kind = ?
+           ORDER BY observed_at DESC, rowid DESC LIMIT 1`
+        )
+        .get(lane.provider, window, lane.kind) as { observedAt: string } | undefined;
+      if (!newest) {
+        result.renamed = this.db
+          .prepare(
+            `UPDATE quota_observations SET model_scope = ?
+             WHERE provider = ? AND model_scope = ? AND kind = ?`
+          )
+          .run(window, lane.provider, lane.modelScope, lane.kind).changes;
+        continue;
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM quota_observations
+           WHERE provider = ? AND model_scope = ? AND kind = ?
+           ORDER BY observed_at ASC, rowid ASC`
+        )
+        .all(lane.provider, lane.modelScope, lane.kind) as Array<Record<string, unknown>>;
+      this.db
+        .prepare(
+          "DELETE FROM quota_observations WHERE provider = ? AND model_scope = ? AND kind = ?"
+        )
+        .run(lane.provider, lane.modelScope, lane.kind);
+      const newestMs = Date.parse(newest.observedAt);
+      const occupied = this.db.prepare(
+        `SELECT 1 FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
+      );
+      for (const row of rows) {
+        if (occupied.get(lane.provider, window, lane.kind, row.observed_slot)) {
+          result.dropped++;
+          continue;
+        }
+        const columns = Object.keys(row);
+        const values: Record<string, unknown> = { ...row, model_scope: window };
+        const observedAt = String(row.observed_at);
+        if (Date.parse(observedAt) > newestMs) {
+          values.window_ms = this.windowMsForCandidate({
+            provider: lane.provider,
+            modelScope: window,
+            kind: lane.kind as QuotaWindowKind,
+            observedAt,
+            percentLeft: Number(row.percent_left),
+            resetAtIso: (row.reset_at_iso as string | null) ?? null,
+          });
+          values.processed = 0;
+          for (const column of CONTROLLER_COLUMNS) values[column] = null;
+          result.replayed++;
+        } else {
+          result.kept++;
+        }
+        this.db
+          .prepare(
+            `INSERT INTO quota_observations (${columns.join(", ")})
+             VALUES (${columns.map((column) => `@${column}`).join(", ")})`
+          )
+          .run(values);
+      }
+    }
+    return carried;
+  }
+
+  /**
+   * Resolve a stored `model_scope` to the models its lane paces (#1282): `[]`
+   * for the provider-wide key, the listed models for a pre-#1282 model-list
+   * key, and for a window name the models that window had in the provider's
+   * latest parsed reading that shows it. Scrapes and manual readings both
+   * store that reading in `quota_scrapes.parsed_state`, so one source answers
+   * for both. A name no retained reading shows (raw retention has dropped
+   * them all), or a malformed key, resolves to `null`: unusable evidence,
+   * never widened to provider scope. Readings are scanned newest first, a
+   * page at a time, and only as far as the names asked for need.
+   */
+  private laneModelsResolver(provider: string): (modelScope: string) => string[] | null {
+    const known = new Map<string, string[]>();
+    let before: { scrapedAt: string; rowid: number } | null = null;
+    let exhausted = false;
+    const page = this.db.prepare(
+      `SELECT rowid, scraped_at AS scrapedAt, parsed_state AS parsedState FROM quota_scrapes
+       WHERE provider = ? AND parsed_state IS NOT NULL
+         AND (? IS NULL OR scraped_at < ? OR (scraped_at = ? AND rowid < ?))
+       ORDER BY scraped_at DESC, rowid DESC LIMIT ?`
+    );
+    const readMore = (): void => {
+      const rows = page.all(
+        provider,
+        before?.scrapedAt ?? null,
+        before?.scrapedAt ?? null,
+        before?.scrapedAt ?? null,
+        before?.rowid ?? null,
+        LANE_MODELS_PAGE
+      ) as Array<{ rowid: number; scrapedAt: string; parsedState: string }>;
+      if (rows.length < LANE_MODELS_PAGE) exhausted = true;
+      const last = rows.at(-1);
+      if (last) before = { scrapedAt: last.scrapedAt, rowid: last.rowid };
+      for (const row of rows) {
+        for (const limit of parseParsedState(row.parsedState)?.limits ?? []) {
+          if (!isModelScopedWindow(limit)) continue;
+          const window = observationScopeKey(limit, provider);
+          if (!window || known.has(window) || typeof limit.scope !== "object") continue;
+          known.set(window, [...new Set((limit.scope.models ?? []).map((model) => model.trim()))]);
+        }
+      }
+    };
+    return (modelScope) => {
+      if (modelScope === PROVIDER_SCOPE_KEY) return [];
+      if (modelScope.startsWith("{")) return parseLegacyModelListKey(modelScope);
+      while (!known.has(modelScope) && !exhausted) readMore();
+      return known.get(modelScope) ?? null;
+    };
   }
 
   /**
@@ -1045,8 +1245,9 @@ export class SharedQuotaStore {
       .all(provider, sinceIso) as Array<
       Omit<QuotaHistoryRecord, "scope" | "models"> & { modelScope: string }
     >;
+    const laneModels = this.laneModelsResolver(provider);
     return rows.flatMap(({ modelScope, ...row }): QuotaHistoryRecord[] => {
-      const models = parseModelScopeKey(modelScope);
+      const models = laneModels(modelScope);
       if (models === null) return [];
       return models.length === 0
         ? [{ scope: "provider" as const, ...row }]
@@ -1509,8 +1710,9 @@ export class SharedQuotaStore {
          ORDER BY model_scope ASC`
       )
       .all(provider, kind) as Array<CanonicalQuotaObservation & { modelScope: string }>;
+    const laneModels = this.laneModelsResolver(provider);
     return rows.flatMap((row): QuotaLaneObservation[] => {
-      const models = parseModelScopeKey(row.modelScope);
+      const models = laneModels(row.modelScope);
       if (models === null) return [];
       return [{ ...row, models, key: bucketKey(provider, models, row.kind) }];
     });
@@ -1555,8 +1757,9 @@ export class SharedQuotaStore {
       )
       .all(provider) as Array<{ modelScope: string }>;
     const modelLanes: PersistedQuotaModelLaneStatus[] = [];
+    const laneModels = this.laneModelsResolver(provider);
     for (const { modelScope } of scopes) {
-      const models = parseModelScopeKey(modelScope);
+      const models = laneModels(modelScope);
       if (!models || models.length === 0) continue;
       const lane = this.scopeThrottle(provider, modelScope, models, options.relax);
       if (lane) modelLanes.push({ ...lane, models });
