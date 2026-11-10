@@ -29,6 +29,7 @@ const MAINTENANCE_BUILD = "pnpm --reporter=silent run build:maintenance --silent
 
 const SCRIPT_FILES = {
   "backfill:codex-quota": "backfill-codex-quota-parses.mjs",
+  "backfill:fable-wildcard-lane": "backfill-fable-wildcard-lane.mjs",
   "backfill:token-records": "backfill-run-token-records.mjs",
   "drill:quota-rollback": "quota-rollback-drill.mjs",
   "eval:quota": "eval-quota-extraction.mjs",

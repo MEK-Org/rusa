@@ -1329,9 +1329,15 @@ class ChatPage {
 /// scopes record them (#728, #752).
 const kFableModelIds = {'claude-fable-5', 'claude-fable-5-1'};
 
+/// The wildcard entry a quota lane names the whole Fable family by (#1282).
+const kFableModelPattern = 'claude-fable-*';
+
 /// True when [modelIds] names Fable and nothing else.
 bool isFableModelScope(List<String> modelIds) =>
-    modelIds.isNotEmpty && modelIds.every(kFableModelIds.contains);
+    modelIds.isNotEmpty &&
+    modelIds.every(
+      (id) => id == kFableModelPattern || kFableModelIds.contains(id),
+    );
 
 /// One quota window from `GET /api/quota`.
 class QuotaWindowDto {

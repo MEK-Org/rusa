@@ -394,7 +394,7 @@ const LLM_WINDOW_ITEM_SCHEMA = {
     models: {
       type: Type.ARRAY,
       description:
-        "Model-specific windows ONLY: the configured model IDs (verbatim from the configured model list in the instructions) this window applies to — e.g. a Claude 'Current Week (Fable)' row lists the configured Fable model IDs. Omit for provider-wide windows. Windows whose models match nothing configured are dropped downstream, so list only models that are actually configured.",
+        "Model-specific windows ONLY: the configured model IDs this window applies to, except a Claude 'Current Week (Fable)' row must use the single wildcard entry claude-fable-* instead of individual Fable IDs. Omit for provider-wide windows. IDs or patterns matching nothing configured are dropped downstream.",
       items: {
         type: Type.STRING,
       },
@@ -690,7 +690,7 @@ async function parseQuotaWithLlm(
     provider === "claude"
       ? "For Claude: it will show session/week usage windows with percentage used and reset times (e.g. 'resets in 4 hours 12 minutes' or 'resets Jul 13, 2:59am (UTC)'). " +
         "Provider-wide session/week rows carry no `models` and alone determine status. " +
-        "Named-model rows such as 'Current Week (Fable)' are model-specific: emit them with `models` set to the configured IDs for that model from the configured model list, and never use them to determine status. " +
+        "Named-model rows are model-specific and never determine status. For 'Current Week (Fable)', emit `models: [\"claude-fable-*\"]` instead of listing individual configured Fable IDs; for other named-model rows, use the configured IDs from the configured model list. " +
         "If any provider-wide window is 100% used or the output says 'rate limit exceeded' or 'limit exceeded', " +
         "status is 'exhausted'.\n"
       : provider === "codex"

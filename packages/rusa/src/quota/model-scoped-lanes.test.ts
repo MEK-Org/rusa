@@ -303,6 +303,48 @@ describe("model-scoped quota lanes: store (#588)", () => {
     }
   });
 
+  it("keeps one lane for a wildcard manual window as the catalog grows (#1282)", () => {
+    const store = new SharedQuotaStore(tempDb("rusa-1282-wildcard-"));
+    store.configureController({ maxIntervalSeconds: 36000 });
+    store.setQuotaReadingMode("claude", "manual", "2029-12-31T23:59:00.000Z");
+    const grown: ModelEntry[] = [
+      ...CATALOG,
+      { identifier: "claude-fable-5-2", displayLabel: "Claude Fable 5.2" },
+    ];
+    const wildcard = ["claude-fable-*"];
+    recordStandingErrors(store, 0, 6, 2, 12, recordManual, wildcard);
+    recordStandingErrors(
+      store,
+      6,
+      6,
+      2,
+      12,
+      (target, scrapedAt, limits) => recordManual(target, scrapedAt, limits, grown),
+      wildcard
+    );
+
+    // The same readings under one explicit model, never re-keyed.
+    const control = new SharedQuotaStore(tempDb("rusa-1282-wildcard-control-"));
+    control.configureController({ maxIntervalSeconds: 36000 });
+    recordStandingErrors(control, 0, 12, 2, 12);
+    try {
+      const lanes = store.getProviderThrottle("claude")?.modelLanes;
+      expect(lanes).toHaveLength(1);
+      expect(lanes?.[0]).toMatchObject({
+        models: wildcard,
+        governingBucketKey: "claude[claude-fable-*]:weekly",
+      });
+      // One controller history across the catalog change, equal to the control's.
+      const history = (rows: ScopedRow[]) =>
+        rows.filter((row) => row.modelScope !== "").map(({ modelScope: _scope, ...row }) => row);
+      expect(history(reasonedRows(store))).toEqual(history(reasonedRows(control)));
+      expect(history(reasonedRows(store))).toHaveLength(12);
+    } finally {
+      store.close();
+      control.close();
+    }
+  });
+
   it("drops a manual model window the catalog cannot resolve and says why", () => {
     const store = new SharedQuotaStore(tempDb("rusa-966-manual-drop-"));
     try {
@@ -507,6 +549,20 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
     expect(modelLanePacing(status, undefined)).toBeUndefined();
     // An older coordinator publishes no model lanes: provider-only pacing.
     expect(modelLanePacing({}, FABLE)).toBeUndefined();
+  });
+
+  it("applies a wildcard lane to every model its pattern covers (#1282)", () => {
+    const status = {
+      modelLanes: [
+        laneStatus({ intervalSeconds: 120, models: ["claude-fable-*"] }),
+        laneStatus({ intervalSeconds: 600, models: ["claude-other"] }),
+      ],
+    };
+    const paced = { intervalSeconds: 120, deferUntil: null, exhaustedUntil: null };
+    expect(modelLanePacing(status, FABLE)).toEqual(paced);
+    // A model that joined the family after the lane was published is paced too.
+    expect(modelLanePacing(status, "claude-fable-9")).toEqual(paced);
+    expect(modelLanePacing(status, SONNET)).toBeUndefined();
   });
 
   it("takes the latest exhaustion, and only fresh evidence as an absolute gate", () => {

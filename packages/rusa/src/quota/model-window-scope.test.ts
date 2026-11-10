@@ -47,6 +47,30 @@ describe("catalog-aware model window scope", () => {
     expect(resolveWindowModels(["claude-fable"], identifierLabelCollision)).toEqual([]);
     expect(resolveWindowModels(["Fable"], identifierLabelCollision)).toEqual(["claude-fable"]);
   });
+
+  it("keeps a wildcard that covers a configured model, in place of the models it covers (#1282)", () => {
+    const fable = [
+      { identifier: "claude-fable-5", displayLabel: "Claude Fable 5" },
+      { identifier: "claude-fable-5-1", displayLabel: "Claude Fable 5.1" },
+      { identifier: "claude-opus-5-5", displayLabel: "Claude Opus 5.5" },
+    ];
+    const grown = [...fable, { identifier: "claude-fable-5-2", displayLabel: "Claude Fable 5.2" }];
+
+    // The list, and so the lane's identity, is the same whatever the catalog holds.
+    expect(resolveWindowModels(["claude-fable-*"], fable)).toEqual(["claude-fable-*"]);
+    expect(resolveWindowModels(["claude-fable-*"], grown)).toEqual(["claude-fable-*"]);
+    // A covered model named beside the pattern adds nothing; an uncovered one stays.
+    expect(resolveWindowModels(["Claude Fable 5.1", "claude-fable-*"], fable)).toEqual([
+      "claude-fable-*",
+    ]);
+    expect(resolveWindowModels(["claude-opus-5-5", "claude-fable-*"], fable)).toEqual([
+      "claude-fable-*",
+      "claude-opus-5-5",
+    ]);
+    // A pattern covering nothing configured is no model scope at all.
+    expect(resolveWindowModels(["claude-haiku-*"], fable)).toEqual([]);
+    expect(resolveWindowModels(["claude-fable-*"], [])).toEqual([]);
+  });
 });
 
 describe("keepWindowLaneModels (#1078)", () => {
@@ -74,6 +98,13 @@ describe("keepWindowLaneModels (#1078)", () => {
     );
     expect(modelsOf(kept)).toEqual([null, FABLE]);
     expect(kept[1]).toMatchObject({ label: "Current week (Fable)", percentLeft: 46 });
+  });
+
+  it("preserves a wildcard reading through the Claude lane guard with listed or wildcard history", () => {
+    const current = window(["claude-fable-*"]);
+    for (const history of [[], [window(FABLE)], [window(["claude-fable-*"])]]) {
+      expect(keepWindowLaneModels([current], history, catalog)).toEqual([current]);
+    }
   });
 
   it("takes a reading that names more models, or different ones, as read", () => {
