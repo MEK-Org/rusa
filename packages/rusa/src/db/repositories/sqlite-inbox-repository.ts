@@ -98,8 +98,18 @@ export class SqliteInboxRepository implements InboxRepository, InboxDeliveryStor
       throw new Error("Inbox delivery requires migration 0068_instance_inbox_delivery");
   }
 
+  /**
+   * The direction filter is two-valued and almost always 'incoming', so it must
+   * never choose the index. The unary `+` keeps SQLite from driving these reads
+   * through `actor_inbox_outgoing_pending`, which would discard the existing
+   * actor/handled indexes and their ORDER BY (see 0066).
+   */
+  private incomingFilter(): string {
+    return "+delivery_direction = 'incoming'";
+  }
+
   private incomingWhere(): string {
-    return this.hasDeliveryColumns ? " AND delivery_direction = 'incoming'" : "";
+    return this.hasDeliveryColumns ? ` AND ${this.incomingFilter()}` : "";
   }
 
   private prepareInboxInsert(): Database.Statement {
@@ -300,7 +310,7 @@ export class SqliteInboxRepository implements InboxRepository, InboxDeliveryStor
       throw new Error("inbox list limit must be an integer from 1 to 100");
     }
     const where = ["actor_id = ?"];
-    if (this.hasDeliveryColumns) where.push("delivery_direction = 'incoming'");
+    if (this.hasDeliveryColumns) where.push(this.incomingFilter());
     const params: Array<string | number> = [actorId];
     if (status === "unhandled") where.push("handled_at IS NULL");
     else if (status === "handled") where.push("handled_at IS NOT NULL");
