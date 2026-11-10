@@ -40,7 +40,9 @@ describe("follower repository authority (#1019)", () => {
     const db = migrated();
     const follower = createFollowerRepositories(db);
 
-    expect(Object.keys(follower).sort()).toEqual(["actorRuns", "runPrompts"]);
+    // #1020 draft: the instance-owned design adds a local `execution` port beside
+    // the #1019 run facades, so a follower owns the actors and inbox it hosts.
+    expect(Object.keys(follower).sort()).toEqual(["actorRuns", "execution", "runPrompts"]);
     expect(Object.getPrototypeOf(follower)).toBe(Object.prototype);
     expect(Object.isFrozen(follower)).toBe(true);
     expect(Object.isFrozen(follower.actorRuns)).toBe(true);
@@ -62,10 +64,30 @@ describe("follower repository authority (#1019)", () => {
         expect(untyped[name], name).toBeUndefined();
     for (const name of ["db", "role", "rawObligations", "rawSqliteInbox", "portableContext"])
       expect(untyped[name], name).toBeUndefined();
-    for (const value of reachable(follower)) {
+    // The run facades keep #1019's property: no repository or database behind them.
+    for (const value of [...reachable(follower.actorRuns), ...reachable(follower.runPrompts)]) {
       expect(value).not.toBeInstanceOf(Database);
       expect(value).not.toBeInstanceOf(ActorRunRepository);
     }
+
+    // The execution port is a fixed, frozen set of locally owned repositories.
+    // It deliberately holds real repository instances (so the database handle is
+    // reachable through it); global obligation, principal, grant and placement
+    // repositories stay off it.
+    const execution = follower.execution as unknown as Record<string, unknown>;
+    expect(Object.isFrozen(execution)).toBe(true);
+    expect(Object.keys(execution).sort()).toEqual([
+      "actorRuns",
+      "actors",
+      "inbox",
+      "inboxFocus",
+      "meshChat",
+      "referenceCache",
+      "runPrompts",
+    ]);
+    for (const name of ["obligations", "principals", "capabilityGrants", "db", "role"])
+      expect(execution[name], `execution.${name}`).toBeUndefined();
+    expect(() => Object.assign(execution, { obligations: {} })).toThrow(TypeError);
     expect(() => Object.assign(untyped, { obligations: {} })).toThrow(TypeError);
     expect(() => Object.assign(follower.actorRuns, { getById: () => undefined })).toThrow(
       TypeError
@@ -109,7 +131,7 @@ describe("follower repository authority (#1019)", () => {
     try {
       initDb(dir);
       const follower = getRepositories("follower");
-      expect(Object.keys(follower).sort()).toEqual(["actorRuns", "runPrompts"]);
+      expect(Object.keys(follower).sort()).toEqual(["actorRuns", "execution", "runPrompts"]);
       expect(getRepositories("follower")).toBe(follower);
       expect(() => getRepositories("leader")).toThrow(
         /already initialized for role "follower", cannot access as "leader"/

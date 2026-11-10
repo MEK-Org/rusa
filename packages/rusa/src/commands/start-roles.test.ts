@@ -340,8 +340,9 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const repos = getRepositories("follower");
     const untyped = repos as unknown as Record<string, unknown>;
 
-    // The follower gets its run capabilities only; global control is absent.
-    expect(Object.keys(repos).sort()).toEqual(["actorRuns", "runPrompts"]);
+    // The follower gets its run capabilities plus the #1020 draft's local
+    // execution port; global control is absent.
+    expect(Object.keys(repos).sort()).toEqual(["actorRuns", "execution", "runPrompts"]);
     expect(untyped.obligations).toBeUndefined();
     expect(untyped.actors).toBeUndefined();
     expect(untyped.principals).toBeUndefined();

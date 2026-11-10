@@ -37,6 +37,8 @@ function place() {
   const remote = new RemoteInstance(TARGET, process.platform, process.pid);
   const hub = {
     createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
+    // A peer without the instance-execution capability keeps the legacy path.
+    ownsExecution: () => false,
     toolUrls: () => [],
   } as unknown as FollowerHub;
   const config = configWith({ codex: { cliCommand: "codex" } });
@@ -110,10 +112,32 @@ describe("instanceWorkerFactory", () => {
     );
   });
 
+  it("refuses an instance-owned placement when the execution handoff is not composed (#1020 draft)", () => {
+    const remote = new RemoteInstance(TARGET, process.platform, process.pid);
+    const hub = {
+      createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
+      ownsExecution: () => true,
+      toolUrls: () => [],
+    } as unknown as FollowerHub;
+    const context = {
+      executionTarget: TARGET,
+      record: { id: ACTOR_ID },
+      getRecord: () => ({ id: ACTOR_ID }),
+    } as unknown as ActorFactoryContext;
+    const options = {
+      modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
+    } as unknown as ActorOptions;
+
+    expect(() => instanceWorkerFactory(configWith({}), hub)(context, options)).toThrow(
+      /Instance execution handoff is not composed/
+    );
+  });
+
   it("marks a sessionless remote rehydration as reconnectable (#963)", () => {
     const remote = new RemoteInstance(TARGET, process.platform, process.pid);
     const hub = {
       createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
+      ownsExecution: () => false,
       toolUrls: () => [],
     } as unknown as FollowerHub;
     const context = {
@@ -151,6 +175,7 @@ describe("instanceWorkerFactory", () => {
     const remote = new RemoteInstance(TARGET, process.platform, process.pid);
     const hub = {
       createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
+      ownsExecution: () => false,
       toolUrls: () => [],
     } as unknown as FollowerHub;
     const context = {
