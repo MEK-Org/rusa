@@ -443,9 +443,6 @@ interface ThreadDto {
   compatibleLanes?: string[];
   /** The lane a claimed admission holds, else `null`. */
   claimedLane?: string | null;
-  /** Whether selected inbox work has exhausted bounded retries and requires attention. */
-  needsAttention?: boolean;
-  needsAttentionReason?: string | null;
 }
 
 /**
@@ -2544,13 +2541,6 @@ export async function handleMeshApiRequest(
           voiceConfig: r.voiceConfig ?? null,
           ...(selectedInboxItem ? { selectedInboxItem } : {}),
           ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
-          ...(typeof deps.mesh?.hasExhaustedSelectedWork === "function" &&
-          deps.mesh.hasExhaustedSelectedWork(r.id)
-            ? {
-                needsAttention: true,
-                needsAttentionReason: "Selected work exhausted retries without being handled",
-              }
-            : {}),
         };
       })
     );

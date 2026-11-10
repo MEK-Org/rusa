@@ -50,8 +50,6 @@ ThreadDto makeThread(
   String? selectedProvider,
   String? selectedModel,
   String? selectedEffort,
-  bool needsAttention = false,
-  String? needsAttentionReason,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -89,8 +87,6 @@ ThreadDto makeThread(
   selectedProvider: selectedProvider,
   selectedModel: selectedModel,
   selectedEffort: selectedEffort,
-  needsAttention: needsAttention,
-  needsAttentionReason: needsAttentionReason,
 );
 
 InboxEntryDto makeInboxEntry(

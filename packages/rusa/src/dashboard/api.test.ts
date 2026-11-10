@@ -905,27 +905,26 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
-  it("GET /api/mesh/threads surfaces exhausted selected work as needs attention (#664)", async () => {
+  it("GET /api/mesh/threads does not run the exhausted-retries check per actor (#1277)", async () => {
+    // The check rereads an actor's whole completed-run history whenever it has
+    // unhandled inbox work, so the thread list must not call it for any row.
     actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, UUID_A, "retired"));
+    const hasExhaustedSelectedWork = vi.fn(() => true);
     const { res } = await call(
-      {
-        ...deps,
-        mesh: {
-          hasExhaustedSelectedWork: (actorId: string) => actorId === UUID_A,
-        } as unknown as ActorMesh,
-      },
+      { ...deps, mesh: { hasExhaustedSelectedWork } as unknown as ActorMesh },
       "GET",
       "/api/mesh/threads"
     );
 
     expect(res.statusCode).toBe(200);
-    const thread = (JSON.parse(res.body).threads as Array<Record<string, unknown>>).find(
-      (item) => item.id === UUID_A
-    );
-    expect(thread).toMatchObject({
-      needsAttention: true,
-      needsAttentionReason: "Selected work exhausted retries without being handled",
-    });
+    const threads = JSON.parse(res.body).threads as Array<Record<string, unknown>>;
+    expect(threads.map((thread) => thread.id).sort()).toEqual([UUID_A, UUID_B].sort());
+    expect(hasExhaustedSelectedWork).not.toHaveBeenCalled();
+    for (const thread of threads) {
+      expect(thread).not.toHaveProperty("needsAttention");
+      expect(thread).not.toHaveProperty("needsAttentionReason");
+    }
   });
 
   describe("auth-disabled local mode attribution (#460)", () => {

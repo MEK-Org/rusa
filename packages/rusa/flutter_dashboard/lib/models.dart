@@ -219,8 +219,6 @@ class ThreadDto {
     this.selectedInboxItem,
     this.moreInboxItemsCount,
     this.voiceConfig,
-    this.needsAttention = false,
-    this.needsAttentionReason,
   });
 
   final String id;
@@ -337,10 +335,6 @@ class ThreadDto {
   /// a stored voice setting, including all actors on an older server.
   final VoiceConfigDto? voiceConfig;
 
-  /// Whether selected inbox work has exhausted bounded retries and requires attention.
-  final bool needsAttention;
-  final String? needsAttentionReason;
-
   bool get isRetired => status == 'retired';
 
   ThreadDto copyWith({
@@ -381,8 +375,6 @@ class ThreadDto {
     Object? selectedInboxItem = _keepThreadField,
     Object? moreInboxItemsCount = _keepThreadField,
     Object? voiceConfig = _keepThreadField,
-    bool? needsAttention,
-    Object? needsAttentionReason = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -452,10 +444,6 @@ class ThreadDto {
     voiceConfig: identical(voiceConfig, _keepThreadField)
         ? this.voiceConfig
         : voiceConfig as VoiceConfigDto?,
-    needsAttention: needsAttention ?? this.needsAttention,
-    needsAttentionReason: identical(needsAttentionReason, _keepThreadField)
-        ? this.needsAttentionReason
-        : needsAttentionReason as String?,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(
@@ -527,8 +515,6 @@ class ThreadDto {
             config: {'voiceName': j['voiceName']},
           )
         : null,
-    needsAttention: j['needsAttention'] as bool? ?? false,
-    needsAttentionReason: j['needsAttentionReason'] as String?,
   );
 }
 
