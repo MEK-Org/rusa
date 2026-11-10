@@ -874,4 +874,127 @@ describe("QuotaCollectionLoop", () => {
       store.close();
     }
   });
+
+  it("#1282: keeps one Fable lane, its period start and its pacing when the window's model list grows", async () => {
+    const root = makeRoot();
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    store.configureController({ maxIntervalSeconds: 3600 });
+    const twoModels = ["claude-fable-5", "claude-fable-5-1"];
+    const threeModels = ["claude-fable-5", "claude-fable-5-1", "claude-fable-5-2"];
+    const catalog: ModelEntry[] = [
+      { identifier: "claude-fable-5", displayLabel: "Claude Fable 5" },
+      { identifier: "claude-fable-5-1", displayLabel: "Claude Fable 5.1" },
+      { identifier: "claude-opus-5-5", displayLabel: "Claude Opus 5.5" },
+    ];
+    const resetAtIso = "2026-11-16T03:00:00.000Z";
+    // The Nov 10 sequence of the issue: the same "Current week (Fable)" line,
+    // same reset, read before and after a third Fable model joined the catalog.
+    const capture = (usedPercent: string, models: string[]) => ({
+      text: () =>
+        JSON.stringify({
+          status: "available",
+          windows: [
+            { label: "Current week (all models)", kind: "weekly", usedPercent: "19", resetAtIso },
+            { label: "Current week (Fable)", kind: "weekly", usedPercent, resetAtIso, models },
+          ],
+        }),
+    });
+    mockGenerateContent.mockReset();
+    mockGenerateContent
+      .mockResolvedValueOnce(capture("26", twoModels))
+      .mockResolvedValueOnce(capture("27", twoModels))
+      .mockResolvedValueOnce(capture("30", threeModels));
+    let nowMs = Date.parse("2026-11-10T07:56:28.000Z");
+    const run = vi.fn().mockResolvedValue({
+      success: true,
+      output: "synthetic Claude /usage panel",
+      exitCode: 0,
+    });
+    const quotaService = configuredClaudeService({
+      root,
+      store,
+      now: () => nowMs,
+      run,
+      ttlMs: 1,
+      modelCatalog: catalog,
+    });
+    const loop = new QuotaCollectionLoop({
+      store,
+      quotaService,
+      providers: ["claude"],
+      maxIntervalSeconds: 3600,
+    });
+    const socketPath = join(root, "coordinator.sock");
+    const coordinator = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      now: () => nowMs,
+    });
+    const client = new QuotaCoordinatorClient({ socketPath, configuredProviders: ["claude"] });
+    const detector = new MissedQuotaWindowDetector();
+    const since = "2026-11-10T00:00:00.000Z";
+    const observe = async () => {
+      const history = (await client.getHistory("claude", since)) ?? [];
+      return {
+        history,
+        missed: detector.observe("claude", history, client.getCachedScrapeOutcomes("claude")),
+      };
+    };
+    const fableRows = () =>
+      store.db
+        .prepare(
+          `SELECT model_scope AS modelScope, observed_at AS observedAt,
+                  reset_at_iso AS resetAtIso, window_ms AS windowMs,
+                  controller_integral AS controllerIntegral, interval_seconds AS intervalSeconds
+           FROM quota_observations WHERE provider = 'claude' AND model_scope <> ''
+           ORDER BY observed_at`
+        )
+        .all() as Array<{
+        modelScope: string;
+        observedAt: string;
+        resetAtIso: string;
+        windowMs: number;
+        controllerIntegral: number;
+        intervalSeconds: number;
+      }>;
+    try {
+      await coordinator.start();
+      await loop.tick();
+      nowMs = Date.parse("2026-11-10T08:26:28.000Z");
+      await loop.tick();
+      expect((await observe()).missed).toEqual([]);
+
+      // The catalog grows by one Fable model and the coordinator restarts.
+      catalog.push({ identifier: "claude-fable-5-2", displayLabel: "Claude Fable 5.2" });
+      nowMs = Date.parse("2026-11-10T08:57:13.000Z");
+      await loop.tick();
+      const { history, missed } = await observe();
+
+      expect(run).toHaveBeenCalledTimes(3);
+      expect(missed).toEqual([]);
+      const rows = fableRows();
+      expect(rows).toHaveLength(3);
+      expect(new Set(rows.map((row) => row.modelScope)).size).toBe(1);
+      const periodStarts = rows.map((row) => Date.parse(row.resetAtIso) - row.windowMs);
+      expect(new Set(periodStarts)).toEqual(new Set([Date.parse("2026-11-10T07:56:28.000Z")]));
+      // The third step continues the lane's controller memory instead of
+      // starting a fresh one (whose first integral is 0): it holds at least
+      // the second row's integral, which anti-windup may keep at its bound.
+      expect(rows[1].controllerIntegral).not.toBe(0);
+      expect(Math.abs(rows[2].controllerIntegral)).toBeGreaterThanOrEqual(
+        Math.abs(rows[1].controllerIntegral)
+      );
+      const historyLanes = history
+        .filter((record) => record.scope === "model")
+        .map((record) => quotaLaneKey("model", record.models ?? [], record.kind));
+      expect(new Set(historyLanes).size).toBe(1);
+      const lanes = store.getProviderThrottle("claude")?.modelLanes ?? [];
+      expect(lanes).toHaveLength(1);
+      expect([...(lanes[0]?.models ?? [])].sort()).toEqual(threeModels);
+    } finally {
+      await coordinator.stop();
+      store.close();
+    }
+  });
 });
