@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
+import 'dashboard_resource_timing.dart';
 import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
@@ -71,7 +72,10 @@ class DashboardApi {
     Map<String, String> Function(Uri url)? imageHeaders,
   }) : _base = base ?? Uri.base,
        _imageHeaders = imageHeaders ?? _noImageHeaders {
-    _client = DashboardTimingClient(SessionClient(client, session));
+    _client = DashboardTimingClient(
+      SessionClient(client, session),
+      resourceTiming: defaultDashboardResourceTimingSource(),
+    );
     _timings = DashboardTimingReporter(client: _client, base: _base);
   }
 
