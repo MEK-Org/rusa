@@ -60,12 +60,10 @@ export interface AtIo {
   list(): { id: string; script: string }[];
   remove(id: string): void;
   /**
-   * Read the script of a single job by id. Returns null if the job does not
-   * exist or has already run.
+   * Read the script of a single job by id: one `at -c`. Returns null if the
+   * job does not exist or has already run.
    */
-  readJob?(id: string): { id: string; script: string } | null;
-  /** List all queued job ids without reading their scripts. */
-  listJobIds?(): string[];
+  readJob(id: string): { id: string; script: string } | null;
 }
 
 /** Raised when a host without a working `at` facility needs a one-shot job. */
@@ -88,9 +86,6 @@ export function unavailableAtIo(issues: string[]): AtIo {
     },
     readJob(): { id: string; script: string } | null {
       return null;
-    },
-    listJobIds(): string[] {
-      return [];
     },
     remove(): void {
       throw new AtUnavailableError(issues);
@@ -150,7 +145,6 @@ export function execAtIo(): AtIo {
       if (!match) throw new Error(`could not parse at output: ${result.stderr}`);
       return match[1];
     },
-    listJobIds,
     readJob,
     list(): { id: string; script: string }[] {
       const ids = listJobIds();

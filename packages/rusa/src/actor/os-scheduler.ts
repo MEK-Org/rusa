@@ -82,7 +82,16 @@ export interface ScheduledMessage {
 export interface ScheduledMessageScheduler {
   scheduleMessageDelivery(message: ScheduledMessage): void;
   cancelMessageDelivery(id: string): void;
+  /** Every pending delivery this instance owns, from one full read of the queue. */
   listMessageDeliveries(): ScheduledMessage[];
+  /**
+   * The pending deliveries this instance knows it queued, each read back from
+   * its own job: one `at -c` per known message job, never a read of
+   * activations, foreign instances' jobs or the queue listing.
+   */
+  listKnownMessageDeliveries(): ScheduledMessage[];
+  /** One pending delivery, read back only from the jobs known under its own tag. */
+  readMessageDelivery(id: string): ScheduledMessage | null;
 }
 
 /**
@@ -340,6 +349,18 @@ export function decodeScheduledMessagePayload(payload: string): ScheduledMessage
   }
 }
 
+/** Whether one of `script`'s lines is exactly `tag`. */
+function carriesTag(script: string, tag: string): boolean {
+  return script.split("\n").some((line) => line.trim() === tag);
+}
+
+function sortScheduledMessages(messages: Map<string, ScheduledMessage>): ScheduledMessage[] {
+  return [...messages.values()].sort(
+    (left, right) =>
+      Date.parse(left.deliverAt) - Date.parse(right.deliverAt) || left.id.localeCompare(right.id)
+  );
+}
+
 function decodeScheduledMessage(script: string): ScheduledMessage {
   const match = script.match(/-d 'payload=([A-Za-z0-9_-]+)'/);
   if (!match) throw new Error("scheduled-message job has no payload");
@@ -350,7 +371,16 @@ export class DefaultOsScheduler implements OsScheduler {
   readonly instanceId: string;
   private readonly log: Logger;
   private readonly now: () => number;
+  /**
+   * The `at` job ids this instance owns, by tag. Seeded from one full read of
+   * the queue the first time any tag is consulted, then kept by this
+   * scheduler's own writes and removals and rebuilt by every later full read.
+   * Every id is read back and tag-checked before it is acted on, so an entry
+   * that went stale (the job fired, or its id now holds another job) is
+   * dropped, never removed.
+   */
   private readonly knownAtJobsByTag = new Map<string, Set<string>>();
+  private knownAtJobsSeeded = false;
 
   constructor(
     private readonly mutator: CrontabMutator,
@@ -694,18 +724,64 @@ export class DefaultOsScheduler implements OsScheduler {
     }
   }
 
-  /** Ids of the queued `at` jobs whose script carries exactly `tag`. */
-  private staleAtIds(tag: string): string[] {
-    if (!this.atIo.readJob) {
-      return this.atJobIdsFor(this.atIo.list(), tag);
+  /**
+   * Replace the known-job record with exactly the owned tags `jobs` carries.
+   * `jobs` must be one complete read of the queue.
+   */
+  private rememberOwnedAtJobs(jobs: { id: string; script: string }[]): void {
+    this.knownAtJobsByTag.clear();
+    for (const job of jobs) {
+      for (const raw of job.script.split("\n")) {
+        const line = raw.trim();
+        if (
+          this.ownedId("obligation-activation", line) !== null ||
+          this.ownedId("message-delivery", line) !== null
+        ) {
+          this.trackAtJob(line, job.id);
+        }
+      }
     }
-    return Array.from(this.knownAtJobsByTag.get(tag) ?? []);
+    this.knownAtJobsSeeded = true;
   }
 
-  private atJobIdsFor(jobs: { id: string; script: string }[], tag: string): string[] {
-    return jobs
-      .filter((job) => job.script.split("\n").some((line) => line.trim() === tag))
-      .map((job) => job.id);
+  /**
+   * A fresh process knows nothing it did not write, yet boot reconciliation
+   * replaces and cancels jobs the previous process left. One full read the
+   * first time tag state is needed covers every caller, whatever order it
+   * runs in.
+   */
+  private ensureKnownAtJobs(): void {
+    if (!this.knownAtJobsSeeded) this.rememberOwnedAtJobs(this.atIo.list());
+  }
+
+  /**
+   * The queued jobs whose script still carries exactly `tag`, read back one
+   * `at -c` per id known under that tag. A known id that is gone or now
+   * carries anything else is forgotten, never removed: the shared queue is
+   * only mutated for a job attributed to this instance by its tag.
+   */
+  private verifiedAtJobs(tag: string): { id: string; script: string }[] {
+    this.ensureKnownAtJobs();
+    const verified: { id: string; script: string }[] = [];
+    for (const atJobId of Array.from(this.knownAtJobsByTag.get(tag) ?? [])) {
+      const job = this.atIo.readJob(atJobId);
+      if (job && carriesTag(job.script, tag)) {
+        verified.push(job);
+        continue;
+      }
+      this.untrackAtJob(tag, atJobId);
+      this.log.info("at_job_forgotten", {
+        tag,
+        atJobId,
+        reason: job ? "job no longer carries tag" : "job no longer queued",
+      });
+    }
+    return verified;
+  }
+
+  /** Ids of the queued `at` jobs whose script carries exactly `tag`. */
+  private staleAtIds(tag: string): string[] {
+    return this.verifiedAtJobs(tag).map((job) => job.id);
   }
 
   /**
@@ -757,33 +833,9 @@ export class DefaultOsScheduler implements OsScheduler {
     atJobId: string,
     date: Date
   ) {
-    if (this.atIo.readJob) {
-      const job = this.atIo.readJob(atJobId);
-      const queueSize = this.atIo.listJobIds ? this.atIo.listJobIds().length : 1;
-      const fields = { family, id, tag, atJobId, queueSize };
-      if (job?.script.split("\n").some((line) => line.trim() === tag)) {
-        this.log.info("at_enqueue_confirmed", fields);
-        return;
-      }
-      if (atRunInstant(date) <= this.now()) {
-        this.log.warn("at_enqueue_unconfirmed", {
-          ...fields,
-          reason: "job run minute has begun; may already have run",
-        });
-        return;
-      }
-      this.log.error("at_enqueue_unconfirmed", { ...fields, reason: "job missing from queue" });
-      try {
-        this.removeAtIds(family, id, tag, [atJobId], "unconfirmed enqueue");
-      } catch (err) {
-        this.log.warn("at_job_remove_failed", { ...fields, err });
-      }
-      throw new AtEnqueueUnconfirmedError(tag, atJobId);
-    }
-
-    const queue = this.atIo.list();
-    const fields = { family, id, tag, atJobId, queueSize: queue.length };
-    if (this.atJobIdsFor(queue, tag).includes(atJobId)) {
+    const job = this.atIo.readJob(atJobId);
+    const fields = { family, id, tag, atJobId };
+    if (job && carriesTag(job.script, tag)) {
       this.log.info("at_enqueue_confirmed", fields);
       return;
     }
@@ -791,6 +843,8 @@ export class DefaultOsScheduler implements OsScheduler {
     // job could have run and left the queue unseen. `at`, atd and this process
     // share the host clock, so no further allowance is applied.
     if (atRunInstant(date) <= this.now()) {
+      // Gone either way: nothing is left under this id to replace or cancel.
+      this.untrackAtJob(tag, atJobId);
       this.log.warn("at_enqueue_unconfirmed", {
         ...fields,
         reason: "job run minute has begun; may already have run",
@@ -893,23 +947,22 @@ export class DefaultOsScheduler implements OsScheduler {
 
   listObligationActivations(): ObligationActivationRecord[] {
     const entries = new Map<string, ObligationActivationRecord>();
-    const add = (line: string, jobId?: string): void => {
+    const add = (line: string): void => {
       const record = parseObligationActivationTag(line);
-      if (record) {
-        entries.set(activationRecordKey(record), record);
-        if (jobId && record.instanceId === this.instanceId) {
-          this.trackAtJob(line.trim(), jobId);
-        }
-      }
+      if (record) entries.set(activationRecordKey(record), record);
     };
 
     const current = this.mutator.read();
     for (const line of current.split("\n")) {
       add(line);
     }
-    for (const job of this.atIo.list()) {
+    const jobs = this.atIo.list();
+    // A full read is the truth about the queue, so the known-job record is
+    // rebuilt from it: this prunes ids that fired since the last read.
+    this.rememberOwnedAtJobs(jobs);
+    for (const job of jobs) {
       for (const line of job.script.split("\n")) {
-        add(line, job.id);
+        add(line);
       }
     }
     return Array.from(entries.values());
@@ -967,33 +1020,66 @@ export class DefaultOsScheduler implements OsScheduler {
    * boot reconciliation cannot cancel a recipient it merely does not know.
    */
   listMessageDeliveries(): ScheduledMessage[] {
+    const jobs = this.atIo.list();
+    // A full read is the truth about the queue, so the known-job record is
+    // rebuilt from it: this prunes ids that fired since the last read.
+    this.rememberOwnedAtJobs(jobs);
     const messages = new Map<string, ScheduledMessage>();
-    for (const job of this.atIo.list()) {
-      const tagLines = job.script
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith(instanceTagPrefix("message-delivery")));
-      if (!tagLines.some((line) => this.ownedId("message-delivery", line) !== null)) continue;
-      for (const tagLine of tagLines) {
-        if (this.ownedId("message-delivery", tagLine) !== null) {
-          this.trackAtJob(tagLine, job.id);
-        }
-      }
-      let message: ScheduledMessage;
-      try {
-        message = decodeScheduledMessage(job.script);
-        if (tagLines.length !== 1 || tagLines[0] !== this.messageTag(message.id)) {
-          throw new Error("scheduled-message tag does not match its payload id");
-        }
-      } catch (cause) {
-        throw new Error(`Invalid scheduled-message host job ${job.id}`, { cause });
-      }
-      messages.set(message.id, message);
+    for (const job of jobs) {
+      const message = this.decodeOwnedMessageJob(job);
+      if (message) messages.set(message.id, message);
     }
-    return [...messages.values()].sort(
-      (left, right) =>
-        Date.parse(left.deliverAt) - Date.parse(right.deliverAt) || left.id.localeCompare(right.id)
-    );
+    return sortScheduledMessages(messages);
+  }
+
+  /**
+   * The send-time cap check's read (#1274): only the message jobs this
+   * instance knows it queued are read back, so its cost follows this
+   * instance's own pending messages, not the length of a queue shared with
+   * activations and other instances.
+   */
+  listKnownMessageDeliveries(): ScheduledMessage[] {
+    this.ensureKnownAtJobs();
+    const messages = new Map<string, ScheduledMessage>();
+    for (const tag of Array.from(this.knownAtJobsByTag.keys())) {
+      if (this.ownedId("message-delivery", tag) === null) continue;
+      for (const job of this.verifiedAtJobs(tag)) {
+        const message = this.decodeOwnedMessageJob(job);
+        if (message) messages.set(message.id, message);
+      }
+    }
+    return sortScheduledMessages(messages);
+  }
+
+  /** The cancel path's read (#1274): only the jobs known under this message's own tag. */
+  readMessageDelivery(id: string): ScheduledMessage | null {
+    for (const job of this.verifiedAtJobs(this.messageTag(id))) {
+      const message = this.decodeOwnedMessageJob(job);
+      if (message) return message;
+    }
+    return null;
+  }
+
+  /**
+   * The message an owned job carries, or null for a job this instance does
+   * not own. An owned job whose payload does not match its tag is corrupt and
+   * throws rather than being skipped.
+   */
+  private decodeOwnedMessageJob(job: { id: string; script: string }): ScheduledMessage | null {
+    const tagLines = job.script
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith(instanceTagPrefix("message-delivery")));
+    if (!tagLines.some((line) => this.ownedId("message-delivery", line) !== null)) return null;
+    try {
+      const message = decodeScheduledMessage(job.script);
+      if (tagLines.length !== 1 || tagLines[0] !== this.messageTag(message.id)) {
+        throw new Error("scheduled-message tag does not match its payload id");
+      }
+      return message;
+    } catch (cause) {
+      throw new Error(`Invalid scheduled-message host job ${job.id}`, { cause });
+    }
   }
 
   private messageTag(id: string): string {

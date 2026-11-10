@@ -29,6 +29,8 @@ describe("legacy actor import", () => {
         scheduled.delete(id);
       },
       listMessageDeliveries: () => [...scheduled.values()].map((message) => ({ ...message })),
+      listKnownMessageDeliveries: () => [...scheduled.values()].map((message) => ({ ...message })),
+      readMessageDelivery: (id) => scheduled.get(id) ?? null,
     };
   });
 
@@ -171,6 +173,8 @@ describe("legacy actor import", () => {
       },
       cancelMessageDelivery: () => {},
       listMessageDeliveries: () => [],
+      listKnownMessageDeliveries: () => [],
+      readMessageDelivery: () => null,
     };
 
     expect(() => importState()).toThrow("at submission failed");
@@ -184,6 +188,8 @@ describe("legacy actor import", () => {
         scheduled.delete(id);
       },
       listMessageDeliveries: () => [...scheduled.values()],
+      listKnownMessageDeliveries: () => [...scheduled.values()],
+      readMessageDelivery: (id) => scheduled.get(id) ?? null,
     };
     const retry = importState();
 

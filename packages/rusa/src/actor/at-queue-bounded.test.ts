@@ -3,8 +3,11 @@
 // Scheduling a wake re-reads the whole `at` queue with one synchronous process
 // spawn per queued job, blocking the event loop.
 //
-// Scheduling, confirming or removing one wake must do a bounded amount of
-// blocking work that does not grow with the number of unrelated jobs in the queue.
+// Scheduling, confirming, looking up or removing one wake must do a bounded
+// amount of blocking work that does not grow with the number of unrelated jobs
+// in the queue. After the one full read a process makes at start-up, a send
+// spawns K+2 processes for K messages this instance knows it has pending, and
+// a cancel spawns three.
 
 import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
@@ -24,36 +27,28 @@ vi.mock("node:child_process", () => {
 interface InstrumentedQueue {
   io: AtIo;
   jobs: Map<string, string>;
-  counts: {
-    schedule: number;
-    list: number;
-    remove: number;
-    readJob: number;
-    listJobIds: number;
-  };
-  totalScriptReads: () => number;
+  counts: { schedule: number; list: number; remove: number; readJob: number };
+  /**
+   * Host processes spawned so far, priced as {@link execAtIo} spends them: one
+   * `at`, `atrm` or `at -c` per call, and `atq` plus one `at -c` per queued
+   * job for a full list.
+   */
+  spawns: () => number;
+  reset: () => void;
 }
 
 function createInstrumentedQueue(
-  initialJobs: Array<{ id: string; script: string }> = [],
-  options: { withSingleJobSeam?: boolean } = { withSingleJobSeam: true }
+  initialJobs: Array<{ id: string; script: string }> = []
 ): InstrumentedQueue {
   const jobs = new Map<string, string>();
   for (const job of initialJobs) {
     jobs.set(job.id, job.script);
   }
-
-  const counts = {
-    schedule: 0,
-    list: 0,
-    remove: 0,
-    readJob: 0,
-    listJobIds: 0,
-  };
-
+  const counts = { schedule: 0, list: 0, remove: 0, readJob: 0 };
+  let listSpawns = 0;
   let nextId = 1000;
 
-  const baseIo: AtIo = {
+  const io: AtIo = {
     schedule: vi.fn((script: string) => {
       counts.schedule++;
       const id = String(nextId++);
@@ -62,7 +57,13 @@ function createInstrumentedQueue(
     }),
     list: vi.fn(() => {
       counts.list++;
+      listSpawns += 1 + jobs.size;
       return Array.from(jobs.entries()).map(([id, script]) => ({ id, script }));
+    }),
+    readJob: vi.fn((id: string) => {
+      counts.readJob++;
+      const script = jobs.get(id);
+      return script !== undefined ? { id, script } : null;
     }),
     remove: vi.fn((id: string) => {
       counts.remove++;
@@ -70,28 +71,29 @@ function createInstrumentedQueue(
     }),
   };
 
-  const io: AtIo = options.withSingleJobSeam
-    ? {
-        ...baseIo,
-        readJob: vi.fn((id: string) => {
-          counts.readJob++;
-          const script = jobs.get(id);
-          return script !== undefined ? { id, script } : null;
-        }),
-        listJobIds: vi.fn(() => {
-          counts.listJobIds++;
-          return Array.from(jobs.keys());
-        }),
-      }
-    : baseIo;
-
   return {
     io,
     jobs,
     counts,
-    totalScriptReads: () => counts.list * jobs.size + counts.readJob,
+    spawns: () => counts.schedule + counts.remove + counts.readJob + listSpawns,
+    reset: () => {
+      counts.schedule = 0;
+      counts.list = 0;
+      counts.remove = 0;
+      counts.readJob = 0;
+      listSpawns = 0;
+    },
   };
 }
+
+const b64 = (value: string) => Buffer.from(value).toString("base64url");
+
+/** Message jobs another instance on the host queued: never read, never touched. */
+const foreignJobs = (count: number) =>
+  Array.from({ length: count }, (_, i) => ({
+    id: `foreign-${i}`,
+    script: `# mc-message-delivery-instance:v1:${b64("other-instance")}:${b64(`foreign-${i}`)}\ncurl /wake-message\n`,
+  }));
 
 describe("MEK-Org/rusa#1274 bounded at-queue operations", () => {
   const crontabIo: CrontabIo = {
@@ -108,92 +110,139 @@ describe("MEK-Org/rusa#1274 bounded at-queue operations", () => {
     });
   };
 
-  const makeMessage = (id: string, deliverAt = "2026-09-16T12:00:00.000Z"): ScheduledMessage => ({
+  const makeMessage = (
+    id: string,
+    deliverAt = "2026-09-16T12:00:00.000Z",
+    toId = "recipient"
+  ): ScheduledMessage => ({
     id,
-    toId: "recipient",
+    toId,
     fromId: "sender",
     body: `body-${id}`,
     deliverAt,
   });
 
-  it("scheduling one wake does bounded script reads independent of queue size", () => {
-    // 50 unrelated jobs sitting in the queue
-    const unrelatedJobs = Array.from({ length: 50 }, (_, i) => ({
-      id: `foreign-${i}`,
-      script: `# foreign-tag-${i}\ncurl /wake\n`,
-    }));
+  const activationAt = { kind: "at" as const, date: new Date("2026-09-16T12:00:00.000Z") };
 
-    const queue = createInstrumentedQueue(unrelatedJobs);
+  /**
+   * A booted scheduler over 50 foreign jobs plus `activations` of its own
+   * activations and `messages` of its own messages. Boot's full reads have
+   * run, so the counts start at zero with the known-job record seeded.
+   */
+  const booted = (activations: number, messages: number) => {
+    const queue = createInstrumentedQueue(foreignJobs(50));
     const scheduler = createScheduler(queue.io);
+    for (let i = 0; i < activations; i++) {
+      scheduler.scheduleObligationActivation(`ob-${i}`, activationAt);
+    }
+    for (let i = 0; i < messages; i++) {
+      scheduler.scheduleMessageDelivery(makeMessage(`own-${i}`, undefined, `recipient-${i}`));
+    }
+    // Start-up's reconciliations each make one full read.
+    scheduler.listMessageDeliveries();
+    scheduler.listObligationActivations();
+    queue.reset();
+    return { queue, scheduler };
+  };
 
-    // Schedule one message wake
-    scheduler.scheduleMessageDelivery(makeMessage("msg-1"));
+  it("a send's cap read and write spawn K+2 processes for K known own messages, whatever the queue holds", () => {
+    for (const activations of [0, 40]) {
+      const { queue, scheduler } = booted(activations, 3);
 
-    // Before #1274: staleAtIds calls list() (50 reads) and confirmAtEnqueue calls list() (51 reads) -> >100 script reads!
-    // After #1274: confirm only reads msg-1's script (1 read) and staleAtIds does 0 full queue reads -> <= 2 script reads.
-    expect(queue.totalScriptReads()).toBeLessThanOrEqual(2);
+      // The mesh's send: its cap read, then the write.
+      expect(scheduler.listKnownMessageDeliveries().map((message) => message.id)).toEqual([
+        "own-0",
+        "own-1",
+        "own-2",
+      ]);
+      scheduler.scheduleMessageDelivery(makeMessage("msg-new"));
+
+      // 3 cap reads + 0 stale reads for a fresh id + 1 `at` + 1 confirming `at -c`.
+      expect(queue.counts.list).toBe(0);
+      expect(queue.spawns()).toBe(3 + 2);
+    }
   });
 
-  it("confirming an enqueue only reads the target job, not every job in the queue", () => {
-    const unrelatedJobs = Array.from({ length: 50 }, (_, i) => ({
-      id: `foreign-${i}`,
-      script: `# foreign-tag-${i}\ncurl /wake\n`,
-    }));
+  it("a cancel's lookup and removal spawn three processes, whatever the queue holds", () => {
+    const { queue, scheduler } = booted(40, 3);
 
-    const queue = createInstrumentedQueue(unrelatedJobs);
-    const scheduler = createScheduler(queue.io);
+    expect(scheduler.readMessageDelivery("own-1")).toMatchObject({ id: "own-1" });
+    scheduler.cancelMessageDelivery("own-1");
 
-    scheduler.scheduleMessageDelivery(makeMessage("msg-confirm"));
-
-    // Script reads must NOT scale with the 50 foreign jobs
+    // One `at -c` to look it up, one to re-verify before removal, one `atrm`.
     expect(queue.counts.list).toBe(0);
-    expect(queue.totalScriptReads()).toBeLessThanOrEqual(2);
-  });
-
-  it("cancelling a wake does not re-read unrelated jobs in the queue", () => {
-    const unrelatedJobs = Array.from({ length: 50 }, (_, i) => ({
-      id: `foreign-${i}`,
-      script: `# foreign-tag-${i}\ncurl /wake\n`,
-    }));
-
-    const queue = createInstrumentedQueue(unrelatedJobs);
-    const scheduler = createScheduler(queue.io);
-
-    scheduler.scheduleMessageDelivery(makeMessage("msg-cancel"));
-    const readsAfterSchedule = queue.totalScriptReads();
-
-    // Cancel the wake
-    scheduler.cancelMessageDelivery("msg-cancel");
-
-    // Before #1274: cancel calls staleAtIds which calls list() over all 51 jobs.
-    // After #1274: cancel answers from what the scheduler knows it wrote -> 0 script reads!
-    const readsDuringCancel = queue.totalScriptReads() - readsAfterSchedule;
-    expect(readsDuringCancel).toBe(0);
-  });
-
-  it("scheduling and cancelling obligation activation with at does bounded script reads", () => {
-    const unrelatedJobs = Array.from({ length: 50 }, (_, i) => ({
-      id: `foreign-${i}`,
-      script: `# foreign-tag-${i}\ncurl /wake\n`,
-    }));
-
-    const queue = createInstrumentedQueue(unrelatedJobs);
-    const scheduler = createScheduler(queue.io);
-
-    scheduler.scheduleObligationActivation("ob-1", {
-      kind: "at",
-      date: new Date("2026-09-16T12:00:00.000Z"),
-    });
-
-    // Schedule activation reads 0 full lists
-    expect(queue.counts.list).toBe(0);
-    expect(queue.totalScriptReads()).toBe(0);
-
-    // Cancel obligation activation
-    scheduler.cancelObligationActivation("ob-1");
-    expect(queue.counts.list).toBe(0);
-    expect(queue.totalScriptReads()).toBe(0);
+    expect(queue.spawns()).toBe(3);
     expect(queue.counts.remove).toBe(1);
+    expect(scheduler.readMessageDelivery("own-1")).toBeNull();
+  });
+
+  it("an unknown message id is looked up with no host process at all", () => {
+    const { queue, scheduler } = booted(10, 3);
+
+    expect(scheduler.readMessageDelivery("never-sent")).toBeNull();
+    expect(queue.spawns()).toBe(0);
+  });
+
+  it("scheduling and cancelling an at activation spawns only its own processes", () => {
+    const { queue, scheduler } = booted(40, 3);
+
+    scheduler.scheduleObligationActivation("ob-new", activationAt);
+    expect(queue.counts.list).toBe(0);
+    expect(queue.spawns()).toBe(1);
+
+    scheduler.cancelObligationActivation("ob-new");
+    expect(queue.counts.list).toBe(0);
+    // One `at -c` to verify the job still carries its tag, one `atrm`.
+    expect(queue.spawns()).toBe(1 + 2);
+    expect(queue.counts.remove).toBe(1);
+  });
+
+  it("a restarted process replaces and cancels the jobs its previous process queued", () => {
+    // Before this fix, a new process knew only jobs it wrote itself, and boot
+    // replays activations before reading them, so each restart duplicated
+    // every at activation and orphaned the old job.
+    const queue = createInstrumentedQueue(foreignJobs(5));
+    const before = createScheduler(queue.io);
+    before.scheduleObligationActivation("ob-1", activationAt);
+    before.scheduleMessageDelivery(makeMessage("msg-1"));
+    const ownJobs = () =>
+      [...queue.jobs.entries()].filter(([id]) => !id.startsWith("foreign-")).map(([id]) => id);
+    expect(ownJobs()).toHaveLength(2);
+
+    const after = createScheduler(queue.io);
+    after.scheduleObligationActivation("ob-1", activationAt);
+    expect(ownJobs()).toHaveLength(2);
+
+    after.cancelObligationActivation("ob-1");
+    after.cancelMessageDelivery("msg-1");
+    expect(ownJobs()).toEqual([]);
+    expect(queue.jobs.size).toBe(5);
+  });
+
+  it("forgets, and never removes, a known id that now holds another job", () => {
+    const { queue, scheduler } = booted(0, 1);
+    const [ownId] = [...queue.jobs.keys()].filter((id) => !id.startsWith("foreign-"));
+    // The job ran, and `at` handed its id to an unrelated job.
+    queue.jobs.set(ownId, "# someone else's job\ncurl /elsewhere\n");
+
+    scheduler.cancelMessageDelivery("own-0");
+    expect(scheduler.listKnownMessageDeliveries()).toEqual([]);
+
+    expect(queue.counts.remove).toBe(0);
+    expect(queue.jobs.get(ownId)).toBe("# someone else's job\ncurl /elsewhere\n");
+    // Forgotten after one read: the second lookup spawns nothing.
+    expect(queue.counts.readJob).toBe(1);
+  });
+
+  it("drops a job that has fired from the known record after one read", () => {
+    const { queue, scheduler } = booted(0, 2);
+    const [firstId] = [...queue.jobs.keys()].filter((id) => !id.startsWith("foreign-"));
+    queue.jobs.delete(firstId);
+
+    expect(scheduler.listKnownMessageDeliveries().map((message) => message.id)).toEqual(["own-1"]);
+    queue.reset();
+    scheduler.listKnownMessageDeliveries();
+    expect(queue.spawns()).toBe(1);
   });
 
   it("confirmAtEnqueue fails closed when the newly scheduled job is missing from queue before run minute", () => {
@@ -213,6 +262,7 @@ describe("MEK-Org/rusa#1274 bounded at-queue operations", () => {
 
     // Verifies removal attempt on unconfirmed enqueue
     expect(queue.counts.remove).toBe(1);
+    expect(scheduler.readMessageDelivery("msg-fail")).toBeNull();
   });
 
   it("confirmAtEnqueue tolerates missing job when job run minute has already begun", () => {
@@ -230,6 +280,10 @@ describe("MEK-Org/rusa#1274 bounded at-queue operations", () => {
     expect(() =>
       scheduler.scheduleMessageDelivery(makeMessage("msg-tolerated", deliverAt))
     ).not.toThrow();
+    // Nothing is left under that id, so it is not carried as known.
+    queue.reset();
+    expect(scheduler.listKnownMessageDeliveries()).toEqual([]);
+    expect(queue.spawns()).toBe(0);
   });
 
   it("confirmAtEnqueue fails closed when job is in queue but tag does not match", () => {
@@ -250,17 +304,6 @@ describe("MEK-Org/rusa#1274 bounded at-queue operations", () => {
       scheduler.scheduleMessageDelivery(makeMessage("msg-bad-tag", "2026-09-16T12:00:00.000Z"))
     ).toThrow(AtEnqueueUnconfirmedError);
   });
-
-  it("backward compatibility: falls back to list() when readJob is not implemented on AtIo", () => {
-    const queue = createInstrumentedQueue([], { withSingleJobSeam: false });
-    expect(queue.io.readJob).toBeUndefined();
-
-    const scheduler = createScheduler(queue.io);
-    scheduler.scheduleMessageDelivery(makeMessage("msg-fallback"));
-
-    // Legacy list() path was used
-    expect(queue.counts.list).toBeGreaterThan(0);
-  });
 });
 
 describe("execAtIo and unavailableAtIo unit behavior", () => {
@@ -277,24 +320,13 @@ describe("execAtIo and unavailableAtIo unit behavior", () => {
       ...overrides,
     }) as ReturnType<typeof spawnSync>;
 
-  it("execAtIo listJobIds parses job ids from atq output", () => {
-    mockedSpawnSync.mockReturnValueOnce(
-      makeResult({
-        stdout: "42\tWed Sep  2 04:30:00 2026 a user\n43\tWed Sep  2 04:35:00 2026 a user\n",
-      })
-    );
-
-    const io = execAtIo();
-    expect(io.listJobIds?.()).toEqual(["42", "43"]);
-  });
-
   it("execAtIo readJob returns script when job exists", () => {
     mockedSpawnSync.mockReturnValueOnce(
       makeResult({ status: 0, stdout: "# test script\ncurl /wake\n" })
     );
 
     const io = execAtIo();
-    expect(io.readJob?.("42")).toEqual({
+    expect(io.readJob("42")).toEqual({
       id: "42",
       script: "# test script\ncurl /wake\n",
     });
@@ -306,7 +338,7 @@ describe("execAtIo and unavailableAtIo unit behavior", () => {
     );
 
     const io = execAtIo();
-    expect(io.readJob?.("42")).toBeNull();
+    expect(io.readJob("42")).toBeNull();
   });
 
   it("execAtIo readJob throws on unexpected error", () => {
@@ -315,12 +347,11 @@ describe("execAtIo and unavailableAtIo unit behavior", () => {
     );
 
     const io = execAtIo();
-    expect(() => io.readJob?.("42")).toThrow(/at -c 42 failed/);
+    expect(() => io.readJob("42")).toThrow(/at -c 42 failed/);
   });
 
-  it("unavailableAtIo provides no-op readJob and listJobIds", () => {
+  it("unavailableAtIo reads no job", () => {
     const unavailable = unavailableAtIo(["preflight failed"]);
-    expect(unavailable.readJob?.("any")).toBeNull();
-    expect(unavailable.listJobIds?.()).toEqual([]);
+    expect(unavailable.readJob("any")).toBeNull();
   });
 });

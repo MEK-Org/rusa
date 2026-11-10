@@ -5732,6 +5732,10 @@ describe("multi-instance crontab reconciliation (#304)", () => {
         return id;
       }),
       list: vi.fn(() => [...sharedAtJobs]),
+      readJob: vi.fn((id: string) => {
+        const job = sharedAtJobs.find((j) => j.id === id);
+        return job ? { id: job.id, script: job.script } : null;
+      }),
       remove: vi.fn((id: string) => {
         const idx = sharedAtJobs.findIndex((j) => j.id === id);
         if (idx !== -1) sharedAtJobs.splice(idx, 1);

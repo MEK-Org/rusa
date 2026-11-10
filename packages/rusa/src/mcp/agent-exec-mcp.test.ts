@@ -119,6 +119,12 @@ class FakeScheduledMessages implements ScheduledMessageScheduler {
   listMessageDeliveries(): ScheduledMessage[] {
     return [...this.messages.values()];
   }
+  listKnownMessageDeliveries(): ScheduledMessage[] {
+    return this.listMessageDeliveries();
+  }
+  readMessageDelivery(id: string): ScheduledMessage | null {
+    return this.messages.get(id) ?? null;
+  }
 }
 
 const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-mcp-test-secrets-"));

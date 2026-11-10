@@ -47,6 +47,8 @@ describe("DefaultOsScheduler", () => {
         return "123";
       }),
       list: vi.fn(() => jobs.map((job) => ({ ...job }))),
+      // Reads through `list`, so a test that stubs the listing stubs both.
+      readJob: vi.fn((id: string) => at.list().find((job) => job.id === id) ?? null),
       remove: vi.fn(),
     };
 
@@ -155,6 +157,8 @@ describe("DefaultOsScheduler", () => {
       { id: "first", script: firstScript },
       { id: "second", script: secondScript },
     ]);
+    // A full read is the truth about the queue and rebuilds what is known.
+    scheduler.listMessageDeliveries();
 
     scheduler.cancelMessageDelivery("a");
 
@@ -351,6 +355,7 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     const at: AtIo = {
       schedule: vi.fn().mockReturnValue("1"),
       list: vi.fn().mockReturnValue([]),
+      readJob: vi.fn().mockReturnValue(null),
       remove: vi.fn(),
     };
 
@@ -532,7 +537,7 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
 
     const working = new DefaultOsScheduler(
       new CrontabMutator(cron),
-      { schedule: () => "1", list: () => [], remove: () => {} },
+      { schedule: () => "1", list: () => [], readJob: () => null, remove: () => {} },
       options
     );
     expect(working.canScheduleAt()).toBe(true);
@@ -686,6 +691,7 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
     const at: AtIo = {
       schedule: vi.fn(),
       list: vi.fn().mockReturnValue(atJobs),
+      readJob: vi.fn((id: string) => atJobs.find((job) => job.id === id) ?? null),
       remove: vi.fn(),
     };
 
@@ -731,6 +737,7 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
             "# at wrapper\n# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:YXQ6YTpi\ncurl /wake-obligation\n",
         },
       ]),
+      readJob: vi.fn(() => null),
       remove: vi.fn(),
     };
     const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
@@ -785,21 +792,23 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
       },
     };
 
+    const sharedJobs = [
+      {
+        id: "at-prod",
+        script:
+          "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:c2hhcmVkLW9iLWlk\ncurl /wake\n",
+      },
+      {
+        id: "at-staging",
+        script:
+          "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:c2hhcmVkLW9iLWlk\ncurl /wake\n",
+      },
+      { id: "at-legacy", script: "# mc-obligation-activation:legacy-ob-1\ncurl /wake\n" },
+    ];
     const at: AtIo = {
       schedule: vi.fn(),
-      list: vi.fn().mockReturnValue([
-        {
-          id: "at-prod",
-          script:
-            "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:c2hhcmVkLW9iLWlk\ncurl /wake\n",
-        },
-        {
-          id: "at-staging",
-          script:
-            "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:c2hhcmVkLW9iLWlk\ncurl /wake\n",
-        },
-        { id: "at-legacy", script: "# mc-obligation-activation:legacy-ob-1\ncurl /wake\n" },
-      ]),
+      list: vi.fn().mockReturnValue(sharedJobs),
+      readJob: vi.fn((id: string) => sharedJobs.find((job) => job.id === id) ?? null),
       remove: vi.fn(),
     };
 
@@ -842,9 +851,6 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       readJob(id) {
         const job = this.list().find((j) => j.id === id);
         return job ? { ...job } : null;
-      },
-      listJobIds() {
-        return this.list().map((job) => job.id);
       },
       remove: (id) => {
         const index = jobs.findIndex((job) => job.id === id);
@@ -1056,7 +1062,6 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
           id: "msg-a",
           tag: MSG_TAG,
           atJobId: "100",
-          queueSize: 1,
         },
         {
           component: "os-scheduler",
@@ -1127,7 +1132,6 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
           id: "msg-a",
           tag: MSG_TAG,
           atJobId: "101",
-          queueSize: 1,
           reason: "job missing from queue",
         },
         // The id `at` printed is cleared whether or not it exists, so a
