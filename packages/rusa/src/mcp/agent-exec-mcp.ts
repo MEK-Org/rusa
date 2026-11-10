@@ -710,6 +710,15 @@ export function createAgentExecMcpServer(
     }
   );
 
+  // The one ancestry seam for acting on another actor's record (#1284):
+  // retire, re-charter and reparent all require a strict descendant. Ancestry
+  // includes the caller itself and resolves the legacy root alias, so self is
+  // excluded by resolved id — no actor writes its own record this way.
+  const isSelf = (targetId: string) =>
+    mesh.resolveActorId(targetId) === mesh.resolveActorId(selfId);
+  const isStrictDescendant = (targetId: string) =>
+    !isSelf(targetId) && mesh.isAncestorOf(selfId, targetId);
+
   server.registerTool(
     "retire_thread",
     {
@@ -747,7 +756,7 @@ export function createAgentExecMcpServer(
         if (!mesh.actors.get(thread_id)) {
           return toolError(new Error(`unknown thread id: ${thread_id}`));
         }
-        if (!mesh.isAncestorOf(selfId, thread_id) || thread_id === selfId) {
+        if (!isStrictDescendant(thread_id)) {
           return toolError(new Error("you can only retire your own descendant threads"));
         }
         mesh.retire(thread_id, { forceQueued: force });
@@ -1620,6 +1629,88 @@ export function createAgentExecMcpServer(
     );
   }
 
+  // ── Descendant stewardship ── Every actor may re-charter and reorganize its
+  // own strict descendants, authorized by ancestry exactly as retire_thread is
+  // (#1284). Detaching to top level leaves the subtree, so it stays with
+  // `actor-admin`.
+  server.registerTool(
+    "set_thread_charter",
+    {
+      title: "Replace a descendant's charter",
+      description:
+        "Replace a descendant actor's charter — its standing brief — on the durable thread record. The actor must be a strict descendant of yours (a child, grandchild, …); you can never replace your own charter or that of an actor outside your subtree. The charter is read fresh and re-injected into the actor's prompt each run, so the new charter takes effect on its next wake. Use to durably re-scope an actor (e.g. promote an elder reviewer to a steward) rather than re-scoping by message alone, which a session reap can lose — the charter is the durable re-derivation anchor. Pass the complete intended charter; it replaces the prior one wholesale.",
+      inputSchema: {
+        thread_id: z.string().describe("The descendant actor's thread id."),
+        charter: z
+          .string()
+          .describe("The complete new charter; replaces the prior charter wholesale."),
+      },
+    },
+    async ({ thread_id, charter }) => {
+      try {
+        if (!isStrictDescendant(thread_id)) {
+          throw new Error(
+            isSelf(thread_id)
+              ? `${selfId} may not replace its own charter (only a strict descendant's)`
+              : `${selfId} may only re-charter its own strict descendants (cannot re-charter ${thread_id})`
+          );
+        }
+        mesh.setThreadCharter(thread_id, charter);
+        return toolOk(`set charter for ${thread_id}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "reparent_thread",
+    {
+      title: "Move a descendant to a new parent",
+      description:
+        "Re-parent one of your strict descendants under yourself or another actor in your own subtree (e.g. promote a steward and move workers under it so they report to it). Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Passing a null new_parent_id detaches it to top level, which moves it out of your subtree and so requires the actor-admin capability. Rejected if it would create a cycle, move yourself, move an actor outside your subtree, or reference an unknown or retired thread.",
+      inputSchema: {
+        thread_id: z.string().describe("The descendant actor to move."),
+        new_parent_id: z
+          .string()
+          .nullable()
+          .describe(
+            "Yourself or an actor in your subtree that becomes its new parent, or null to detach it to top level (actor-admin only)."
+          ),
+      },
+    },
+    async ({ thread_id, new_parent_id }) => {
+      try {
+        if (!isStrictDescendant(thread_id)) {
+          throw new Error(
+            isSelf(thread_id)
+              ? `${selfId} may not reparent itself (only its strict descendants)`
+              : `${selfId} may only reparent strict descendants in its own subtree (cannot reparent ${thread_id})`
+          );
+        }
+        if (new_parent_id === null) {
+          if (!holds(ACTOR_ADMIN_CAPABILITY)) {
+            throw new Error(
+              `detaching ${thread_id} to top level moves it out of your subtree and requires ${ACTOR_ADMIN_CAPABILITY}`
+            );
+          }
+        } else if (!inSubtree(new_parent_id)) {
+          throw new Error(
+            `${selfId} may only reparent under itself or an actor in its own subtree (cannot reparent under ${new_parent_id})`
+          );
+        }
+        mesh.reparentThread(thread_id, new_parent_id);
+        return toolOk(
+          new_parent_id === null
+            ? `detached ${thread_id} to top level`
+            : `reparented ${thread_id} under ${new_parent_id}`
+        );
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
   // ── Actor administration ── Lifecycle, record and routing edits on other
   // actors, held by `actor-admin` and confined to the caller's subtree.
   if (holds(ACTOR_ADMIN_CAPABILITY)) {
@@ -1665,71 +1756,6 @@ export function createAgentExecMcpServer(
           assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "retitle");
           mesh.setThreadTitle(thread_id, title);
           return toolOk(`set title for ${thread_id}`);
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-
-    server.registerTool(
-      "set_thread_charter",
-      {
-        title: "Replace an actor's charter (actor-admin)",
-        description:
-          "Replace a long-lived actor's charter — its standing brief — on the durable thread record. Requires the actor-admin capability; the actor must lie in your own subtree. The charter is read fresh and re-injected into the actor's prompt each run, so the new charter takes effect on its next wake. Use to durably re-scope an actor (e.g. promote an elder reviewer to a steward) rather than re-scoping by message alone, which a session reap can lose — the charter is the durable re-derivation anchor. Pass the complete intended charter; it replaces the prior one wholesale.",
-        inputSchema: {
-          thread_id: z.string().describe("The actor's thread id."),
-          charter: z
-            .string()
-            .describe("The complete new charter; replaces the prior charter wholesale."),
-        },
-      },
-      async ({ thread_id, charter }) => {
-        const denied = assertActorAdmin();
-        if (denied) return denied;
-        try {
-          assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "re-charter");
-          mesh.setThreadCharter(thread_id, charter);
-          return toolOk(`set charter for ${thread_id}`);
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-
-    server.registerTool(
-      "reparent_thread",
-      {
-        title: "Move an actor to a new parent (actor-admin)",
-        description:
-          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it), or pass a null new_parent_id to detach it to top level. Requires the actor-admin capability; the actor must be a strict descendant of yours, and a non-null new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Detaching moves the actor out of your subtree, so you lose administrative reach over it at once. Rejected if it would create a cycle, move yourself, or reference an unknown or retired thread.",
-        inputSchema: {
-          thread_id: z.string().describe("The actor to move."),
-          new_parent_id: z
-            .string()
-            .nullable()
-            .describe("The actor that becomes its new parent, or null to detach it to top level."),
-        },
-      },
-      async ({ thread_id, new_parent_id }) => {
-        const denied = assertActorAdmin();
-        if (denied) return denied;
-        try {
-          assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "reparent");
-          // Ancestry includes the caller itself; moving yourself is not a
-          // reorganization of your subtree, detached or not.
-          if (thread_id === selfId || mesh.resolveLiveActorId(thread_id)?.id === selfId) {
-            throw new Error(`${selfId} may not reparent itself`);
-          }
-          if (new_parent_id !== null) {
-            assertInSubtree(ACTOR_ADMIN_CAPABILITY, new_parent_id, "reparent under");
-          }
-          mesh.reparentThread(thread_id, new_parent_id);
-          return toolOk(
-            new_parent_id === null
-              ? `detached ${thread_id} to top level`
-              : `reparented ${thread_id} under ${new_parent_id}`
-          );
         } catch (err) {
           return toolError(err);
         }

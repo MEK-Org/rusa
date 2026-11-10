@@ -53,7 +53,7 @@ export type MeshEventKind =
   // outcome, reason? }. The underlying actor retirement event remains the
   // record of the completed lifecycle change.
   | "operator_actor_retire"
-  // The root durably re-scoped an actor by replacing its charter via
+  // An ancestor durably re-scoped an actor by replacing its charter via
   // set_thread_charter (e.g. promoting an elder to a steward). `actorId` = the
   // re-chartered actor, `detail` = a charter excerpt.
   | "actor_charter_set"

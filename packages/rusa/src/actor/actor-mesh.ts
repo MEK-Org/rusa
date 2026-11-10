@@ -5257,8 +5257,8 @@ export class ActorMesh {
   /**
    * Replace a thread's charter on an existing record — the post-spawn path the
    * spawn-time `charter` otherwise lacked (charter was immutable once spawned).
-   * Root-only at the tool layer; here it just validates the thread exists and
-   * patches the durable record. The charter is the actor's standing brief, read
+   * The tool layer confines it to the caller's strict descendants (#1284); here
+   * it just validates the thread exists and patches the durable record. The charter is the actor's standing brief, read
    * fresh from the record each run and re-injected into its prompt (see
    * `buildWorkerPrompt(r.charter, …)` in start.ts), so a new charter takes effect
    * on the actor's next wake. Use to re-scope a long-lived actor durably (e.g.
