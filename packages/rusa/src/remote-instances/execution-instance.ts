@@ -218,10 +218,6 @@ export class ExecutionInstance {
                 {
                   threadId: current.id,
                   parentId: current.parentId,
-                  handles: (current.handles ?? []).map((h) => ({
-                    id: h.id,
-                    label: repos.actors.get(h.id)?.title ?? h.id,
-                  })),
                   understandingMountEnabled: false,
                   gitIdentity: resolveMeshGitIdentity(options.gitIdentity),
                 },
