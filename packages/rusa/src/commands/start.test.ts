@@ -1526,6 +1526,51 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }
       });
 
+      it("paces Fable on a wildcard lane and treats the rename as no retirement", async () => {
+        let wildcard = false;
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => {
+          const status = withFableLane(throttleStatus("claude"), { intervalSeconds: 3600 });
+          if (!wildcard) return { claude: status };
+          return {
+            claude: {
+              ...status,
+              modelLanes: status.modelLanes?.map((lane) => ({
+                ...lane,
+                governingBucketKey: "claude[claude-fable-*]:weekly",
+                models: ["claude-fable-*"],
+              })),
+            },
+          };
+        });
+        try {
+          await triggerQuotaThrottleTick();
+          wildcard = true;
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          await expect(mesh.gateRun(ran, [fableEntry], false).result).resolves.toBe(
+            "claude-fable-5-1"
+          );
+          // The wildcard lane's hour-long pace holds the next Fable start.
+          const fableGate = mesh.gateRun(ran, [fableEntry], false);
+          fableGate.result.catch(() => {});
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(fableGate.started).toBe(false);
+          fableGate.cancel?.();
+          expect(
+            getRepositories()
+              .inbox.list(rootId)
+              .entries.filter(
+                (entry) =>
+                  (entry.payload as { type?: string }).type === "system.quota_model_lane_retired"
+              )
+          ).toEqual([]);
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
       it("raises the retirement alarm for a published lane no candidate has paced", async () => {
         let publishFable = true;
         const { close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({

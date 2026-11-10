@@ -10,6 +10,7 @@ import type {
   QuotaSprintPolicy,
   QuotaSprintState,
 } from "./coordinator-protocol.js";
+import { modelListsOverlap } from "./model-wildcard.js";
 import {
   type QuotaCycleObservation,
   quotaCycleChanged,
@@ -466,7 +467,7 @@ export class QuotaSprintRegistry {
       .some(
         (lane) =>
           lane.key !== policy.bucketKey &&
-          lane.models.some((model) => policy.models.includes(model)) &&
+          modelListsOverlap(lane.models, policy.models) &&
           Date.parse(lane.observedAt) > latestMs
       );
   }

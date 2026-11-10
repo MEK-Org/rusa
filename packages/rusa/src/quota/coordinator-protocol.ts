@@ -1,4 +1,5 @@
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { modelListCovers } from "./model-wildcard.js";
 import type {
   PersistedQuotaBucketStatus,
   PersistedQuotaModelLaneStatus,
@@ -769,7 +770,7 @@ export function modelLanePacing(
   const lanes: unknown[] = Array.isArray(status?.modelLanes) ? status.modelLanes : [];
   const applicable = lanes.filter(
     (lane): lane is PublishedThrottleModelLaneStatus =>
-      isPublishedModelLane(lane) && lane.models.includes(model)
+      isPublishedModelLane(lane) && modelListCovers(lane.models, model)
   );
   if (applicable.length === 0) return undefined;
   let intervalSeconds = 0;

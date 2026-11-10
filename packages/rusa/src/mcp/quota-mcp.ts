@@ -28,6 +28,7 @@ import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
+import { joinWildcardLanes } from "../quota/model-wildcard.js";
 import {
   configuredModelRefs,
   keepWindowLaneModels,
@@ -246,6 +247,8 @@ export interface QuotaMcpDeps {
       inferredParsed: ProviderQuotaSnapshot
     ): void;
     recordParseError(id: string, error: unknown): void;
+    /** The model lists of the provider's stored model lanes, when the store keeps lanes. */
+    listModelLaneLists?(provider: string): string[][];
   };
   /**
    * Quota coordinator client for reading quota status via GET /v1/quota without local probes
@@ -1471,7 +1474,14 @@ export class QuotaService {
     });
     try {
       const rawState = await parse();
-      const limits = this.keepClaudeLaneModels(provider, rawState.limits, prevState?.limits);
+      // A stored lane whose list covers a window by wildcard keeps that window (#1282).
+      const joined =
+        rawState.limits &&
+        joinWildcardLanes(
+          rawState.limits,
+          this.deps.scrapeStore?.listModelLaneLists?.(provider) ?? []
+        );
+      const limits = this.keepClaudeLaneModels(provider, joined, prevState?.limits);
       const inferredState = inferQuotaState({ ...rawState, limits }, prevState, scrapedAt);
       if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState);
       if (rawState.status === "unknown") this.failedReads.add(inferredState);

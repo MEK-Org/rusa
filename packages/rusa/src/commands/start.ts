@@ -339,6 +339,7 @@ import {
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
+import { modelListCovers } from "../quota/model-wildcard.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { resolveReference } from "../references/resolve.js";
@@ -2432,7 +2433,8 @@ async function composeStart(
       )
     );
     for (const model of publishedModelsByLane.get(lane) ?? []) {
-      if (published.has(model)) continue;
+      // A wildcard entry that covers the model still publishes its lane (#1282).
+      if (published.has(model) || modelListCovers([...published], model)) continue;
       log.info("quota_model_lane_retired", { provider: lane, model });
       raiseModelLaneRetiredAlarm?.(lane, model);
     }
