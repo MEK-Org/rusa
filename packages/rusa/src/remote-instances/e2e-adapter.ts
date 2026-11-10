@@ -53,6 +53,7 @@ export function instanceWorkerFactory(
       },
       context,
       actorOptions: options,
+      isPlacementHeld: () => hub.isPlacementHeld(target),
       snapshot: () => {
         const current = context.getRecord();
         if (!current) throw new Error("Actor record is missing");

@@ -173,6 +173,7 @@ export class FollowerHub {
   private onRegisterListeners: ((follower: RemoteInstance) => void)[] = [];
   private onUpdateStatusListeners: ((followerId: string, status: FollowerUpdateStatus) => void)[] =
     [];
+  private onPlacementReleasedListeners: ((followerId: string) => void)[] = [];
   readonly triggerStore?: FollowerUpdateTriggerStore;
   readonly reconciler?: FollowerUpdateReconciler;
   private sweep = setInterval(() => this.sweepFollowers(), 5000);
@@ -237,6 +238,49 @@ export class FollowerHub {
     };
   }
 
+  /**
+   * Called with a follower whose update hold ({@link isPlacementHeld}) has just
+   * lifted, so the runs it refused can be asked for again.
+   */
+  onPlacementReleased(callback: (followerId: string) => void): () => void {
+    this.onPlacementReleasedListeners.push(callback);
+    return () => {
+      const idx = this.onPlacementReleasedListeners.indexOf(callback);
+      if (idx >= 0) this.onPlacementReleasedListeners.splice(idx, 1);
+    };
+  }
+
+  /**
+   * Whether a new run on this follower must wait for its own update (#1272):
+   * an update it is running now, or the trigger's update the reconciler holds
+   * it for. Placement itself is never refused for this; only run admission
+   * consults it, and {@link onPlacementReleased} fires when it lifts.
+   */
+  isPlacementHeld(followerId: string): boolean {
+    const follower = this.followers.get(followerId);
+    if (!follower) return false;
+    if (follower.isUpdateInProgress()) return true;
+    return this.reconciler?.holdsPlacement(follower) ?? false;
+  }
+
+  private releaseIfLifted(followerIds: readonly string[]): void {
+    for (const followerId of followerIds) {
+      if (this.isPlacementHeld(followerId)) continue;
+      this.log.info("follower_placement_released", { followerId });
+      for (const listener of this.onPlacementReleasedListeners) {
+        try {
+          listener(followerId);
+        } catch (err) {
+          this.log.warn("follower_placement_listener_error", { followerId, err });
+        }
+      }
+    }
+  }
+
+  private heldFollowerIds(): string[] {
+    return [...this.followers.keys()].filter((id) => this.isPlacementHeld(id));
+  }
+
   onUpdateStatus(callback: (followerId: string, status: FollowerUpdateStatus) => void): () => void {
     this.onUpdateStatusListeners.push(callback);
     return () => {
@@ -259,7 +303,11 @@ export class FollowerHub {
 
   /** Permit automatic reconciliation; the leader calls this once boot has completed. */
   armReconciliation(): void {
+    // Arming ends the boot window: release every follower it was holding that
+    // is not now the one with the pending automatic attempt.
+    const held = this.heldFollowerIds();
     this.reconciler?.arm();
+    this.releaseIfLifted(held);
   }
   async listen(host: string, port: number): Promise<string> {
     // Never accidentally expose the follower gateway on every public interface.
@@ -354,19 +402,6 @@ export class FollowerHub {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
     follower.assertDispatchable();
-    if (follower.isUpdateInProgress()) {
-      throw new Error(
-        `Follower ${followerId} update is in progress (${follower.updateStatus?.status})`
-      );
-    }
-    const trigger = this.triggerStore?.getActiveTrigger();
-    if (trigger && follower.commitSha !== trigger.targetSha) {
-      if (!this.triggerStore?.hasFailed(followerId, trigger.targetSha)) {
-        throw new Error(
-          `Follower ${followerId} is pending update to ${trigger.targetSha} (current: ${follower.commitSha ?? "unknown"})`
-        );
-      }
-    }
     const host = follower.createHost(actorId);
     host.once("exit", () => {
       for (const [key, route] of this.routes)
@@ -829,6 +864,8 @@ export class FollowerHub {
     // Fence before invoking synchronous listeners: an earlier listener may
     // have performed a side effect before a later listener throws.
     follower.recordEvent(event.eventId, "failed");
+    const statusEvent = event.actorId === "$instance" && event.message?.type === "update_status";
+    const heldBefore = statusEvent && this.isPlacementHeld(follower.id);
     try {
       follower.receive(event);
     } catch {
@@ -840,7 +877,7 @@ export class FollowerHub {
       return false;
     }
     follower.recordEvent(event.eventId, "accepted");
-    if (event.actorId === "$instance" && event.message?.type === "update_status") {
+    if (statusEvent) {
       const status = follower.updateStatus;
       if (status) {
         for (const listener of this.onUpdateStatusListeners) {
@@ -854,6 +891,9 @@ export class FollowerHub {
           }
         }
       }
+      // The reconciler, a listener above, has recorded any terminal outcome:
+      // a terminal status is what lifts this follower's hold.
+      if (heldBefore) this.releaseIfLifted([follower.id]);
     }
     return true;
   }

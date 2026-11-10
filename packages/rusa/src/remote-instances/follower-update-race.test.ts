@@ -1,452 +1,453 @@
-// Reproduction and verification for MEK-Org/rusa#1272.
+// MEK-Org/rusa#1272: a leader started a run on a follower still on the old
+// revision while that follower's update was persisted, then the update's
+// restart killed the run and the leader booked it as a failed run with a
+// parent notice.
 //
-// Deploy observation: the new leader dispatched a run to a follower still on
-// the old revision while an update trigger for it was already persisted; two
-// seconds later it told the follower to update, and the follower's restart
-// killed the run. The leader booked it as a failed run and notified the
-// parent, rather than treating it as an interruption.
-//
-// Repaired behaviors verified here against disposable followers:
-// (a) Placement gate: refuse placement on stale followers while an update trigger
-//     is active, unless the attempt terminally failed; resume on target revision.
-// (b) Attribution & booking: attribute update restart exit to the in-flight update,
-//     booking it as an interruption rather than a failed run, with exactly one
-//     inbox reconcile re-queue on reconnect. Unrelated exit -1 stays a failed result.
-// (c) Unchanged: boot-time hold on reconciliation arming; retained-admission drop.
+// (a) Hold: placement always succeeds, but run admission on a follower waits
+//     while its own update is pending or running, or during the boot window.
+//     A terminal outcome, read from the reconciler's record, releases it and
+//     its actors are dispatched again.
+// (b) Attribution: an exit while the follower drains or restarts for an
+//     update is an interruption, and the work runs on the new revision.
 
-import { randomBytes } from "node:crypto";
-import { EventEmitter } from "node:events";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorLifecycle, type ActorLifecycleEndEvent } from "../actor/actor-lifecycle.js";
-import type { ActorFactoryContext, ActorMesh } from "../actor/actor-mesh.js";
-import type { ActorRecord } from "../actor/actor-record.js";
-import type { ActorChannel } from "./actor-channel.js";
+import Database from "better-sqlite3";
+import { afterEach, describe, expect, it } from "vitest";
+import type { ActorLifecycleEndEvent } from "../actor/actor-lifecycle.js";
+import { ActorMesh } from "../actor/actor-mesh.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+} from "../actor/event-subscriptions.js";
+import { ExternalRootDriver } from "../actor/external-root-driver.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import type { Logger } from "../observability/logger.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
-import { FollowerHub } from "./follower-hub.js";
+import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
+import { FollowerInstance } from "./follower-instance.js";
+import { registerFollowerRegistrationRecovery } from "./follower-registration-recovery.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
-import { INSTANCE_PROTOCOL_VERSION, type LeaderCommand } from "./protocol.js";
+import {
+  type FollowerUpdateStatusPhase,
+  INSTANCE_PROTOCOL_VERSION,
+  type ProviderFactory,
+} from "./protocol.js";
 
 const TARGET_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const STALE_SHA = "0011223344556677889900aabbccddeeff001122";
 
-const hubs: FollowerHub[] = [];
+const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
-  await Promise.all(hubs.splice(0).map((hub) => hub.close()));
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-describe("MEK-Org/rusa#1272 (a) dispatch to a stale-revision follower", () => {
-  it("refuses new placement while an update trigger is active and reconciliation is unarmed", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "rusa-1272-trigger-"));
-    try {
-      const store = new FollowerUpdateTriggerStore(dir);
-      store.createTrigger({ targetSha: TARGET_SHA, branch: "staging" });
-      const token = randomBytes(32).toString("hex");
-      const hub = new FollowerHub(token, { triggerStore: store });
-      hubs.push(hub);
-      const origin = await hub.listen("127.0.0.1", 0);
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 
-      const response = await fetch(`${origin}/register`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          id: "edge",
-          platform: "linux",
-          pid: 4321,
-          generation: "edge-process-one",
-          protocolVersion: INSTANCE_PROTOCOL_VERSION,
-          commitSha: STALE_SHA,
-        }),
-      });
-      expect(response.status).toBe(200);
-      expect(hub.getReconciliationStatus().armed).toBe(false);
-      expect(hub.getReconciliationStatus().state).toBe("active");
-
-      // Stale follower is pending update; placement must be refused.
-      expect(() => hub.createHost("edge", "actor-1")).toThrow(/pending update to a1b2c3d4/i);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("permits placement when the follower is already on the target revision", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "rusa-1272-current-"));
-    try {
-      const store = new FollowerUpdateTriggerStore(dir);
-      store.createTrigger({ targetSha: TARGET_SHA, branch: "staging" });
-      const token = randomBytes(32).toString("hex");
-      const hub = new FollowerHub(token, { triggerStore: store });
-      hubs.push(hub);
-      const origin = await hub.listen("127.0.0.1", 0);
-
-      const response = await fetch(`${origin}/register`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          id: "current-node",
-          platform: "linux",
-          pid: 4322,
-          generation: "current-process-one",
-          protocolVersion: INSTANCE_PROTOCOL_VERSION,
-          commitSha: TARGET_SHA,
-        }),
-      });
-      expect(response.status).toBe(200);
-
-      expect(() => hub.createHost("current-node", "actor-current")).not.toThrow();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("permits placement on a stale follower after a terminal update failure (broken updater does not strand actors)", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "rusa-1272-failed-"));
-    try {
-      const store = new FollowerUpdateTriggerStore(dir);
-      store.createTrigger({ targetSha: TARGET_SHA, branch: "staging" });
-      // Follower attempted the update but failed terminally.
-      store.recordFailure("edge-failed", TARGET_SHA, "git pull rejected");
-
-      const token = randomBytes(32).toString("hex");
-      const hub = new FollowerHub(token, { triggerStore: store });
-      hubs.push(hub);
-      const origin = await hub.listen("127.0.0.1", 0);
-
-      const response = await fetch(`${origin}/register`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          id: "edge-failed",
-          platform: "linux",
-          pid: 4323,
-          generation: "edge-process-failed",
-          protocolVersion: INSTANCE_PROTOCOL_VERSION,
-          commitSha: STALE_SHA,
-        }),
-      });
-      expect(response.status).toBe(200);
-
-      // Terminal failure recorded on active trigger: gate lifts, dispatch proceeds on old revision.
-      expect(() => hub.createHost("edge-failed", "actor-fallback")).not.toThrow();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("refuses placement while an update is actively in progress on the follower", async () => {
-    const token = randomBytes(32).toString("hex");
-    const hub = new FollowerHub(token);
-    hubs.push(hub);
-    const origin = await hub.listen("127.0.0.1", 0);
-
-    const response = await fetch(`${origin}/register`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        id: "draining-node",
-        platform: "linux",
-        pid: 4324,
-        generation: "draining-process",
-        protocolVersion: INSTANCE_PROTOCOL_VERSION,
-        commitSha: TARGET_SHA,
-      }),
-    });
-    expect(response.status).toBe(200);
-
-    // Trigger update on follower so status is active (pending/draining).
-    hub.updateFollower("draining-node", { targetSha: TARGET_SHA, branch: "staging" });
-    expect(() => hub.createHost("draining-node", "actor-draining")).toThrow(
-      /update is in progress/i
-    );
-  });
-});
-
-/** In-memory actor channel; stands in for the follower-side host connection. */
-class SyntheticChannel extends EventEmitter implements ActorChannel {
-  connected = true;
-  exitCode: number | null = null;
-  signalCode: NodeJS.Signals | null = null;
-  updateRestart = false;
-  readonly nodeId = "edge";
-  readonly sent: LeaderCommand[] = [];
-
-  send(message: LeaderCommand, callback: (error: Error | null) => void): boolean {
-    if (!this.connected) {
-      callback(new Error("Remote instance actor disconnected"));
-      return false;
-    }
-    this.sent.push(message);
-    callback(null);
-    return true;
-  }
-
-  isUpdateRestart(): boolean {
-    return this.updateRestart;
-  }
-
-  /** What RemoteInstance.close() synthesizes when the hub drops the follower. */
-  followerProcessDied(options?: { updateRestart?: boolean }): void {
-    this.connected = false;
-    this.exitCode = -1;
-    this.updateRestart = options?.updateRestart ?? true;
-    this.emit("exit", -1, null);
+async function eventually(check: () => boolean, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("timed out");
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
-describe("MEK-Org/rusa#1272 (b) update restart ends an in-flight run", () => {
-  it("books the run as an interruption, not a failed run with a parent notice, when exit is an update restart", async () => {
-    const channel = new SyntheticChannel();
-    const ends: ActorLifecycleEndEvent[] = [];
-    const lifecycle = new ActorLifecycle([{ onEnd: (event) => void ends.push(event) }]);
-    const handle = new ActorHandle({
-      host: channel,
-      bootstrap: { id: "actor-1", cwd: "/tmp/rusa-1272" },
-      context: {
-        lifecycle,
-        onRuntimeStateChanged: () => {},
-      } as unknown as ActorFactoryContext,
-      snapshot: () => {
-        throw new Error("snapshot not needed for this reproduction");
-      },
-      saveSession: () => {},
-      onFailure: () => {},
+async function leaderHub(store?: FollowerUpdateTriggerStore, logger?: Logger) {
+  const token = randomBytes(32).toString("hex");
+  const hub = new FollowerHub(token, { triggerStore: store, logger });
+  cleanups.push(() => hub.close());
+  const origin = await hub.listen("127.0.0.1", 0);
+  const post = (path: string, body: object, signal?: AbortSignal) =>
+    fetch(`${origin}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
     });
-
-    channel.emit("message", {
-      type: "runStart",
-      runId: "run-1",
-      selected: { provider: "test" },
-      responsive: false,
+  const register = async (id: string, generation: string, commitSha?: string) => {
+    const response = await post("/register", {
+      id,
+      platform: process.platform,
+      pid: process.pid,
+      generation,
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      ...(commitSha ? { commitSha } : {}),
     });
-    expect(ends).toHaveLength(0);
+    expect(response.status).toBe(200);
+    return { id, ...((await response.json()) as { session: string }) };
+  };
+  const reportStatus = async (
+    session: { id: string; session: string },
+    status: FollowerUpdateStatusPhase,
+    extra: Record<string, unknown> = {}
+  ) => {
+    const response = await post("/events", {
+      ...session,
+      batchId: randomUUID(),
+      events: [
+        {
+          eventId: randomUUID(),
+          actorId: "$instance",
+          message: { type: "update_status", updateId: "update-1", status, ...extra },
+        },
+      ],
+    });
+    expect(response.status).toBe(200);
+  };
+  return { hub, post, register, reportStatus };
+}
 
-    // Follower restart caused by update
-    channel.followerProcessDied({ updateRestart: true });
-    await handle.exited;
+function triggerStore(): FollowerUpdateTriggerStore {
+  const store = new FollowerUpdateTriggerStore(tempDir("rusa-1272-trigger-"));
+  store.createTrigger({ targetSha: TARGET_SHA, branch: "staging" });
+  return store;
+}
 
-    const end = ends.find((event) => event.runId === "run-1");
-    expect(end).toBeDefined();
-    expect(end?.terminal.kind).toBe("abandoned");
-    if (end?.terminal.kind === "abandoned") {
-      expect(end.terminal.started).toBe(true);
-      expect(end.terminal.reason).toBe("unreported");
-    }
+describe("MEK-Org/rusa#1272 (a) which followers the update holds", () => {
+  it("holds a follower not on the target during the boot window, unless its outcome is terminal", async () => {
+    const store = triggerStore();
+    store.recordFailure("failed-edge", TARGET_SHA, "git pull rejected");
+    // already_current records success before a registration refreshes commitSha,
+    // and registration keeps commitSha only when it is a full SHA.
+    store.recordSuccess("short-sha-edge", TARGET_SHA);
+    const { hub, register } = await leaderHub(store);
+    await register("stale-edge", "stale-one", STALE_SHA);
+    await register("current-edge", "current-one", TARGET_SHA);
+    await register("failed-edge", "failed-one", STALE_SHA);
+    await register("short-sha-edge", "short-one");
+
+    expect(hub.getReconciliationStatus().armed).toBe(false);
+    expect(hub.isPlacementHeld("stale-edge")).toBe(true);
+    expect(hub.isPlacementHeld("current-edge")).toBe(false);
+    expect(hub.isPlacementHeld("failed-edge")).toBe(false);
+    expect(hub.isPlacementHeld("short-sha-edge")).toBe(false);
+    // Placement itself is never refused: only runs wait.
+    expect(() => hub.createHost("stale-edge", "actor-stale")).not.toThrow();
   });
 
-  it("books the run as a failed result with parent notice when exit is not an update restart", async () => {
-    const channel = new SyntheticChannel();
-    const ends: ActorLifecycleEndEvent[] = [];
-    const lifecycle = new ActorLifecycle([{ onEnd: (event) => void ends.push(event) }]);
-    const handle = new ActorHandle({
-      host: channel,
-      bootstrap: { id: "actor-unrelated", cwd: "/tmp/rusa-1272" },
-      context: {
-        lifecycle,
-        onRuntimeStateChanged: () => {},
-      } as unknown as ActorFactoryContext,
-      snapshot: () => {
-        throw new Error("snapshot not needed for this reproduction");
-      },
-      saveSession: () => {},
-      onFailure: () => {},
-    });
+  it("once armed, holds only the follower with the pending attempt, and arming releases the rest", async () => {
+    const store = triggerStore();
+    const { hub, register } = await leaderHub(store);
+    const released: string[] = [];
+    hub.onPlacementReleased((followerId) => released.push(followerId));
+    await register("edge-a", "a-one", STALE_SHA);
+    await register("edge-b", "b-one", STALE_SHA);
+    expect(hub.isPlacementHeld("edge-a")).toBe(true);
+    expect(hub.isPlacementHeld("edge-b")).toBe(true);
 
-    channel.emit("message", {
-      type: "runStart",
-      runId: "run-unrelated",
-      selected: { provider: "test" },
-      responsive: false,
-    });
-    expect(ends).toHaveLength(0);
+    hub.armReconciliation();
 
-    // Follower crash with NO update in flight
-    channel.followerProcessDied({ updateRestart: false });
-    await handle.exited;
-
-    const end = ends.find((event) => event.runId === "run-unrelated");
-    expect(end).toBeDefined();
-    expect(end?.terminal.kind).toBe("result");
-    if (end?.terminal.kind === "result") {
-      expect(end.terminal.result.success).toBe(false);
-      expect(end.terminal.result.exitCode).toBe(-1);
-      expect(end.terminal.result.output).toBe("Remote actor exited (-1)");
-    }
+    const pending = Object.entries(store.getActiveTrigger()?.attempts ?? {})
+      .filter(([, attempt]) => attempt.status === "pending")
+      .map(([id]) => id);
+    expect(pending).toHaveLength(1);
+    const [updating] = pending;
+    const waiting = updating === "edge-a" ? "edge-b" : "edge-a";
+    expect(hub.isPlacementHeld(updating as string)).toBe(true);
+    // Waiting behind another follower's attempt holds nothing here.
+    expect(hub.isPlacementHeld(waiting)).toBe(false);
+    expect(released).toEqual([waiting]);
   });
 
-  it("owes inbox reconciliation after an update restart and triggers exactly one re-queue on reattach", async () => {
-    const channel = new SyntheticChannel();
-    const ends: ActorLifecycleEndEvent[] = [];
-    const lifecycle = new ActorLifecycle([{ onEnd: (event) => void ends.push(event) }]);
-    const reconcileInboxSpy = vi.fn();
-    const mockMesh = {
-      reconcileActorInbox: reconcileInboxSpy,
-    } as unknown as ActorMesh;
+  it("holds a follower running an update without a trigger, and releases it once on a terminal status", async () => {
+    const { hub, register, reportStatus } = await leaderHub();
+    const released: string[] = [];
+    hub.onPlacementReleased((followerId) => released.push(followerId));
+    const edge = await register("manual-edge", "manual-one", STALE_SHA);
+    expect(hub.isPlacementHeld("manual-edge")).toBe(false);
 
-    const handle = new ActorHandle({
-      host: channel,
-      bootstrap: { id: "actor-reconcile", cwd: "/tmp/rusa-1272" },
-      context: {
-        lifecycle,
-        mesh: mockMesh,
-        onRuntimeStateChanged: () => {},
-      } as unknown as ActorFactoryContext,
-      snapshot: () => ({
-        record: { id: "actor-reconcile", modelConfig: [] } as unknown as ActorRecord,
-        prompt: "",
-        mcpServers: [],
-      }),
-      saveSession: () => {},
-      onFailure: () => {},
-    });
+    await reportStatus(edge, "building");
+    expect(hub.isPlacementHeld("manual-edge")).toBe(true);
+    await reportStatus(edge, "building", { step: "build" });
+    expect(released).toEqual([]);
 
-    channel.emit("message", {
-      type: "runStart",
-      runId: "run-interrupted",
-      selected: { provider: "test" },
-      responsive: false,
-    });
-
-    // Update restart occurs
-    channel.followerProcessDied({ updateRestart: true });
-    await handle.exited;
-    expect(reconcileInboxSpy).not.toHaveBeenCalled();
-
-    // Reconnected channel rebinds
-    const replacementChannel = new SyntheticChannel();
-    handle.attachHost(replacementChannel);
-
-    // Exactly one re-queue triggered through reconcileActorInbox
-    expect(reconcileInboxSpy).toHaveBeenCalledTimes(1);
-    expect(reconcileInboxSpy).toHaveBeenCalledWith("actor-reconcile");
+    await reportStatus(edge, "failed", { error: "build failed" });
+    expect(hub.isPlacementHeld("manual-edge")).toBe(false);
+    expect(released).toEqual(["manual-edge"]);
   });
 });
 
-describe("MEK-Org/rusa#1272 unchanged reconciliation and admission behaviors", () => {
-  it("preserves the boot-time hold on automatic reconciliation until armed", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "rusa-1272-boot-"));
-    try {
-      const store = new FollowerUpdateTriggerStore(dir);
-      store.createTrigger({ targetSha: TARGET_SHA, branch: "staging" });
-      const token = randomBytes(32).toString("hex");
-      const hub = new FollowerHub(token, { triggerStore: store });
-      hubs.push(hub);
-      const origin = await hub.listen("127.0.0.1", 0);
+/** A leader mesh with registration recovery and one in-process follower per generation. */
+async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore }) {
+  const home = tempDir("rusa-1272-e2e-");
+  const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+  let log!: Logger;
+  const write = (event: string, fields?: Record<string, unknown>) =>
+    records.push({ event, fields });
+  log = { debug: write, info: write, warn: write, error: write, child: () => log };
+  const leader = await leaderHub(opts.store, log);
+  const { hub } = leader;
 
-      const response = await fetch(`${origin}/register`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          id: "lagging-boot-follower",
-          platform: "linux",
-          pid: 4325,
-          generation: "boot-process",
-          protocolVersion: INSTANCE_PROTOCOL_VERSION,
-          commitSha: STALE_SHA,
-        }),
+  const actors = new InMemoryActorRepository();
+  const inboxDb = new Database(":memory:");
+  runMigrations(inboxDb);
+  cleanups.push(() => inboxDb.close());
+  const inboxStore = new SqliteInboxRepository(inboxDb);
+  const principals = new PrincipalRepository(inboxDb);
+  principals.createUser({ email: "operator@example.test", createdAt: "t" });
+  const starts: string[] = [];
+  const ends: ActorLifecycleEndEvent[] = [];
+  let releaseRuns: (() => void) | undefined;
+  let blockRuns = false;
+  const provider: ProviderFactory = (_bridge, _options, selected) => ({
+    name: "update-fixture",
+    providerName: "update-fixture",
+    model: selected?.model,
+    async run() {
+      if (blockRuns) await new Promise<void>((resolve) => (releaseRuns = resolve));
+      return { success: true, output: "done", exitCode: 0 };
+    },
+  });
+  const mesh = new ActorMesh({
+    actors,
+    principals,
+    rootId: "root",
+    inboxStore,
+    eventSourceOwners: new InMemoryEventSourceOwnerStore(),
+    eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
+    capabilityGrants: new InMemoryCapabilityGrantStore(),
+    recordChat: () => "message",
+    supportsExecutionTarget: (target) => target.length > 0,
+    createActor: (context) => {
+      const target = context.record.executionConfig?.executionTarget;
+      if (!target) throw new Error("fixture worker lacks a follower target");
+      context.lifecycle.add({
+        onStart: (event) => void starts.push(event.runId),
+        onEnd: (event) => void ends.push(event),
       });
-      expect(response.status).toBe(200);
-
-      // 1. Automatic reconciliation is held back while leader boot is incomplete
-      expect(hub.getReconciliationStatus().armed).toBe(false);
-      expect(hub.getFollowerUpdateStatus("lagging-boot-follower")).toBeUndefined();
-
-      // 2. Arming dispatches automatic reconciliation to connected followers
-      hub.armReconciliation();
-      expect(hub.getReconciliationStatus().armed).toBe(true);
-      expect(hub.getFollowerUpdateStatus("lagging-boot-follower")?.status).toBe("pending");
-      expect(hub.getFollowerUpdateStatus("lagging-boot-follower")?.newSha).toBe(TARGET_SHA);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+      return new ActorHandle({
+        host: hub.createHost(target, context.record.id),
+        context,
+        isPlacementHeld: () => hub.isPlacementHeld(target),
+        bootstrap: {
+          id: context.record.id,
+          cwd: home,
+          modelConfig: context.record.modelConfig,
+          providerOptions: { delayMs: 0 },
+        },
+        snapshot: () => ({ record: context.record, prompt: "update fixture" }),
+        saveSession: () => {},
+        onFailure: () => {},
+        logger: log,
+      });
+    },
   });
+  const root = {
+    id: "root",
+    parentId: null,
+    charter: "root",
+    executionConfig: { unsandboxed: true },
+    status: "active" as const,
+    createdAt: new Date().toISOString(),
+  };
+  actors.upsert(root);
+  mesh.adopt(root, new ExternalRootDriver("root"));
+  cleanups.push(registerFollowerRegistrationRecovery({ actors, hub, log, mesh }));
 
-  it("preserves retained-admission drop and inbox re-queue when an unclaimed ticket is dropped", async () => {
-    const channel = new SyntheticChannel();
-    const ends: ActorLifecycleEndEvent[] = [];
-    const lifecycle = new ActorLifecycle([{ onEnd: (event) => void ends.push(event) }]);
-    const reconcileInboxSpy = vi.fn();
-    const mockMesh = {
-      reconcileActorInbox: reconcileInboxSpy,
-      hasActiveCapability: () => false,
-    } as unknown as ActorMesh;
-
-    const gateHandle = {
-      started: false,
-      cancel: vi.fn(),
-      result: new Promise(() => {}),
+  /** Register a follower generation and pump its commands and events. */
+  const follower = async (id: string, generation: string, commitSha: string) => {
+    const events: FollowerEvent[] = [];
+    const instance = new FollowerInstance(
+      join(home, generation),
+      false,
+      (event) => events.push(event),
+      provider
+    );
+    cleanups.push(() => instance.close());
+    const session = await leader.register(id, generation, commitSha);
+    const pump = async (done: () => boolean, turns = 60) => {
+      for (let turn = 0; turn < turns && !done(); turn++) {
+        if (events.length) {
+          const response = await leader.post("/events", {
+            ...session,
+            batchId: randomUUID(),
+            events: events.splice(0),
+          });
+          expect(response.status).toBe(200);
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 50);
+        try {
+          const response = await leader.post("/poll", session, controller.signal);
+          if (response.ok) {
+            for (const command of (await response.json()) as Array<{
+              actorId?: string;
+              message: never;
+            }>) {
+              // The fixture follower has no updater; tests report its status.
+              if (typeof command.actorId === "string") instance.dispatch(command as never);
+            }
+          }
+        } catch (error) {
+          if (!(error instanceof Error && error.name === "AbortError")) throw error;
+        } finally {
+          clearTimeout(timer);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      if (!done()) throw new Error("follower pump finished without reaching its condition");
     };
+    return { session, instance, pump };
+  };
 
-    const handle = new ActorHandle({
-      host: channel,
-      bootstrap: { id: "actor-retained", cwd: "/tmp/rusa-1272" },
-      context: {
-        lifecycle,
-        mesh: mockMesh,
-        onRuntimeStateChanged: () => {},
-        gate: vi.fn(() => gateHandle),
-      } as unknown as ActorFactoryContext,
-      snapshot: () => ({
-        record: { id: "actor-retained", modelConfig: [] } as unknown as ActorRecord,
-        prompt: "",
-        mcpServers: [],
-      }),
-      saveSession: () => {},
-      onFailure: () => {},
+  const deliver = (actorId: string) => {
+    const [entry] = inboxStore.append([
+      { actorId, source: "test:work", payload: { type: "test.work" } },
+    ]);
+    if (!entry) throw new Error("expected a durable work entry");
+    mesh.dispatch(actorId);
+    return entry;
+  };
+  const heldAdmissions = () =>
+    records.filter((record) => record.event === "remote_admission_held_for_update").length;
+
+  return {
+    ...leader,
+    actors,
+    mesh,
+    inboxStore,
+    starts,
+    ends,
+    follower,
+    deliver,
+    heldAdmissions,
+    blockRuns: () => {
+      blockRuns = true;
+    },
+    releaseRun: () => releaseRuns?.(),
+  };
+}
+
+describe("MEK-Org/rusa#1272 (a) held runs wait and then run once", () => {
+  it("spawns onto a follower whose update is pending, holds its work, and runs it once when the update fails", async () => {
+    const store = triggerStore();
+    store.recordAttempt("edge", {
+      status: "pending",
+      targetSha: TARGET_SHA,
+      lastAttemptAt: new Date().toISOString(),
     });
+    const leader = await leaderWithFollowers({ store });
+    leader.hub.armReconciliation();
+    const edge = await leader.follower("edge", "edge-one", STALE_SHA);
+    expect(leader.hub.isPlacementHeld("edge")).toBe(true);
 
-    // Simulate leader admitting run #42
-    channel.emit("message", {
-      type: "queued",
-      runId: "run-42",
-      mode: "normal",
-      priority: "normal",
+    // Spawn succeeds and the child stays active rather than being retired.
+    const workerId = leader.mesh.spawn({
+      charter: "work on the edge follower",
+      parentId: "root",
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      executionTarget: "edge",
     });
+    expect(leader.actors.get(workerId)?.status).toBe("active");
+    expect(leader.mesh.get(workerId)).toBeDefined();
 
-    // Follower requests admission, creating a gate entry
-    channel.emit("message", {
-      type: "request",
-      requestId: 101,
-      request: {
-        op: "admit",
-        candidates: [{ provider: "mock", model: "mock" }],
-        responsive: false,
-      },
+    const work = leader.deliver(workerId);
+    await edge.pump(() => leader.heldAdmissions() > 0);
+    expect(leader.starts).toEqual([]);
+    expect(leader.inboxStore.read(workerId, work.id)?.handledAt).toBeNull();
+
+    await leader.reportStatus(edge.session, "failed", { error: "build failed" });
+    expect(store.hasFailed("edge", TARGET_SHA)).toBe(true);
+    expect(leader.hub.isPlacementHeld("edge")).toBe(false);
+
+    await edge.pump(() => leader.ends.some((event) => event.terminal.kind === "result"));
+    expect(leader.starts).toHaveLength(1);
+    const finished = leader.ends.filter((event) => event.terminal.kind === "result");
+    expect(finished).toHaveLength(1);
+    expect(finished[0]).toMatchObject({
+      runId: leader.starts[0],
+      terminal: { kind: "result", result: { success: true, output: "done" } },
     });
+    expect(leader.heldAdmissions()).toBe(1);
+  }, 15_000);
 
-    // Allow async admit handler to register the gate
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    // Channel disconnects while admission is retained
-    channel.followerProcessDied({ updateRestart: false });
-    await handle.exited;
-
-    // Follower reattaches with a fresh generation that does not reclaim the admission
-    const replacementChannel = new SyntheticChannel();
-    handle.attachHost(replacementChannel);
-
-    // Initial state report from follower does not report run-42, dropping the ticket
-    replacementChannel.emit("message", {
-      type: "state",
-      state: "idle",
-      generation: "new-gen",
-      ready: true,
-      hasQueued: false,
+  it("revives a thread onto a follower whose update is pending without rolling it back", async () => {
+    const store = triggerStore();
+    store.recordAttempt("edge", {
+      status: "pending",
+      targetSha: TARGET_SHA,
+      lastAttemptAt: new Date().toISOString(),
     });
+    const leader = await leaderWithFollowers({ store });
+    leader.hub.armReconciliation();
+    await leader.follower("edge", "edge-one", STALE_SHA);
+    const record = {
+      id: "retired-worker",
+      parentId: "root",
+      charter: "revived on the edge follower",
+      executionConfig: { executionTarget: "edge" },
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      status: "retired" as const,
+      createdAt: new Date().toISOString(),
+    };
+    leader.actors.upsert(record);
+    expect(leader.hub.isPlacementHeld("edge")).toBe(true);
 
-    // Allow async dropRetainedAdmission to settle
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    leader.mesh.reviveThread(record.id);
 
-    const dropEnd = ends.find((event) => event.runId === "run-42");
-    expect(dropEnd).toBeDefined();
-    expect(dropEnd?.terminal.kind).toBe("abandoned");
-    if (dropEnd?.terminal.kind === "abandoned") {
-      expect(dropEnd.terminal.started).toBe(false);
-      expect(dropEnd.terminal.reason).toBe("start-cancelled");
-    }
-    // Dropping an unclaimed retained admission re-queues via reconcileActorInbox
-    expect(reconcileInboxSpy).toHaveBeenCalledTimes(1);
-    expect(reconcileInboxSpy).toHaveBeenCalledWith("actor-retained");
+    expect(leader.actors.get(record.id)?.status).toBe("active");
+    expect(leader.mesh.get(record.id)).toBeDefined();
   });
+});
+
+describe("MEK-Org/rusa#1272 (b) an update restart interrupts the run in flight", () => {
+  it("books an exit while draining as an interruption and runs the work once on the new revision", async () => {
+    const leader = await leaderWithFollowers({});
+    const old = await leader.follower("edge", "edge-one", STALE_SHA);
+    const worker = {
+      id: "restart-worker",
+      parentId: "root",
+      charter: "interrupted by an update",
+      executionConfig: { executionTarget: "edge" },
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    leader.actors.upsert(worker);
+    leader.mesh.rehydrate(worker);
+    leader.blockRuns();
+    const work = leader.deliver(worker.id);
+    await old.pump(() => leader.starts.length > 0);
+
+    await leader.reportStatus(old.session, "draining");
+    // The updated process is a new generation on the target, which ends the old one.
+    const updated = await leader.follower("edge", "edge-two", TARGET_SHA);
+
+    await eventually(() => leader.ends.length > 0);
+    expect(leader.ends[0]).toMatchObject({
+      runId: leader.starts[0],
+      terminal: { kind: "abandoned", reason: "unreported", started: true },
+    });
+    expect(leader.inboxStore.read(worker.id, work.id)?.handledAt).toBeNull();
+
+    await updated.pump(() => leader.starts.length > 1);
+    leader.releaseRun();
+    await updated.pump(() => leader.ends.some((event) => event.terminal.kind === "result"));
+    expect(leader.starts).toHaveLength(2);
+    expect(leader.ends.filter((event) => event.terminal.kind === "abandoned")).toEqual([
+      expect.objectContaining({
+        runId: leader.starts[0],
+        terminal: { kind: "abandoned", reason: "unreported", started: true },
+      }),
+    ]);
+    expect(leader.ends.filter((event) => event.terminal.kind === "result")).toEqual([
+      expect.objectContaining({
+        runId: leader.starts[1],
+        terminal: expect.objectContaining({
+          kind: "result",
+          result: expect.objectContaining({ success: true, output: "done" }),
+        }),
+      }),
+    ]);
+  }, 15_000);
 });

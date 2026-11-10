@@ -41,6 +41,12 @@ export interface ActorHandleOptions {
   onFailure: (error: Error) => void;
   actorOptions?: ActorOptions;
   target?: string;
+  /**
+   * Whether the hosting follower's update holds new runs (#1272). Consulted
+   * once per admission, before a provider ticket is taken; a held admission is
+   * deferred, and the follower's release dispatches the work again.
+   */
+  isPlacementHeld?: () => boolean;
   logger?: Logger;
   startupTimeoutMs?: number;
   stateStaleTimeoutMs?: number;
@@ -755,7 +761,7 @@ export class ActorHandle implements MeshActor {
   private redispatchDroppedWork(): void {
     this.redispatchOwed = false;
     try {
-      this.opts.context.mesh?.reconcileActorInbox?.(this.id);
+      this.opts.context.mesh.reconcileActorInbox(this.id);
     } catch (error) {
       // A missed nudge over durable state; boot reconciliation still lists it.
       this.log.warn("remote_redispatch_failed", {
@@ -806,17 +812,13 @@ export class ActorHandle implements MeshActor {
     // a boot timeout books nothing.
     const terminate = () => {
       if (this.runOpen) {
-        if (isUpdateRestart) {
-          void this.endQueuedRun("unreported", true);
-          this.redispatchOwed = true;
-        } else {
-          void this.endRun({ success: false, output: error.message, exitCode: -1 });
-        }
+        // An update restart interrupts the run rather than failing it: no
+        // failed result and no parent notice. Its work is still unhandled, and
+        // the follower's registration on the new revision dispatches it.
+        if (isUpdateRestart) void this.endQueuedRun("unreported", true);
+        else void this.endRun({ success: false, output: error.message, exitCode: -1 });
       } else if (this.queuedRunId && !retained) {
         void this.endQueuedRun("start-cancelled", false);
-        if (isUpdateRestart) {
-          this.redispatchOwed = true;
-        }
       }
     };
     if (this.receiveChain) {
@@ -1271,6 +1273,17 @@ export class ActorHandle implements MeshActor {
                 if (this.pendingQueuedPromotion) {
                   this.pendingQueuedPromotion = false;
                   if (!request.responsive) this.logAdmissionPromoted();
+                }
+                // The follower is about to update, or is updating (#1272). Defer
+                // before a provider ticket is taken; the hub releases the
+                // follower's actors when its update reaches a terminal outcome.
+                if (this.opts.isPlacementHeld?.()) {
+                  this.log.info("remote_admission_held_for_update", {
+                    actorId: this.id,
+                    target: this.opts.target ?? this.channel.nodeId,
+                  });
+                  this.send({ type: "reply", requestId, value: { deferred: true } });
+                  return;
                 }
                 // A remote actor's provider gate lives here, not inside the
                 // follower. Recheck host authority immediately before reserving

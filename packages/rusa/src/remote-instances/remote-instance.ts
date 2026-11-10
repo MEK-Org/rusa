@@ -172,6 +172,16 @@ export const ACTIVE_UPDATE_PHASES = new Set<FollowerUpdateStatusPhase>([
   "restarting",
 ] satisfies readonly FollowerUpdateStatusPhase[]);
 
+/**
+ * The phases in which the follower is stopping its actors to restart onto the
+ * new revision. Only an exit in one of these is the update's doing; earlier
+ * phases leave actors running, so an exit then is an ordinary failure.
+ */
+const UPDATE_RESTART_PHASES = new Set<FollowerUpdateStatusPhase>([
+  "draining",
+  "restarting",
+] satisfies readonly FollowerUpdateStatusPhase[]);
+
 /** In-memory deduplication tracker preserving at-most-once delivery across follower reconnects. */
 export class FollowerDedupeTracker {
   private readonly processedBatches = new Set<string>();
@@ -321,6 +331,12 @@ export class RemoteInstance {
     return status !== undefined && ACTIVE_UPDATE_PHASES.has(status);
   }
 
+  /** Whether this follower is stopping its actors for an update restart. */
+  isUpdateRestarting(): boolean {
+    const status = this.updateStatus?.status;
+    return status !== undefined && UPDATE_RESTART_PHASES.has(status);
+  }
+
   setUpdateStatus(status: FollowerUpdateStatus): boolean {
     // A delayed status from a previous command must not replace the current
     // command's operator-visible state.
@@ -360,7 +376,7 @@ export class RemoteInstance {
         this.commands.push({ actorId, message });
         this.flush();
       },
-      () => this.isUpdateInProgress()
+      () => this.isUpdateRestarting()
     );
     this.hosts.set(actorId, host);
     host.once("exit", () => this.hosts.delete(actorId));
@@ -583,7 +599,7 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
     readonly nodeId: string,
     readonly pid: number,
     private readonly enqueue: (message: LeaderCommand) => void,
-    private readonly isUpdateActive?: () => boolean
+    private readonly isUpdateRestarting: () => boolean
   ) {
     super();
   }
@@ -608,7 +624,7 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
       this.connected = false;
       this.exitCode = message.code;
       this.signalCode = message.signal;
-      this.updateRestart = Boolean(this.isUpdateActive?.());
+      this.updateRestart = this.isUpdateRestarting();
       this.emit("exit", message.code, message.signal);
     } else this.emit("message", message);
   }
