@@ -1,10 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Obligation } from "../obligations/obligation.js";
-import type {
-  PortableBrief,
-  PortableContextState,
-  PortableMemoryPriority,
-} from "./portable-context-state.js";
+import type { PortableBrief, PortableContextState } from "./portable-context-state.js";
 
 /**
  * Provider-agnostic context (design ISSUE_NUM). When an actor selects portable
@@ -30,20 +26,6 @@ export interface PriorRun {
 }
 
 /**
- * Aggregate content-free metrics on active durable ledger items and overflow (#328).
- */
-export interface LedgerMetrics {
-  active: number;
-  selected: number;
-  dropped: number;
-  droppedByPriority: Record<PortableMemoryPriority, number>;
-  minSelectedEvidenceTs: string | null;
-  maxSelectedEvidenceTs: string | null;
-  minDroppedEvidenceTs: string | null;
-  maxDroppedEvidenceTs: string | null;
-}
-
-/**
  * The per-run inject record (design ISSUE_NUM, root's one attached requirement).
  * Emitted at inject time so "what was injected into run X" is answerable even
  * after observability events age out. `bytes` is the A/B PRIMARY metric
@@ -59,16 +41,18 @@ export interface InjectRecord {
   sourceEventIds: string[];
   /** How many prior runs survived the byte cap. */
   runCount: number;
-  /** Ledger generation of the snapshot hashed by stateHash; brief generation is in the rendered heading. */
+  /** Generation of the stored portable-state snapshot hashed by stateHash; brief generation is in the rendered heading. */
   stateGeneration?: number;
   /** Hash of the complete v2 materialized state. */
   stateHash?: string;
   /** Inbound messages rendered verbatim in the recent-message journal. */
   sourceMessageEventIds?: string[];
-  /** Byte breakdown for diagnosing what consumed the bounded prompt budget. */
+  /**
+   * Byte breakdown for diagnosing what consumed the bounded prompt budget.
+   * `ledger` measures the durable-intent (brief) section; the key keeps its
+   * old name because persisted inject records already carry it.
+   */
   sections?: { ledger: number; messages: number; runs: number };
-  /** Aggregate content-free metrics on active durable ledger items and overflow (#328). */
-  ledger?: LedgerMetrics;
 }
 
 export interface PortableContext {
@@ -101,7 +85,7 @@ export function portableContextMaxRuns(): number {
 
 /**
  * Runtime size of the verbatim inbound-message journal. The override is mainly
- * useful to exercise the ledger boundary cheaply in the E2E rig.
+ * useful to exercise the journal boundary cheaply in the E2E rig.
  */
 export function portableContextMaxMessages(): number {
   const raw = process.env.PORTABLE_CONTEXT_MAX_MESSAGES;
@@ -124,25 +108,10 @@ export const PORTABLE_CONTEXT_MESSAGES_MAX_BYTES = 8_000;
  * Obligations are the system of record for work state , so this section
  * is a read-through of that store, not a second lifecycle: nothing rendered here
  * can be marked done from the prompt. It gets its own budget rather than sharing
- * the ledger's so that a large ledger cannot silently starve the actor's work
+ * the brief's so that a large brief cannot silently starve the actor's work
  * queue, or the reverse.
  */
 export const PORTABLE_CONTEXT_OBLIGATIONS_MAX_BYTES = 6_000;
-
-/**
- * Per-run ceiling on the fold loop, in source pages and in source-body bytes.
- *
- * The fold pages forward from the ledger watermark until the journal is drained,
- * so switching a long-lived actor into ledger mode backfills its entire history
- * past that watermark in one run — through a cheap-tier model on a 60s timeout.
- * Today's worst case is ~2MB of yield notes, comfortably survivable, but an
- * unbounded loop is a latent bug at whatever size the log reaches next. Hitting
- * a cap is not data loss: the watermark advanced, so the next run resumes
- * exactly where this one stopped, and {@link PortableContextCompactionSummary.foldStop}
- * says it happened.
- */
-export const PORTABLE_CONTEXT_FOLD_MAX_PAGES = 20;
-export const PORTABLE_CONTEXT_FOLD_MAX_BYTES = 256_000;
 
 const HEADER =
   "## Recent activity (your own prior runs)\n\n" +
@@ -304,7 +273,7 @@ function renderObligations(obligations: Obligation[]): string {
     if (lines.length === 0) {
       // The single highest-priority obligation does not fit alone. Dropping it
       // would leave the actor's most urgent work invisible, so it is truncated
-      // instead — the same trade the ledger makes.
+      // instead.
       //
       // The *whole rendered line* is what gets bounded, not just the intent
       // inside it. Reserving a fixed allowance for the id and external ref only
@@ -382,8 +351,8 @@ function boundedMessages(messages: PriorMessage[]): { section: string; selected:
  * Render the brief-mode durable-intent section: the three sections verbatim
  * under a heading naming the mode, the brief's generation and its last update,
  * and the one line that tells the actor the brief is its own to keep. The
- * 16 KB cap is enforced when a write is accepted, so unlike the ledger render
- * this can never emit an "omitted due to budget" line.
+ * 16 KB cap is enforced when a write is accepted, so this can never emit an
+ * "omitted due to budget" line.
  */
 function renderBrief(brief: PortableBrief): string {
   return (

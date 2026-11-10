@@ -3290,9 +3290,7 @@ export class ActorMesh {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
     this.assertPlacementSupported(req.executionTarget);
-    if (req.context?.type === "portable" && req.context.mode === "ledger") {
-      throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
-    }
+    assertSpawnContextSupported(req);
     const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
     if (modelConfig.length === 0) {
       throw new Error("modelConfig must declare at least one provider/model entry");
@@ -5289,7 +5287,7 @@ export class ActorMesh {
    * any thread in its subtree, itself included; any other caller may only set
    * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
-   * portable (ledger/tail/brief) actor — a native provider session can't move.
+   * portable (tail/brief) actor — a native provider session can't move.
    * The replacement is atomic (the whole pool or nothing). A run already in
    * flight keeps its launched pool and the replacement applies when that run
    * ends; an idle or queued actor has it applied and persisted now (#652), so

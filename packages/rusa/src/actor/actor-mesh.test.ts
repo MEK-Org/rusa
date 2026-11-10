@@ -1225,6 +1225,67 @@ describe("ActorMesh", () => {
     expect(mesh.get("root")).toBeDefined(); // root untouched (was already live)
   });
 
+  it("reads, boots past and revives a stored retired ledger row without refusing it (#1266)", () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    const actorRepo = new SqliteActorRepository(db);
+    actorRepo.upsert({
+      id: "root",
+      charter: "Root",
+      parentId: null,
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+      context: { type: "native" },
+      status: "active",
+      createdAt: "2026-09-03T13:00:00.000Z",
+    });
+    // Written as raw SQL: the row predates the retirement, so no supported
+    // write path can produce it any more.
+    db.prepare(`
+      INSERT INTO actors (id, charter, parent_id, retired_at, execution_config, context_config, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "retired-ledger-worker",
+      "archived worker from ledger era",
+      "root",
+      "2026-01-02T00:00:00.000Z",
+      JSON.stringify({ schemaVersion: 1, unsandboxed: false }),
+      JSON.stringify({
+        schemaVersion: 1,
+        type: "portable",
+        mode: "ledger",
+        compactionModel: "claude-test-model",
+      }),
+      "2026-01-01T00:00:00.000Z"
+    );
+    const storedContext = {
+      type: "portable",
+      mode: "ledger",
+      compactionModel: "claude-test-model",
+    };
+
+    const { mesh } = setup({ actors: actorRepo });
+    // Boot: rehydrateAll skips the retired row instead of refusing it.
+    expect(() => mesh.rehydrateAll()).not.toThrow();
+    expect(mesh.get("retired-ledger-worker")).toBeUndefined();
+    expect(mesh.get("root")).toBeDefined();
+
+    // List and view reads keep the stored shape.
+    const listed = mesh.actors.list().find((r) => r.id === "retired-ledger-worker");
+    expect(listed?.status).toBe("retired");
+    expect(listed?.context).toEqual(storedContext);
+    expect(mesh.actors.get("retired-ledger-worker")?.context).toEqual(storedContext);
+
+    // Revive does not check context: the actor comes back live, unchanged, and
+    // is refused at its first prompt build (covered in start.test.ts).
+    mesh.reviveThread("retired-ledger-worker");
+    expect(mesh.get("retired-ledger-worker")).toBeDefined();
+    expect(actorRepo.get("retired-ledger-worker")?.status).toBe("active");
+    expect(actorRepo.get("retired-ledger-worker")?.context).toEqual(storedContext);
+
+    db.close();
+  });
+
   it("rehydrate is idempotent — a second call doesn't replace a live actor", () => {
     const { mesh, registry } = setup();
     registry.upsert({
@@ -7697,7 +7758,6 @@ describe("ActorMesh", () => {
         parentId: "root",
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
         context: { type: "portable", mode: "tail" },
-        conversationId: "portable-session-a",
       });
       mesh.sendMessage(workerA, "run A", "root");
       await tick();
@@ -7712,7 +7772,6 @@ describe("ActorMesh", () => {
         parentId: "root",
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
         context: { type: "portable", mode: "tail" },
-        conversationId: "portable-session-b",
       });
       mesh.sendMessage(workerB, "run B", "root");
       await tick();
@@ -7943,19 +8002,14 @@ describe("ActorMesh", () => {
         createdAt: "2026-10-01T00:00:00.000Z",
       };
       expect(() =>
-        assembleConfiguredPortableInjection(legacyActor, "dummy-api-key", contextStore, mockRepos)
+        assembleConfiguredPortableInjection(legacyActor, contextStore, mockRepos)
       ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
 
       // 1. Initial portable brief mode: prompt injection includes brief
       const workerBefore = actorRepo.get(worker);
       expect(workerBefore).toBeDefined();
       const initialBriefInj = workerBefore
-        ? assembleConfiguredPortableInjection(
-            workerBefore,
-            "dummy-api-key",
-            contextStore,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerBefore, contextStore, mockRepos)
         : undefined;
       expect(initialBriefInj?.priorContext).toContain("### Durable brief");
       expect(initialBriefInj?.priorContext).toContain("Persistent guidance");
@@ -7985,12 +8039,7 @@ describe("ActorMesh", () => {
       const workerInNative = actorRepo.get(worker);
       expect(workerInNative).toBeDefined();
       const nativeInj = workerInNative
-        ? assembleConfiguredPortableInjection(
-            workerInNative,
-            "dummy-api-key",
-            contextStore,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerInNative, contextStore, mockRepos)
         : undefined;
       expect(nativeInj).toBeUndefined();
       const nativePrompt = buildWorkerPrompt(
@@ -8018,12 +8067,7 @@ describe("ActorMesh", () => {
       const workerInBrief = actorRepo.get(worker);
       expect(workerInBrief).toBeDefined();
       const briefInj = workerInBrief
-        ? assembleConfiguredPortableInjection(
-            workerInBrief,
-            "dummy-api-key",
-            contextStore,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerInBrief, contextStore, mockRepos)
         : undefined;
       expect(briefInj?.priorContext).toContain("## Durable brief");
       expect(briefInj?.priorContext).toContain("Persistent guidance");
@@ -8082,12 +8126,7 @@ describe("ActorMesh", () => {
       const workerNative = actorRepo.get(worker);
       expect(workerNative).toBeDefined();
       const nativeInj = workerNative
-        ? assembleConfiguredPortableInjection(
-            workerNative,
-            "dummy-api-key",
-            contextStore,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerNative, contextStore, mockRepos)
         : undefined;
       expect(nativeInj).toBeUndefined();
 
@@ -8102,7 +8141,7 @@ describe("ActorMesh", () => {
       const workerTail = actorRepo.get(worker);
       expect(workerTail).toBeDefined();
       const tailInj = workerTail
-        ? assembleConfiguredPortableInjection(workerTail, "dummy-api-key", contextStore, mockRepos)
+        ? assembleConfiguredPortableInjection(workerTail, contextStore, mockRepos)
         : undefined;
       expect(tailInj?.priorContext).toBeUndefined();
     });

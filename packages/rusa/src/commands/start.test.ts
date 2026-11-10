@@ -6423,7 +6423,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
     expect(prompt).toContain("Message before the preserved ledger cursor.");
     expect(prompt).toContain("Message after the preserved ledger cursor.");
-    expect(built.injectRecord?.ledger).toBeUndefined();
+    expect(Object.keys(JSON.parse(JSON.stringify(built.injectRecord ?? {})))).not.toContain(
+      "ledger"
+    );
     expect(getRepositories().portableContext.load(rootId).lastFoldedSourceId).toBe(foldedMessage);
     expect(getRepositories().portableContext.load(rootId).brief?.generation).toBe(0);
     // A brief mount must disappear with its actor, including live HTTP access.

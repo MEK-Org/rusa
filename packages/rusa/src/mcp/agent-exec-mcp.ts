@@ -1147,6 +1147,8 @@ export function createAgentExecMcpServer(
         context_mode: z
           .string()
           .describe("The context mode to assign: one of 'native', 'tail', 'brief'."),
+        // Declared only so a stale caller's argument reaches the named refusal in
+        // resolveContextSelection; undeclared, zod would strip it silently (#1266).
         compaction_model: z
           .string()
           .optional()

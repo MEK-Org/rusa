@@ -51,7 +51,10 @@ import {
   createComputerUseAdmission,
 } from "../actor/computer-use-lock.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
-import { assertSpawnContextSupported } from "../actor/context-selection.js";
+import {
+  assertSpawnContextSupported,
+  PORTABLE_LEDGER_RETIRED,
+} from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
@@ -975,13 +978,10 @@ interface PortableInjection {
  */
 function assemblePortableInjection(
   id: string,
-  mode: "tail" | "ledger" | "brief",
+  mode: "tail" | "brief",
   store: PortableContextStore,
   repositories: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = getRepositories()
 ): PortableInjection {
-  if (mode === "ledger") {
-    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
-  }
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
@@ -1029,19 +1029,17 @@ function assemblePortableInjection(
 
 export function assembleConfiguredPortableInjection(
   record: ActorRecord,
-  _apiKey: string | null,
   store: PortableContextStore,
   repositories?: Pick<Repositories, "actorRuns" | "obligations" | "meshChat">
 ): PortableInjection | undefined {
-  if (
-    (record.context?.type === "portable" && record.context.mode === "ledger") ||
-    (record.desiredContextConfig?.type === "portable" &&
-      record.desiredContextConfig.mode === "ledger")
-  ) {
-    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+  const desired = record.desiredContextConfig;
+  if (desired?.type === "portable" && desired.mode === "ledger") {
+    throw new Error(PORTABLE_LEDGER_RETIRED);
   }
-  if (record.context?.type !== "portable") return undefined;
-  return assemblePortableInjection(record.id, record.context.mode, store, repositories);
+  const context = record.context;
+  if (context?.type !== "portable") return undefined;
+  if (context.mode === "ledger") throw new Error(PORTABLE_LEDGER_RETIRED);
+  return assemblePortableInjection(record.id, context.mode, store, repositories);
 }
 
 /**
@@ -1228,7 +1226,6 @@ async function composeStart(
       impact: "too short to remove from log text; only credential-named fields are redacted",
     });
   }
-  const portableContextApiKey = config.geminiApiKey?.trim() || null;
 
   if (config.sandbox !== "container-boundary") {
     // bubblewrap is required for sandboxed worker runs. The root itself is
@@ -3819,11 +3816,7 @@ async function composeStart(
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.
-            const injection = assembleConfiguredPortableInjection(
-              r,
-              portableContextApiKey,
-              portableContextStore
-            );
+            const injection = assembleConfiguredPortableInjection(r, portableContextStore);
             return {
               prompt: buildWorkerPrompt(
                 r.charter,

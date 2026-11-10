@@ -27,6 +27,12 @@ export function isContextSelection(value: unknown): value is ContextSelection {
   return typeof value === "string" && (CONTEXT_SELECTIONS as readonly string[]).includes(value);
 }
 
+/** The one refusal for the retired portable ledger mode (#1266), shared by every boundary. */
+export const PORTABLE_LEDGER_RETIRED =
+  "portable ledger mode has been retired; use 'brief' or 'tail' mode instead";
+const COMPACTION_MODEL_RETIRED =
+  "compactionModel is not supported; portable ledger mode has been retired";
+
 /**
  * Turn a wire-level selection into the durable {@link ContextConfig}, or throw
  * with a message naming the valid values.
@@ -52,15 +58,15 @@ export function resolveContextSelection(
 
   if (raw === undefined || raw === null || raw === "") {
     if (compactionModel) {
-      throw new Error("compactionModel is not supported; portable ledger mode has been retired");
+      throw new Error(COMPACTION_MODEL_RETIRED);
     }
     return undefined;
   }
   if (raw === "ledger") {
-    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+    throw new Error(PORTABLE_LEDGER_RETIRED);
   }
   if (compactionModel) {
-    throw new Error("compactionModel is not supported; portable ledger mode has been retired");
+    throw new Error(COMPACTION_MODEL_RETIRED);
   }
   if (!isContextSelection(raw)) {
     throw new Error(
@@ -70,13 +76,7 @@ export function resolveContextSelection(
   if (raw === "native") {
     return { type: "native" };
   }
-  if (raw === "tail") {
-    return { type: "portable", mode: "tail" };
-  }
-  if (raw === "brief") {
-    return { type: "portable", mode: "brief" };
-  }
-  throw new Error(`unknown context selection: ${String(raw)}`);
+  return { type: "portable", mode: raw };
 }
 
 /**
@@ -116,12 +116,13 @@ export function resolveContextConfig(value: unknown): ContextConfig | undefined 
  *   and a seeded `conversationId` would be written to the record and then never
  *   resumed. The caller would believe it promoted a conversation into an actor
  *   and get a blank one.
- * - Portable ledger mode has been retired; brief and tail modes are supported.
+ * - Portable ledger mode has been retired (#1266); a stale ledger request is
+ *   refused rather than silently converted to another mode.
  */
-export function assertSpawnContextSupported(
-  req: { context?: ContextConfig; conversationId?: string },
-  _caps?: unknown
-): void {
+export function assertSpawnContextSupported(req: {
+  context?: ContextConfig;
+  conversationId?: string;
+}): void {
   const context = req.context;
   if (context?.type !== "portable") return;
   if (req.conversationId) {
@@ -131,6 +132,6 @@ export function assertSpawnContextSupported(
     );
   }
   if (context.mode === "ledger") {
-    throw new Error("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+    throw new Error(PORTABLE_LEDGER_RETIRED);
   }
 }

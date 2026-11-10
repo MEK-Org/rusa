@@ -807,7 +807,7 @@ function printDriveHelp(opts: {
     console.log(`  curl -s ${rootControl}/root/wakes | jq`);
     console.log(`\nSpawn a root child without invoking a root provider:`);
     console.log(
-      `  curl -s -XPOST ${rootControl}/actors -d '{"charter":"...","provider":"<configured key>","model":"<model>","contextMode":"ledger"}'`
+      `  curl -s -XPOST ${rootControl}/actors -d '{"charter":"...","provider":"<configured key>","model":"<model>","contextMode":"brief"}'`
     );
     console.log(`\nMessage it and inspect its durable context:`);
     console.log(`  curl -s -XPOST ${rootControl}/actors/<id>/messages -d '{"body":"..."}'`);
