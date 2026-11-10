@@ -15,7 +15,6 @@ import {
   type QuotaObservationResult,
 } from "./coordinator-metrics.js";
 import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
-import { isModelPattern, joinWildcardLanes, modelListCovers } from "./model-wildcard.js";
 import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.js";
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
@@ -191,22 +190,6 @@ export interface QuotaControllerResetResult {
   observations: number;
 }
 
-export interface QuotaThrottleElectionOptions {
-  /**
-   * One bucket whose ordinary decision enters the governing election as zero
-   * delay (#861): an armed sprint's target. Every other bucket, the published
-   * per-bucket decisions and the exhaustion gate are unchanged.
-   */
-  relax?: { modelScope: string; kind: QuotaWindowKind };
-}
-
-/** The newest observation of one lane, as the sprint policy reads it (#861). */
-export interface QuotaLaneObservation extends CanonicalQuotaObservation {
-  modelScope: string;
-  models: string[];
-  key: string;
-}
-
 export interface PersistedQuotaBucketStatus {
   key: string;
   percentLeft: number;
@@ -334,9 +317,6 @@ export const PROVIDER_SCOPE_KEY = "";
  * Versioned `model_scope` blob of a model-scoped observation. The models are
  * the catalog-validated canonical IDs, sorted so one allocation has exactly
  * one durable identity whatever order the catalog or parser listed them in.
- * An entry may be a wildcard pattern such as `claude-fable-*`
- * (`./model-wildcard.js`), which keeps that identity when a model joins the
- * family.
  */
 interface ModelScopeBlob {
   version: 1;
@@ -433,23 +413,6 @@ function resolveManualModelScopes(
   }
   return { limits: kept, dropped };
 }
-
-/**
- * One-time backfill targets (#1282): lanes whose explicit model lists the
- * wildcard list replaces. Throwaway; delete once every store has opened with it.
- */
-const WILDCARD_LANE_BACKFILL: ReadonlyArray<{ provider: string; models: readonly string[] }> = [
-  { provider: "claude", models: ["claude-fable-*"] },
-];
-
-/** Controller columns a replayed backfill row clears so the controller reasons it again. */
-const CONTROLLER_COLUMNS = [
-  "controller_error",
-  "controller_derivative",
-  "controller_integral",
-  "uncapped_interval_seconds",
-  "interval_seconds",
-] as const;
 
 export function bucketKey(provider: string, models: readonly string[], kind: string): string {
   return models.length === 0 ? `${provider}:${kind}` : `${provider}[${models.join(",")}]:${kind}`;
@@ -659,7 +622,6 @@ export class SharedQuotaStore {
       );
     `);
       this.ensureColumnsInTransaction();
-      this.backfillWildcardLanesInTransaction();
       if (currentVersion < QUOTA_SCHEMA_VERSION) {
         this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
       }
@@ -731,136 +693,6 @@ export class SharedQuotaStore {
     if (!columns.has("controller_integral")) {
       this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
     }
-  }
-
-  /**
-   * One-time backfill (#1282, throwaway): move every lane keyed by an explicit
-   * model list that a {@link WILDCARD_LANE_BACKFILL} list covers onto that
-   * wildcard list, as a data rewrite when the store opens. Lanes are taken
-   * oldest first. The first is renamed in place, so its rows, period start and
-   * controller memory carry unchanged. A later lane's rows newer than the
-   * merged lane's newest reading are re-inserted in order with their window
-   * duration derived again and their controller columns cleared, as if the
-   * key had always been the wildcard; its older rows are kept as recorded, and
-   * a row whose slot the merged lane already holds is dropped. The provider's
-   * latest stored snapshot is rewritten the same way so boot hydration agrees.
-   */
-  private backfillWildcardLanesInTransaction(): void {
-    for (const target of WILDCARD_LANE_BACKFILL) {
-      const to = modelScopeKey(target.models);
-      const lanes = this.db
-        .prepare(
-          `SELECT model_scope AS modelScope, kind, MIN(observed_at) AS firstObservedAt
-           FROM quota_observations
-           WHERE provider = ? AND model_scope <> '' AND model_scope <> ?
-           GROUP BY model_scope, kind
-           ORDER BY kind, firstObservedAt, model_scope`
-        )
-        .all(target.provider, to) as Array<{ modelScope: string; kind: string }>;
-      for (const lane of lanes) {
-        const models = parseModelScopeKey(lane.modelScope);
-        if (
-          !models ||
-          models.some(isModelPattern) ||
-          !models.every((model) => modelListCovers(target.models, model))
-        ) {
-          continue;
-        }
-        const key = [target.provider, lane.modelScope, lane.kind] as const;
-        const newest = this.db
-          .prepare(
-            `SELECT observed_at AS observedAt FROM quota_observations
-             WHERE provider = ? AND model_scope = ? AND kind = ?
-             ORDER BY observed_at DESC, rowid DESC LIMIT 1`
-          )
-          .get(target.provider, to, lane.kind) as { observedAt: string } | undefined;
-        if (!newest) {
-          this.db
-            .prepare(
-              `UPDATE quota_observations SET model_scope = ?
-               WHERE provider = ? AND model_scope = ? AND kind = ?`
-            )
-            .run(to, ...key);
-          continue;
-        }
-        const rows = this.db
-          .prepare(
-            `SELECT * FROM quota_observations
-             WHERE provider = ? AND model_scope = ? AND kind = ?
-             ORDER BY observed_at ASC, rowid ASC`
-          )
-          .all(...key) as Array<Record<string, unknown>>;
-        this.db
-          .prepare(
-            "DELETE FROM quota_observations WHERE provider = ? AND model_scope = ? AND kind = ?"
-          )
-          .run(...key);
-        const newestMs = Date.parse(newest.observedAt);
-        for (const row of rows) {
-          const occupied = this.db
-            .prepare(
-              `SELECT 1 FROM quota_observations
-               WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
-            )
-            .get(target.provider, to, lane.kind, row.observed_slot);
-          if (occupied) continue;
-          const values: Record<string, unknown> = { ...row, model_scope: to };
-          const observedAt = String(row.observed_at);
-          if (Date.parse(observedAt) > newestMs) {
-            values.window_ms = this.windowMsForCandidate({
-              provider: target.provider,
-              modelScope: to,
-              kind: lane.kind as QuotaWindowKind,
-              observedAt,
-              percentLeft: Number(row.percent_left),
-              resetAtIso: (row.reset_at_iso as string | null) ?? null,
-            });
-            values.processed = 0;
-            for (const column of CONTROLLER_COLUMNS) values[column] = null;
-          }
-          const columns = Object.keys(row);
-          this.db
-            .prepare(
-              `INSERT INTO quota_observations (${columns.join(", ")})
-               VALUES (${columns.map((column) => `@${column}`).join(", ")})`
-            )
-            .run(values);
-        }
-      }
-      const latest = this.db
-        .prepare(
-          `SELECT rowid, parsed_state AS parsedState FROM quota_scrapes
-           WHERE provider = ? AND parsed_state IS NOT NULL
-           ORDER BY scraped_at DESC, rowid DESC LIMIT 1`
-        )
-        .get(target.provider) as { rowid: number; parsedState: string } | undefined;
-      const state = latest ? parseParsedState(latest.parsedState) : null;
-      if (!latest || !state?.limits) continue;
-      const limits = joinWildcardLanes(state.limits, [target.models]);
-      if (limits.every((limit, index) => limit === state.limits?.[index])) continue;
-      this.db
-        .prepare("UPDATE quota_scrapes SET parsed_state = ? WHERE rowid = ?")
-        .run(serializeParsedState({ ...state, limits }), latest.rowid);
-    }
-  }
-
-  /**
-   * The model list of every model lane this provider has observations for. A
-   * new reading joins the one that covers it by wildcard
-   * (`joinWildcardLanes`), so a lane named `claude-fable-*` keeps the reading
-   * of a model list the provider has since grown.
-   */
-  listModelLaneLists(provider: string): string[][] {
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT model_scope AS modelScope FROM quota_observations
-         WHERE provider = ? AND model_scope <> '' ORDER BY model_scope`
-      )
-      .all(provider.trim().toLocaleLowerCase("en-US")) as Array<{ modelScope: string }>;
-    return rows.flatMap(({ modelScope }) => {
-      const models = parseModelScopeKey(modelScope);
-      return models && models.length > 0 ? [models] : [];
-    });
   }
 
   /**
@@ -1024,10 +856,7 @@ export class SharedQuotaStore {
       input.snapshot.limits ?? [],
       opts.configuredModels ?? []
     );
-    const snapshot: ProviderQuotaSnapshot = {
-      ...input.snapshot,
-      limits: joinWildcardLanes(resolved.limits, this.listModelLaneLists(provider)),
-    };
+    const snapshot: ProviderQuotaSnapshot = { ...input.snapshot, limits: resolved.limits };
     const candidates = this.manualObservationSlots(snapshot, observedMs);
     if (candidates.length === 0)
       throw new Error("manual observation has no provider-scoped limits");
@@ -1642,65 +1471,14 @@ export class SharedQuotaStore {
   }
 
   /**
-   * The newest observation of every lane of `kind` for a provider, one per
-   * model scope, provider scope first. A row whose stored scope does not
-   * decode is not evidence for any lane and is left out.
-   */
-  listLatestLaneObservations(provider: string, kind: QuotaWindowKind): QuotaLaneObservation[] {
-    const rows = this.db
-      .prepare(
-        `SELECT provider, model_scope AS modelScope, kind, label,
-                observed_at AS observedAt, percent_left AS percentLeft,
-                reset_at_iso AS resetAtIso, window_ms AS windowMs
-         FROM quota_observations o
-         WHERE provider = ? AND kind = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM quota_observations newer
-             WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
-               AND newer.kind = o.kind
-               AND (newer.observed_at > o.observed_at OR
-                    (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
-           )
-         ORDER BY model_scope ASC`
-      )
-      .all(provider, kind) as Array<CanonicalQuotaObservation & { modelScope: string }>;
-    return rows.flatMap((row): QuotaLaneObservation[] => {
-      const models = parseModelScopeKey(row.modelScope);
-      if (models === null) return [];
-      return [{ ...row, models, key: bucketKey(provider, models, row.kind) }];
-    });
-  }
-
-  /** Observations of one lane at or after `sinceIso`, oldest first. */
-  listLaneObservationsSince(
-    provider: string,
-    modelScope: string,
-    kind: QuotaWindowKind,
-    sinceIso: string
-  ): CanonicalQuotaObservation[] {
-    return this.db
-      .prepare(
-        `SELECT provider, kind, label, observed_at AS observedAt,
-                percent_left AS percentLeft, reset_at_iso AS resetAtIso, window_ms AS windowMs
-         FROM quota_observations
-         WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_at >= ?
-         ORDER BY observed_at ASC, rowid ASC`
-      )
-      .all(provider, modelScope, kind, sinceIso) as CanonicalQuotaObservation[];
-  }
-
-  /**
    * The provider-wide lane's persisted status, with one `modelLanes` entry per
    * model scope that has reasoned evidence (#588). Each lane is elected from
    * its own rows only: a model-scoped reading never enters the provider
    * lane's governing election, and the provider's rows never enter a model
    * lane's. Combining them for a concrete candidate is the client's job.
    */
-  getProviderThrottle(
-    provider: string,
-    options: QuotaThrottleElectionOptions = {}
-  ): PersistedQuotaProviderStatus | null {
-    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY, [], options.relax);
+  getProviderThrottle(provider: string): PersistedQuotaProviderStatus | null {
+    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY, []);
     if (!status) return null;
     const scopes = this.db
       .prepare(
@@ -1713,7 +1491,7 @@ export class SharedQuotaStore {
     for (const { modelScope } of scopes) {
       const models = parseModelScopeKey(modelScope);
       if (!models || models.length === 0) continue;
-      const lane = this.scopeThrottle(provider, modelScope, models, options.relax);
+      const lane = this.scopeThrottle(provider, modelScope, models);
       if (lane) modelLanes.push({ ...lane, models });
     }
     return modelLanes.length > 0 ? { ...status, modelLanes } : status;
@@ -1722,8 +1500,7 @@ export class SharedQuotaStore {
   private scopeThrottle(
     provider: string,
     modelScope: string,
-    models: readonly string[] = [],
-    relax?: QuotaThrottleElectionOptions["relax"]
+    models: readonly string[] = []
   ): Omit<PersistedQuotaProviderStatus, "modelLanes"> | null {
     const reasoned = this.db
       .prepare(
@@ -1792,16 +1569,9 @@ export class SharedQuotaStore {
     // then ages the lane by that bucket (it is governing), which is the slower
     // direction (§5.7) and lasts until the controller reasons the newest rows or
     // the next scrape lands.
-    //
-    // A relaxed bucket (#861) enters the election with zero even-spread delay.
-    // Only the election sees that: `buckets` below keeps the ordinary decision.
-    const eligibleReasoned = (
-      currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned
-    ).map((row) =>
-      relax && relax.modelScope === modelScope && relax.kind === row.kind
-        ? { ...row, intervalSeconds: 0, uncappedIntervalSeconds: 0 }
-        : row
-    );
+    const eligibleReasoned = [
+      ...(currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned),
+    ];
     // Ties break on kind so one set of rows always elects the same bucket.
     eligibleReasoned.sort(
       (a, b) =>

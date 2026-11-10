@@ -15,7 +15,6 @@ import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
-  modelScopeKey,
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
   QUOTA_INTEGRAL_TIME_SECONDS,
@@ -1425,49 +1424,6 @@ describe("SharedQuotaStore persisted controller", () => {
       expect(latest(again, "weekly")).toMatchObject({ interval: 0, i: 0 });
     } finally {
       again.close();
-    }
-  });
-
-  it("relaxes one bucket for the election only (#861)", () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-relax-"));
-    roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"));
-    try {
-      store.configureController({ maxIntervalSeconds: 3600 });
-      recordObservation(
-        store,
-        "claude",
-        "2030-01-01T00:00:00.000Z",
-        50,
-        "2030-01-08T00:00:00.000Z"
-      );
-      recordObservation(
-        store,
-        "claude",
-        "2030-01-01T01:00:00.000Z",
-        49,
-        "2030-01-08T00:00:00.000Z"
-      );
-      const ordinary = store.getProviderThrottle("claude");
-      expect(ordinary?.governingBucketKey).toBe("claude:weekly");
-      expect(ordinary?.intervalSeconds).toBeGreaterThan(0);
-      const relaxed = store.getProviderThrottle("claude", {
-        relax: { modelScope: "", kind: "weekly" },
-      });
-      expect(relaxed?.intervalSeconds).toBe(0);
-      expect(relaxed?.uncappedIntervalSeconds).toBe(0);
-      expect(relaxed?.buckets).toEqual(ordinary?.buckets);
-      // A relaxation naming another lane or window changes nothing here.
-      expect(
-        store.getProviderThrottle("claude", { relax: { modelScope: "", kind: "session" } })
-      ).toEqual(ordinary);
-      expect(
-        store.getProviderThrottle("claude", {
-          relax: { modelScope: modelScopeKey(["claude-fable-5-1"]), kind: "weekly" },
-        })
-      ).toEqual(ordinary);
-    } finally {
-      store.close();
     }
   });
 

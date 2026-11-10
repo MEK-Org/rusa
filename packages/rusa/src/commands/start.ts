@@ -339,7 +339,7 @@ import {
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
-import { modelListCovers } from "../quota/model-wildcard.js";
+import { modelListCovers } from "../quota/model-matchers.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { resolveReference } from "../references/resolve.js";

@@ -17,7 +17,6 @@ import {
   publishedThrottle,
 } from "./coordinator-protocol.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
-import { joinWildcardLanes } from "./model-wildcard.js";
 import { modelScopeKey, parseModelScopeKey, SharedQuotaStore } from "./shared-store.js";
 
 // #588: a provider-wide Claude window and a Fable-only window are paced as
@@ -155,30 +154,14 @@ describe("model-scoped quota lanes: store (#588)", () => {
     const reopened = new SharedQuotaStore(path);
     try {
       reopened.configureController({ maxIntervalSeconds: 36000 });
-      // Reopening moves the Fable lane onto its wildcard list (#1282) and
-      // changes nothing else about it; later readings join that lane.
-      const wildcardKey = modelScopeKey(["claude-fable-*"]);
-      const onWildcard = <T>(value: T): T =>
-        JSON.parse(JSON.stringify(value).replaceAll(FABLE, "claude-fable-*"));
-      expect(reopened.getProviderThrottle("claude")).toEqual(onWildcard(before));
-      recordStandingErrors(reopened, 6, 6, 2, 12, (target, scrapedAt, limits) =>
-        recordScrape(
-          target,
-          scrapedAt,
-          joinWildcardLanes(limits, target.listModelLaneLists("claude"))
-        )
-      );
+      expect(reopened.getProviderThrottle("claude")).toEqual(before);
+      recordStandingErrors(reopened, 6, 6, 2, 12);
 
       const rows = reasonedRows(reopened);
-      expect(rows).toEqual(
-        reasonedRows(control).map((row) => ({
-          ...row,
-          modelScope: row.modelScope === "" ? "" : wildcardKey,
-        }))
-      );
+      expect(rows).toEqual(reasonedRows(control));
       const scopes = [...new Set(rows.map((row) => row.modelScope))];
-      expect(scopes).toEqual(["", wildcardKey]);
-      expect(parseModelScopeKey(scopes[1] as string)).toEqual(["claude-fable-*"]);
+      expect(scopes).toEqual(["", modelScopeKey([FABLE])]);
+      expect(parseModelScopeKey(scopes[1] as string)).toEqual([FABLE]);
       const provider = rows.filter((row) => row.modelScope === "");
       const fable = rows.filter((row) => row.modelScope !== "");
       expect(provider).toHaveLength(12);
@@ -196,8 +179,8 @@ describe("model-scoped quota lanes: store (#588)", () => {
       expect(status?.buckets.map((bucket) => bucket.key)).toEqual(["claude:weekly"]);
       expect(status?.modelLanes).toHaveLength(1);
       expect(status?.modelLanes?.[0]).toMatchObject({
-        models: ["claude-fable-*"],
-        governingBucketKey: "claude[claude-fable-*]:weekly",
+        models: [FABLE],
+        governingBucketKey: `claude[${FABLE}]:weekly`,
         intervalSeconds: (fable.at(-1) as ScopedRow).interval,
       });
       expect(status?.intervalSeconds).toBe((provider.at(-1) as ScopedRow).interval);
@@ -205,9 +188,7 @@ describe("model-scoped quota lanes: store (#588)", () => {
       const history = reopened.listHistorySince("claude", "2000-01-01T00:00:00.000Z");
       expect(history.filter((point) => point.scope === "provider")).toHaveLength(12);
       expect(
-        history
-          .filter((point) => point.scope === "model")
-          .every((p) => p.models?.[0] === "claude-fable-*")
+        history.filter((point) => point.scope === "model").every((p) => p.models?.[0] === FABLE)
       ).toBe(true);
       // Canonical (provider-only) readers never see a model row.
       expect(reopened.listCanonicalSince("claude", "2000-01-01T00:00:00.000Z")).toHaveLength(12);
@@ -316,6 +297,48 @@ describe("model-scoped quota lanes: store (#588)", () => {
         provider: "claude",
         models: [FABLE],
       });
+    } finally {
+      store.close();
+      control.close();
+    }
+  });
+
+  it("keeps one lane for a wildcard manual window as the catalog grows (#1282)", () => {
+    const store = new SharedQuotaStore(tempDb("rusa-1282-wildcard-"));
+    store.configureController({ maxIntervalSeconds: 36000 });
+    store.setQuotaReadingMode("claude", "manual", "2029-12-31T23:59:00.000Z");
+    const grown: ModelEntry[] = [
+      ...CATALOG,
+      { identifier: "claude-fable-5-2", displayLabel: "Claude Fable 5.2" },
+    ];
+    const wildcard = ["claude-fable-*"];
+    recordStandingErrors(store, 0, 6, 2, 12, recordManual, wildcard);
+    recordStandingErrors(
+      store,
+      6,
+      6,
+      2,
+      12,
+      (target, scrapedAt, limits) => recordManual(target, scrapedAt, limits, grown),
+      wildcard
+    );
+
+    // The same readings under one explicit model, never re-keyed.
+    const control = new SharedQuotaStore(tempDb("rusa-1282-wildcard-control-"));
+    control.configureController({ maxIntervalSeconds: 36000 });
+    recordStandingErrors(control, 0, 12, 2, 12);
+    try {
+      const lanes = store.getProviderThrottle("claude")?.modelLanes;
+      expect(lanes).toHaveLength(1);
+      expect(lanes?.[0]).toMatchObject({
+        models: wildcard,
+        governingBucketKey: "claude[claude-fable-*]:weekly",
+      });
+      // One controller history across the catalog change, equal to the control's.
+      const history = (rows: ScopedRow[]) =>
+        rows.filter((row) => row.modelScope !== "").map(({ modelScope: _scope, ...row }) => row);
+      expect(history(reasonedRows(store))).toEqual(history(reasonedRows(control)));
+      expect(history(reasonedRows(store))).toHaveLength(12);
     } finally {
       store.close();
       control.close();
@@ -528,13 +551,17 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
     expect(modelLanePacing({}, FABLE)).toBeUndefined();
   });
 
-  it("#1282: a lane naming a model family by wildcard paces each member and no other model", () => {
+  it("applies a wildcard lane to every model its pattern covers (#1282)", () => {
     const status = {
-      modelLanes: [laneStatus({ intervalSeconds: 45, models: ["claude-fable-*"] })],
+      modelLanes: [
+        laneStatus({ intervalSeconds: 120, models: ["claude-fable-*"] }),
+        laneStatus({ intervalSeconds: 600, models: ["claude-other"] }),
+      ],
     };
-    for (const model of ["claude-fable-5", FABLE, "claude-fable-5-2"]) {
-      expect(modelLanePacing(status, model)?.intervalSeconds).toBe(45);
-    }
+    const paced = { intervalSeconds: 120, deferUntil: null, exhaustedUntil: null };
+    expect(modelLanePacing(status, FABLE)).toEqual(paced);
+    // A model that joined the family after the lane was published is paced too.
+    expect(modelLanePacing(status, "claude-fable-9")).toEqual(paced);
     expect(modelLanePacing(status, SONNET)).toBeUndefined();
   });
 
@@ -920,98 +947,4 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       store.close();
     }
   }, 15_000);
-});
-
-describe("model-scoped quota lanes: wildcard backfill (#1282)", () => {
-  const WILDCARD = ["claude-fable-*"];
-  const TWO = ["claude-fable-5", FABLE];
-  const THREE = ["claude-fable-5", FABLE, "claude-fable-5-2"];
-  const at = (minutes: number) => new Date(STARTED_MS + minutes * 60_000).toISOString();
-  const fable = (percentLeft: number, models: string[]) =>
-    fableLimit(percentLeft, { provider: "claude", models });
-  const rows = (store: SharedQuotaStore) =>
-    store.db
-      .prepare(
-        `SELECT model_scope AS modelScope, observed_at AS observedAt, percent_left AS percentLeft,
-                reset_at_iso AS resetAtIso, window_ms AS windowMs, processed,
-                controller_integral AS controllerIntegral, interval_seconds AS intervalSeconds
-         FROM quota_observations WHERE provider = 'claude' AND model_scope <> ''
-         ORDER BY observed_at`
-      )
-      .all() as Array<{
-      modelScope: string;
-      observedAt: string;
-      resetAtIso: string;
-      windowMs: number;
-      processed: number;
-      intervalSeconds: number | null;
-    }>;
-
-  it("merges the lanes a grown model list split, replaying the later lane's rows", () => {
-    const path = tempDb("rusa-quota-wildcard-");
-    let store = new SharedQuotaStore(path);
-    store.configureController({ maxIntervalSeconds: 36000 });
-    // The window is read with two models, then with three: two lanes, and the
-    // second one's period starts at its own first reading.
-    recordScrape(store, at(0), [providerLimit(90), fable(90, TWO)]);
-    recordScrape(store, at(30), [providerLimit(89), fable(88, TWO)]);
-    recordScrape(store, at(60), [providerLimit(88), fable(86, THREE)]);
-    recordScrape(store, at(90), [providerLimit(87), fable(84, THREE)]);
-    // A sonnet-only window is another allocation and is left alone.
-    recordScrape(store, at(95), [fable(50, [SONNET])]);
-    const split = rows(store).filter((row) => row.modelScope !== modelScopeKey([SONNET]));
-    expect(split.map((row) => row.modelScope)).toEqual([
-      modelScopeKey(TWO),
-      modelScopeKey(TWO),
-      modelScopeKey(THREE),
-      modelScopeKey(THREE),
-    ]);
-    const periodStart = (row: { resetAtIso: string; windowMs: number }) =>
-      Date.parse(row.resetAtIso) - row.windowMs;
-    expect(periodStart(split[2])).toBe(Date.parse(at(60)));
-    store.close();
-
-    store = new SharedQuotaStore(path);
-    const merged = rows(store).filter((row) => row.modelScope !== modelScopeKey([SONNET]));
-    expect(merged.map((row) => row.modelScope)).toEqual(
-      Array.from({ length: 4 }, () => modelScopeKey(WILDCARD))
-    );
-    expect(merged.map((row) => row.observedAt)).toEqual([at(0), at(30), at(60), at(90)]);
-    // Every row has the first lane's period start; the replayed rows wait for
-    // the controller to reason them on top of the first lane's memory.
-    expect(new Set(merged.map(periodStart))).toEqual(new Set([Date.parse(at(0))]));
-    expect(merged.map((row) => row.processed)).toEqual([1, 1, 0, 0]);
-    expect(merged.slice(2).map((row) => row.intervalSeconds)).toEqual([null, null]);
-    expect(rows(store).filter((row) => row.modelScope === modelScopeKey([SONNET]))).toHaveLength(1);
-    // The latest stored snapshot of the window names the wildcard lane too.
-    recordScrape(store, at(96), [providerLimit(86), fable(83, THREE)]);
-    store.close();
-    store = new SharedQuotaStore(path);
-    const hydrated = store.getLatestSnapshot("claude")?.limits?.map((limit) => limit.scope);
-    expect(hydrated).toEqual([{ provider: "claude" }, { provider: "claude", models: WILDCARD }]);
-
-    // Opening again changes nothing.
-    const once = rows(store);
-    store.close();
-    store = new SharedQuotaStore(path);
-    expect(rows(store)).toEqual(once);
-    store.close();
-  });
-
-  it("puts a manual reading of the grown model list on the wildcard lane", () => {
-    const path = tempDb("rusa-quota-wildcard-manual-");
-    let store = new SharedQuotaStore(path);
-    recordScrape(store, at(0), [providerLimit(90), fable(90, [FABLE])]);
-    store.close();
-    store = new SharedQuotaStore(path);
-    expect(store.listModelLaneLists("claude")).toEqual([WILDCARD]);
-    store.setQuotaReadingMode("claude", "manual", at(1));
-    const result = recordManual(store, at(30), [providerLimit(89), fable(88, [FABLE])]);
-    expect(result.result).toBe("accepted");
-    expect(rows(store).map((row) => row.modelScope)).toEqual([
-      modelScopeKey(WILDCARD),
-      modelScopeKey(WILDCARD),
-    ]);
-    store.close();
-  });
 });
