@@ -191,7 +191,9 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
   const actors = new InMemoryActorRepository();
   const inboxDb = new Database(":memory:");
   runMigrations(inboxDb);
-  cleanups.push(() => inboxDb.close());
+  cleanups.push(() => {
+    inboxDb.close();
+  });
   const inboxStore = new SqliteInboxRepository(inboxDb);
   const principals = new PrincipalRepository(inboxDb);
   principals.createUser({ email: "operator@example.test", createdAt: "t" });
