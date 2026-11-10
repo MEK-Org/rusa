@@ -9,6 +9,7 @@ import { OpenRouterProvider } from "./openrouter/provider.js";
 import {
   isProviderCommand,
   type ProviderCommand,
+  providerCapabilityName,
   validateProviderSelection,
 } from "./provider-selection.js";
 import type { CodingProvider } from "./types.js";
@@ -86,13 +87,11 @@ function resolveThrottleLaneAlias(raw: string): string {
  * OpenRouter's provider identity and queue text). Antigravity's binary is
  * `agy`, so it canonicalizes there even when `cliCommand` is left unset.
  */
-export function providerThrottleKey(providerName: string, config?: RusaConfig): string {
-  const cliCommand = config?.providers?.[providerName]?.cliCommand?.trim();
-  if (cliCommand && cliCommand.toLowerCase() === "pi") {
-    return resolveThrottleLaneAlias(providerName);
-  }
-  const key = cliCommand || providerName;
-  return resolveThrottleLaneAlias(key);
+export function providerThrottleKey(providerName: string, config: RusaConfig): string {
+  const capability = providerCapabilityName(providerName, config);
+  // Pi is a harness with no quota of its own, so its lane is the configured
+  // provider. Every other cliCommand alias shares its CLI's quota lane.
+  return resolveThrottleLaneAlias(capability === "pi" ? providerName : capability);
 }
 
 /**
