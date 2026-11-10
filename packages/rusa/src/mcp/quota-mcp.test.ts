@@ -1036,6 +1036,48 @@ describe("quota MCP server", () => {
       }
     });
 
+    it("instructs the Claude parser to emit and preserve the Fable wildcard", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: "20",
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "Current Week (Fable)",
+                kind: "weekly",
+                usedPercent: "30",
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: ["claude-fable-*"],
+              },
+            ],
+          }),
+      });
+      const parsed = await parseClaudeQuota(
+        "Current Week (Fable): 30% used",
+        "test-key",
+        Date.now(),
+        [
+          { identifier: "claude-fable-5-1", displayLabel: "Fable 5.1", passable: true },
+          { identifier: "claude-fable-5-2", displayLabel: "Fable 5.2", passable: true },
+        ]
+      );
+      expect(lastSystemInstruction()).toContain('models: ["claude-fable-*"]');
+      const request = mockGenerateContent.mock.calls[0][0];
+      expect(
+        request.config.responseSchema.properties.windows.items.properties.models.description
+      ).toContain("single wildcard entry claude-fable-*");
+      expect(parsed.limits?.[1]).toMatchObject({
+        percentLeft: 70,
+        scope: { provider: "claude", models: ["claude-fable-*"] },
+      });
+    });
+
     it("keeps a configured named-model window beside provider evidence with canonical IDs", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>

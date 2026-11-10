@@ -100,6 +100,13 @@ describe("keepWindowLaneModels (#1078)", () => {
     expect(kept[1]).toMatchObject({ label: "Current week (Fable)", percentLeft: 46 });
   });
 
+  it("preserves a wildcard reading through the Claude lane guard with listed or wildcard history", () => {
+    const current = window(["claude-fable-*"]);
+    for (const history of [[], [window(FABLE)], [window(["claude-fable-*"])]]) {
+      expect(keepWindowLaneModels([current], history, catalog)).toEqual([current]);
+    }
+  });
+
   it("takes a reading that names more models, or different ones, as read", () => {
     expect(
       modelsOf(keepWindowLaneModels([window(FABLE)], [window(["claude-fable-5"])], catalog))
