@@ -59,37 +59,6 @@ interface ActorRunRow {
   abandon_reason: string | null;
 }
 
-export type PortableLedgerSourceKind = "message_received" | "run_yielded";
-
-/** A compactor input backed by a durable entity, not an observability event. */
-export interface PortableLedgerSource {
-  id: string;
-  ts: string;
-  kind: PortableLedgerSourceKind;
-  actorId: string;
-  detail: string | null;
-  body: string | null;
-  payload: string | null;
-  success: null;
-}
-
-interface PortableLedgerSourceRow {
-  id: string;
-  ts: string;
-  kind: PortableLedgerSourceKind;
-  actor_id: string;
-  detail: string | null;
-  body: string | null;
-  payload: string | null;
-  source_order: number;
-}
-
-interface SourceCursor {
-  id: string;
-  ts: string;
-  source_order: number;
-}
-
 /** Match the historical run_end capture bound while moving authority off the event log. */
 export const ACTOR_RUN_OUTPUT_MAX_CHARS = 40_000;
 
@@ -360,93 +329,6 @@ export class ActorRunRepository {
       }
     });
   }
-
-  /**
-   * Interleave received chat and self-authored yield notes oldest first.
-   *
-   * `afterSourceId` normally names a mesh_chat row or actor_run row. During the
-   * v2→v3 file migration it may briefly name the old message_received/run_yielded
-   * event; the migration-retained ids resolve that cursor without reading event
-   * prose or making the event table authoritative again.
-   */
-  listLedgerSourcesAfter(
-    actorId: string,
-    afterSourceId: string | null,
-    limit = 50
-  ): { sources: PortableLedgerSource[]; hasMore: boolean } {
-    if (limit <= 0) return { sources: [], hasMore: false };
-    assertLimit(limit);
-    const cursor = afterSourceId ? this.resolveSourceCursor(actorId, afterSourceId) : null;
-    if (afterSourceId && !cursor) {
-      throw new Error(`portable-context durable source not found: ${afterSourceId}`);
-    }
-
-    const params: Array<string | number> = [actorId, actorId];
-    let after = "";
-    if (cursor) {
-      after = `WHERE (
-        ts > ? OR
-        (ts = ? AND source_order > ?) OR
-        (ts = ? AND source_order = ? AND id > ?)
-      )`;
-      params.push(
-        cursor.ts,
-        cursor.ts,
-        cursor.source_order,
-        cursor.ts,
-        cursor.source_order,
-        cursor.id
-      );
-    }
-    params.push(limit + 1);
-    const rows = this.db
-      .prepare(
-        `WITH durable_sources AS (
-           SELECT id, ts, 'message_received' AS kind, recipient_id AS actor_id,
-                  session_id AS detail, body,
-                  json_object('messageId', id, 'from', sender_id) AS payload,
-                  0 AS source_order
-           FROM mesh_chat
-           WHERE recipient_id = ?
-           UNION ALL
-           SELECT id, yielded_at AS ts, 'run_yielded' AS kind, actor_id,
-                  yield_status AS detail, yield_note AS body, NULL AS payload,
-                  1 AS source_order
-           FROM actor_runs
-           WHERE actor_id = ? AND yielded_at IS NOT NULL AND yield_note IS NOT NULL
-         )
-         SELECT * FROM durable_sources
-         ${after}
-         ORDER BY ts ASC, source_order ASC, id ASC
-         LIMIT ?`
-      )
-      .all(...params) as PortableLedgerSourceRow[];
-    return {
-      sources: rows.slice(0, limit).map(toPortableLedgerSource),
-      hasMore: rows.length > limit,
-    };
-  }
-
-  private resolveSourceCursor(actorId: string, sourceId: string): SourceCursor | null {
-    const row = this.db
-      .prepare(
-        `SELECT id, ts, source_order
-         FROM (
-           SELECT id, ts, 0 AS source_order
-           FROM mesh_chat
-           WHERE recipient_id = ? AND (id = ? OR received_event_id = ?)
-           UNION ALL
-           SELECT id, yielded_at AS ts, 1 AS source_order
-           FROM actor_runs
-           WHERE actor_id = ? AND yielded_at IS NOT NULL
-             AND (id = ? OR legacy_yield_event_id = ?)
-         )
-         ORDER BY source_order ASC
-         LIMIT 1`
-      )
-      .get(actorId, sourceId, sourceId, actorId, sourceId, sourceId) as SourceCursor | undefined;
-    return row ?? null;
-  }
 }
 
 function assertLimit(limit: number): void {
@@ -473,18 +355,5 @@ function toActorRun(row: ActorRunRow): ActorRun {
     provider: modelConfig?.provider ?? row.provider,
     model: modelConfig?.model ?? row.model,
     abandonReason: row.abandon_reason,
-  };
-}
-
-function toPortableLedgerSource(row: PortableLedgerSourceRow): PortableLedgerSource {
-  return {
-    id: row.id,
-    ts: row.ts,
-    kind: row.kind,
-    actorId: row.actor_id,
-    detail: row.detail,
-    body: row.body,
-    payload: row.payload,
-    success: null,
   };
 }
