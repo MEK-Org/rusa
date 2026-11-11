@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { generateHandle } from "../actor/handle-generator.js";
+import { DEFAULT_ROOT_HANDLE } from "../actor/handle-generator.js";
 import { rootBrandingImage } from "../avatar/avatars.js";
 import { resolveHome } from "../config/index.js";
 import { resolveConfiguredActor } from "../db/configured-actor-import.js";
@@ -106,7 +106,7 @@ export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): 
   // nothing durable records which: an explicit `handle: root-actor` and an
   // omitted one read back the same. The default reading wins, so every install
   // that never configured a handle keeps the built-in id it always had.
-  const isCustomHandle = Boolean(rootHandle && rootHandle !== generateHandle("root"));
+  const isCustomHandle = Boolean(rootHandle && rootHandle !== DEFAULT_ROOT_HANDLE);
   const applicationId =
     isCustomHandle && rootHandle
       ? deriveAndroidApplicationId(rootHandle)

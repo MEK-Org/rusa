@@ -94,19 +94,25 @@ describe("legacy actor import", () => {
     expect(existsSync(join(home, "threads.json"))).toBe(false);
   });
 
-  it("defers a session-only install until startup creates the first root", () => {
+  it("refuses a session-only install with no root, leaving its files in place (#1261)", () => {
     const sessionPath = join(home, "root-agent", "session.json");
     writeFileSync(sessionPath, JSON.stringify({ sessionId: "root-session" }));
 
-    const result = importState();
-
-    expect(result).toMatchObject({
-      importedActors: 0,
-      importedScheduledMessages: 0,
-      deferredRootSessionId: "root-session",
-    });
-    expect(result.backupFiles).toEqual([]);
+    expect(() => importState()).toThrow(
+      /root-agent\/session\.json names a root session but no actor exists to carry it.*boot the last release that carries the configured-actor import once/
+    );
     expect(existsSync(sessionPath)).toBe(true);
+  });
+
+  it("refuses an empty threads.json beside a root session, leaving both files in place (#1261)", () => {
+    const sessionPath = join(home, "root-agent", "session.json");
+    const threadsPath = join(home, "threads.json");
+    writeFileSync(sessionPath, JSON.stringify({ sessionId: "root-session" }));
+    writeFileSync(threadsPath, JSON.stringify({ threads: [] }));
+
+    expect(() => importState()).toThrow(/names a root session but no actor exists to carry it/);
+    expect(existsSync(sessionPath)).toBe(true);
+    expect(existsSync(threadsPath)).toBe(true);
   });
 
   it("imports and archives the legacy sources", () => {

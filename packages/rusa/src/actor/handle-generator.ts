@@ -521,13 +521,21 @@ export const ANIMALS = [
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
+ * The handle the configured-actor import stored when `rootActor.handle` was
+ * omitted. Dashboard branding and the Android application id read it as
+ * "unbranded", and an installed app's id can never change, so this value is
+ * fixed independently of how {@link generateHandle} treats the legacy id.
+ */
+export const DEFAULT_ROOT_HANDLE = "root-actor";
+
+/**
  * Generates a deterministic, friendly display handle for a thread UUID.
  *
  * The grandfathered root id `"root"` displays as `root-actor` by default. Fresh
  * roots have opaque ids; their display handle is stored on the actor row.
  */
 export function generateHandle(uuid: string): string {
-  if (uuid === "root") return "root-actor";
+  if (uuid === "root") return DEFAULT_ROOT_HANDLE;
   if (!UUID_REGEX.test(uuid)) return uuid;
 
   const hash = createHash("sha256").update(uuid).digest();

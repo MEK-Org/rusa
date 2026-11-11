@@ -1555,7 +1555,6 @@ async function composeStart(
         error: err.name,
         reason: err.message,
         action: err.action,
-        candidates: err.candidates,
       });
     } else if (err instanceof RootModelConfigStartupError) {
       log.error("root_model_config_invalid", {

@@ -37,9 +37,9 @@ class ActorAvatar extends StatelessWidget {
   final bool retired;
 
   /// Optional store . When present, the lightbox opened from this
-  /// avatar offers an upload control (root excluded), re-fetches past
-  /// the browser's URL-keyed image cache after a successful upload, and
-  /// drives the generating ring from the server's `avatar` SSE frames.
+  /// avatar offers an upload control, re-fetches past the browser's
+  /// URL-keyed image cache after a successful upload, and drives the
+  /// generating ring from the server's `avatar` SSE frames.
   final DashboardStore? store;
 
   @override

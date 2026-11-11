@@ -7,18 +7,15 @@ export const CONFIGURED_ACTOR_IMPORT_SOURCE = "config.yaml:rootActor";
 
 /**
  * Startup refused to resolve the configured actor from its import receipt.
- * Carries what an operator can do about it, in words that fit one journal line,
- * and the candidate ids it considered.
+ * Carries what an operator can do about it, in words that fit one journal line.
  */
 export class ConfiguredActorImportError extends Error {
   override readonly name = "ConfiguredActorImportError";
   readonly action: string;
-  readonly candidates: string[];
 
-  constructor(message: string, action: string, candidates: string[] = []) {
+  constructor(message: string, action: string) {
     super(message);
     this.action = action;
-    this.candidates = candidates;
   }
 }
 
@@ -68,8 +65,7 @@ export function resolveConfiguredActor(
   if (!record) {
     throw new ConfiguredActorImportError(
       `the imported configured actor ${actorId} has no actor record`,
-      "restore its row in mesh.db's actors table from a backup; startup will not create a replacement for an imported actor",
-      [actorId]
+      "restore its row in mesh.db's actors table from a backup; startup will not create a replacement for an imported actor"
     );
   }
 

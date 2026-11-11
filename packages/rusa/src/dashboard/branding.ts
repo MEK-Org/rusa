@@ -1,4 +1,4 @@
-import { generateHandle } from "../actor/handle-generator.js";
+import { DEFAULT_ROOT_HANDLE } from "../actor/handle-generator.js";
 import { type RootAvatarIdentity, rootBrandingImage } from "../avatar/avatars.js";
 
 /**
@@ -63,7 +63,7 @@ export function resolveDashboardBranding(rootIdentity?: RootAvatarIdentity): Das
   // An unset handle resolves to the default `root-actor`, which is
   // the plumbing name for "no identity configured" — not a name to brand with.
   const handle = rootIdentity?.handle;
-  const name = handle && handle !== generateHandle("root") ? formatBrandName(handle) : null;
+  const name = handle && handle !== DEFAULT_ROOT_HANDLE ? formatBrandName(handle) : null;
 
   const image = rootBrandingImage();
   if (!image) return name === null ? NO_BRANDING : { ...NO_BRANDING, name };

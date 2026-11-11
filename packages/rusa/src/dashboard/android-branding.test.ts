@@ -80,23 +80,6 @@ describe("resolveAndroidBranding", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("names the app after the imported root handle and derives its id from it", () => {
-    seedFixtureDb({
-      receiptActorId: "actor-sf",
-      actor: { id: "actor-sf", displayHandle: "silicon-familiar", parentId: null },
-    });
-
-    expect(resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR })).toEqual({
-      label: "Silicon Familiar",
-      labelSource: 'imported root handle "silicon-familiar"',
-      applicationId: "com.siliconfamiliar.dashboard",
-      applicationIdSource: "derived from imported root handle",
-      iconPath: resolve(FLUTTER_APP_DIR, "web/icons/prod/Icon-maskable-512.png"),
-      iconType: "image/png",
-      iconSource: "bundled prod dashboard icon",
-    });
-  });
-
   it("keeps the built-in name, id and instance icon when no root handle is configured", () => {
     const branding = resolveAndroidBranding({
       flutterAppDir: FLUTTER_APP_DIR,
@@ -143,22 +126,13 @@ describe("resolveAndroidBranding", () => {
     );
   });
 
-  it("produces byte-identical applicationId, label, and launcher icon for an imported installation from a fixture database (#1261 acceptance)", () => {
-    mkdirSync(join(home, "data"), { recursive: true });
+  it("names the app after the imported root handle, derives its id from it and uses the uploaded root image (#1261 acceptance)", () => {
     mkdirSync(join(home, "avatars"), { recursive: true });
     writeFileSync(join(home, "avatars", "root.png"), JPEG_BYTES);
-
-    const db = initDb(home);
-    const now = new Date().toISOString();
-    const execConfig = JSON.stringify({ schemaVersion: 1, unsandboxed: false });
-    db.prepare(
-      `INSERT INTO actors (id, charter, parent_id, created_at, execution_config, display_handle)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run("actor-sf", "charter", null, now, execConfig, "silicon-familiar");
-    db.prepare(
-      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
-       VALUES (?, ?, ?, ?)`
-    ).run(CONFIGURED_ACTOR_IMPORT_SOURCE, now, 1, "actor-sf");
+    seedFixtureDb({
+      receiptActorId: "actor-sf",
+      actor: { id: "actor-sf", displayHandle: "silicon-familiar", parentId: null },
+    });
 
     const branding = resolveAndroidBranding({
       flutterAppDir: FLUTTER_APP_DIR,

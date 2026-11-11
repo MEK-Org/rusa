@@ -118,8 +118,6 @@ export interface LegacyActorImportResult {
   importedActors: number;
   importedScheduledMessages: number;
   backupFiles: string[];
-  /** Present only for a session-only legacy install whose root has not yet been created. */
-  deferredRootSessionId?: string;
 }
 
 function readJson(path: string): unknown {
@@ -274,12 +272,22 @@ function validateGraph(records: ActorRecord[], pending: ScheduledMessage[]): Act
   return ordered;
 }
 
+/**
+ * A legacy root session with no actor to carry it. Only the configured-actor
+ * import could create that actor, and #1261 removed it, so boot refuses
+ * rather than starting rootless while the session file is silently ignored.
+ */
+function unclaimedRootSessionError(): Error {
+  return new Error(
+    "Legacy actor import: root-agent/session.json names a root session but no actor exists to carry it. " +
+      "Only the removed configured-actor import could create that actor: boot the last release that carries the configured-actor import once, with the rootActor block still in config.yaml, then upgrade."
+  );
+}
+
 /** A read-only plan of what {@link applyLegacyActorImport} would do, with no writes performed. */
 export type LegacyActorImportPlan =
   | { kind: "noop" }
-  | { kind: "deferred-root-session"; sessionId: string }
   | { kind: "adopt-root-session"; rootId: string; sessionId: string; shouldPatchSession: boolean }
-  | { kind: "deferred-empty-threads"; sessionId: string }
   | {
       kind: "import";
       records: ActorRecord[];
@@ -338,10 +346,8 @@ export function planLegacyActorImport(options: {
   if (!hasThreads) {
     const roots = options.repositories.actors.list().filter((record) => record.parentId === null);
     if (roots.length === 0) {
-      const plan: LegacyActorImportPlan = rootSessionId
-        ? { kind: "deferred-root-session", sessionId: rootSessionId }
-        : { kind: "noop" };
-      return { ...base, plan, plannedActors: 0, plannedScheduledMessages: 0 };
+      if (rootSessionId) throw unclaimedRootSessionError();
+      return { ...base, plan: { kind: "noop" }, plannedActors: 0, plannedScheduledMessages: 0 };
     }
     if (roots.length !== 1) throw new Error("Legacy actor import: database has multiple roots");
     const root = roots[0];
@@ -381,12 +387,7 @@ export function planLegacyActorImport(options: {
   const existing = options.repositories.actors.list();
 
   if (ordered.length === 0 && existing.length === 0 && rootSessionId) {
-    return {
-      ...base,
-      plan: { kind: "deferred-empty-threads", sessionId: rootSessionId },
-      plannedActors: 0,
-      plannedScheduledMessages: 0,
-    };
+    throw unclaimedRootSessionError();
   }
 
   if (existing.length > 0) {
@@ -434,14 +435,6 @@ export function applyLegacyActorImport(
     case "noop":
       return { importedActors: 0, importedScheduledMessages: 0, backupFiles: [] };
 
-    case "deferred-root-session":
-      return {
-        importedActors: 0,
-        importedScheduledMessages: 0,
-        backupFiles: [],
-        deferredRootSessionId: plan.sessionId,
-      };
-
     case "adopt-root-session": {
       if (plan.shouldPatchSession) {
         options.repositories.actors.patch(plan.rootId, { sessionId: plan.sessionId });
@@ -452,14 +445,6 @@ export function applyLegacyActorImport(
         backupFiles: hasSession ? [archive(sessionPath)] : [],
       };
     }
-
-    case "deferred-empty-threads":
-      return {
-        importedActors: 0,
-        importedScheduledMessages: 0,
-        backupFiles: [archive(threadsPath)],
-        deferredRootSessionId: plan.sessionId,
-      };
 
     case "import": {
       const { records, pending, existingCount } = plan;
@@ -526,10 +511,4 @@ export function importLegacyActorState(options: {
 }): LegacyActorImportResult {
   const planResult = planLegacyActorImport(options);
   return applyLegacyActorImport(planResult, options);
-}
-
-/** Finish the rare session-only import once startup has minted its first root actor. */
-export function finishDeferredRootSessionImport(mcHome: string): string | undefined {
-  const sessionPath = join(mcHome, "root-agent", "session.json");
-  return existsSync(sessionPath) ? archive(sessionPath) : undefined;
 }

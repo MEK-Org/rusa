@@ -31,9 +31,9 @@ export { resolveHome } from "./secrets.js";
 
 export const ROOT_ACTOR_REMOVAL_ERROR =
   "config.yaml: rootActor configuration has been removed. " +
-  "Delete the rootActor block from config.yaml. " +
-  "Actor identity now lives in the mesh database; create a first actor from the dashboard or POST /api/mesh/actors. " +
-  "If this installation never completed the one-time configured-actor import, boot the last release that carries the import once, then upgrade.";
+  "If this installation never completed the one-time configured-actor import, first boot the last release that carries it once, with the rootActor block still in place. " +
+  "Then delete the rootActor block from config.yaml and upgrade. " +
+  "Actor identity now lives in the mesh database; create a first actor from the dashboard or POST /api/mesh/actors.";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends Array<infer U>
@@ -308,10 +308,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
   }
-  if (
-    "rootActor" in (parsed as object) &&
-    (parsed as { rootActor?: unknown }).rootActor !== undefined
-  ) {
+  if ((parsed as { rootActor?: unknown }).rootActor !== undefined) {
     throw new Error(ROOT_ACTOR_REMOVAL_ERROR);
   }
   if (parsed.understanding?.rootNodeId !== undefined) {

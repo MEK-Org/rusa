@@ -51,15 +51,17 @@ describe("loadConfig rootActor removal", () => {
     }
     expect(thrownError).toBeDefined();
     const msg = thrownError?.message ?? "";
-    // 1. Delete the block
-    expect(msg).toContain("Delete the rootActor block from config.yaml");
-    // 2. Identity now in DB / dashboard / POST /api/mesh/actors
+    // The never-imported step comes first: it needs the block still in place,
+    // so an operator reading top to bottom must meet it before deleting it.
+    const importFirst = msg.indexOf(
+      "If this installation never completed the one-time configured-actor import, first boot the last release that carries it once, with the rootActor block still in place"
+    );
+    const deleteBlock = msg.indexOf("Then delete the rootActor block from config.yaml");
+    expect(importFirst).toBeGreaterThan(-1);
+    expect(deleteBlock).toBeGreaterThan(importFirst);
+    // Where identity lives now.
     expect(msg).toContain(
       "Actor identity now lives in the mesh database; create a first actor from the dashboard or POST /api/mesh/actors"
-    );
-    // 3. Never-imported install instruction
-    expect(msg).toContain(
-      "If this installation never completed the one-time configured-actor import, boot the last release that carries the import once, then upgrade"
     );
   });
 
