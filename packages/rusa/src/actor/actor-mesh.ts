@@ -2457,17 +2457,6 @@ export class ActorMesh {
     );
   }
 
-  hasExhaustedSelectedWork(actorId: string): boolean {
-    actorId = this.resolveThreadId(actorId);
-    const entries = this.unhandledInboxEntries(actorId);
-    return (
-      this.exhaustedInboxEntryIds(
-        actorId,
-        entries.map((entry) => entry.id)
-      ).size > 0
-    );
-  }
-
   hasOnlyExhaustedWork(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
     const entries = this.unhandledInboxEntries(actorId);

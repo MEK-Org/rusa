@@ -15206,14 +15206,13 @@ describe("accountRun token accounting (#443)", () => {
       inboxStore.append([
         { id: "item-1", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
       ]);
-      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(false);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(false);
 
       await tick();
       // It ran initial run + 1 retry = 2 calls
       expect(fake(worker).calls).toHaveLength(2);
 
       // On second completion, retry budget is exhausted
-      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
       expect(mesh.hasOnlyExhaustedWork(worker)).toBe(true);
 
       // Further tick does not dispatch a third run
@@ -15227,7 +15226,6 @@ describe("accountRun token accounting (#443)", () => {
 
       // When the entry is marked handled, exhaustion clears
       inboxStore.markHandled(worker, ["item-1"]);
-      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(false);
       expect(mesh.hasOnlyExhaustedWork(worker)).toBe(false);
     });
 
@@ -15266,7 +15264,7 @@ describe("accountRun token accounting (#443)", () => {
 
       await tick();
       expect(fake(worker).calls).toHaveLength(1);
-      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(true);
 
       mesh.reconcileInbox();
       await tick();
@@ -15325,7 +15323,6 @@ describe("accountRun token accounting (#443)", () => {
 
       expect(() => mesh.selectInboxEntries("root", ["old-item"])).toThrow(/needs attention/i);
       expect(mesh.selectInboxEntries("root", ["new-item"])).toHaveLength(1);
-      expect(mesh.hasExhaustedSelectedWork("root")).toBe(true);
       expect(mesh.hasOnlyExhaustedWork("root")).toBe(false);
     });
 
@@ -15363,7 +15360,6 @@ describe("accountRun token accounting (#443)", () => {
       // Initial run + 1 retry = 2 calls
       await tick();
       expect(fake(worker).calls).toHaveLength(2);
-      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
 
       // Parent (root) received mechanical failure notice
       const parentInbox = inboxStore.list("root");
@@ -15416,7 +15412,7 @@ describe("accountRun token accounting (#443)", () => {
       completed = 2;
       mesh.finishInboxRun("root", { successful: true, runId: "root-run-1" });
 
-      expect(mesh.hasExhaustedSelectedWork("root")).toBe(true);
+      expect(() => mesh.selectInboxEntries("root", ["root-item"])).toThrow(/needs attention/i);
       // No mechanical notices appended anywhere
       const rootList = inboxStore.list("root", { status: "all" });
       const mechanical = rootList.entries.filter((e) => e.source.startsWith("mesh:mechanical:"));
@@ -15567,7 +15563,6 @@ describe("accountRun token accounting (#443)", () => {
       inboxStore.append([
         { id: "item-1", actorId: child, source: "chat", payload: payload("mesh.message") },
       ]);
-      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
 
       // Child cannot select while locked
       expect(() => mesh.selectInboxEntries(child, ["item-1"])).toThrow(/needs attention/i);
@@ -15599,8 +15594,7 @@ describe("accountRun token accounting (#443)", () => {
       expect(replacement?.source).toBe("chat");
       expect(replacement?.payload).toEqual(payload("mesh.message"));
 
-      // Old entry is handled, fresh entry has 0 completed focus runs; child has no exhausted work
-      expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
+      // Old entry is handled, fresh entry has 0 completed focus runs and is selectable.
       expect(mesh.selectInboxEntries(child, [replacementId])).toHaveLength(1);
 
       // Child is dispatched upon release, and the replacement gets the full
@@ -15626,7 +15620,6 @@ describe("accountRun token accounting (#443)", () => {
       inboxStore.append([
         { id: "item-1", actorId: child, source: "chat", payload: payload("mesh.message") },
       ]);
-      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
 
       // Parent marks handled
       const res = mesh.markChildInboxHandled(
@@ -15645,8 +15638,8 @@ describe("accountRun token accounting (#443)", () => {
         `Marked handled by parent (${parent}): confirmed review feedback was completed in PR #730`
       );
 
-      // Exhaustion clears because the entry is now handled
-      expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
+      // The entry is gone from the unhandled selection set after handling.
+      expect(mesh.hasOnlyExhaustedWork(child)).toBe(false);
     });
 
     it("preserves unhandled entries if atomic replacement fails during release (#748)", async () => {
@@ -15665,7 +15658,6 @@ describe("accountRun token accounting (#443)", () => {
       inboxStore.append([
         { id: "item-1", actorId: child, source: "chat", payload: payload("mesh.message") },
       ]);
-      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
 
       // Simulate a failure in replaceEntries (e.g. database insertion error)
       const originalReplace = inboxStore.replaceEntries;
@@ -15682,8 +15674,8 @@ describe("accountRun token accounting (#443)", () => {
       expect(entry?.handledAt).toBeNull();
       expect(entry?.handledNote).toBeNull();
 
-      // Child still has the entry available (still exhausted, not lost)
-      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
+      // The entry remains unhandled but cannot be re-selected while exhausted.
+      expect(() => mesh.selectInboxEntries(child, ["item-1"])).toThrow(/needs attention/i);
 
       // Restore and verify release works cleanly
       inboxStore.replaceEntries = originalReplace;

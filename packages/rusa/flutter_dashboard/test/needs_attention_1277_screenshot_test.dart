@@ -98,7 +98,6 @@ void main() {
         );
         await settleImages(tester, portraitUrls(_ids));
         expect(find.text('Repair the inbox listing query'), findsOneWidget);
-        expect(find.text('NEEDS ATTENTION'), findsNothing);
         expect(tester.takeException(), isNull);
         await captureBoundary(
           key,

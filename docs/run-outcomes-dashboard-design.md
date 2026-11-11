@@ -78,16 +78,11 @@ through three places:
      screenshot illustrates the handled case.
 
 Recent Activity is not where unresolved work is discovered. Selected work that
-a run leaves unhandled stays visible on the surfaces that own it:
-
-- **Selected / Work focus**: the item remains under "Selected work this run"
-  after the run ends, with its retry count. After bounded retries are exhausted
-  it carries a **Needs attention** badge until a meaningful change or explicit
-  operator action clears it.
-- **Queue**: the same card shows the Needs attention badge instead of an
-  ordinary queued checkpoint.
-- **Actor tree / overview row**: the owning actor carries the badge, so the
-  case is discoverable without opening the actor.
+a run leaves unhandled remains in the actor's inbox and may receive one durable
+retry. Once recovery is exhausted, selection refuses the entry until a meaningful
+change or explicit resolution. An active non-root child emits an
+`exhausted_inbox` notice to its parent. Root and actors with inactive parents
+receive neither a parent notice nor a dedicated dashboard exhaustion badge (#1277).
 
 The screenshot illustrates this completed work flow:
 
@@ -114,9 +109,9 @@ completion from an ordinary successful CLI return.
 
 After terminal settlement, reconcile only that run's selected inbox ids against
 durable handled state. Unhandled selected work remains pending and may receive a
-bounded, durable retry. Exhaustion projects Needs attention and requires a
-meaningful change or explicit operator action; unrelated inbox work cannot
-refill that budget. Delegation uses the child or transferred owner; dependency
+bounded, durable retry. After exhaustion it remains unhandled and selection
+refuses it until a meaningful change or explicit resolution; unrelated inbox work
+cannot refill that budget. Delegation uses the child or transferred owner; dependency
 waiting uses its durable edge. Neither needs a routine `complete` or `blocked`
 yield label.
 

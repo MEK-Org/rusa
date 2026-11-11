@@ -154,8 +154,8 @@ the pushed head → snooze the obligation only if it remains ready; otherwise
 schedule that wake to check the head's Checks and review.
 \`mark_handled\` accepts only entries selected in this run. Leave deferred work
 unhandled. A successful provider return gets at most one durable recovery for
-selected, still-unhandled work; after that it remains visible as Needs attention
-until the operator handles it. Listed-but-unselected work does not consume or gain a
+selected, still-unhandled work; after that it remains unhandled and cannot be
+selected again until resolved through the recovery path. Listed-but-unselected work does not consume or gain a
 recovery attempt.`;
 
 /** The inbox contract, with the active queue policy sentence where the host runs it. */
