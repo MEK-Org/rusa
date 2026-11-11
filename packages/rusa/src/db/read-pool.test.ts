@@ -290,6 +290,38 @@ describe("DbReadPool", () => {
     }
   });
 
+  it("keeps a queued read for a ready worker instead of handing it to a cold replacement", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-read-pool-cold-"));
+    const dbPath = join(dir, "cold.db");
+    new Database(dbPath).close();
+    const pool = await openPool({ size: 2, dbPath });
+    try {
+      // Replacements can no longer open the database, so none ever becomes ready.
+      rmSync(dbPath);
+      const running = testReads(pool).read("hold", { ms: 3000 });
+      const dying = testReads(pool).read("exit", {});
+      const queued = testReads(pool).read("hold", { ms: 0 });
+      await expect(dying).rejects.toBeInstanceOf(DbReadWorkerExitedError);
+      // A read arriving while the replacement is still starting.
+      const late = testReads(pool).read("hold", { ms: 0 });
+      // Bound to a replacement, either read would die with it; held for a ready
+      // worker, each is refused only once the pool gives up on starting one.
+      for (const read of [queued, late]) {
+        const failure = await read.then(
+          () => undefined,
+          (err: unknown) => err
+        );
+        expect(failure).not.toBeInstanceOf(DbReadWorkerExitedError);
+        expect(failure).toBeInstanceOf(DbReadUnavailableError);
+        expect(String(failure)).toMatch(/read workers failed to start 3 times/);
+      }
+      await expect(running).resolves.toBe(3000);
+    } finally {
+      await pool.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses reads beyond its queue bound instead of buffering without limit", async () => {
     const pool = await openPool({ size: 1, maxQueued: 1 });
     try {

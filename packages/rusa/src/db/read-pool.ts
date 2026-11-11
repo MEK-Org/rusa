@@ -128,7 +128,7 @@ export class DbReadPool implements DbReads {
         resolve: resolve as (value: unknown) => void,
         reject,
       };
-      const idle = this.slots.find((slot) => slot.current === null);
+      const idle = this.slots.find((slot) => slot.ready && slot.current === null);
       if (idle) this.dispatch(idle, pending);
       else if (this.queue.length >= this.maxQueued) {
         reject(new DbReadQueueFullError(`read queue is full (${this.maxQueued} waiting)`));
@@ -201,6 +201,7 @@ export class DbReadPool implements DbReads {
     if (message.type === "ready") {
       slot.ready = true;
       this.startFailures = 0;
+      this.pump(slot);
       return;
     }
     const pending = slot.current;
@@ -252,9 +253,9 @@ export class DbReadPool implements DbReads {
       );
       return;
     }
-    const replacement = this.spawn();
-    this.slots[index] = replacement;
-    this.pump(replacement);
+    // The replacement takes queued reads once it reports ready; until then
+    // they wait for whichever worker is ready first.
+    this.slots[index] = this.spawn();
   }
 
   /** Stop replacing workers; refuse waiting and future reads with `error`. */
