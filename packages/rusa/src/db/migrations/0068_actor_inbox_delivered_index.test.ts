@@ -113,8 +113,8 @@ describe("0068_actor_inbox_delivered_index", () => {
     expect(plan).not.toContain("TEMP B-TREE FOR ORDER BY");
   });
 
-  it("proves query plans fail without 0068 (requiring TEMP B-TREE FOR ORDER BY)", () => {
-    // Drop the 0068 index and re-analyze to simulate pre-0068 schema with statistics
+  it("proves the actual pre-0068 schema scans and sorts handled and all listings", () => {
+    // Drop 0068 and re-analyze: every other migration remains installed.
     db.exec("DROP INDEX idx_actor_inbox_delivered; ANALYZE;");
 
     const handledPlan = planOf(
@@ -122,6 +122,7 @@ describe("0068_actor_inbox_delivered_index", () => {
       "test-actor",
       11
     );
+    expect(handledPlan).toContain("SCAN actor_inbox_entries");
     expect(handledPlan).toContain("USE TEMP B-TREE FOR ORDER BY");
     expect(handledPlan).not.toContain("idx_actor_inbox_delivered");
 
@@ -130,12 +131,51 @@ describe("0068_actor_inbox_delivered_index", () => {
       "test-actor",
       11
     );
+    expect(allPlan).toContain("SCAN actor_inbox_entries");
     expect(allPlan).toContain("USE TEMP B-TREE FOR ORDER BY");
     expect(allPlan).not.toContain("idx_actor_inbox_delivered");
   });
 
   it("serves seeded history with exact order, pagination cursor, and unhandled count", () => {
     const actorId = "test-actor";
+    const tieActorId = "tie-actor";
+    const tiedDeliveredAt = "2026-11-09T13:00:00.000Z";
+    db.prepare(
+      `INSERT INTO actor_inbox_entries (id, actor_id, source, delivered_at, handled_at, payload_json)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      "tied-a",
+      tieActorId,
+      "mesh:peer",
+      tiedDeliveredAt,
+      tiedDeliveredAt,
+      JSON.stringify({ type: "normal" })
+    );
+    // Insert against the expected tie order: `id DESC` must still put tied-z first.
+    db.prepare(
+      `INSERT INTO actor_inbox_entries (id, actor_id, source, delivered_at, handled_at, payload_json)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      "tied-z",
+      tieActorId,
+      "mesh:peer",
+      tiedDeliveredAt,
+      tiedDeliveredAt,
+      JSON.stringify({ type: "normal" })
+    );
+
+    const tiedFirstPage = inbox.list(tieActorId, { status: "handled", limit: 1 });
+    expect(tiedFirstPage.entries.map((entry) => entry.id)).toEqual(["tied-z"]);
+    expect(tiedFirstPage.nextCursor).not.toBeNull();
+    expect(
+      inbox
+        .list(tieActorId, {
+          status: "handled",
+          limit: 1,
+          cursor: tiedFirstPage.nextCursor ?? undefined,
+        })
+        .entries.map((entry) => entry.id)
+    ).toEqual(["tied-a"]);
 
     // 1. Handled listing page 1
     const p1 = inbox.list(actorId, { status: "handled", limit: 10 });
