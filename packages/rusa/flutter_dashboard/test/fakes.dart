@@ -242,7 +242,13 @@ class FakeApi extends DashboardApi {
   final eventOrderCalls = <String?>[];
   List<String> rootControlProviders = ['agy', 'codex'];
   final rootSpawnCalls =
-      <({String charter, String? title, String? provider, String? model})>[];
+      <({
+        String charter,
+        String? title,
+        String? provider,
+        String? model,
+        bool? unsandboxed,
+      })>[];
   final rootHoldClearCalls = <({String provider, List<String>? models})>[];
   int rootHoldClearReleased = 2;
   Object? rootHoldClearError;
@@ -484,16 +490,25 @@ class FakeApi extends DashboardApi {
     String? title,
     String? provider,
     String? model,
+    bool? unsandboxed,
   }) async {
     rootSpawnCalls.add((
       charter: charter,
       title: title,
       provider: provider,
       model: model,
+      unsandboxed: unsandboxed,
     ));
+    final hasRoot = threadsResult.any((t) => t.id == 'root');
     threadsResult = [
       ...threadsResult,
-      makeThread(spawnedRootChildId, parent: 'root', title: title),
+      makeThread(
+        spawnedRootChildId,
+        parent: hasRoot ? 'root' : null,
+        title: title,
+        charterPreview: charters[spawnedRootChildId] ?? charter,
+        runState: RunState.idle,
+      ),
     ];
     return spawnedRootChildId;
   }

@@ -202,6 +202,13 @@ export interface SpawnRequest {
   conversationId?: string;
   /** A brief one-line description of what this actor is tasked with, shown under its name in the dashboard. */
   title?: string;
+  /**
+   * Record the new actor as running outside managed sandboxing (#550). Spawn's
+   * default is sandboxed and every existing caller omits this; the operator
+   * dashboard's first-actor bootstrap is the only path that may pass `true`,
+   * and root control gates that case (empty mesh) before it reaches spawn.
+   */
+  unsandboxed?: boolean;
 }
 
 export type MessageDeliveryResult =
@@ -3313,10 +3320,18 @@ export class ActorMesh {
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
-      // A spawned child is sandboxed: the default, since spawn never asks
-      // for `unsandboxed` (#550).
-      ...(req.executionTarget !== undefined
-        ? { executionConfig: { executionTarget: req.executionTarget } }
+      // A spawned child is sandboxed by default. `unsandboxed: true` is only
+      // ever passed by the operator first-actor bootstrap (root control gates
+      // the empty-mesh case); every other caller omits it (#550).
+      ...(req.executionTarget !== undefined || req.unsandboxed === true
+        ? {
+            executionConfig: {
+              ...(req.unsandboxed === true ? { unsandboxed: true } : {}),
+              ...(req.executionTarget !== undefined
+                ? { executionTarget: req.executionTarget }
+                : {}),
+            },
+          }
         : {}),
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can

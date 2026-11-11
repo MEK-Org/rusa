@@ -1423,6 +1423,56 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
+  it("POST /api/mesh/actors forwards the operator's sandbox choice", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/actors",
+      JSON.stringify({
+        charter: "Bootstrap the mesh",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        unsandboxed: true,
+      })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+
+    expect(res.statusCode).toBe(201);
+    expect(rootSpawns).toEqual([
+      {
+        principal: LOCAL_USER,
+        request: {
+          charter: "Bootstrap the mesh",
+          modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium", effort: undefined },
+          title: undefined,
+          context: undefined,
+          unsandboxed: true,
+        },
+      },
+    ]);
+  });
+
+  it("POST /api/mesh/actors omits a malformed sandbox choice", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/actors",
+      JSON.stringify({
+        charter: "Bootstrap the mesh",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        unsandboxed: "yes",
+      })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+
+    expect(res.statusCode).toBe(201);
+    expect(rootSpawns).toHaveLength(1);
+    expect(rootSpawns[0].request).not.toHaveProperty("unsandboxed");
+  });
+
   it("POST /api/mesh/actors/:id/reparent delegates an operator move", async () => {
     const { res } = await call(
       deps,

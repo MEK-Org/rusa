@@ -1063,9 +1063,12 @@ export async function handleMeshApiRequest(
                 typeof body.compactionModel === "string" ? body.compactionModel : undefined,
             });
             const target = typeof body.target === "string" ? body.target : undefined;
+            const unsandboxed =
+              typeof body.unsandboxed === "boolean" ? body.unsandboxed : undefined;
             const id = deps.rootControl?.spawnChild(
               {
                 ...(target !== undefined ? { executionTarget: target } : {}),
+                ...(unsandboxed !== undefined ? { unsandboxed } : {}),
                 charter: typeof body.charter === "string" ? body.charter : "",
                 modelConfig: {
                   provider: typeof body.provider === "string" ? body.provider : "",

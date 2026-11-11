@@ -3,6 +3,7 @@ import { assertConcreteModelConfig, isModelClassReference } from "../providers/m
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
+import { defaultGrantRecipient } from "./administrative-capabilities.js";
 import {
   type RootControlMesh,
   type RootControlOptions,
@@ -490,5 +491,108 @@ describe("RootControlService", () => {
       "halt recovery is unavailable"
     );
     expect(events).toHaveLength(0);
+  });
+
+  it("forwards the bootstrap sandbox choice to the mesh and audits it", () => {
+    const { mesh, events, service } = setup();
+    service.spawnChild(
+      {
+        charter: "first actor",
+        modelConfig: { provider: "agy", model: "flash" },
+        unsandboxed: true,
+      },
+      "e2e-controller"
+    );
+    expect(mesh.spawn).toHaveBeenCalledWith(expect.objectContaining({ unsandboxed: true }));
+    expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({ unsandboxed: true });
+
+    service.spawnChild(
+      { charter: "second actor", modelConfig: { provider: "agy", model: "flash" } },
+      "e2e-controller"
+    );
+    // An absent choice keeps the sandboxed default and is not sent at all.
+    expect(vi.mocked(mesh.spawn).mock.calls[1][0]).not.toHaveProperty("unsandboxed");
+  });
+
+  it("refuses unsandboxed once the mesh has any actor", () => {
+    const { mesh, service } = setup();
+    vi.mocked(mesh.list).mockReturnValue([{ id: "actor-1" } as never]);
+    expect(() =>
+      service.spawnChild(
+        {
+          charter: "late unsandboxed ask",
+          modelConfig: { provider: "agy", model: "flash" },
+          unsandboxed: true,
+        },
+        "e2e-controller"
+      )
+    ).toThrow(/empty mesh/);
+    expect(mesh.spawn).not.toHaveBeenCalled();
+  });
+
+  it("records the chosen sandbox setting and makes the first actor the default grant recipient", () => {
+    const actors = new InMemoryActorRepository();
+    const mesh = new ActorMesh({
+      actors,
+      idgen: (() => {
+        let n = 0;
+        return () => `actor-${++n}`;
+      })(),
+      createActor: () => ({ run: vi.fn() }) as unknown as Actor,
+    });
+    const service = new RootControlService({ mesh, providers: ["agy"] });
+    const operator = "00000000-0000-4000-8000-000000000001";
+
+    const first = service.spawnChild(
+      {
+        charter: "bootstrap the mesh",
+        modelConfig: { provider: "agy", model: "flash" },
+        unsandboxed: true,
+      },
+      operator
+    );
+    // The chosen isolation is recorded on the versioned execution_config
+    // document, and the first actor is the default grant recipient by being
+    // the oldest active parentless actor (#1260 amendment).
+    expect(actors.get(first)?.executionConfig?.unsandboxed).toBe(true);
+    expect(defaultGrantRecipient(mesh.list())?.id).toBe(first);
+
+    // Sandboxed first-actor choice on an empty mesh records unsandboxed: false
+    // and is also the default grant recipient.
+    const actorsSandboxed = new InMemoryActorRepository();
+    const meshSandboxed = new ActorMesh({
+      actors: actorsSandboxed,
+      idgen: () => "actor-sandboxed",
+      createActor: () => ({ run: vi.fn() }) as unknown as Actor,
+    });
+    const serviceSandboxed = new RootControlService({ mesh: meshSandboxed, providers: ["agy"] });
+    const firstSandboxed = serviceSandboxed.spawnChild(
+      {
+        charter: "bootstrap the mesh sandboxed",
+        modelConfig: { provider: "agy", model: "flash" },
+        unsandboxed: false,
+      },
+      operator
+    );
+    expect(actorsSandboxed.get(firstSandboxed)?.executionConfig?.unsandboxed ?? false).toBe(false);
+    expect(defaultGrantRecipient(meshSandboxed.list())?.id).toBe(firstSandboxed);
+
+    const second = service.spawnChild(
+      { charter: "ordinary child", modelConfig: { provider: "agy", model: "flash" } },
+      operator
+    );
+    expect(actors.get(second)?.executionConfig?.unsandboxed ?? false).toBe(false);
+
+    // The mesh is no longer empty: unsandboxed is refused from here on.
+    expect(() =>
+      service.spawnChild(
+        {
+          charter: "late unsandboxed ask",
+          modelConfig: { provider: "agy", model: "flash" },
+          unsandboxed: true,
+        },
+        operator
+      )
+    ).toThrow(/empty mesh/);
   });
 });
