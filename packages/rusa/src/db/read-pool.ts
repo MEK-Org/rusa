@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
@@ -6,22 +5,29 @@ import { type Logger, nullLogger } from "../observability/logger.js";
 import type { DbReads, ReadInput, ReadOperationName, ReadOutput } from "./read-operations.js";
 import type { ReadRequest, ReadWorkerMessage } from "./read-worker-runtime.js";
 
-/** Too many reads are already waiting; the caller should answer "busy". */
-export class DbReadQueueFullError extends Error {
+/**
+ * The pool could not serve a read, though nothing was wrong with the read
+ * itself. The dashboard answers 503 for every subclass.
+ */
+export class DbReadUnavailableError extends Error {
+  override readonly name: string = "DbReadUnavailableError";
+}
+
+/** Too many reads are already waiting. */
+export class DbReadQueueFullError extends DbReadUnavailableError {
   override readonly name = "DbReadQueueFullError";
 }
 
 /** The pool is shutting down or has stopped; it accepts no new reads. */
-export class DbReadPoolClosedError extends Error {
+export class DbReadPoolClosedError extends DbReadUnavailableError {
   override readonly name = "DbReadPoolClosedError";
 }
 
 /**
- * The worker running this read stopped before answering. A read changes
- * nothing, so the caller may simply ask again; the pool has already replaced
- * the worker.
+ * The worker running this read stopped before answering. The pool has already
+ * replaced it, so a later request can succeed.
  */
-export class DbReadWorkerExitedError extends Error {
+export class DbReadWorkerExitedError extends DbReadUnavailableError {
   override readonly name = "DbReadWorkerExitedError";
 }
 
@@ -58,12 +64,15 @@ const MAX_START_FAILURES = 3;
 
 /**
  * The read worker tsup builds beside the shared chunk that carries this pool,
- * or null when running from source (tests, `tsx`), where nothing was built.
- * Returned as a path: Node's `Worker` rejects a `URL` from any other realm.
+ * or null when this module runs from source (tests, `tsx`), where nothing was
+ * built. A built run always gets the path, even when the file is missing, so a
+ * packaging regression fails `DbReadPool.open` at startup instead of quietly
+ * keeping reads on the main thread. Returned as a path: Node's `Worker`
+ * rejects a `URL` from any other realm.
  */
-export function bundledReadWorker(): string | null {
-  const path = join(dirname(fileURLToPath(import.meta.url)), "db-read-worker.js");
-  return existsSync(path) ? path : null;
+export function bundledReadWorker(moduleUrl: string = import.meta.url): string | null {
+  if (moduleUrl.endsWith(".ts")) return null;
+  return join(dirname(fileURLToPath(moduleUrl)), "db-read-worker.js");
 }
 
 /**
@@ -236,7 +245,11 @@ export class DbReadPool implements DbReads {
     }
     if (this.startFailures >= MAX_START_FAILURES) {
       this.slots.splice(index, 1);
-      this.fail(new Error(`read workers failed to start ${this.startFailures} times: ${reason}`));
+      this.fail(
+        new DbReadUnavailableError(
+          `read workers failed to start ${this.startFailures} times: ${reason}`
+        )
+      );
       return;
     }
     const replacement = this.spawn();

@@ -4444,11 +4444,12 @@ async function composeStart(
   // Read workers open their connections only now, after migrations and before
   // the dashboard serves a request; acquired before the dashboard server, so
   // shutdown stops serving first and then drains the reads already accepted.
-  // A source run has no built worker and keeps the dashboard's reads in-process.
+  // A source run has no built worker and keeps the dashboard's reads in-process;
+  // a built run whose worker is missing fails here instead.
   const readWorker = bindDashboard ? bundledReadWorker() : null;
   if (bindDashboard && !readWorker) {
     log.warn("db_read_pool_unavailable", {
-      reason: "read worker not built; reads stay in-process",
+      reason: "running from source; reads stay in-process",
     });
   }
   const dbReads = readWorker

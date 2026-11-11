@@ -15,8 +15,8 @@ export default defineConfig({
     cli: "src/cli.ts",
     "commands/e2e.cli": "src/commands/e2e.cli.ts",
     // Started by DbReadPool, which resolves it beside the shared chunk that
-    // carries the pool; a worker that fails to load fails DbReadPool.open at
-    // startup rather than a later read (#1289).
+    // carries the pool; a built run whose worker is missing or fails to load
+    // fails DbReadPool.open at startup rather than a later read (#1289).
     "db-read-worker": "src/db/read-worker.ts",
   },
   format: ["esm"],

@@ -15,6 +15,7 @@ import {
   DbReadPool,
   DbReadPoolClosedError,
   DbReadQueueFullError,
+  DbReadUnavailableError,
   DbReadWorkerExitedError,
 } from "./read-pool.js";
 
@@ -317,8 +318,46 @@ describe("DbReadPool", () => {
     await closing;
   });
 
-  it("finds no bundled worker from source, so a source run keeps its reads in-process", () => {
-    expect(bundledReadWorker()).toBeNull();
+  it("keeps reads in-process only from source; a built run missing its worker fails startup", async () => {
+    expect(bundledReadWorker(pathToFileURL(join(here, "read-pool.ts")).href)).toBeNull();
+    const dir = mkdtempSync(join(tmpdir(), "rusa-read-pool-dist-"));
+    try {
+      const worker = bundledReadWorker(pathToFileURL(join(dir, "chunk-abc123.js")).href);
+      expect(worker).toBe(join(dir, "db-read-worker.js"));
+      await expect(
+        DbReadPool.open({ dbPath: meshDbPath(home), worker: worker as string })
+      ).rejects.toThrow(/Cannot find module/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("answers 503 when the pool cannot serve a route's read, including the tree route", async () => {
+    const pool = await openPool({ size: 1, maxQueued: 0 });
+    const deps = {
+      reads: pool,
+      obligations: getRepositories().obligations,
+    } as unknown as DashboardDataDeps;
+    const server: Server = createServer((req, res) => {
+      void handleMeshApiRequest(req, res, new URL(req.url ?? "/", "http://localhost"), deps);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const running = testReads(pool).read("hold", { ms: 1000 });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      for (const path of ["/api/mesh/obligations", "/api/mesh/obligations/root-a/tree"]) {
+        const response = await fetch(`${base}${path}`);
+        expect({ path, status: response.status }).toEqual({ path, status: 503 });
+        expect(((await response.json()) as { error: string }).error).toMatch(/queue is full/);
+      }
+      await running;
+      const tree = await fetch(`${base}/api/mesh/obligations/root-a/tree`);
+      expect(tree.status).toBe(200);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await pool.close();
+    }
   });
 
   it("fails startup when its workers cannot open the database", async () => {
@@ -345,6 +384,7 @@ describe("DbReadPool", () => {
           (err: unknown) => (err instanceof DbReadWorkerExitedError ? undefined : err)
         );
       }
+      expect(failure).toBeInstanceOf(DbReadUnavailableError);
       expect(String(failure)).toMatch(/read workers failed to start 3 times/);
     } finally {
       await pool.close();

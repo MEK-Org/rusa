@@ -19,6 +19,7 @@ import {
   uploadAvatar,
 } from "../avatar/avatars.js";
 import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
+import { DbReadUnavailableError } from "../db/read-pool.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type {
   AvailabilityHold,
@@ -1011,6 +1012,23 @@ async function resolveReferenceBatch(
  * server) every mesh route 503s — the static UI is unaffected.
  */
 export async function handleMeshApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: DashboardDataDeps | null
+): Promise<boolean> {
+  try {
+    return await routeMeshApiRequest(req, res, url, deps);
+  } catch (err) {
+    // A full queue, a worker that stopped mid-read or a closed or failed pool
+    // is the service being unavailable, not the request being bad (#1289).
+    if (!(err instanceof DbReadUnavailableError) || res.headersSent) throw err;
+    sendJson(res, 503, { error: err.message });
+    return true;
+  }
+}
+
+async function routeMeshApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
@@ -2810,7 +2828,10 @@ export async function handleMeshApiRequest(
     try {
       tree = await readsOf(deps).read("obligationTree", { id });
     } catch (err) {
-      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      // Only the tree's own validation (a cycle) is the request's fault. Matched
+      // by name: a read worker carries back an error's name, not its class.
+      if (!(err instanceof Error) || err.name !== "ObligationValidationError") throw err;
+      sendJson(res, 400, { error: err.message });
       return true;
     }
     if (!tree) {
