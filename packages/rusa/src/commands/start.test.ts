@@ -6662,17 +6662,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   it("runs portable brief and tail mode actors cleanly without compaction", async () => {
     let mesh: ActorMesh | undefined;
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "brief" },
-        },
       }),
       "utf8"
     );
@@ -8176,7 +8171,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       },
       geminiApiKey: "fake-gemini-key",
     };
-    patchRootActor({ context: { type: "portable", mode: "ledger" } });
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
     let mesh: ActorMesh | undefined;
@@ -8267,7 +8262,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     };
     patchRootActor({
       modelConfig: [{ provider: "claude", model: "claude-sonnet-5", effort: "high" }],
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "brief" },
     });
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
@@ -10367,7 +10362,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       2
     );
     writeFileSync(join(legacyDir, `${rootId}.json`), legacyBytes, "utf8");
-    patchRootActor({ context: { type: "portable", mode: "ledger" } });
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({

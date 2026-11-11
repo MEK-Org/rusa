@@ -1605,10 +1605,7 @@ async function composeStart(
   let rootModelConfigDescription: string | undefined;
   if (rootId !== undefined && importedRoot?.status === "active") {
     try {
-      assertSpawnContextSupported(
-        { context: importedRoot.context },
-        { ledgerCompactionAvailable: portableContextApiKey !== null }
-      );
+      assertSpawnContextSupported({ context: importedRoot.context });
     } catch (err) {
       log.error("root_context_unsupported", {
         rootId,

@@ -118,7 +118,7 @@ describe("resolveDashboardBranding", () => {
   });
 
   it("keeps the bundled icons when the root still shows the bundled default", () => {
-    // Nothing uploaded and no `rootActor.avatar`: the only image available is the
+    // Nothing uploaded and no stored root avatar: the only image available is the
     // generic bundled one, which is not this root's face.
     expect(resolveDashboardBranding({ handle: "ember-familiar" }).iconUrl).toBeNull();
   });
@@ -144,7 +144,7 @@ describe("resolveDashboardBranding", () => {
     expect(branding.iconUrl).toContain("/api/mesh/avatar/root.jpg?v=");
   });
 
-  it("uses a configured rootActor.avatar when nothing has been uploaded", () => {
+  it("uses a stored root avatar when nothing has been uploaded", () => {
     const configured = join(home, "custom-root.png");
     writeFileSync(configured, PNG_BYTES);
     const branding = resolveDashboardBranding({ avatarPath: configured });
@@ -153,7 +153,7 @@ describe("resolveDashboardBranding", () => {
     expect(branding.name).toBeNull();
   });
 
-  it("ignores a rootActor.avatar path that does not exist", () => {
+  it("ignores a stored root avatar path that does not exist", () => {
     expect(resolveDashboardBranding({ avatarPath: join(home, "missing.png") }).iconUrl).toBeNull();
   });
 });
