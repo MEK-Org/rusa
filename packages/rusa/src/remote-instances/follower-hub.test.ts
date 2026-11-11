@@ -955,7 +955,7 @@ describe("follower protocol window (#719)", () => {
     ...extra,
   });
 
-  it("fully admits a deployed v8 follower, dispatches the pending update and records it reconciled", async () => {
+  it("fully admits a deployed v8 follower, holds its runs for the pending update and records it reconciled", async () => {
     // The client is the deployed v8 follower.ts, reduced to its wire handling: it
     // sends its own constant, stops unless the reply carries exactly that constant,
     // and takes an update as a command without actorId whose type is "update",
@@ -990,6 +990,8 @@ describe("follower protocol window (#719)", () => {
     ]);
     // Full admission: it takes actor placement like any current follower.
     expect(() => h.hub.createHost("lagging", "actor-1")).not.toThrow();
+    // Its own update is pending, so new runs on it wait for that update (#1272).
+    expect(h.hub.isPlacementHeld("lagging")).toBe(true);
 
     const commands = (await (await h.post("/poll", { id: "lagging", session })).json()) as Array<
       Record<string, unknown>
@@ -1014,6 +1016,8 @@ describe("follower protocol window (#719)", () => {
     expect(h.hub.list()).toEqual([
       expect.objectContaining({ id: "lagging", protocolVersion: N, commitSha: targetSha }),
     ]);
+    // On the target revision its runs are no longer held.
+    expect(h.hub.isPlacementHeld("lagging")).toBe(false);
   });
 
   it("registers a current-protocol follower normally", async () => {

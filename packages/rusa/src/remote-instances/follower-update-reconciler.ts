@@ -20,6 +20,7 @@ export interface ReconcilerHub {
       id: string;
       commitSha?: string;
       updateStatus?: FollowerUpdateStatus;
+      generation?: string;
     }) => void
   ): () => void;
   onUpdateStatus?(callback: (followerId: string, status: FollowerUpdateStatus) => void): () => void;
@@ -43,6 +44,15 @@ export class FollowerUpdateReconciler {
   private readonly log: Logger;
   private unregisterCallbacks: (() => void)[] = [];
   private armed = false;
+  /**
+   * The generation this leader itself asked to update. It stays in memory: a
+   * successor cannot distinguish an interrupted command from one still draining.
+   */
+  private pendingAutomaticGeneration:
+    | { followerId: string; targetSha: string; generation: string }
+    | undefined;
+  /** Registration gives the process generation without exposing it in follower status. */
+  private readonly registeredGenerations = new Map<string, string>();
 
   constructor(
     private readonly store: FollowerUpdateTriggerStore,
@@ -132,7 +142,9 @@ export class FollowerUpdateReconciler {
     // is what releases the next follower after a successful automatic update.
     const followers = this.hub.list();
     for (const follower of followers) {
-      this.recordCurrentFollower(follower, trigger);
+      if (this.recordCurrentFollower(follower, trigger)) {
+        this.clearPendingAutomaticGeneration(follower.id, trigger.targetSha);
+      }
     }
 
     // recordCurrentFollower() persists a terminal attempt. Reload before consulting the
@@ -146,11 +158,10 @@ export class FollowerUpdateReconciler {
     // or restarting on its follower. Dispatching another automatic update there would
     // turn that uncertainty into a parallel rollout, so wait for its terminal outcome.
     //
-    // This gate also remains fail-closed if a pending follower dies mid-update and reconnects
-    // still lagging (e.g. host reboot or OOM kill before build reporting). A lagging reconnect
-    // does not release the gate because registration is terminal evidence only on proven targetSha
-    // restart. Operators can diagnose this stall via GET /followers/reconciliation, and clear it
-    // via POST /followers/:id/update or allow the next leader update (createTrigger) to reset it.
+    // A replacement leader remains fail-closed if a pending follower reconnects
+    // lagging: it cannot know whether the former command is still draining. The
+    // leader that sent the command keeps an in-memory generation witness and can
+    // record its own lagging replacement as a terminal failure on registration.
     const pendingFollowerId = this.pendingAutomaticFollower(refreshedTrigger);
     if (pendingFollowerId) {
       this.log.debug?.("follower_update_reconciliation_waiting_for_terminal_status", {
@@ -183,14 +194,14 @@ export class FollowerUpdateReconciler {
 
     // A terminal already_current status can arrive before the next registration
     // refreshes commitSha. Its durable success record is still terminal for this target.
-    if (this.store.hasSucceeded(follower.id, activeTrigger.targetSha)) return false;
+    if (this.terminalOutcome(follower, activeTrigger) === "succeeded") return false;
 
     // A previous automatic command has not yet reached a terminal outcome. This canonical
     // gate check ensures single-flight serialization across all callers to reconcileFollower().
     if (this.pendingAutomaticFollower(activeTrigger)) return false;
 
     // Fail-stop loop prevention: do NOT retry automatically if this follower previously failed for this targetSha
-    if (this.store.hasFailed(follower.id, activeTrigger.targetSha)) {
+    if (this.terminalOutcome(follower, activeTrigger) === "failed") {
       this.log.info("follower_update_skipped_prior_failure", {
         followerId: follower.id,
         targetSha: activeTrigger.targetSha,
@@ -219,6 +230,10 @@ export class FollowerUpdateReconciler {
       lastAttemptAt: new Date().toISOString(),
     };
     this.store.recordAttempt(follower.id, attempt);
+    const generation = this.registeredGenerations.get(follower.id);
+    this.pendingAutomaticGeneration = generation
+      ? { followerId: follower.id, targetSha: activeTrigger.targetSha, generation }
+      : undefined;
     try {
       this.hub.updateFollower(follower.id, {
         targetSha: activeTrigger.targetSha,
@@ -233,6 +248,7 @@ export class FollowerUpdateReconciler {
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       this.store.recordFailure(follower.id, activeTrigger.targetSha, error);
+      this.clearPendingAutomaticGeneration(follower.id, activeTrigger.targetSha);
       this.log.warn("follower_update_reconciliation_dispatch_error", {
         followerId: follower.id,
         targetSha: activeTrigger.targetSha,
@@ -246,7 +262,9 @@ export class FollowerUpdateReconciler {
     id: string;
     commitSha?: string;
     updateStatus?: FollowerUpdateStatus;
+    generation?: string;
   }): void {
+    if (follower.generation) this.registeredGenerations.set(follower.id, follower.generation);
     if (!this.armed) {
       this.log.debug?.("follower_reconciliation_deferred_not_armed", { followerId: follower.id });
       return;
@@ -254,7 +272,20 @@ export class FollowerUpdateReconciler {
     const trigger = this.store.getActiveTrigger();
     if (!trigger) return;
 
-    this.recordCurrentFollower(follower, trigger);
+    if (this.recordCurrentFollower(follower, trigger)) {
+      this.clearPendingAutomaticGeneration(follower.id, trigger.targetSha);
+    } else if (this.isSameLeaderLaggingReplacement(follower, trigger)) {
+      this.store.recordFailure(
+        follower.id,
+        trigger.targetSha,
+        "Follower registered a new generation before its automatic update reached a terminal outcome."
+      );
+      this.clearPendingAutomaticGeneration(follower.id, trigger.targetSha);
+      this.log.warn("follower_update_reconciliation_generation_replaced", {
+        followerId: follower.id,
+        targetSha: trigger.targetSha,
+      });
+    }
     this.reconcileAll();
   }
 
@@ -279,6 +310,8 @@ export class FollowerUpdateReconciler {
 
     if (status.status === "failed") {
       this.store.recordFailure(followerId, targetSha, status.error);
+      if (releasesAutomaticQueue)
+        this.clearPendingAutomaticGeneration(followerId, trigger.targetSha);
       this.log.warn("follower_update_reconciliation_failure", {
         followerId,
         targetSha,
@@ -287,6 +320,8 @@ export class FollowerUpdateReconciler {
       if (releasesAutomaticQueue) this.reconcileAll();
     } else if (status.status === "already_current") {
       this.store.recordSuccess(followerId, targetSha);
+      if (releasesAutomaticQueue)
+        this.clearPendingAutomaticGeneration(followerId, trigger.targetSha);
       this.log.info("follower_update_reconciliation_already_current", {
         followerId,
         targetSha,
@@ -294,6 +329,43 @@ export class FollowerUpdateReconciler {
       if (releasesAutomaticQueue) this.reconcileAll();
       else this.reportIfAllCurrent();
     }
+  }
+
+  /**
+   * Whether new runs on this follower must wait for its own update (#1272).
+   *
+   * Held while the active trigger's update for this follower has not reached a
+   * terminal outcome and either reconciliation is not armed yet (the boot
+   * window, when this leader has not decided who updates first) or this
+   * follower holds the one pending automatic attempt. A follower waiting
+   * behind another follower's attempt is not held. The terminal outcome is the
+   * same record {@link reconcileFollower} reads, so the two cannot disagree.
+   *
+   * A pending attempt that never advances keeps this follower held for as long
+   * as it keeps the single-flight gate closed: until its terminal status, an
+   * operator update of this follower, or the next trigger (see reconcileAll).
+   */
+  holdsPlacement(follower: { id: string; commitSha?: string }): boolean {
+    const trigger = this.store.getActiveTrigger();
+    if (!trigger) return false;
+    if (this.terminalOutcome(follower, trigger) !== null) return false;
+    if (!this.armed) return true;
+    return this.pendingAutomaticFollower(trigger) === follower.id;
+  }
+
+  /**
+   * This follower's terminal outcome for the trigger, read without recording:
+   * running the target is success even before {@link recordCurrentFollower}
+   * persists it.
+   */
+  private terminalOutcome(
+    follower: { id: string; commitSha?: string },
+    trigger: FollowerUpdateTrigger
+  ): "succeeded" | "failed" | null {
+    if (follower.commitSha === trigger.targetSha) return "succeeded";
+    if (this.store.hasSucceeded(follower.id, trigger.targetSha)) return "succeeded";
+    if (this.store.hasFailed(follower.id, trigger.targetSha)) return "failed";
+    return null;
   }
 
   /** Records a restart-confirmed success and tells the caller whether the follower is current. */
@@ -310,6 +382,29 @@ export class FollowerUpdateReconciler {
       });
     }
     return true;
+  }
+
+  /** A new process this leader saw after it sent the automatic update command. */
+  private isSameLeaderLaggingReplacement(
+    follower: { id: string; generation?: string },
+    trigger: FollowerUpdateTrigger
+  ): boolean {
+    const pending = this.pendingAutomaticGeneration;
+    return Boolean(
+      pending &&
+        pending.followerId === follower.id &&
+        pending.targetSha === trigger.targetSha &&
+        follower.generation &&
+        pending.generation !== follower.generation &&
+        this.pendingAutomaticFollower(trigger) === follower.id
+    );
+  }
+
+  private clearPendingAutomaticGeneration(followerId: string, targetSha: string): void {
+    const pending = this.pendingAutomaticGeneration;
+    if (pending?.followerId === followerId && pending.targetSha === targetSha) {
+      this.pendingAutomaticGeneration = undefined;
+    }
   }
 
   /** The one automatic command whose terminal outcome must be observed before another starts. */
