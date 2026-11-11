@@ -183,12 +183,7 @@ export class Repositories {
   }
 }
 
-export type {
-  ActorRun,
-  ActorRunOutcome,
-  PortableLedgerSource,
-  PortableLedgerSourceKind,
-} from "./actor-run-repository.js";
+export type { ActorRun, ActorRunOutcome } from "./actor-run-repository.js";
 export { ActorRunRepository } from "./actor-run-repository.js";
 export type {
   AvailabilityHold,
