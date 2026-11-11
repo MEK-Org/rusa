@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ActorOptions } from "../actor/actor.js";
 import type { ActorLifecycleEndEvent } from "../actor/actor-lifecycle.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
@@ -24,12 +25,13 @@ import {
   InMemoryEventSourceSubscriptionStore,
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
+import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { ActorHandle } from "./actor-handle.js";
+import { instanceWorkerFactory } from "./e2e-adapter.js";
 import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { registerFollowerRegistrationRecovery } from "./follower-registration-recovery.js";
@@ -42,6 +44,12 @@ import {
 
 const TARGET_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const STALE_SHA = "0011223344556677889900aabbccddeeff001122";
+const FIXTURE_CONFIG: RusaConfig = {
+  github: { account: "test-bot" },
+  webhook: { port: 0, secret: "test-secret" },
+  providers: {},
+  rootActor: { provider: "update-fixture", model: "test" },
+};
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -201,13 +209,14 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
   const ends: ActorLifecycleEndEvent[] = [];
   let releaseRuns: (() => void) | undefined;
   let blockRuns = false;
+  let runResult = { success: true, output: "done", exitCode: 0 };
   const provider: ProviderFactory = (_bridge, _options, selected) => ({
     name: "update-fixture",
     providerName: "update-fixture",
     model: selected?.model,
     async run() {
       if (blockRuns) await new Promise<void>((resolve) => (releaseRuns = resolve));
-      return { success: true, output: "done", exitCode: 0 };
+      return runResult;
     },
   });
   const mesh = new ActorMesh({
@@ -220,28 +229,21 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
     capabilityGrants: new InMemoryCapabilityGrantStore(),
     recordChat: () => "message",
     supportsExecutionTarget: (target) => target.length > 0,
+    // The production worker factory, so these cases cover its hold wiring.
     createActor: (context) => {
-      const target = context.record.executionConfig?.executionTarget;
-      if (!target) throw new Error("fixture worker lacks a follower target");
       context.lifecycle.add({
         onStart: (event) => void starts.push(event.runId),
         onEnd: (event) => void ends.push(event),
       });
-      return new ActorHandle({
-        host: hub.createHost(target, context.record.id),
-        context,
-        isPlacementHeld: () => hub.isPlacementHeld(target),
-        bootstrap: {
-          id: context.record.id,
-          cwd: home,
-          modelConfig: context.record.modelConfig,
-          providerOptions: { delayMs: 0 },
-        },
-        snapshot: () => ({ record: context.record, prompt: "update fixture" }),
-        saveSession: () => {},
-        onFailure: () => {},
-        logger: log,
-      });
+      const options = {
+        cwd: home,
+        mcpServers: [],
+        modelConfig: context.record.modelConfig ?? [],
+        loadSessionId: () => undefined,
+        saveSessionId: () => {},
+        buildPrompt: () => ({ prompt: "update fixture" }),
+      } as unknown as ActorOptions;
+      return instanceWorkerFactory(FIXTURE_CONFIG, hub, { logger: log })(context, options);
     },
   });
   const root = {
@@ -327,10 +329,51 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
       blockRuns = true;
     },
     releaseRun: () => releaseRuns?.(),
+    failRuns: () => {
+      runResult = { success: false, output: "provider failed", exitCode: 1 };
+    },
   };
 }
 
 describe("MEK-Org/rusa#1272 (a) held runs wait and then run once", () => {
+  it("holds ready work on a stale follower that registers before arming, then runs it once on the target", async () => {
+    // The reported ordering: a persisted trigger, the stale follower registers
+    // and work is ready while the leader is still booting.
+    const store = triggerStore();
+    const leader = await leaderWithFollowers({ store });
+    const stale = await leader.follower("edge", "edge-one", STALE_SHA);
+    const workerId = leader.mesh.spawn({
+      charter: "ready before arming",
+      parentId: "root",
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      executionTarget: "edge",
+    });
+    leader.deliver(workerId);
+    await stale.pump(() => leader.heldAdmissions() > 0);
+    expect(leader.starts).toEqual([]);
+
+    // Arming dispatches this follower's update, which keeps it held.
+    leader.hub.armReconciliation();
+    expect(store.getActiveTrigger()?.attempts.edge?.status).toBe("pending");
+    expect(leader.hub.isPlacementHeld("edge")).toBe(true);
+    expect(leader.starts).toEqual([]);
+
+    const updated = await leader.follower("edge", "edge-two", TARGET_SHA);
+    await updated.pump(() => leader.ends.some((event) => event.terminal.kind === "result"));
+    expect(leader.starts).toHaveLength(1);
+    // The old generation's never-started admission is dropped and re-queued as
+    // before; only one run executes.
+    expect(leader.ends.filter((event) => event.terminal.kind === "result")).toEqual([
+      expect.objectContaining({
+        runId: leader.starts[0],
+        terminal: expect.objectContaining({
+          kind: "result",
+          result: expect.objectContaining({ success: true }),
+        }),
+      }),
+    ]);
+  }, 15_000);
+
   it("fails a same-leader lagging replacement's pending attempt and runs its held work without retrying the update", async () => {
     const store = triggerStore();
     const leader = await leaderWithFollowers({ store });
@@ -510,6 +553,36 @@ describe("MEK-Org/rusa#1272 (b) an update restart interrupts the run in flight",
     expect(leader.ends[0]).toMatchObject({
       runId: leader.starts[0],
       terminal: { kind: "result", result: { success: false } },
+    });
+  }, 15_000);
+
+  it("keeps a run that fails on its own while draining an ordinary failed result", async () => {
+    const leader = await leaderWithFollowers({});
+    const old = await leader.follower("edge", "edge-one", STALE_SHA);
+    const worker = {
+      id: "draining-failure-worker",
+      parentId: "root",
+      charter: "fails during a drain",
+      executionConfig: { executionTarget: "edge" },
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    leader.actors.upsert(worker);
+    leader.mesh.rehydrate(worker);
+    leader.blockRuns();
+    leader.deliver(worker.id);
+    await old.pump(() => leader.starts.length > 0);
+
+    // The drain lets in-flight runs finish; this one fails by itself and
+    // reports its result, not an exit, so attribution does not apply.
+    await leader.reportStatus(old.session, "draining");
+    leader.failRuns();
+    leader.releaseRun();
+    await old.pump(() => leader.ends.length > 0);
+    expect(leader.ends[0]).toMatchObject({
+      runId: leader.starts[0],
+      terminal: { kind: "result", result: { success: false, output: "provider failed" } },
     });
   }, 15_000);
 });
