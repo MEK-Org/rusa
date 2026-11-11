@@ -26,7 +26,7 @@ function openrouterLog(): Logger {
   return _openrouterLogger;
 }
 
-/** Local end-to-end prototype. Fresh Pi process, portable context, built-in and MCP tools.
+/** Fresh Pi process, portable context, built-in and MCP tools.
  * Worker launches use the shared actor bwrap boundary with isolated Pi state.
  * Usage stays in an internal artifact, outside subscription accounting and quota pacing.
  */
@@ -51,14 +51,9 @@ export class OpenRouterProvider implements CodingProvider {
       return { success: false, output: reason, exitCode: 1 };
     };
     try {
-      const config = this.config.openrouterPoc;
-      if (process.env.RUSA_OPENROUTER_POC !== "1" || !config || !this.model) {
-        throw new Error(
-          "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, openrouterPoc and model"
-        );
-      }
+      if (!this.model) throw new Error("OpenRouter requires a model");
       if (opts.session?.id || opts.computerUse) {
-        throw new Error("OpenRouter prototype supports fresh runs without computer use only");
+        throw new Error("OpenRouter supports fresh runs without computer use only");
       }
       const actorCwd = resolve(opts.cwd);
       const authDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -129,7 +124,7 @@ export class OpenRouterProvider implements CodingProvider {
         "--model",
         this.model,
       ];
-      let command = config.piCommand ?? "pi";
+      let command = this.config.cliCommand ?? "pi";
       let spawnArgs = args;
       if (opts.sandbox) {
         const sandbox = buildActorBwrapArgs(
@@ -198,9 +193,9 @@ export class OpenRouterProvider implements CodingProvider {
         },
         handleStderrData: () => {},
         buildKilledResult: (termination) => ({ success: false, ...termination }),
-        buildSignalResult: () => failed("Pi prototype process signalled"),
-        buildExitResult: () => failed("Pi prototype process exited before settlement"),
-        buildSpawnErrorResult: () => failed("Pi prototype could not start"),
+        buildSignalResult: () => failed("Pi process signalled"),
+        buildExitResult: () => failed("Pi process exited before settlement"),
+        buildSpawnErrorResult: () => failed("Pi could not start"),
       });
       await transport?.close();
       if (!outcome) return processResult;

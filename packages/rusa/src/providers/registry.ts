@@ -9,6 +9,7 @@ import { OpenRouterProvider } from "./openrouter/provider.js";
 import {
   isProviderCommand,
   type ProviderCommand,
+  providerCapabilityName,
   validateProviderSelection,
 } from "./provider-selection.js";
 import type { CodingProvider } from "./types.js";
@@ -22,7 +23,11 @@ export {
 
 // Keyed by CLI command (the `cliCommand` resolved in getProvider). Antigravity's
 // binary is `agy`, so it registers under "agy" while its provider name is
-// "antigravity".
+// "antigravity". OpenRouter runs through Pi the same way: "pi" here, while the
+// configured provider name stays "openrouter". The Pi adapter is OpenRouter-only
+// (it passes `--provider openrouter`), so `cliCommand: pi` means Pi via OpenRouter.
+// Quota and pacing identity follows the configured provider ("openrouter"),
+// rather than `cliCommand` ("pi"), because Pi is only a harness and has no quota.
 interface ProviderAdapter {
   create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
 }
@@ -43,7 +48,7 @@ const providerAdapters = {
   },
   kimi: { create: (name, config, model) => new KimiProvider(name, config, model) },
   copilot: { create: (name, config, model) => new CopilotProvider(name, config, model) },
-  openrouter: {
+  pi: {
     create: (name, config, model) => new OpenRouterProvider(name, config, model),
   },
   fake: { create: (name) => new FakeProvider(undefined, name) },
@@ -74,13 +79,19 @@ function resolveThrottleLaneAlias(raw: string): string {
 /**
  * The canonical provider-pacing lane key for a configured provider name — the
  * shared identity used to fan multiple config keys aliasing the same CLI (or
- * modelConfig pool entries) onto one pacer/quota lane. Antigravity's binary is
+ * modelConfig pool entries) onto one pacer/quota lane.
+ *
+ * Quota and pacing identity follows the configured provider identity when the
+ * underlying capability is a harness without its own quota (e.g. Pi is only a
+ * harness and has no quota of its own; changing the executable to `pi` retains
+ * OpenRouter's provider identity and queue text). Antigravity's binary is
  * `agy`, so it canonicalizes there even when `cliCommand` is left unset.
  */
 export function providerThrottleKey(providerName: string, config: RusaConfig): string {
-  const cliCommand = config.providers[providerName]?.cliCommand;
-  const key = cliCommand ?? providerName;
-  return resolveThrottleLaneAlias(key);
+  const capability = providerCapabilityName(providerName, config);
+  // Pi is a harness with no quota of its own, so its lane is the configured
+  // provider. Every other cliCommand alias shares its CLI's quota lane.
+  return resolveThrottleLaneAlias(capability === "pi" ? providerName : capability);
 }
 
 /**

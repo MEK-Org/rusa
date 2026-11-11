@@ -1,5 +1,9 @@
 import type { RusaConfig } from "../config/types.js";
-import { providerCapabilityName, validateProviderSelection } from "./registry.js";
+import {
+  providerCapabilityName,
+  providerThrottleKey,
+  validateProviderSelection,
+} from "./registry.js";
 
 /**
  * One declared provider/model/effort choice — the atomic unit of the
@@ -256,12 +260,12 @@ export function validateModelConfigPool(
         `modelConfig entry for provider "${providerName}" is missing a model — omitted/blank models are not allowed, since that would silently select the provider's default`
       );
     }
-    if (providerCapabilityName(providerName, config) === "openrouter" && !opts.portable) {
-      throw new Error("OpenRouter prototype requires portable context");
+    if (providerCapabilityName(providerName, config) === "pi" && !opts.portable) {
+      throw new Error("OpenRouter requires portable context");
     }
     const selection = validateProviderSelection(config, providerName, requestedModel, entry.effort);
     const identity = JSON.stringify([
-      providerCapabilityName(providerName, config),
+      providerThrottleKey(providerName, config),
       selection.model ?? "",
       selection.effort ?? "",
     ]);
