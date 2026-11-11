@@ -513,6 +513,28 @@ describe("DbReadPool", () => {
     }
   });
 
+  it("takes a built worker's build from its code, not from the dist it was loaded from", async () => {
+    // The production entry, built as tsup.config.ts builds it but with a known
+    // id; the sentinel beside it names another build, as after a rollback
+    // restores an older dist under a worker that has already loaded a newer one.
+    const dir = mkdtempSync(join(buildDir, "built-worker-"));
+    await build({
+      config: false,
+      entry: { "db-read-worker": join(packageRoot, "src", "db", "read-worker.ts") },
+      outDir: dir,
+      format: ["esm"],
+      target: "node20",
+      external: ["better-sqlite3"],
+      define: { __RUSA_BUILD_ID__: JSON.stringify("compiled-build") },
+      silent: true,
+      clean: false,
+    });
+    writeFileSync(join(dir, ".build-ok"), "dist-build\n");
+    await expect(
+      DbReadPool.open({ dbPath: meshDbPath(home), worker: join(dir, "db-read-worker.js"), size: 1 })
+    ).rejects.toThrow(/read worker runs build compiled-build, but this process runs \(none\)/);
+  });
+
   it("refuses a worker that loaded another build, at startup and as a replacement", async () => {
     const control = controlDir();
     const pool = await DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 1 });

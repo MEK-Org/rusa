@@ -12,8 +12,8 @@ export interface ReadRequest {
 }
 
 /**
- * A worker's answer: `ready` once its connection is open, carrying the build it
- * loaded (see `readBuildSentinel`), then one per request.
+ * A worker's answer: `ready` once its connection is open, carrying the build of
+ * the code it runs (`BUILD_ID`), then one per request.
  */
 export type ReadWorkerMessage =
   | { readonly type: "ready"; readonly build: string | null }

@@ -2,7 +2,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import { readBuildSentinel } from "../update/build-sentinel.js";
+import { BUILD_ID } from "./build-id.js";
 import type { DbReads, ReadInput, ReadOperationName, ReadOutput } from "./read-operations.js";
 import type { ReadRequest, ReadWorkerMessage } from "./read-worker-runtime.js";
 
@@ -62,13 +62,6 @@ const DEFAULT_SIZE = 2;
 const DEFAULT_MAX_QUEUED = 256;
 /** Consecutive workers that may fail before opening their connection. */
 const MAX_START_FAILURES = 3;
-
-/**
- * The build this process runs: the sentinel the update tool writes into `dist`
- * and swaps in with it, read beside this module when it loads, at startup.
- * Null from source and from builds that write no sentinel.
- */
-const PROCESS_BUILD = readBuildSentinel(dirname(fileURLToPath(import.meta.url)));
 
 /**
  * The read worker tsup builds beside the shared chunk that carries this pool,
@@ -209,17 +202,17 @@ export class DbReadPool implements DbReads {
 
   private onMessage(slot: Slot, message: ReadWorkerMessage): void {
     if (message.type === "ready") {
-      if (message.build !== PROCESS_BUILD) {
+      if (message.build !== BUILD_ID) {
         // An update swapped `dist` (or a rollback restored it) after this
-        // process started, and the replacement loaded that build. Its reads
-        // and result shapes need not match this process or its migrations, so
-        // reads stay unavailable until the restart that follows the swap.
+        // process started, and the replacement loaded that build, wholly or in
+        // part. Its reads and result shapes need not match this process or its
+        // migrations, so reads stay unavailable until the process restarts.
         slot.stopping = true;
         void slot.worker.terminate();
         this.fail(
           new DbReadUnavailableError(
             `read worker runs build ${message.build ?? "(none)"}, ` +
-              `but this process runs ${PROCESS_BUILD ?? "(none)"}; reads resume after restart`
+              `but this process runs ${BUILD_ID ?? "(none)"}; reads resume after restart`
           )
         );
         return;
