@@ -182,12 +182,13 @@ import {
   ConfiguredActorImportError,
   resolveConfiguredActor,
 } from "../db/configured-actor-import.js";
-import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
+import { bundledReadWorker, DbReadPool } from "../db/read-pool.js";
 import type {
   AvailabilityHold,
   AvailabilityHoldOrigin,
@@ -4440,6 +4441,24 @@ async function composeStart(
     // cold cache as an authoritative empty snapshot (#527).
     await initialQuotaHistoryWarmup;
   }
+  // Read workers open their connections only now, after migrations and before
+  // the dashboard serves a request; acquired before the dashboard server, so
+  // shutdown stops serving first and then drains the reads already accepted.
+  // A source run has no built worker and keeps the dashboard's reads in-process.
+  const readWorker = bindDashboard ? bundledReadWorker() : null;
+  if (bindDashboard && !readWorker) {
+    log.warn("db_read_pool_unavailable", {
+      reason: "read worker not built; reads stay in-process",
+    });
+  }
+  const dbReads = readWorker
+    ? await DbReadPool.open({
+        dbPath: meshDbPath(mcHome),
+        worker: readWorker,
+        logger: log.child({ component: "db-read-pool" }),
+      })
+    : undefined;
+  if (dbReads) resources.acquire("db read pool", () => dbReads.close());
   const dashboardServer = bindDashboard
     ? await startDashboardServer({
         auth: config.auth,
@@ -4461,6 +4480,7 @@ async function composeStart(
           pushDeviceTokens: getRepositories().pushDeviceTokens,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
+          reads: dbReads,
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,

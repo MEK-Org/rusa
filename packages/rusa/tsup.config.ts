@@ -14,6 +14,10 @@ export default defineConfig({
   entry: {
     cli: "src/cli.ts",
     "commands/e2e.cli": "src/commands/e2e.cli.ts",
+    // Started by DbReadPool, which resolves it beside the shared chunk that
+    // carries the pool; a worker that fails to load fails DbReadPool.open at
+    // startup rather than a later read (#1289).
+    "db-read-worker": "src/db/read-worker.ts",
   },
   format: ["esm"],
   target: "node20",

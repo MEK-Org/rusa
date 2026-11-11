@@ -40,6 +40,11 @@ export interface TaskRow {
   result: string | null;
 }
 
+/** Where an instance's mesh database lives: `<mcHome>/data/mesh.db`. */
+export function meshDbPath(mcHome: string): string {
+  return join(mcHome, "data", "mesh.db");
+}
+
 /**
  * Open (and migrate) the SQLite database under `<mcHome>/data/mesh.db`.
  * Idempotent: returns the existing handle if already open.
@@ -47,11 +52,8 @@ export interface TaskRow {
 export function initDb(mcHome: string): Database.Database {
   if (db) return db;
 
-  const dataDir = join(mcHome, "data");
-  mkdirSync(dataDir, { recursive: true });
-
-  const dbPath = join(dataDir, "mesh.db");
-  db = new Database(dbPath);
+  mkdirSync(join(mcHome, "data"), { recursive: true });
+  db = new Database(meshDbPath(mcHome));
 
   // WAL for better concurrent read performance; enforce relational constraints.
   // The conversion goes through `widenToWal` rather than the bare pragma: a
