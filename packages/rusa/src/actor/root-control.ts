@@ -331,7 +331,6 @@ function normalizeContext(context: ContextConfig | undefined): ContextConfig | u
   return {
     type: "portable",
     mode: context.mode,
-    compactionModel: optionalTrimmed(context.compactionModel),
   };
 }
 

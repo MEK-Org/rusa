@@ -893,10 +893,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   applySecretFiles(parsed, mcHome);
 
   try {
-    assertSpawnContextSupported(
-      { context: parsed.rootActor?.context },
-      { ledgerCompactionAvailable: Boolean(parsed.geminiApiKey?.trim()) }
-    );
+    assertSpawnContextSupported({ context: parsed.rootActor?.context });
   } catch (err) {
     throw new Error(
       `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`

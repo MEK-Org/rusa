@@ -90,7 +90,7 @@ The core primitives:
 | `view_actor(actor_id?)` | Read an actor's id, handle, status, model and context configuration, charter and brief; omit `actor_id` for yourself. The current configuration and any `pending` replacement are reported separately, and your own view adds what your current run launched on. Any actor can be read by id. |
 | `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. Only a parent can retire its descendants. |
 | `set_actor_model(actor_id, model_config)` | Replace a child's provider/model pool in place (parent or root only). Provider changes and multi-entry pools are only allowed for portable-context actors. |
-| `set_actor_context(actor_id, context_mode, compaction_model?)` | Update an existing actor's context mode in place (`native`, `ledger`, `tail`, `brief`). Parent or subtree admin; the configured root can switch itself. Running actors switch at run end; idle or queued actors switch immediately. |
+| `set_actor_context(actor_id, context_mode)` | Update an existing actor's context mode in place (`native`, `tail`, `brief`). Parent or subtree admin; the configured root can switch itself. Running actors switch at run end; idle or queued actors switch immediately. |
 
 Two rules keep the mesh safe:
 
@@ -212,7 +212,7 @@ that the actor is not relying on the native session storage so it supports
 switching providers in addition to models.
 
 In code these are the actor's context modes: `native` (the provider's own
-session), and the portable `ledger` and `tail` modes. Only portable actors may
+session), and the portable `tail` and `brief` modes. Only portable actors may
 carry a **pool** of `{provider, model, effort?}` entries, tried
 earliest-available first, or be moved across providers with `set_actor_model`.
 

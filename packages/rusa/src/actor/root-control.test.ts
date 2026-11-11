@@ -208,8 +208,7 @@ describe("RootControlService", () => {
         modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
         context: {
           type: "portable",
-          mode: "ledger",
-          compactionModel: "  gemini-custom  ",
+          mode: "brief",
         },
       },
       "e2e-controller"
@@ -217,8 +216,7 @@ describe("RootControlService", () => {
 
     const context = {
       type: "portable",
-      mode: "ledger",
-      compactionModel: "gemini-custom",
+      mode: "brief",
     };
     expect(mesh.spawn).toHaveBeenCalledWith(
       expect.objectContaining({

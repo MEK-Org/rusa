@@ -1641,7 +1641,7 @@ describe("handleMeshApiRequest", () => {
     expect(rootHaltClears).toEqual([]);
   });
 
-  it("POST /api/mesh/actors forwards a portable context selection ", async () => {
+  it("POST /api/mesh/actors 400s the retired portable ledger context selection", async () => {
     const { res } = await call(
       deps,
       "POST",
@@ -1656,11 +1656,11 @@ describe("handleMeshApiRequest", () => {
     await new Promise((resolve) => process.nextTick(resolve));
     await new Promise((resolve) => process.nextTick(resolve));
 
-    expect(res.statusCode).toBe(201);
-    expect(rootSpawns[0]?.request).toMatchObject({
-      modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
-      context: { type: "portable", mode: "ledger" },
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({
+      error: "portable ledger mode has been retired; use 'brief' or 'tail' mode instead",
     });
+    expect(rootSpawns).toEqual([]);
   });
 
   it("POST /api/mesh/actors forwards target to root control", async () => {
