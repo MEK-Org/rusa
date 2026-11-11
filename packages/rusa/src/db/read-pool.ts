@@ -2,6 +2,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { readBuildSentinel } from "../update/build-sentinel.js";
 import type { DbReads, ReadInput, ReadOperationName, ReadOutput } from "./read-operations.js";
 import type { ReadRequest, ReadWorkerMessage } from "./read-worker-runtime.js";
 
@@ -61,6 +62,13 @@ const DEFAULT_SIZE = 2;
 const DEFAULT_MAX_QUEUED = 256;
 /** Consecutive workers that may fail before opening their connection. */
 const MAX_START_FAILURES = 3;
+
+/**
+ * The build this process runs: the sentinel the update tool writes into `dist`
+ * and swaps in with it, read beside this module when it loads, at startup.
+ * Null from source and from builds that write no sentinel.
+ */
+const PROCESS_BUILD = readBuildSentinel(dirname(fileURLToPath(import.meta.url)));
 
 /**
  * The read worker tsup builds beside the shared chunk that carries this pool,
@@ -175,7 +183,9 @@ export class DbReadPool implements DbReads {
       const onMessage = (message: ReadWorkerMessage) => {
         if (message.type !== "ready") return;
         cleanup();
-        resolve();
+        // The pool's own handler ran first and has refused a mismatched build.
+        if (this.failure) reject(this.failure);
+        else resolve();
       };
       const onExit = (code: number) => {
         cleanup();
@@ -199,6 +209,21 @@ export class DbReadPool implements DbReads {
 
   private onMessage(slot: Slot, message: ReadWorkerMessage): void {
     if (message.type === "ready") {
+      if (message.build !== PROCESS_BUILD) {
+        // An update swapped `dist` (or a rollback restored it) after this
+        // process started, and the replacement loaded that build. Its reads
+        // and result shapes need not match this process or its migrations, so
+        // reads stay unavailable until the restart that follows the swap.
+        slot.stopping = true;
+        void slot.worker.terminate();
+        this.fail(
+          new DbReadUnavailableError(
+            `read worker runs build ${message.build ?? "(none)"}, ` +
+              `but this process runs ${PROCESS_BUILD ?? "(none)"}; reads resume after restart`
+          )
+        );
+        return;
+      }
       slot.ready = true;
       this.startFailures = 0;
       this.pump(slot);
@@ -230,9 +255,10 @@ export class DbReadPool implements DbReads {
       startFailures: this.startFailures,
     });
     const index = this.slots.indexOf(slot);
-    if (this.closed) {
-      // Shutting down: finish with the workers that remain rather than start
-      // one that close() might never stop.
+    if (this.closed || this.failure) {
+      // Shutting down, or failed for good: finish with the workers that remain
+      // rather than start one that close() might never stop or that the
+      // failure has already ruled out.
       this.slots.splice(index, 1);
       if (this.slots.length === 0) {
         for (const waiting of this.queue.splice(0)) {

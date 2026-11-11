@@ -55,8 +55,9 @@ import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
-import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import * as readPool from "../db/read-pool.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
@@ -778,6 +779,48 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(passedOpts.quotaClientHealth?.()).toEqual({ quota_client_service_connected: 0 });
     } finally {
       startDashboardServerSpy.mockRestore();
+    }
+  });
+
+  it("hands the dashboard the read pool it opens on the mesh database (#1289)", async () => {
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    // A source run has no built worker; stand in for a built run's pool.
+    const workerSpy = vi
+      .spyOn(readPool, "bundledReadWorker")
+      .mockReturnValue("/dist/db-read-worker.js");
+    const pool = { read: vi.fn(), close: vi.fn(async () => {}) };
+    const openSpy = vi
+      .spyOn(readPool.DbReadPool, "open")
+      .mockResolvedValue(pool as unknown as readPool.DbReadPool);
+    try {
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      expect(openSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          dbPath: meshDbPath(homeDir),
+          worker: "/dist/db-read-worker.js",
+        })
+      );
+      expect(startDashboardServerSpy.mock.calls[0][0].mesh?.reads).toBe(pool);
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      expect(pool.close).toHaveBeenCalled();
+    } finally {
+      startDashboardServerSpy.mockRestore();
+      workerSpy.mockRestore();
+      openSpy.mockRestore();
     }
   });
 

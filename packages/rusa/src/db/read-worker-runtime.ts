@@ -11,9 +11,12 @@ export interface ReadRequest {
   readonly input: unknown;
 }
 
-/** A worker's answer: `ready` once its connection is open, then one per request. */
+/**
+ * A worker's answer: `ready` once its connection is open, carrying the build it
+ * loaded (see `readBuildSentinel`), then one per request.
+ */
 export type ReadWorkerMessage =
-  | { readonly type: "ready" }
+  | { readonly type: "ready"; readonly build: string | null }
   | { readonly type: "result"; readonly id: number; readonly value: unknown }
   | {
       readonly type: "error";
@@ -44,7 +47,8 @@ export function openReadConnection(dbPath: string): Database.Database {
 export function serveReads(
   port: MessagePort,
   db: Database.Database,
-  operations: ReadOperationTable
+  operations: ReadOperationTable,
+  build: string | null
 ): void {
   const repos: ReadRepositories = {
     obligations: new ObligationRepository(db),
@@ -67,5 +71,5 @@ export function serveReads(
     }
     port.postMessage(message);
   });
-  port.postMessage({ type: "ready" } satisfies ReadWorkerMessage);
+  port.postMessage({ type: "ready", build } satisfies ReadWorkerMessage);
 }

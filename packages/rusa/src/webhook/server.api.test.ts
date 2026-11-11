@@ -22,9 +22,11 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import type { DashboardDataDeps } from "../dashboard/api.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { DbReads } from "../db/read-operations.js";
 import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
@@ -244,6 +246,36 @@ describe("static dashboard request handler", () => {
       await started.close();
       db.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("startDashboardServer passes the read pool through to the obligation routes (#1289)", async () => {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const read = vi.fn(async () => null);
+    const started = await startDashboardServer({
+      port,
+      mesh: {
+        actors: new InMemoryActorRepository(),
+        meshEvents: new MeshEventRepository(db),
+        meshChat: new MeshChatRepository(db),
+        emitter: new MeshEventEmitter(),
+        obligations: new ObligationRepository(db),
+        reads: { read } as unknown as DbReads,
+      },
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/mesh/obligations/root-a/tree`);
+      expect(res.status).toBe(404);
+      expect(read).toHaveBeenCalledWith("obligationTree", { id: "root-a" });
+    } finally {
+      await started.close();
+      db.close();
     }
   });
 

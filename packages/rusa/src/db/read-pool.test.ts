@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -50,7 +50,44 @@ serveReads(parentPort, db, {
     return { before, after: countObligations() };
   },
   exit: () => process.exit(7),
-});
+}, null);
+`;
+
+// A worker that speaks only the pool's protocol, for the pool's own lifecycle.
+// It takes `dbPath` as a control directory: it records each start in `spawns`;
+// `mode` makes it start normally, die before `ready` (`fail`), or wait for a
+// `gate` file, report ready and exit soon after (`gated`); `build` is the build
+// it reports. `hold` answers after `ms`; `exit` dies mid-request.
+const PROTOCOL_WORKER_SOURCE = `
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { parentPort, workerData } from "node:worker_threads";
+
+const dir = workerData.dbPath;
+const control = (name) =>
+  existsSync(join(dir, name)) ? readFileSync(join(dir, name), "utf8") : null;
+appendFileSync(join(dir, "spawns"), "x");
+const mode = control("mode") ?? "ok";
+if (mode === "fail") process.exit(1);
+const serve = () => {
+  parentPort.on("message", (request) => {
+    if (request.op === "exit") process.exit(7);
+    const answer = { type: "result", id: request.id, value: request.input.ms };
+    setTimeout(() => parentPort.postMessage(answer), request.input.ms);
+  });
+  parentPort.postMessage({ type: "ready", build: control("build") });
+};
+if (mode === "gated") {
+  const timer = setInterval(() => {
+    if (!existsSync(join(dir, "gate"))) return;
+    clearInterval(timer);
+    serve();
+    setTimeout(() => {
+      appendFileSync(join(dir, "gated-exited"), "x");
+      process.exit(3);
+    }, 50);
+  }, 10);
+} else serve();
 `;
 
 /** The test worker's extra operations, which the production table does not name. */
@@ -67,6 +104,19 @@ let buildDir: string;
 let ownerA: string;
 let ownerB: string;
 let workerUrl: URL;
+let protocolWorker: string;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A control directory for the protocol worker, removed after the test. */
+function controlDir(): { dir: string; spawns: () => number; remove: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "rusa-read-pool-control-"));
+  return {
+    dir,
+    spawns: () => readFileSync(join(dir, "spawns"), "utf8").length,
+    remove: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
 
 /** Largest gap between 5 ms ticks while `work` runs: how long the event loop was held. */
 async function maxLoopGap<T>(work: () => Promise<T>): Promise<{ gap: number; value: T }> {
@@ -116,6 +166,8 @@ beforeAll(async () => {
     clean: false,
   });
   workerUrl = pathToFileURL(join(buildDir, "test-read-worker.js"));
+  protocolWorker = join(buildDir, "protocol-worker.mjs");
+  writeFileSync(protocolWorker, PROTOCOL_WORKER_SOURCE);
 }, 60_000);
 
 afterAll(() => {
@@ -421,6 +473,71 @@ describe("DbReadPool", () => {
     } finally {
       await pool.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays failed: a replacement already starting when the pool fails is not replaced", async () => {
+    const control = controlDir();
+    const pool = await DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 2 });
+    try {
+      // The second worker's replacement waits at its gate.
+      writeFileSync(join(control.dir, "mode"), "gated");
+      const held = testReads(pool).read("hold", { ms: 100 });
+      await expect(testReads(pool).read("exit", {})).rejects.toBeInstanceOf(
+        DbReadWorkerExitedError
+      );
+      await expect(held).resolves.toBe(100);
+      // The first worker's replacements cannot start, so the pool fails.
+      writeFileSync(join(control.dir, "mode"), "fail");
+      await expect(testReads(pool).read("exit", {})).rejects.toBeInstanceOf(
+        DbReadWorkerExitedError
+      );
+      await expect(testReads(pool).read("hold", { ms: 0 })).rejects.toThrow(
+        /read workers failed to start 3 times/
+      );
+      expect(control.spawns()).toBe(6);
+      // The gated replacement now reports ready late, then exits.
+      writeFileSync(join(control.dir, "gate"), "");
+      for (let i = 0; i < 200 && !existsSync(join(control.dir, "gated-exited")); i++) {
+        await sleep(10);
+      }
+      expect(existsSync(join(control.dir, "gated-exited"))).toBe(true);
+      await sleep(500);
+      expect(control.spawns()).toBe(6);
+      await expect(testReads(pool).read("hold", { ms: 0 })).rejects.toThrow(
+        /read workers failed to start 3 times/
+      );
+    } finally {
+      await pool.close();
+      control.remove();
+    }
+  });
+
+  it("refuses a worker that loaded another build, at startup and as a replacement", async () => {
+    const control = controlDir();
+    const pool = await DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 1 });
+    try {
+      // An update swaps in a new dist; the replacement loads it.
+      writeFileSync(join(control.dir, "build"), "next-build");
+      await expect(testReads(pool).read("exit", {})).rejects.toBeInstanceOf(
+        DbReadWorkerExitedError
+      );
+      const refused = await testReads(pool)
+        .read("hold", { ms: 0 })
+        .then(
+          () => undefined,
+          (err: unknown) => err
+        );
+      expect(refused).toBeInstanceOf(DbReadUnavailableError);
+      expect(String(refused)).toMatch(/runs build next-build, but this process runs \(none\)/);
+      await sleep(200);
+      expect(control.spawns()).toBe(2);
+      await expect(
+        DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 1 })
+      ).rejects.toThrow(/runs build next-build/);
+    } finally {
+      await pool.close();
+      control.remove();
     }
   });
 });
