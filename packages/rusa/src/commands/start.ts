@@ -852,27 +852,11 @@ export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boole
 }
 
 /**
- * The configured root actor runs unsandboxed by default (#465, #550). The e2e
- * harness has always sandboxed its root independently of deployment mode; retain
- * that harness-only exception, including container-boundary mode. Its record
- * states the same requested builder intent, not an isolation/authorization claim.
- * Both values derive from one flag, so stored intent and builder option agree.
- */
-export function rootExecutionIntent(params: { e2eMode: boolean }): {
-  sandbox: boolean;
-  executionConfig: ExecutionConfig;
-} {
-  return params.e2eMode
-    ? { sandbox: true, executionConfig: {} }
-    : { sandbox: false, executionConfig: { unsandboxed: true } };
-}
-
-/**
  * The builder `sandbox` flag for the configured actor, read from the execution
  * config stored on its row (#1002) so the two cannot disagree once the import
  * has made the row authoritative: the same deployment mapping as every worker.
- * The e2e harness keeps the exception {@link rootExecutionIntent} describes
- * and sandboxes its root whatever the row says.
+ * The e2e harness has always sandboxed its root independently of deployment
+ * mode, and keeps that harness-only exception whatever the row says.
  */
 export function configuredActorSandbox(params: {
   e2eMode: boolean;
@@ -1604,16 +1588,6 @@ async function composeStart(
   let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig> | undefined;
   let rootModelConfigDescription: string | undefined;
   if (rootId !== undefined && importedRoot?.status === "active") {
-    try {
-      assertSpawnContextSupported({ context: importedRoot.context });
-    } catch (err) {
-      log.error("root_context_unsupported", {
-        rootId,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-      process.exit(1);
-      return;
-    }
     try {
       rootBootModelConfig = resolveRootBootModelConfig({
         config,

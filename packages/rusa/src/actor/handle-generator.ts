@@ -524,14 +524,8 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * Generates a deterministic, friendly display handle for a thread UUID.
  *
  * The grandfathered root id `"root"` displays as `root-actor` by default. Fresh
- * roots have opaque ids; production wiring supplies their configured root handle.
+ * roots have opaque ids; their display handle is stored on the actor row.
  */
-export function generateRandomRootHandle(): string {
-  const adjIndex = Math.floor(Math.random() * ADJECTIVES.length);
-  const animIndex = Math.floor(Math.floor(Math.random() * ANIMALS.length));
-  return `${ADJECTIVES[adjIndex]}-${ANIMALS[animIndex]}`;
-}
-
 export function generateHandle(uuid: string): string {
   if (uuid === "root") return "root-actor";
   if (!UUID_REGEX.test(uuid)) return uuid;
@@ -546,9 +540,3 @@ export function generateHandle(uuid: string): string {
 
   return `${adjective}-${animal}`;
 }
-
-/**
- * Default standing charter for the root actor.
- */
-export const DEFAULT_ROOT_CHARTER =
-  "Root Orchestrator: Coordinates worker subagents, triages incoming events, maintains project goals, and oversees codebase tasks.";

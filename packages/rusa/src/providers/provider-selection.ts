@@ -33,10 +33,6 @@ export function isProviderCommand(command: string): command is ProviderCommand {
   return command in PROVIDER_CAPABILITIES;
 }
 
-/** Default root provider — `agy` (Antigravity). */
-export const DEFAULT_ROOT_PROVIDER = "antigravity";
-export const DEFAULT_ROOT_EFFORT = "high";
-
 /** The native CLI capability family behind a logical provider config key. */
 export function providerCapabilityName(providerName: string, config: RusaConfig): string {
   return config.providers[providerName]?.cliCommand?.trim() || providerName;

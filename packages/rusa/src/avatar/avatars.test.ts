@@ -10,7 +10,6 @@ import {
   type AvatarGenerationEvent,
   avatarCachePath,
   avatarsDir,
-  configuredRootAvatarPath,
   generateAvatarForce,
   generateAvatarOnce,
   isPngSignature,
@@ -82,12 +81,6 @@ describe("rootAvatarPath", () => {
     expect(p).not.toBeNull();
     expect(existsSync(p as string)).toBe(true);
   });
-
-  it("falls back to the bundled image when the configured path doesn't exist ", () => {
-    const p = rootAvatarPath("/nonexistent/ember.jpg");
-    expect(p).not.toBeNull();
-    expect(p).toBe(rootAvatarPath());
-  });
 });
 
 describe("with an isolated RUSA_HOME", () => {
@@ -123,15 +116,6 @@ describe("with an isolated RUSA_HOME", () => {
 
   it("readAvatar returns null for a worker with no cached file yet", () => {
     expect(readAvatar(UUID)).toBeNull();
-  });
-
-  it("readAvatar serves the configured avatar override for root ", () => {
-    const overridePath = join(home, "ember.jpg");
-    writeFileSync(overridePath, Buffer.from([0xff, 0xd8, 0xff]));
-
-    const served = readAvatar("root", { avatarPath: overridePath });
-    expect(served?.contentType).toBe("image/jpeg");
-    expect(served?.body.toString()).toBe(Buffer.from([0xff, 0xd8, 0xff]).toString());
   });
 
   it("readAvatar resolves root by its configured display handle too ", () => {
@@ -413,17 +397,9 @@ describe("with an isolated RUSA_HOME", () => {
     expect(rootBrandingImage()?.version).not.toBe(first?.version);
   });
 
-  it("rootBrandingImage sniffs a JPEG override without reading the whole file", () => {
-    const overridePath = join(home, "ember.jpg");
-    writeFileSync(overridePath, Buffer.from([0xff, 0xd8, 0xff, 0x00]));
-    expect(rootBrandingImage({ avatarPath: overridePath })?.contentType).toBe("image/jpeg");
-  });
-
-  it("configuredRootAvatarPath resolves only a path that exists", () => {
-    const overridePath = join(home, "ember.png");
-    expect(configuredRootAvatarPath(overridePath)).toBeNull();
-    writeFileSync(overridePath, PNG_BYTES);
-    expect(configuredRootAvatarPath(overridePath)).toBe(overridePath);
-    expect(configuredRootAvatarPath(undefined)).toBeNull();
+  it("rootBrandingImage sniffs a JPEG behind the root .png cache name", () => {
+    mkdirSync(join(home, "avatars"), { recursive: true });
+    writeFileSync(avatarCachePath("root"), Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+    expect(rootBrandingImage()?.contentType).toBe("image/jpeg");
   });
 });

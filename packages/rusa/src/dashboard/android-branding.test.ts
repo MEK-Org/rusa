@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { stringify as toYaml } from "yaml";
 import { CONFIGURED_ACTOR_IMPORT_SOURCE } from "../db/configured-actor-import.js";
 import { closeDb, initDb } from "../db/index.js";
 import {
@@ -37,17 +36,6 @@ describe("Android application id", () => {
 describe("resolveAndroidBranding", () => {
   let home: string;
   let originalHome: string | undefined;
-
-  function writeConfig(overrides: Record<string, unknown> = {}): void {
-    writeFileSync(
-      join(home, "config.yaml"),
-      toYaml({
-        github: { account: "CodeChopsBot" },
-        providers: { codex: { cliCommand: "codex" } },
-        ...overrides,
-      })
-    );
-  }
 
   function seedFixtureDb(opts: {
     receiptActorId?: string;
@@ -93,13 +81,12 @@ describe("resolveAndroidBranding", () => {
   });
 
   it("names the app after the imported root handle and derives its id from it", () => {
-    writeConfig();
     seedFixtureDb({
       receiptActorId: "actor-sf",
       actor: { id: "actor-sf", displayHandle: "silicon-familiar", parentId: null },
     });
 
-    expect(resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR, home })).toEqual({
+    expect(resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR })).toEqual({
       label: "Silicon Familiar",
       labelSource: 'imported root handle "silicon-familiar"',
       applicationId: "com.siliconfamiliar.dashboard",
@@ -111,12 +98,9 @@ describe("resolveAndroidBranding", () => {
   });
 
   it("keeps the built-in name, id and instance icon when no root handle is configured", () => {
-    writeConfig();
-
     const branding = resolveAndroidBranding({
       flutterAppDir: FLUTTER_APP_DIR,
       instance: "staging",
-      home,
     });
     expect(branding.label).toBe("Rusa Staging");
     expect(branding.applicationId).toBe("org.mek.rusa.dashboard");
@@ -126,13 +110,12 @@ describe("resolveAndroidBranding", () => {
   });
 
   it("treats the default root-actor handle as unbranded for both label and id", () => {
-    writeConfig();
     seedFixtureDb({
       receiptActorId: "actor-root",
       actor: { id: "actor-root", displayHandle: "root-actor", parentId: null },
     });
 
-    const branding = resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR, home });
+    const branding = resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR });
     expect(branding.label).toBe("Rusa");
     expect(branding.labelSource).toBe("built-in prod name");
     expect(branding.applicationId).toBe(LEGACY_ANDROID_APPLICATION_ID);
@@ -140,30 +123,27 @@ describe("resolveAndroidBranding", () => {
   });
 
   it("uses the uploaded root image, typed by its signature", () => {
-    writeConfig();
     mkdirSync(join(home, "avatars"));
     writeFileSync(join(home, "avatars", "root.png"), JPEG_BYTES);
 
-    const branding = resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR, home });
+    const branding = resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR });
     expect(branding.iconPath).toBe(join(home, "avatars", "root.png"));
     expect(branding.iconType).toBe("image/jpeg");
     expect(branding.iconSource).toBe("root image");
   });
 
   it("fails the build loudly on a handle with no legal derived id", () => {
-    writeConfig();
     seedFixtureDb({
       receiptActorId: "actor-bad",
       actor: { id: "actor-bad", displayHandle: "9-lives", parentId: null },
     });
 
-    expect(() => resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR, home })).toThrow(
+    expect(() => resolveAndroidBranding({ flutterAppDir: FLUTTER_APP_DIR })).toThrow(
       /root handle "9-lives" does not yield a legal Android application id \(com\.9lives\.dashboard\)/
     );
   });
 
   it("produces byte-identical applicationId, label, and launcher icon for an imported installation from a fixture database (#1261 acceptance)", () => {
-    writeConfig();
     mkdirSync(join(home, "data"), { recursive: true });
     mkdirSync(join(home, "avatars"), { recursive: true });
     writeFileSync(join(home, "avatars", "root.png"), JPEG_BYTES);
@@ -182,7 +162,6 @@ describe("resolveAndroidBranding", () => {
 
     const branding = resolveAndroidBranding({
       flutterAppDir: FLUTTER_APP_DIR,
-      home,
     });
 
     expect(branding).toEqual({

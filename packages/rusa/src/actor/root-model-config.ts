@@ -96,7 +96,7 @@ export function resolveRootBootModelConfig(input: {
     } catch (cause) {
       throw new RootModelConfigStartupError(
         `root actor '${rootId}' has a persisted model_config that is not valid under the current configuration: ${reasonOf(cause)} (persisted pool: ${describeModelConfigPool(persisted)})`,
-        "restore the provider/model it names in config.yaml, or clear the root row's model_config in the actors table; startup never overwrites a persisted root pool from the file",
+        "restore the provider/model it names in config.yaml, or replace the root row's model_config in mesh.db's actors table with a pool valid under the current configuration (clearing it leaves the root with no pool); startup never overwrites a persisted root pool from the file",
         { cause }
       );
     }

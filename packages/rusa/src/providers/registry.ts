@@ -15,8 +15,6 @@ import {
 import type { CodingProvider } from "./types.js";
 
 export {
-  DEFAULT_ROOT_EFFORT,
-  DEFAULT_ROOT_PROVIDER,
   providerCapabilityName,
   validateProviderSelection,
 } from "./provider-selection.js";

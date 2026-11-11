@@ -128,7 +128,7 @@ describe("resolveRootBootModelConfig", () => {
     expect(caught).toBeInstanceOf(RootModelConfigStartupError);
     const error = caught as RootModelConfigStartupError;
     expect(error.name).toBe("RootModelConfigStartupError");
-    expect(error.action).toMatch(/clear the root row's model_config/);
+    expect(error.action).toMatch(/replace the root row's model_config/);
     expect(error.cause).toBeInstanceOf(Error);
     // The failure is the whole point: the record is not touched on the way out.
     expect(actors.get("root")?.modelConfig).toEqual(pool);

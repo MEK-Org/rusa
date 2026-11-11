@@ -63,12 +63,10 @@ export interface ResolveAndroidBrandingOptions {
   instance?: string;
   /** The Flutter app whose bundled web icons are the fallback launcher image. */
   flutterAppDir: string;
-  /** Explicit Rusa home directory override. */
-  home?: string;
 }
 
 export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): AndroidBranding {
-  const mcHome = options.home ?? resolveHome();
+  const mcHome = resolveHome();
   const instance =
     options.instance && options.instance in BUILT_IN_NAMES ? options.instance : "prod";
   const dbPath = join(mcHome, "data", "mesh.db");
@@ -104,6 +102,10 @@ export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): 
   const labelSource =
     name === null ? `built-in ${instance} name` : `imported root handle "${rootHandle}"`;
 
+  // The import stored `rootActor.handle`, else the default `root-actor`, and
+  // nothing durable records which: an explicit `handle: root-actor` and an
+  // omitted one read back the same. The default reading wins, so every install
+  // that never configured a handle keeps the built-in id it always had.
   const isCustomHandle = Boolean(rootHandle && rootHandle !== generateHandle("root"));
   const applicationId =
     isCustomHandle && rootHandle
@@ -113,7 +115,7 @@ export function resolveAndroidBranding(options: ResolveAndroidBrandingOptions): 
     ? "derived from imported root handle"
     : "built-in default (no root handle)";
 
-  const image = rootBrandingImage(rootIdentity);
+  const image = rootBrandingImage();
   const iconPath =
     image?.path ?? resolve(options.flutterAppDir, "web/icons", instance, "Icon-maskable-512.png");
   const iconType = image?.contentType ?? "image/png";

@@ -256,7 +256,6 @@ import {
   type RunStartE2EHandles,
   type RunStartOptions,
   reactToQueuedInboxEntries,
-  rootExecutionIntent,
   shouldAppendServiceBootWake,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
@@ -6557,28 +6556,42 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).toContainEqual(expect.objectContaining({ name: "brief" }));
   });
 
-  it("rejects retired ledger mode on rootActor at startup", async () => {
-    let ready = false;
+  it("boots the receipt-selected actor persisted with retired ledger mode and rejects it at run launch", async () => {
+    // Same contract #1271 gives every stored actor: the row rehydrates so an
+    // operator can still inspect it or switch its context, and the retired mode
+    // fails when a run assembles its prompt. No startup refusal for this one.
     patchRootActor({ context: { type: "portable", mode: "ledger" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
+        geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
     );
 
-    await runStart({
-      e2e: {
-        onReady: () => {
-          ready = true;
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
         },
-      },
+      });
     });
 
-    expect(ready).toBe(false);
-    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(process.exit).not.toHaveBeenCalled();
+    if (!mesh) throw new Error("mesh not ready");
+    const root = mesh.get(rootId);
+    if (!root) throw new Error("root not rehydrated");
+    const rootOpts = (root as unknown as { opts: { buildPrompt: () => { prompt: string } } }).opts;
+    expect(() => rootOpts.buildPrompt()).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
   });
 
   it("rejects an actor persisted with retired ledger mode at run launch before provider invocation", async () => {
@@ -9325,7 +9338,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           level: "error",
           error: "RootModelConfigStartupError",
           reason: expect.stringMatching(/provider "claude" is not configured/),
-          action: expect.stringMatching(/clear the root row's model_config/),
+          action: expect.stringMatching(/replace the root row's model_config/),
         },
       ]);
       // Nothing rewrote the persisted pool on the way out.
@@ -9931,11 +9944,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // boot-time intent on every start.
     expect(booted.actors.get(rootId)?.executionConfig).toEqual({ unsandboxed: true });
     // runStart cannot boot a non-e2e root here, so the production pairing is
-    // asserted on the helpers the composition reads: a created row stores the
-    // intent, and the builder flag is derived from whatever the row stores.
-    const productionRoot = rootExecutionIntent({ e2eMode: false });
-    expect(productionRoot.executionConfig).toEqual({ unsandboxed: true });
-    for (const stored of [productionRoot.executionConfig, {}, { unsandboxed: false }]) {
+    // asserted on the helper the composition reads: the builder flag is
+    // derived from whatever the row stores.
+    for (const stored of [{ unsandboxed: true }, {}, { unsandboxed: false }]) {
       expect(
         configuredActorSandbox({
           e2eMode: false,

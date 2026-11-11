@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { generateHandle } from "../actor/handle-generator.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
@@ -144,17 +145,12 @@ describe("resolveDashboardBranding", () => {
     expect(branding.iconUrl).toContain("/api/mesh/avatar/root.jpg?v=");
   });
 
-  it("uses a stored root avatar when nothing has been uploaded", () => {
-    const configured = join(home, "custom-root.png");
-    writeFileSync(configured, PNG_BYTES);
-    const branding = resolveDashboardBranding({ avatarPath: configured });
+  it("brands the icon but not the name for a root image with no custom handle", () => {
+    cacheRootAvatar(PNG_BYTES);
+    const branding = resolveDashboardBranding({ handle: generateHandle("root") });
     expect(branding.iconUrl).toContain("/api/mesh/avatar/root.png?v=");
     // Image without a name: the built-in "Rusa" name stays.
     expect(branding.name).toBeNull();
-  });
-
-  it("ignores a stored root avatar path that does not exist", () => {
-    expect(resolveDashboardBranding({ avatarPath: join(home, "missing.png") }).iconUrl).toBeNull();
   });
 });
 

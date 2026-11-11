@@ -65,7 +65,7 @@ export function resolveDashboardBranding(rootIdentity?: RootAvatarIdentity): Das
   const handle = rootIdentity?.handle;
   const name = handle && handle !== generateHandle("root") ? formatBrandName(handle) : null;
 
-  const image = rootBrandingImage(rootIdentity);
+  const image = rootBrandingImage();
   if (!image) return name === null ? NO_BRANDING : { ...NO_BRANDING, name };
 
   // Reuse the existing avatar route rather than adding a second way to serve the
