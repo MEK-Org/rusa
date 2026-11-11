@@ -59,6 +59,7 @@ import { meshChatResponsive } from "./0063_mesh_chat_responsive.js";
 import { metricSamples } from "./0064_metric_samples.js";
 import { recentActivityHistoryIndexes } from "./0066_recent_activity_history_indexes.js";
 import { pushDeviceTokens } from "./0067_push_device_tokens.js";
+import { instanceInboxDelivery } from "./0068_instance_inbox_delivery.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -130,4 +131,5 @@ export const migrations: Migration[] = [
   metricSamples,
   recentActivityHistoryIndexes,
   pushDeviceTokens,
+  instanceInboxDelivery,
 ];

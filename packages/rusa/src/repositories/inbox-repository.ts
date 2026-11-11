@@ -68,7 +68,39 @@ export interface InboxAppendInput {
   actorId: string;
   source: string;
   deliveredAt?: Date;
+  /** Omit for ordinary inbound work. Outgoing rows are never actionable locally. */
+  deliveryDirection?: "incoming" | "outgoing";
+  /** Omit for ordinary inbound work, which is already delivered locally. */
+  deliveryState?: "pending" | "delivered";
   payload: InboxPayload;
+}
+
+/** One atomic chat-body write plus its corresponding durable delivery intent. */
+export interface InboxMessageDeliveryInput {
+  messageId: string;
+  senderId: string;
+  recipientId: string;
+  body: string;
+  responsive?: boolean;
+  deliveredAt?: Date;
+  /** The complete row is supplied by the caller so entity identity stays explicit. */
+  entry: InboxAppendInput;
+}
+
+export interface InboxMessageDelivery {
+  messageId: string;
+  entry: InboxEntry;
+}
+
+/**
+ * SQLite-only delivery extension used by the instance-owned execution draft.
+ * It intentionally does not widen the portable InboxRepository seam: normal
+ * consumers and their lightweight stores have no transport-delivery role.
+ */
+export interface InboxDeliveryStore {
+  recordMessageDelivery(input: InboxMessageDeliveryInput): InboxMessageDelivery;
+  listPendingOutgoing(): InboxEntry[];
+  markOutgoingDelivered(entryId: string): boolean;
 }
 
 export interface MarkHandledResult {
