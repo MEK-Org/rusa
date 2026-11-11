@@ -43,8 +43,8 @@ export interface ActorHandleOptions {
   target?: string;
   /**
    * Whether the hosting follower's update holds new runs (#1272). Consulted
-   * once per admission, before a provider ticket is taken; a held admission is
-   * deferred, and the follower's release dispatches the work again.
+   * before a provider ticket is taken and again after provider pacing; a held
+   * admission is deferred, and the follower's release dispatches the work again.
    */
   isPlacementHeld?: () => boolean;
   logger?: Logger;
@@ -1316,6 +1316,14 @@ export class ActorHandle implements MeshActor {
                     // actual admission boundary before exposing a snapshot to
                     // the follower, so no ordinary provider launch can cross a
                     // newly opened voice session.
+                    if (this.opts.isPlacementHeld?.()) {
+                      this.log.info("remote_admission_held_for_update", {
+                        actorId: this.id,
+                        target: this.opts.target ?? this.channel.nodeId,
+                      });
+                      this.send({ type: "reply", requestId, value: { deferred: true } });
+                      return;
+                    }
                     if (
                       !(await (ctx.admitRun?.({
                         responsive: admission.responsive,

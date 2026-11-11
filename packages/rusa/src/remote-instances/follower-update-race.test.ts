@@ -331,6 +331,38 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
 }
 
 describe("MEK-Org/rusa#1272 (a) held runs wait and then run once", () => {
+  it("fails a same-leader lagging replacement's pending attempt and runs its held work without retrying the update", async () => {
+    const store = triggerStore();
+    const leader = await leaderWithFollowers({ store });
+    leader.hub.armReconciliation();
+    const old = await leader.follower("edge", "edge-one", STALE_SHA);
+    expect(store.getActiveTrigger()?.attempts.edge?.status).toBe("pending");
+    expect(leader.hub.isPlacementHeld("edge")).toBe(true);
+
+    const workerId = leader.mesh.spawn({
+      charter: "wait for the edge follower",
+      parentId: "root",
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      executionTarget: "edge",
+    });
+    leader.deliver(workerId);
+    await old.pump(() => leader.heldAdmissions() > 0);
+    expect(leader.starts).toEqual([]);
+
+    // The old process disappeared before it could report a terminal update
+    // status. This leader saw both generations, so its durable pending attempt
+    // is now an ordinary failure rather than a permanent placement hold.
+    const replacement = await leader.follower("edge", "edge-two", STALE_SHA);
+    expect(store.getActiveTrigger()?.attempts.edge).toMatchObject({ status: "failed" });
+    expect(leader.hub.isPlacementHeld("edge")).toBe(false);
+    // A failed automatic attempt is fail-stop: the lagging replacement runs
+    // work, but the reconciler does not issue another update command for it.
+    expect(store.getActiveTrigger()?.attempts.edge?.status).toBe("failed");
+
+    await replacement.pump(() => leader.ends.some((event) => event.terminal.kind === "result"));
+    expect(leader.starts).toHaveLength(1);
+  }, 15_000);
+
   it("spawns onto a follower whose update is pending, holds its work, and runs it once when the update fails", async () => {
     const store = triggerStore();
     store.recordAttempt("edge", {
@@ -451,5 +483,33 @@ describe("MEK-Org/rusa#1272 (b) an update restart interrupts the run in flight",
         }),
       }),
     ]);
+  }, 15_000);
+
+  it("keeps an exit while building as an ordinary failed result", async () => {
+    const leader = await leaderWithFollowers({});
+    const old = await leader.follower("edge", "edge-one", STALE_SHA);
+    const worker = {
+      id: "building-worker",
+      parentId: "root",
+      charter: "fails before an update restart",
+      executionConfig: { executionTarget: "edge" },
+      modelConfig: [{ provider: "update-fixture", model: "test" }],
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    leader.actors.upsert(worker);
+    leader.mesh.rehydrate(worker);
+    leader.blockRuns();
+    leader.deliver(worker.id);
+    await old.pump(() => leader.starts.length > 0);
+
+    await leader.reportStatus(old.session, "building");
+    await leader.follower("edge", "edge-two", TARGET_SHA);
+
+    await eventually(() => leader.ends.length > 0);
+    expect(leader.ends[0]).toMatchObject({
+      runId: leader.starts[0],
+      terminal: { kind: "result", result: { success: false } },
+    });
   }, 15_000);
 });
