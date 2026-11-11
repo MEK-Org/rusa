@@ -126,7 +126,7 @@ import {
 } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { ShadowResponsiveInterruptionClassifier } from "../actor/responsive-interruption.js";
-import { RootControlService } from "../actor/root-control.js";
+import { type RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
   RootModelConfigStartupError,
   resolveRootBootModelConfig,
@@ -789,7 +789,31 @@ export interface RunStartE2EHooks {
   /** Stands in for the Slack Web API client; the socket source still needs real config. */
   slackClient?: SlackClient;
   chatSource?: ChatSource;
+  /**
+   * Which actor `rootDriver` drives. Only applies to `harnessActor` (below);
+   * other actors keep their ordinary driver.
+   */
   rootDriver?: "provider" | "external";
+  /**
+   * The harness's own explicit actor choice (#1261). It gets the E2E external
+   * driver (when `rootDriver` is `"external"`), the forced E2E sandbox, and
+   * the control server. A legacy import receipt never selects it; it stays
+   * historical provenance.
+   *
+   * - `id`: an actor this harness created earlier (a resumed home). It must be
+   *   active.
+   * - `create`: with no `id`, startup creates the actor through the ordinary
+   *   creation path ({@link RootControlService.spawnChild}, #1262) as
+   *   `e2e-controller`, before `onReady`. It refuses a home that already has
+   *   active actors. `onCreated` receives the new id so the harness can save it.
+   *
+   * Without this field, no actor gets E2E harness treatment.
+   */
+  harnessActor?: {
+    id?: string;
+    create?: RootChildRequest;
+    onCreated?: (id: string) => void;
+  };
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
@@ -1566,6 +1590,12 @@ async function composeStart(
     throw err;
   }
   const rootId = importedRoot?.id;
+  // The E2E harness's actor (see RunStartE2EHooks.harnessActor). It is chosen
+  // by the harness, never by an import receipt. `e2eHarnessCreating` is set
+  // only around the one synchronous spawn that creates it, so the factory can
+  // recognise that actor while building it.
+  let e2eHarnessActorId = opts?.e2e ? opts.e2e.harnessActor?.id : undefined;
+  let e2eHarnessCreating = false;
 
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
@@ -3601,10 +3631,12 @@ async function composeStart(
         // The flag selects inner sandboxing; container-boundary mode relies on its
         // deployment boundary. The Actor derives the sandbox (rooted at cwd, git+gh);
         // each provider mounts its own auth dir rw (see providerWritableStateDirs).
+        if (e2eHarnessCreating) e2eHarnessActorId = id;
+        const isE2eHarness = Boolean(opts?.e2e) && id === e2eHarnessActorId;
         const sandbox = configuredActorSandbox({
-          // E2E's forced sandboxing is only the imported actor's harness
-          // exception. Ordinary workers retain their stored deployment intent.
-          e2eMode: id === rootId && Boolean(opts?.e2e),
+          // E2E's forced sandboxing applies only to the harness's selected
+          // actor. Ordinary workers retain their stored deployment intent.
+          e2eMode: isE2eHarness,
           executionConfig: rec.executionConfig,
           sandboxMode: config.sandbox,
         });
@@ -3625,9 +3657,9 @@ async function composeStart(
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
           prepareRunMcp: (runId) => prepareRunMcp(runId),
-          // E2E preserves the external-driver transport for the imported actor,
-          // but its durable construction and tool surface stay ordinary.
-          isE2eRoot: id === rootId && Boolean(opts?.e2e),
+          // E2E preserves the external-driver transport for the harness's
+          // actor, but its durable construction and tool surface stay ordinary.
+          isE2eRoot: isE2eHarness,
           isComputerUseAdmitted: computerUseAdmission.isAdmitted,
           // Keep the legacy configured workspace available to the imported
           // record. This is a stored workspace mapping, not a privileged
@@ -3874,7 +3906,7 @@ async function composeStart(
           },
         });
         const externalRoot =
-          id === rootId && opts?.e2e?.rootDriver === "external"
+          isE2eHarness && opts?.e2e?.rootDriver === "external"
             ? new ExternalRootDriver(id, undefined, (state) =>
                 mesh.actorRuntimeStateChanged(id, state)
               )
@@ -3890,24 +3922,22 @@ async function composeStart(
         addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
-        if (id === rootId) {
-          configuredRootActor = actor;
-          configuredExternalRoot = externalRoot;
-          if (externalRoot) rootControl.recordDriverAttached("e2e-controller");
-          if (externalRoot) {
-            console.log(
-              `[root] driver=external tools=${workerMcp.map((server) => server.name).join(",")}`
-            );
-          } else {
-            const rootContext = actors.get(id)?.context;
-            const sessionDescription =
-              rootContext?.type === "portable"
-                ? `portable/${rootContext.mode} (stateless)`
-                : (actors.get(id)?.sessionId ?? "(new)");
-            console.log(
-              `[root] model_config=${rootModelConfigDescription ?? describeModelConfigPool(modelConfigPool)} (${rootBootModelConfig?.source ?? "durable"}) session=${sessionDescription} tools=${workerMcp.map((server) => server.name).join(",")}`
-            );
-          }
+        if (id === rootId) configuredRootActor = actor;
+        if (isE2eHarness) configuredExternalRoot = externalRoot;
+        if (externalRoot) {
+          rootControl.recordDriverAttached("e2e-controller");
+          console.log(
+            `[root] driver=external tools=${workerMcp.map((server) => server.name).join(",")}`
+          );
+        } else if (id === rootId) {
+          const rootContext = actors.get(id)?.context;
+          const sessionDescription =
+            rootContext?.type === "portable"
+              ? `portable/${rootContext.mode} (stateless)`
+              : (actors.get(id)?.sessionId ?? "(new)");
+          console.log(
+            `[root] model_config=${rootModelConfigDescription ?? describeModelConfigPool(modelConfigPool)} (${rootBootModelConfig?.source ?? "durable"}) session=${sessionDescription} tools=${workerMcp.map((server) => server.name).join(",")}`
+          );
         }
         // Implied event ownership begins only after successful construction.
         if (impliedOwnerId === undefined && defaultGrantRecipient(actors.list())?.id === id) {
@@ -4025,7 +4055,13 @@ async function composeStart(
 
   const rootControl = new RootControlService({
     mesh,
-    rootId: importedRoot?.status === "active" ? rootId : undefined,
+    // An E2E harness selection replaces the imported actor here: the control
+    // server acts for the actor the harness chose (#1261).
+    rootId: opts?.e2e?.harnessActor
+      ? () => e2eHarnessActorId
+      : importedRoot?.status === "active"
+        ? rootId
+        : undefined,
     providers: Object.keys(config.providers),
     availabilityHolds,
     releaseHalts: () => releaseHalts(),
@@ -4160,6 +4196,32 @@ async function composeStart(
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
+  }
+
+  // E2E: settle the harness's actor now that the stored actors are live.
+  const harnessSelection = opts?.e2e?.harnessActor;
+  if (harnessSelection) {
+    if (e2eHarnessActorId !== undefined) {
+      if (actors.get(e2eHarnessActorId)?.status !== "active" || !mesh.get(e2eHarnessActorId)) {
+        throw new Error(
+          `e2e harness actor ${e2eHarnessActorId} is not an active actor in this home`
+        );
+      }
+    } else if (harnessSelection.create) {
+      const active = actors.list().filter((r) => r.status === "active");
+      if (active.length > 0) {
+        throw new Error(
+          `e2e harness actor creation refused: this home already has ${active.length} active actor(s); pass harnessActor.id to select one`
+        );
+      }
+      e2eHarnessCreating = true;
+      try {
+        e2eHarnessActorId = rootControl.spawnChild(harnessSelection.create, "e2e-controller");
+      } finally {
+        e2eHarnessCreating = false;
+      }
+      harnessSelection.onCreated?.(e2eHarnessActorId);
+    }
   }
 
   if (followerHub) {

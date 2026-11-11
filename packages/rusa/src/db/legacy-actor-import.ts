@@ -276,11 +276,13 @@ function validateGraph(records: ActorRecord[], pending: ScheduledMessage[]): Act
  * A legacy root session with no actor to carry it. Only the configured-actor
  * import could create that actor, and #1261 removed it, so boot refuses
  * rather than starting rootless while the session file is silently ignored.
+ * Moving the file aside is the deliberate way to drop the session instead.
  */
 function unclaimedRootSessionError(): Error {
   return new Error(
     "Legacy actor import: root-agent/session.json names a root session but no actor exists to carry it. " +
-      "Only the removed configured-actor import could create that actor: boot the last release that carries the configured-actor import once, with the rootActor block still in config.yaml, then upgrade."
+      "Only the removed configured-actor import could create that actor: boot the last release that carries the configured-actor import once, with the rootActor block still in config.yaml, then upgrade. " +
+      "Otherwise, to give up that session: move root-agent/session.json out of this home, boot, and create a first actor from the dashboard."
   );
 }
 

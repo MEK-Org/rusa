@@ -1,4 +1,12 @@
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -102,6 +110,18 @@ describe("legacy actor import", () => {
       /root-agent\/session\.json names a root session but no actor exists to carry it.*boot the last release that carries the configured-actor import once/
     );
     expect(existsSync(sessionPath)).toBe(true);
+
+    // The message's other way out: move the session file aside and the home
+    // boots empty, ready for a first actor from the dashboard.
+    expect(() => importState()).toThrow(
+      /Otherwise, to give up that session: move root-agent\/session\.json out of this home/
+    );
+    renameSync(sessionPath, join(home, "session.json.aside"));
+    expect(importState()).toEqual({
+      importedActors: 0,
+      importedScheduledMessages: 0,
+      backupFiles: [],
+    });
   });
 
   it("refuses an empty threads.json beside a root session, leaving both files in place (#1261)", () => {

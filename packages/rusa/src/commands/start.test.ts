@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -59,7 +60,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
-import { buildE2EConfig } from "../e2e/provision.js";
+import { buildE2EConfig, provisionE2EInstance } from "../e2e/provision.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
@@ -248,6 +249,11 @@ vi.mock("../observability/logger.js", async (importOriginal) => {
   };
 });
 
+import {
+  E2E_HARNESS_ACTOR_FILE,
+  e2eHarnessActor,
+  startRootControlServer,
+} from "./e2e-actor-mesh.js";
 import {
   configuredActorSandbox,
   getShutdownExitCode,
@@ -953,7 +959,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   }, 15_000);
 
-  it("adopts the external E2E root through the configured-root construction path", async () => {
+  it("drives a receipt-imported actor externally only when the harness selects it by id (#1261)", async () => {
     let mesh: ActorMesh | undefined;
     let root: unknown;
     let externalRoot: unknown;
@@ -961,6 +967,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({
         e2e: {
           rootDriver: "external",
+          harnessActor: { id: rootId },
           onReady: (handles) => {
             mesh = handles.mesh;
             root = handles.root;
@@ -975,6 +982,164 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(externalRoot).not.toBeNull();
     expect(root).toBe(externalRoot);
     expect(mesh?.get(rootId)).toBe(externalRoot);
+  });
+
+  /**
+   * A newly provisioned e2e home, through the real provisioner: no actor row,
+   * no import receipt, no `rootActor` block (#1264). Provisioning repoints the
+   * process at the new home; the rest of the e2e environment is restored here
+   * and RUSA_HOME by the shared afterEach.
+   */
+  const provisionFreshE2EHome = () => {
+    closeDb();
+    const keys = ["GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "TMPDIR"] as const;
+    const saved = new Map(keys.map((key) => [key, process.env[key]]));
+    const root = mkdtempSync(join(tmpdir(), "rusa-e2e-fresh-"));
+    onTestFinished(() => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    });
+    // A missing base config keeps provisioning hermetic: fake + default providers.
+    return provisionE2EInstance({ root, baseConfigHome: join(root, "no-base-config") });
+  };
+
+  const getControl = async (handles: RunStartE2EHandles, path: string) => {
+    const server = startRootControlServer({ port: 0, handles });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}${path}`);
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
+
+  const bootE2E = async (e2e: Omit<NonNullable<RunStartOptions["e2e"]>, "onReady">) => {
+    let handles: RunStartE2EHandles | undefined;
+    await new Promise<void>((resolve, reject) => {
+      runStart({
+        e2e: {
+          ...e2e,
+          onReady: (h) => {
+            handles = h;
+            shutdownFn = h.shutdown;
+            resolve();
+          },
+        },
+      }).catch(reject);
+    });
+    if (!handles) throw new Error("mesh not ready");
+    return handles;
+  };
+  const harnessSpawnAudits = () =>
+    getRepositories()
+      .meshEvents.listByKinds(["root_control_action"], { bodyKinds: [] })
+      .map((event) => ({ actorId: event.actorId, ...JSON.parse(event.payload ?? "{}") }))
+      .filter((payload) => payload.action === "spawn_child");
+
+  it("a freshly provisioned e2e home creates its harness actor through ordinary creation and drives it externally (#1264)", async () => {
+    const instance = provisionFreshE2EHome();
+    expect(instance.config).not.toHaveProperty("rootActor");
+    const handles = await bootE2E({
+      rootDriver: "external",
+      harnessActor: e2eHarnessActor(instance.root),
+    });
+    // No import receipt selected anything: the harness chose its own actor.
+    expect(
+      getRepositories().legacyImportReceipts.actorFor("config.yaml:rootActor")
+    ).toBeUndefined();
+    const harnessId = handles.rootControl.rootId;
+    if (!harnessId) throw new Error("no harness actor");
+    expect(readFileSync(join(instance.root, E2E_HARNESS_ACTOR_FILE), "utf8").trim()).toBe(
+      harnessId
+    );
+    expect(handles.mesh.list().map((record) => [record.id, record.parentId])).toEqual([
+      [harnessId, null],
+    ]);
+    // Created by the #1262 creation path, attributed to the E2E controller.
+    expect(harnessSpawnAudits()).toEqual([
+      expect.objectContaining({
+        actorId: harnessId,
+        principal: "e2e-controller",
+        targetId: harnessId,
+        modelConfig: [{ provider: "fake", model: "fake-model" }],
+      }),
+    ]);
+    // External control reaches the created actor.
+    expect(handles.externalRoot).not.toBeNull();
+    expect(handles.mesh.get(harnessId)).toBe(handles.externalRoot);
+    expect(await getControl(handles, "/actors")).toMatchObject({ status: 200 });
+  });
+
+  it("a provider-driven harness actor on a fresh e2e home keeps the forced e2e sandbox (#1264)", async () => {
+    const instance = provisionFreshE2EHome();
+    const handles = await bootE2E({ harnessActor: e2eHarnessActor(instance.root) });
+    const harnessId = handles.rootControl.rootId;
+    if (!harnessId) throw new Error("no harness actor");
+    expect(handles.externalRoot).toBeNull();
+    const live = handles.mesh.get(harnessId) as unknown as {
+      opts: { sandbox?: boolean; isE2eRoot?: boolean };
+    };
+    expect(live).toBeInstanceOf(Actor);
+    expect(live.opts).toMatchObject({ sandbox: true, isE2eRoot: true });
+    // An ordinary child of the harness actor keeps its stored deployment intent.
+    const child = handles.mesh.spawn({
+      charter: "worker",
+      parentId: harnessId,
+      modelConfig: { provider: "fake", model: "fake-model" },
+    });
+    expect(
+      (handles.mesh.get(child) as unknown as { opts: { isE2eRoot?: boolean } }).opts.isE2eRoot
+    ).toBe(false);
+  });
+
+  it("a resumed e2e home reselects the harness actor it saved instead of creating another (#1264)", async () => {
+    const instance = provisionFreshE2EHome();
+    const first = await bootE2E({
+      rootDriver: "external",
+      harnessActor: e2eHarnessActor(instance.root),
+    });
+    const harnessId = first.rootControl.rootId;
+    await shutdownFn?.();
+    shutdownFn = undefined;
+    closeDb();
+
+    expect(e2eHarnessActor(instance.root)).toEqual({ id: harnessId });
+    const resumed = await bootE2E({
+      rootDriver: "external",
+      harnessActor: e2eHarnessActor(instance.root),
+    });
+    expect(resumed.rootControl.rootId).toBe(harnessId);
+    expect(resumed.mesh.list().map((record) => record.id)).toEqual([harnessId]);
+    expect(resumed.mesh.get(harnessId as string)).toBe(resumed.externalRoot);
+    expect(harnessSpawnAudits()).toHaveLength(1);
+  });
+
+  it("refuses to create a harness actor in a home that already has actors (#1264)", async () => {
+    // The shared fixture home holds a receipt-imported actor and no harness selection.
+    await expect(
+      bootE2E({
+        rootDriver: "external",
+        harnessActor: {
+          create: { charter: "harness", modelConfig: { provider: "fake", model: "fake-model" } },
+        },
+      })
+    ).rejects.toThrow(/already has 1 active actor/);
+    await expect(
+      bootE2E({ rootDriver: "external", harnessActor: { id: "ghost" } })
+    ).rejects.toThrow(/ghost is not an active actor/);
+  });
+
+  it("an import receipt alone does not select the e2e harness actor (#1264)", async () => {
+    const handles = await bootE2E({ rootDriver: "external" });
+    expect(getRepositories().legacyImportReceipts.actorFor("config.yaml:rootActor")).toBe(rootId);
+    expect(handles.externalRoot).toBeNull();
+    const live = handles.mesh.get(rootId) as unknown as { opts: { isE2eRoot?: boolean } };
+    expect(live.opts.isE2eRoot).toBe(false);
   });
 
   it("#367 selects greater weekly headroom through the live runStart provider gate and retains fresh evidence through a cold response", async () => {
@@ -9905,6 +10070,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await new Promise<void>((resolve) => {
       runStart({
         e2e: {
+          // The harness names its actor explicitly; the receipt does not (#1261).
+          harnessActor: { id: rootId },
           onReady: (handles) => {
             mesh = handles.mesh;
             shutdownFn = handles.shutdown;
@@ -9934,7 +10101,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(live.opts.sandbox, `${id} sandbox parity`).toBe(expectedWorkerSandbox(stored));
     }
 
-    // The configured root retains the existing e2e harness exception: it is
+    // The harness-selected actor retains the e2e harness exception: it is
     // sandboxed in both modes. Worker deployment mapping above remains unchanged.
     expect((booted.get(rootId) as unknown as { opts: { sandbox?: boolean } }).opts.sandbox).toBe(
       true
