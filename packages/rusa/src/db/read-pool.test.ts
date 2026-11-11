@@ -56,8 +56,9 @@ serveReads(parentPort, db, {
 // A worker that speaks only the pool's protocol, for the pool's own lifecycle.
 // It takes `dbPath` as a control directory: it records each start in `spawns`;
 // `mode` makes it start normally, die before `ready` (`fail`), or wait for a
-// `gate` file, report ready and exit soon after (`gated`); `build` is the build
-// it reports. `hold` answers after `ms`; `exit` dies mid-request.
+// `gate` file, report ready and exit soon after (`gated`) or keep serving
+// (`held`); `build`, read as it starts, is the build it reports. `hold`
+// answers after `ms`; `exit` dies mid-request.
 const PROTOCOL_WORKER_SOURCE = `
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -68,6 +69,7 @@ const control = (name) =>
   existsSync(join(dir, name)) ? readFileSync(join(dir, name), "utf8") : null;
 appendFileSync(join(dir, "spawns"), "x");
 const mode = control("mode") ?? "ok";
+const build = control("build");
 if (mode === "fail") process.exit(1);
 const serve = () => {
   parentPort.on("message", (request) => {
@@ -75,13 +77,14 @@ const serve = () => {
     const answer = { type: "result", id: request.id, value: request.input.ms };
     setTimeout(() => parentPort.postMessage(answer), request.input.ms);
   });
-  parentPort.postMessage({ type: "ready", build: control("build") });
+  parentPort.postMessage({ type: "ready", build });
 };
-if (mode === "gated") {
+if (mode === "gated" || mode === "held") {
   const timer = setInterval(() => {
     if (!existsSync(join(dir, "gate"))) return;
     clearInterval(timer);
     serve();
+    if (mode === "held") return;
     setTimeout(() => {
       appendFileSync(join(dir, "gated-exited"), "x");
       process.exit(3);
@@ -507,6 +510,13 @@ describe("DbReadPool", () => {
       await expect(testReads(pool).read("hold", { ms: 0 })).rejects.toThrow(
         /read workers failed to start 3 times/
       );
+      // Only a refused build is restorable; workers that cannot start stay failed.
+      pool.restore();
+      await sleep(200);
+      expect(control.spawns()).toBe(6);
+      await expect(testReads(pool).read("hold", { ms: 0 })).rejects.toThrow(
+        /read workers failed to start 3 times/
+      );
     } finally {
       await pool.close();
       control.remove();
@@ -557,6 +567,70 @@ describe("DbReadPool", () => {
       await expect(
         DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 1 })
       ).rejects.toThrow(/runs build next-build/);
+    } finally {
+      await pool.close();
+      control.remove();
+    }
+  });
+
+  it("re-admits only its own build once an update rollback restores the dist", async () => {
+    const control = controlDir();
+    const pool = await DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 1 });
+    try {
+      // The swap window: the only worker exits and its replacement loads the
+      // new build, so the pool has no worker left and refuses reads.
+      writeFileSync(join(control.dir, "build"), "next-build");
+      await expect(testReads(pool).read("exit", {})).rejects.toBeInstanceOf(
+        DbReadWorkerExitedError
+      );
+      await sleep(100);
+      await expect(testReads(pool).read("hold", { ms: 0 })).rejects.toThrow(
+        /runs build next-build/
+      );
+      expect(control.spawns()).toBe(2);
+      // Restoring while dist still holds the other build starts one worker, and
+      // refuses it as well; a read waiting for it never reaches it.
+      pool.restore();
+      await expect(testReads(pool).read("hold", { ms: 0 })).rejects.toThrow(
+        /runs build next-build/
+      );
+      await sleep(200);
+      expect(control.spawns()).toBe(3);
+      // The rollback has put this process's build back: the next worker serves.
+      rmSync(join(control.dir, "build"));
+      pool.restore();
+      await expect(testReads(pool).read("hold", { ms: 5 })).resolves.toBe(5);
+      expect(control.spawns()).toBe(4);
+      pool.restore();
+      await expect(testReads(pool).read("hold", { ms: 0 })).resolves.toBe(0);
+      expect(control.spawns()).toBe(4);
+    } finally {
+      await pool.close();
+      control.remove();
+    }
+  });
+
+  it("restores in place of a worker that loaded the other build but has not reported yet", async () => {
+    const control = controlDir();
+    const pool = await DbReadPool.open({ dbPath: control.dir, worker: protocolWorker, size: 1 });
+    try {
+      // A replacement starts during the swap window and loads the new build;
+      // the rollback and restore land before it reports.
+      writeFileSync(join(control.dir, "build"), "next-build");
+      writeFileSync(join(control.dir, "mode"), "held");
+      await expect(testReads(pool).read("exit", {})).rejects.toBeInstanceOf(
+        DbReadWorkerExitedError
+      );
+      await sleep(100);
+      expect(control.spawns()).toBe(2);
+      rmSync(join(control.dir, "build"));
+      rmSync(join(control.dir, "mode"));
+      pool.restore();
+      // Were it still running, the starting worker would now report its build.
+      writeFileSync(join(control.dir, "gate"), "");
+      await sleep(200);
+      await expect(testReads(pool).read("hold", { ms: 5 })).resolves.toBe(5);
+      expect(control.spawns()).toBe(3);
     } finally {
       await pool.close();
       control.remove();

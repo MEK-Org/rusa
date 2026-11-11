@@ -377,7 +377,7 @@ import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
-import { isUpdateInProgress } from "../update/orchestrator.js";
+import { type BuildSeam, isUpdateInProgress } from "../update/orchestrator.js";
 import {
   BuildRunner,
   GitRunner,
@@ -1103,6 +1103,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     await resources.close();
     throw err;
   }
+}
+
+/**
+ * The update's build seam, telling the dashboard's read pool once a failed
+ * update has put the previous dist back. A read worker started during the swap
+ * window loaded the new build and was refused, so without this reads would stay
+ * unavailable until a restart the failed update never makes (#1289). The pool
+ * admits only workers of its own build, so a rollback that restored something
+ * else leaves reads refused.
+ */
+function restoringReadsOnRollback(runner: BuildRunner, restoreReads: () => void): BuildSeam {
+  return {
+    build: (sha) => runner.build(sha),
+    rollback: async () => {
+      await runner.rollback();
+      restoreReads();
+    },
+  };
 }
 
 /**
@@ -2476,6 +2494,8 @@ async function composeStart(
   );
   let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
+  // Set once the dashboard's read pool is open (#1289).
+  let restoreDbReads: () => void = () => {};
 
   const maintenanceDrainer = new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), "");
   const maintenanceShutdown = new MaintenanceShutdownCoordinator({
@@ -2529,10 +2549,13 @@ async function composeStart(
       maintenanceShutdown,
       deps: {
         git: new GitRunner(repoRoot),
-        build: new BuildRunner(
-          packageDir,
-          { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
-          (m) => console.log(m)
+        build: restoringReadsOnRollback(
+          new BuildRunner(
+            packageDir,
+            { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
+            (m) => console.log(m)
+          ),
+          () => restoreDbReads()
         ),
         coordinator: new SystemdCoordinatorRestarter({
           cliPath: join(packageDir, "dist", "cli.js"),
@@ -4459,7 +4482,10 @@ async function composeStart(
         logger: log.child({ component: "db-read-pool" }),
       })
     : undefined;
-  if (dbReads) resources.acquire("db read pool", () => dbReads.close());
+  if (dbReads) {
+    resources.acquire("db read pool", () => dbReads.close());
+    restoreDbReads = () => dbReads.restore();
+  }
   const dashboardServer = bindDashboard
     ? await startDashboardServer({
         auth: config.auth,

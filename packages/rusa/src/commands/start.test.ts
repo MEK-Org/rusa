@@ -80,6 +80,7 @@ import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SlackClient } from "../slack/slack-client.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
+import { BuildRunner } from "../update/runner.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -790,18 +791,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const workerSpy = vi
       .spyOn(readPool, "bundledReadWorker")
       .mockReturnValue("/dist/db-read-worker.js");
-    const pool = { read: vi.fn(), close: vi.fn(async () => {}) };
+    const pool = { read: vi.fn(), close: vi.fn(async () => {}), restore: vi.fn() };
     const openSpy = vi
       .spyOn(readPool.DbReadPool, "open")
       .mockResolvedValue(pool as unknown as readPool.DbReadPool);
+    const rollbackSpy = vi.spyOn(BuildRunner.prototype, "rollback");
     try {
-      await new Promise<void>((resolve) => {
+      const handles = await new Promise<RunStartE2EHandles>((resolve) => {
         void runStart({
           e2e: {
             dashboard: true,
-            onReady: (handles) => {
-              shutdownFn = handles.shutdown;
-              resolve();
+            onReady: (ready) => {
+              shutdownFn = ready.shutdown;
+              resolve(ready);
             },
           },
         });
@@ -814,6 +816,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
         })
       );
       expect(startDashboardServerSpy.mock.calls[0][0].mesh?.reads).toBe(pool);
+
+      // A failed update's rollback restores the pool only once dist is back.
+      const build = handles.updateToolDepsFor?.("self").deps.build;
+      rollbackSpy.mockRejectedValueOnce(new Error("cannot restore previous dist"));
+      await expect(build?.rollback?.()).rejects.toThrow("cannot restore previous dist");
+      expect(pool.restore).not.toHaveBeenCalled();
+      rollbackSpy.mockResolvedValueOnce(undefined);
+      await build?.rollback?.();
+      expect(pool.restore).toHaveBeenCalledOnce();
+
       await shutdownFn?.();
       shutdownFn = undefined;
       expect(pool.close).toHaveBeenCalled();
@@ -821,6 +833,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       startDashboardServerSpy.mockRestore();
       workerSpy.mockRestore();
       openSpy.mockRestore();
+      rollbackSpy.mockRestore();
     }
   });
 

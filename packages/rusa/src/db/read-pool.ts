@@ -25,6 +25,14 @@ export class DbReadPoolClosedError extends DbReadUnavailableError {
 }
 
 /**
+ * A worker loaded a build other than this process's, so reads stop until a
+ * restart or until {@link DbReadPool.restore} finds this build in place again.
+ */
+export class DbReadBuildMismatchError extends DbReadUnavailableError {
+  override readonly name = "DbReadBuildMismatchError";
+}
+
+/**
  * The worker running this read stopped before answering. The pool has already
  * replaced it, so a later request can succeed.
  */
@@ -89,6 +97,7 @@ export function bundledReadWorker(moduleUrl: string = import.meta.url): string |
 export class DbReadPool implements DbReads {
   private readonly slots: Slot[] = [];
   private readonly queue: PendingRead[] = [];
+  private readonly size: number;
   private readonly maxQueued: number;
   private readonly logger: Logger;
   private nextId = 1;
@@ -115,6 +124,7 @@ export class DbReadPool implements DbReads {
   private constructor(private readonly options: DbReadPoolOptions) {
     const size = options.size ?? DEFAULT_SIZE;
     if (!Number.isInteger(size) || size < 1) throw new Error("read pool size must be >= 1");
+    this.size = size;
     this.maxQueued = options.maxQueued ?? DEFAULT_MAX_QUEUED;
     this.logger = options.logger ?? nullLogger;
     for (let index = 0; index < size; index++) this.slots.push(this.spawn());
@@ -135,6 +145,25 @@ export class DbReadPool implements DbReads {
         reject(new DbReadQueueFullError(`read queue is full (${this.maxQueued} waiting)`));
       } else this.queue.push(pending);
     });
+  }
+
+  /**
+   * After an update rollback has put the previous dist back, start workers
+   * again in place of the ones a mismatched build cost, and of any still
+   * starting, which may have loaded the build the rollback removed. Each is
+   * admitted only if it reports this process's build, so if `dist` still holds
+   * another build the pool fails again, having started one worker per slot it
+   * filled. Any other failure, and a closed pool, stay as they are.
+   */
+  restore(): void {
+    if (this.closed) return;
+    if (this.failure && !(this.failure instanceof DbReadBuildMismatchError)) return;
+    for (const slot of this.slots.filter((candidate) => !candidate.ready)) this.discard(slot);
+    if (this.slots.length === this.size) return;
+    this.logger.info("db_read_pool_restoring", { missing: this.size - this.slots.length });
+    this.failure = null;
+    this.startFailures = 0;
+    while (this.slots.length < this.size) this.slots.push(this.spawn());
   }
 
   /**
@@ -200,19 +229,29 @@ export class DbReadPool implements DbReads {
     slot.worker.postMessage(pending.request);
   }
 
+  /** Stop a worker that holds no read and forget it; its exit and messages are ignored. */
+  private discard(slot: Slot): void {
+    slot.stopping = true;
+    void slot.worker.terminate();
+    this.slots.splice(this.slots.indexOf(slot), 1);
+  }
+
   private onMessage(slot: Slot, message: ReadWorkerMessage): void {
+    // A worker the pool has stopped can still deliver what it sent before.
+    if (slot.stopping) return;
     if (message.type === "ready") {
       if (message.build !== BUILD_ID) {
         // An update swapped `dist` (or a rollback restored it) after this
         // process started, and the replacement loaded that build, wholly or in
         // part. Its reads and result shapes need not match this process or its
-        // migrations, so reads stay unavailable until the process restarts.
-        slot.stopping = true;
-        void slot.worker.terminate();
+        // migrations, so reads stay unavailable until the process restarts or
+        // restore() finds this build in `dist` again.
+        this.discard(slot);
         this.fail(
-          new DbReadUnavailableError(
+          new DbReadBuildMismatchError(
             `read worker runs build ${message.build ?? "(none)"}, ` +
-              `but this process runs ${BUILD_ID ?? "(none)"}; reads resume after restart`
+              `but this process runs ${BUILD_ID ?? "(none)"}; reads resume after restart ` +
+              "or once an update rollback restores this build"
           )
         );
         return;
