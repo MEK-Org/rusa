@@ -6081,7 +6081,7 @@ describe("ancestry-authorized charter and reparent (#1284)", () => {
     expect(registry.get("other-forest")?.charter).toBe("other-forest charter");
   });
 
-  it("an actor-admin holder still never writes its own charter, under its id or the root alias", async () => {
+  it("a parented actor never writes its own charter, even holding actor-admin", async () => {
     const { mesh, registry } = ancestryFixture({ stewardCapabilities: [ACTOR_ADMIN_CAPABILITY] });
     const steward = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
     const self = await call(steward, "set_thread_charter", {
@@ -6089,10 +6089,21 @@ describe("ancestry-authorized charter and reparent (#1284)", () => {
       charter: "self-grant",
     });
     expect(self.isError).toBe(true);
+    expect(dataOf(self)).toMatch(/has a parent/);
     expect(registry.get("0b2c3d4e-steward")?.charter).toBe("0b2c3d4e-steward charter");
 
-    // A parentless configured actor holding actor-admin, addressed by its
-    // opaque id or by the legacy alias, is refused the same way.
+    // A grandchild is refused its own charter too, under its own id.
+    const grandchild = await connect(createAgentExecMcpServer(mesh, "grandchild", "root"));
+    const refused = await call(grandchild, "set_thread_charter", {
+      thread_id: "grandchild",
+      charter: "self-grant",
+    });
+    expect(refused.isError).toBe(true);
+    expect(registry.get("grandchild")?.charter).toBe("grandchild charter");
+  });
+
+  it("a parentless actor writes its own charter under its id or the resolved root alias", async () => {
+    // The configured actor with an opaque id and seeded grants.
     const opaque = ancestryFixture({ rootId: "9a8b7c6d-root" });
     seedConfiguredActorGrants(
       opaque.capabilityGrants,
@@ -6103,14 +6114,68 @@ describe("ancestry-authorized charter and reparent (#1284)", () => {
       createAgentExecMcpServer(opaque.mesh, "9a8b7c6d-root", "9a8b7c6d-root")
     );
     for (const id of ["9a8b7c6d-root", "root"]) {
-      const refused = await call(root, "set_thread_charter", { thread_id: id, charter: "self" });
-      expect(refused.isError, id).toBe(true);
+      const ok = await call(root, "set_thread_charter", {
+        thread_id: id,
+        charter: `self via ${id}`,
+      });
+      expect(ok.isError, id).toBeFalsy();
+      expect(opaque.registry.get("9a8b7c6d-root")?.charter).toBe(`self via ${id}`);
     }
-    expect(opaque.registry.get("9a8b7c6d-root")?.charter).toBe("root");
     // Its descendants remain re-chartable.
     const ok = await call(root, "set_thread_charter", { thread_id: "grandchild", charter: "next" });
     expect(ok.isError).toBeFalsy();
     expect(opaque.registry.get("grandchild")?.charter).toBe("next");
+
+    // An ungranted top-level actor in another forest: the exception rests on
+    // having no parent, not on any grant.
+    const { mesh, registry } = ancestryFixture();
+    const other = await connect(createAgentExecMcpServer(mesh, "other-forest", "root"));
+    const self = await call(other, "set_thread_charter", {
+      thread_id: "other-forest",
+      charter: "rescoped other forest",
+    });
+    expect(self.isError).toBeFalsy();
+    expect(registry.get("other-forest")?.charter).toBe("rescoped other forest");
+  });
+
+  it("an actor detached to top level gains its own charter, and loses it again when reattached", async () => {
+    const { mesh, registry } = ancestryFixture();
+    mesh.reparentThread("child-b", null);
+    const detached = await connect(createAgentExecMcpServer(mesh, "child-b", "root"));
+    const ok = await call(detached, "set_thread_charter", {
+      thread_id: "child-b",
+      charter: "on my own",
+    });
+    expect(ok.isError).toBeFalsy();
+    expect(registry.get("child-b")?.charter).toBe("on my own");
+
+    mesh.reparentThread("child-b", "0b2c3d4e-steward");
+    const refused = await call(detached, "set_thread_charter", {
+      thread_id: "child-b",
+      charter: "again",
+    });
+    expect(refused.isError).toBe(true);
+    expect(registry.get("child-b")?.charter).toBe("on my own");
+  });
+
+  it("a parentless actor is still refused charters outside its own subtree", async () => {
+    const { mesh, registry } = ancestryFixture();
+    const other = await connect(createAgentExecMcpServer(mesh, "other-forest", "root"));
+    for (const id of ["root", "0b2c3d4e-steward", "sibling", "grandchild"]) {
+      const refused = await call(other, "set_thread_charter", { thread_id: id, charter: "hijack" });
+      expect(refused.isError, id).toBe(true);
+      expect(dataOf(refused), id).toMatch(/descendant/);
+    }
+    expect(registry.get("root")?.charter).toBe("root");
+    expect(registry.get("0b2c3d4e-steward")?.charter).toBe("0b2c3d4e-steward charter");
+    expect(registry.get("sibling")?.charter).toBe("sibling charter");
+    expect(registry.get("grandchild")?.charter).toBe("grandchild charter");
+    // Nor may it reparent itself: the exception covers its charter only.
+    const move = await call(other, "reparent_thread", {
+      thread_id: "other-forest",
+      new_parent_id: "other-forest",
+    });
+    expect(move.isError).toBe(true);
   });
 
   it("an ungranted actor moves a strict descendant within its subtree", async () => {

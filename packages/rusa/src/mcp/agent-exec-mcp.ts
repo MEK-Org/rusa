@@ -713,11 +713,15 @@ export function createAgentExecMcpServer(
   // The one ancestry seam for acting on another actor's record (#1284):
   // retire, re-charter and reparent all require a strict descendant. Ancestry
   // includes the caller itself and resolves the legacy root alias, so self is
-  // excluded by resolved id — no actor writes its own record this way.
+  // excluded by resolved id. The one exception is set_thread_charter, where a
+  // parentless actor — with no ancestor to steward it — may write its own
+  // charter (#1287); nothing else lets an actor act on its own record.
   const isSelf = (targetId: string) =>
     mesh.resolveActorId(targetId) === mesh.resolveActorId(selfId);
   const isStrictDescendant = (targetId: string) =>
     !isSelf(targetId) && mesh.isAncestorOf(selfId, targetId);
+  // Read at call time, so a detach or reattach takes effect on the next write.
+  const isParentless = () => mesh.actors.get(mesh.resolveActorId(selfId))?.parentId === null;
 
   server.registerTool(
     "retire_thread",
@@ -1632,15 +1636,19 @@ export function createAgentExecMcpServer(
   // ── Descendant stewardship ── Every actor may re-charter and reorganize its
   // own strict descendants, authorized by ancestry exactly as retire_thread is
   // (#1284). Detaching to top level leaves the subtree, so it stays with
-  // `actor-admin`.
+  // `actor-admin`. A parentless actor may also replace its own charter, since
+  // no ancestor can; a parented actor never can, even holding `actor-admin`
+  // (#1287).
   server.registerTool(
     "set_thread_charter",
     {
-      title: "Replace a descendant's charter",
+      title: "Replace a descendant's charter (or your own, if parentless)",
       description:
-        "Replace a descendant actor's charter — its standing brief — on the durable thread record. The actor must be a strict descendant of yours (a child, grandchild, …); you can never replace your own charter or that of an actor outside your subtree. The charter is read fresh and re-injected into the actor's prompt each run, so the new charter takes effect on its next wake. Use to durably re-scope an actor (e.g. promote an elder reviewer to a steward) rather than re-scoping by message alone, which a session reap can lose — the charter is the durable re-derivation anchor. Pass the complete intended charter; it replaces the prior one wholesale.",
+        "Replace a descendant actor's charter — its standing brief — on the durable thread record. The actor must be a strict descendant of yours (a child, grandchild, …), or yourself if you have no parent: a top-level actor has no ancestor to re-charter it, so it may replace its own. An actor with a parent can never replace its own charter, and no actor may replace the charter of an actor outside its subtree. The charter is read fresh and re-injected into the actor's prompt each run, so the new charter takes effect on its next wake. Use to durably re-scope an actor (e.g. promote an elder reviewer to a steward) rather than re-scoping by message alone, which a session reap can lose — the charter is the durable re-derivation anchor. Pass the complete intended charter; it replaces the prior one wholesale.",
       inputSchema: {
-        thread_id: z.string().describe("The descendant actor's thread id."),
+        thread_id: z
+          .string()
+          .describe("The descendant actor's thread id, or your own if you have no parent."),
         charter: z
           .string()
           .describe("The complete new charter; replaces the prior charter wholesale."),
@@ -1648,10 +1656,11 @@ export function createAgentExecMcpServer(
     },
     async ({ thread_id, charter }) => {
       try {
-        if (!isStrictDescendant(thread_id)) {
+        const self = isSelf(thread_id);
+        if (self ? !isParentless() : !isStrictDescendant(thread_id)) {
           throw new Error(
-            isSelf(thread_id)
-              ? `${selfId} may not replace its own charter (only a strict descendant's)`
+            self
+              ? `${selfId} has a parent, so may not replace its own charter (only a strict descendant's)`
               : `${selfId} may only re-charter its own strict descendants (cannot re-charter ${thread_id})`
           );
         }
