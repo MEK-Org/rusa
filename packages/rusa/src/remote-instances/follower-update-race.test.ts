@@ -48,7 +48,6 @@ const FIXTURE_CONFIG: RusaConfig = {
   github: { account: "test-bot" },
   webhook: { port: 0, secret: "test-secret" },
   providers: {},
-  rootActor: { provider: "update-fixture", model: "test" },
 };
 
 const cleanups: Array<() => void | Promise<void>> = [];
