@@ -668,6 +668,13 @@ class FakeScheduledMessageScheduler implements ScheduledMessageScheduler {
   listMessageDeliveries(): ScheduledMessage[] {
     return [...this.messageDeliveries.values()].map((message) => structuredClone(message));
   }
+  listKnownMessageDeliveries(): ScheduledMessage[] {
+    return this.listMessageDeliveries();
+  }
+  readMessageDelivery(id: string): ScheduledMessage | null {
+    const message = this.messageDeliveries.get(id);
+    return message ? structuredClone(message) : null;
+  }
   listForRecipient(actorId: string): ScheduledMessage[] {
     return this.listMessageDeliveries().filter((message) => message.toId === actorId);
   }
@@ -12106,6 +12113,10 @@ describe("ActorMesh", () => {
             return id;
           },
           list: () => jobs.map((job) => ({ ...job })),
+          readJob: (id) => {
+            const job = jobs.find((entry) => entry.id === id);
+            return job ? { ...job } : null;
+          },
           remove: (id) => {
             const index = jobs.findIndex((job) => job.id === id);
             if (index >= 0) jobs.splice(index, 1);
@@ -12139,7 +12150,7 @@ describe("ActorMesh", () => {
           undefined,
           futureDeliverAt()
         );
-        return { mesh, scheduler, inboxStore, recipient };
+        return { mesh, scheduler, inboxStore, recipient, sender };
       }
 
       it.each([
@@ -12198,6 +12209,74 @@ describe("ActorMesh", () => {
         expect(events).toEqual([]);
         expect(chatRows.size).toBe(0);
         expect(scheduler.listMessageDeliveries()).toEqual([]);
+      });
+
+      it("bounds a scheduled send and its cancel by this instance's own message jobs, not the shared queue (#1274)", () => {
+        const { at, jobs } = sharedAtQueue();
+        // Host processes, priced as execAtIo spends them.
+        let spawns = 0;
+        const counted: AtIo = {
+          schedule: (script, date) => {
+            spawns++;
+            return at.schedule(script, date);
+          },
+          list: () => {
+            spawns += 1 + jobs.length;
+            return at.list();
+          },
+          readJob: (id) => {
+            spawns++;
+            return at.readJob(id);
+          },
+          remove: (id) => {
+            spawns++;
+            at.remove(id);
+          },
+        };
+        const staging = bootInstance("/srv/rusa/staging", at);
+        for (let i = 0; i < 50; i++) {
+          staging.scheduler.scheduleMessageDelivery({
+            id: `staging-${i}`,
+            toId: staging.recipient,
+            fromId: staging.sender,
+            body: "foreign",
+            deliverAt: futureDeliverAt(),
+          });
+        }
+        const prod = bootInstance("/srv/rusa/prod", counted);
+        for (let i = 0; i < 30; i++) {
+          prod.scheduler.scheduleObligationActivation(`ob-${i}`, {
+            kind: "at",
+            date: new Date(futureDeliverAt()),
+          });
+        }
+        // Start-up's one full read.
+        prod.mesh.reconcilePendingDeliveries();
+        // 1 legacy + 51 staging messages + 30 prod activations + 1 prod message.
+        expect(jobs).toHaveLength(83);
+        const before = new Set(jobs.map((job) => job.id));
+
+        spawns = 0;
+        prod.mesh.sendMessage(prod.recipient, "bounded", prod.sender, undefined, futureDeliverAt());
+        // Cap: 1 `at -c` for the one message prod knows it has pending. Write:
+        // no stale job under a fresh id, then 1 `at` and 1 confirming `at -c`.
+        expect(spawns).toBe(1 + 2);
+
+        const sent = jobs.find((job) => !before.has(job.id));
+        if (!sent) throw new Error("the scheduled send queued no job");
+        const sentId = JSON.parse(
+          Buffer.from(
+            /payload=([A-Za-z0-9_-]+)/.exec(sent.script)?.[1] ?? "",
+            "base64url"
+          ).toString()
+        ).id as string;
+
+        spawns = 0;
+        prod.mesh.cancelScheduledMessage(sentId, prod.sender);
+        // 1 `at -c` to look it up, 1 to re-verify its tag, 1 `atrm`.
+        expect(spawns).toBe(3);
+        expect(jobs).toHaveLength(83);
+        expect(jobs.some((job) => job.id === sent.id)).toBe(false);
       });
 
       it("still cancels its own job for a recipient it does not know, and only that one", () => {

@@ -5732,6 +5732,10 @@ describe("multi-instance crontab reconciliation (#304)", () => {
         return id;
       }),
       list: vi.fn(() => [...sharedAtJobs]),
+      readJob: vi.fn((id: string) => {
+        const job = sharedAtJobs.find((j) => j.id === id);
+        return job ? { id: job.id, script: job.script } : null;
+      }),
       remove: vi.fn((id: string) => {
         const idx = sharedAtJobs.findIndex((j) => j.id === id);
         if (idx !== -1) sharedAtJobs.splice(idx, 1);
@@ -5951,5 +5955,59 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     assertBlocksUnchanged([...commonForeignBlocks, first.activeBlock]);
     expect(f.getAtJobs().some((job) => job.id === second.staleAtId)).toBe(false);
     assertAtUnchanged("legacy-at-1");
+  });
+
+  it("a restarted process re-arms an at activation without leaving its predecessor's job queued (#1274)", () => {
+    const db = setupDb();
+    const now = Date.now();
+    let crontab = "";
+    const cron: CrontabIo = {
+      read: () => crontab,
+      write: (data: string) => {
+        crontab = data;
+      },
+    };
+    const jobs: { id: string; script: string }[] = [];
+    let nextId = 1;
+    const at: AtIo = {
+      schedule: (script: string) => {
+        const id = String(nextId++);
+        jobs.push({ id, script });
+        return id;
+      },
+      list: () => jobs.map((job) => ({ ...job })),
+      readJob: (id: string) => jobs.find((job) => job.id === id) ?? null,
+      remove: (id: string) => {
+        const index = jobs.findIndex((job) => job.id === id);
+        if (index !== -1) jobs.splice(index, 1);
+      },
+    };
+    const boot = () => {
+      const repo = new ObligationRepository(
+        db,
+        () => true,
+        () => now
+      );
+      repo.setOsScheduler(
+        new DefaultOsScheduler(new CrontabMutator(cron), at, {
+          tokenFile: "/prod/token",
+          portFile: "/prod/port",
+          instanceId: "/srv/rusa-prod",
+        })
+      );
+      return repo;
+    };
+
+    const before = boot();
+    before.create({ title: "Snoozed", id: "snoozed", ownerId: "actor-a", intent: "snoozed" });
+    before.setSnooze("snoozed", new Date(now + 3_600_000).toISOString(), "actor-a");
+    expect(jobs).toHaveLength(1);
+
+    // Each start-up's boot reconciliation re-arms the row before it reads the
+    // queue; the replacement must take the old job's place, not join it.
+    for (let restart = 0; restart < 3; restart++) {
+      boot().reconcileScheduledObligations();
+      expect(jobs).toHaveLength(1);
+    }
   });
 });

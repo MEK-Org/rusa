@@ -4372,7 +4372,14 @@ export class ActorMesh {
       if (!this.scheduledMessages) {
         throw new Error("Scheduled-message OS scheduler is not configured");
       }
-      if (this.pendingScheduledMessages().filter((message) => message.toId === toId).length >= 10) {
+      // Only this instance's own known message jobs are read back here, so
+      // the cost of a send follows its own pending messages rather than the
+      // length of the shared host queue (#1274).
+      const pendingForRecipient = this.scheduledMessages
+        .listKnownMessageDeliveries()
+        .map((message) => this.resolveScheduledMessage(message))
+        .filter((message) => message.toId === toId).length;
+      if (pendingForRecipient >= 10) {
         throw new Error(
           `Cannot schedule message: recipient ${toId} has reached the cap of 10 pending deliveries.`
         );
@@ -4955,7 +4962,10 @@ export class ActorMesh {
     reason?: string
   ): { messageId: string; fromId: string; toId: string; deliverAt: string } {
     by = this.resolveThreadId(by);
-    const message = this.pendingScheduledMessages().find((entry) => entry.id === messageId);
+    // One read of the jobs known under this message's own tag, not a scan of
+    // the host queue (#1274).
+    const found = this.scheduledMessages?.readMessageDelivery(messageId) ?? null;
+    const message = found ? this.resolveScheduledMessage(found) : null;
     if (!message) {
       throw new Error(
         `unknown pending message id: ${messageId} — it may have already been delivered or cancelled`
@@ -6249,11 +6259,17 @@ export class ActorMesh {
   }
 
   private pendingScheduledMessages(): ScheduledMessage[] {
-    return (this.scheduledMessages?.listMessageDeliveries() ?? []).map((message) => ({
+    return (this.scheduledMessages?.listMessageDeliveries() ?? []).map((message) =>
+      this.resolveScheduledMessage(message)
+    );
+  }
+
+  private resolveScheduledMessage(message: ScheduledMessage): ScheduledMessage {
+    return {
       ...message,
       fromId: this.resolveThreadId(message.fromId),
       toId: this.resolveThreadId(message.toId),
-    }));
+    };
   }
 
   /**

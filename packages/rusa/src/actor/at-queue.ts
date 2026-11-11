@@ -59,6 +59,11 @@ export interface AtIo {
   schedule(script: string, date: Date): string;
   list(): { id: string; script: string }[];
   remove(id: string): void;
+  /**
+   * Read the script of a single job by id: one `at -c`. Returns null if the
+   * job does not exist or has already run.
+   */
+  readJob(id: string): { id: string; script: string } | null;
 }
 
 /** Raised when a host without a working `at` facility needs a one-shot job. */
@@ -79,6 +84,9 @@ export function unavailableAtIo(issues: string[]): AtIo {
     list(): { id: string; script: string }[] {
       return [];
     },
+    readJob(): { id: string; script: string } | null {
+      return null;
+    },
     remove(): void {
       throw new AtUnavailableError(issues);
     },
@@ -89,6 +97,34 @@ const AT_JOB_GONE = /cannot find|no such|does not exist|not found/i;
 
 /** Real `at`/`atq`/`atrm` IO. */
 export function execAtIo(): AtIo {
+  const listJobIds = (): string[] => {
+    const result = spawnSync("atq", { encoding: "utf-8" });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`atq failed: ${result.stderr || result.stdout}`);
+    }
+
+    const ids: string[] = [];
+    for (const line of result.stdout.trim().split("\n")) {
+      if (!line) continue;
+      const id = line.split(/\s+/)[0];
+      if (id) ids.push(id);
+    }
+    return ids;
+  };
+
+  const readJob = (id: string): { id: string; script: string } | null => {
+    const scriptResult = spawnSync("at", ["-c", id], { encoding: "utf-8" });
+    if (scriptResult.error) throw scriptResult.error;
+    if (scriptResult.status === 0) {
+      return { id, script: scriptResult.stdout };
+    }
+    if (AT_JOB_GONE.test(`${scriptResult.stderr || ""}${scriptResult.stdout || ""}`)) {
+      return null;
+    }
+    throw new Error(`at -c ${id} failed: ${scriptResult.stderr || scriptResult.stdout}`);
+  };
+
   return {
     schedule(script: string, date: Date): string {
       const pad = (value: number, width: number) => value.toString().padStart(width, "0");
@@ -109,32 +145,23 @@ export function execAtIo(): AtIo {
       if (!match) throw new Error(`could not parse at output: ${result.stderr}`);
       return match[1];
     },
+    readJob,
     list(): { id: string; script: string }[] {
-      const result = spawnSync("atq", { encoding: "utf-8" });
-      if (result.error) throw result.error;
-      if (result.status !== 0) {
-        throw new Error(`atq failed: ${result.stderr || result.stdout}`);
-      }
-
+      const ids = listJobIds();
       const jobs: { id: string; script: string }[] = [];
-      for (const line of result.stdout.trim().split("\n")) {
-        if (!line) continue;
-        const id = line.split(/\s+/)[0];
-        if (!id) continue;
-
-        const scriptResult = spawnSync("at", ["-c", id], { encoding: "utf-8" });
-        if (scriptResult.status === 0) {
-          jobs.push({ id, script: scriptResult.stdout });
-        } else if (!AT_JOB_GONE.test(`${scriptResult.stderr}${scriptResult.stdout}`)) {
-          throw new Error(`at -c ${id} failed: ${scriptResult.stderr || scriptResult.stdout}`);
-        }
+      for (const id of ids) {
+        const job = readJob(id);
+        if (job) jobs.push(job);
       }
       return jobs;
     },
     remove(id: string): void {
       const result = spawnSync("atrm", [id], { encoding: "utf-8" });
       if (result.error) throw result.error;
-      if (result.status !== 0 && !AT_JOB_GONE.test(`${result.stderr}${result.stdout}`)) {
+      if (
+        result.status !== 0 &&
+        !AT_JOB_GONE.test(`${result.stderr || ""}${result.stdout || ""}`)
+      ) {
         throw new Error(`atrm ${id} failed: ${result.stderr || result.stdout}`);
       }
     },
