@@ -124,9 +124,8 @@ export function resolveProvider(
 
 /**
  * Instantiate a provider directly from its config, given an already-resolved
- * (or absent) model. Shared by {@link resolveRootProvider} and
- * {@link resolveProvider} (both config-driven). For CLI providers `modelName`
- * may be undefined → the CLI's own default model runs.
+ * (or absent) model, for the config-driven {@link resolveProvider}. For CLI
+ * providers `modelName` may be undefined → the CLI's own default model runs.
  */
 function instantiateProvider(
   providerName: string,
