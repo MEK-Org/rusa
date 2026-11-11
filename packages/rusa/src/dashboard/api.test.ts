@@ -905,27 +905,18 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
-  it("GET /api/mesh/threads surfaces exhausted selected work as needs attention (#664)", async () => {
+  it("GET /api/mesh/threads omits the removed exhaustion badge fields (#1277)", async () => {
     actors.upsert(rec(UUID_A, "root", "active"));
-    const { res } = await call(
-      {
-        ...deps,
-        mesh: {
-          hasExhaustedSelectedWork: (actorId: string) => actorId === UUID_A,
-        } as unknown as ActorMesh,
-      },
-      "GET",
-      "/api/mesh/threads"
-    );
+    actors.upsert(rec(UUID_B, UUID_A, "retired"));
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
 
     expect(res.statusCode).toBe(200);
-    const thread = (JSON.parse(res.body).threads as Array<Record<string, unknown>>).find(
-      (item) => item.id === UUID_A
-    );
-    expect(thread).toMatchObject({
-      needsAttention: true,
-      needsAttentionReason: "Selected work exhausted retries without being handled",
-    });
+    const threads = JSON.parse(res.body).threads as Array<Record<string, unknown>>;
+    expect(threads.map((thread) => thread.id).sort()).toEqual([UUID_A, UUID_B].sort());
+    for (const thread of threads) {
+      expect(thread).not.toHaveProperty("needsAttention");
+      expect(thread).not.toHaveProperty("needsAttentionReason");
+    }
   });
 
   describe("auth-disabled local mode attribution (#460)", () => {
