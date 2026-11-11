@@ -234,8 +234,7 @@ describe("loadConfig rootActor.context", () => {
           model: "gpt-5.6-sol",
           context: {
             type: "portable",
-            mode: "ledger",
-            compactionModel: "  gemini-test  ",
+            mode: "brief",
           },
         },
       })
@@ -243,8 +242,7 @@ describe("loadConfig rootActor.context", () => {
 
     expect(config.rootActor?.context).toEqual({
       type: "portable",
-      mode: "ledger",
-      compactionModel: "gemini-test",
+      mode: "brief",
     });
   });
 
@@ -253,7 +251,7 @@ describe("loadConfig rootActor.context", () => {
     [{ type: "portable", mode: "typo" }, /unknown context selection/],
     [
       { type: "portable", mode: "tail", compactionModel: "gemini-test" },
-      /compactionModel is meaningless for tail mode/,
+      /compactionModel is not supported; portable ledger mode has been retired/,
     ],
     [{ type: "native", mode: "tail" }, /mode is meaningless for native context/],
   ])("rejects malformed or meaningless context %#", (context, message) => {
@@ -262,11 +260,10 @@ describe("loadConfig rootActor.context", () => {
     ).toThrow(message);
   });
 
-  it("rejects ledger mode when no Gemini key is available", () => {
+  it("rejects retired ledger mode", () => {
     expect(() =>
       loadConfig(
         writeConfig({
-          geminiApiKey: undefined,
           rootActor: {
             provider: "codex",
             model: "gpt-5.6-sol",
@@ -274,7 +271,7 @@ describe("loadConfig rootActor.context", () => {
           },
         })
       )
-    ).toThrow(/portable ledger mode needs a Gemini API key/);
+    ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
   });
 });
 
@@ -1053,6 +1050,30 @@ describe("loadConfig providers.codex.authBroker", () => {
     expect(() =>
       loadConfig(writeConfig({ providers: { codex: { cliCommand: "codex", authBroker: "yes" } } }))
     ).toThrow(/providers\.codex\.authBroker must be true or false/);
+  });
+});
+
+describe("loadConfig providers.<name>.openrouterPoc is rejected", () => {
+  it("accepts OpenRouter as an ordinary pi provider", () => {
+    const providers = { codex: { cliCommand: "codex" }, openrouter: { cliCommand: "pi" } };
+    expect(loadConfig(writeConfig({ providers })).providers).toEqual(providers);
+  });
+
+  it("fails load naming the removed block, including its nested piCommand", () => {
+    for (const openrouterPoc of [{}, { piCommand: "/opt/pi/bin/pi" }]) {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            providers: {
+              codex: { cliCommand: "codex" },
+              openrouter: { cliCommand: "openrouter", openrouterPoc },
+            },
+          })
+        )
+      ).toThrow(
+        /providers\.openrouter\.openrouterPoc has been removed.*Delete the key and set cliCommand: pi/
+      );
+    }
   });
 });
 

@@ -47,7 +47,11 @@ Future<void> _withDashboard(
       tester.view.resetDevicePixelRatio();
     });
     final store = DashboardStore(
-      api: api ?? (FakeApi()..chatRoomParticipants = ['root']),
+      api: api ?? (FakeApi()
+        // A non-empty mesh: the first-actor modal (#1260) must not sit on
+        // these navigation flows.
+        ..threadsResult = [makeThread('root', created: 't0')]
+        ..chatRoomParticipants = ['root']),
       stream: FakeStream(),
     );
     await store.init();
@@ -451,6 +455,9 @@ void main() {
           tester,
           initialUrl: '/work',
           api: FakeApi()
+            // A non-empty mesh: the first-actor modal (#1260) must not sit
+            // on this navigation flow.
+            ..threadsResult = [makeThread('root', created: 't0')]
             ..chatRoomParticipants = ['root']
             ..obligationsResult = [makeObligation('ob-q', title: 'Task Q')],
           body: (store) async {

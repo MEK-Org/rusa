@@ -253,6 +253,9 @@ void main() {
         title: 'Context evaluator',
         provider: 'agy',
         model: 'gemini-3.5-flash-medium',
+        // The ordinary spawn dialog never sends the field: the server keeps
+        // the sandboxed default.
+        unsandboxed: null,
       ));
       expect(store.primary.value, 'spawned-child');
       await store.dispose();

@@ -119,6 +119,12 @@ class FakeScheduledMessages implements ScheduledMessageScheduler {
   listMessageDeliveries(): ScheduledMessage[] {
     return [...this.messages.values()];
   }
+  listKnownMessageDeliveries(): ScheduledMessage[] {
+    return this.listMessageDeliveries();
+  }
+  readMessageDelivery(id: string): ScheduledMessage | null {
+    return this.messages.get(id) ?? null;
+  }
 }
 
 const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-mcp-test-secrets-"));
@@ -138,7 +144,6 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     validateContext?: ActorMeshOptions["validateContext"];
-    ledgerCompactionAvailable?: boolean;
     configuredEventSources?: readonly string[];
     /** Defaults to an empty in-memory store; pass the boot union to test it. */
     eventSourceOwners?: EventSourceOwnerStore;
@@ -208,7 +213,6 @@ function setup(
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     validateContext: opts.validateContext,
-    ledgerCompactionAvailable: opts.ledgerCompactionAvailable,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
@@ -1224,11 +1228,25 @@ describe("agent-execution MCP server", () => {
         arguments: {
           charter: "own a small issue",
           model_config: { provider: "claude", model: "claude-sonnet-4-6" },
-          context_mode: "ledger",
+          context_mode: "tail",
         },
       })) as CallToolResult
     ) as { thread_id: string };
-    expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "ledger" });
+    expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "tail" });
+
+    // Ledger mode is rejected at spawn_actor
+    const ledgerSpawn = (await client.callTool({
+      name: "spawn_actor",
+      arguments: {
+        charter: "reject ledger",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    expect(ledgerSpawn.isError).toBe(true);
+    expect((ledgerSpawn.content[0] as { text: string }).text).toMatch(
+      /portable ledger mode has been retired; use 'brief' or 'tail' mode instead/
+    );
   });
 
   it("spawn_actor lets an ordinary authorized spawner select brief", async () => {
@@ -1321,7 +1339,7 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const result = (await client.callTool({
       name: "spawn_actor",
-      arguments: { charter: "work", context_mode: "ledger" },
+      arguments: { charter: "work", context_mode: "tail" },
     })) as CallToolResult;
     expect(result.isError).toBe(true);
     // No standing default stands in for the caller's choice: the spawn is
@@ -3735,7 +3753,7 @@ describe("runtime model-class management", () => {
       arguments: {
         charter: "first",
         model_config: { class: "review" },
-        context_mode: "ledger",
+        context_mode: "tail",
       },
     })) as CallToolResult;
     const firstId = (dataOf(firstSpawn) as { thread_id: string }).thread_id;
@@ -3825,7 +3843,7 @@ describe("runtime model-class management", () => {
       arguments: {
         charter: "worker",
         model_config: { class: "review" },
-        context_mode: "ledger",
+        context_mode: "tail",
       },
     })) as CallToolResult;
     expect(spawnRes.isError).toBeFalsy();
@@ -3923,7 +3941,7 @@ describe("runtime model-class management", () => {
     for (const charter of ["w1", "w2"]) {
       const spawned = (await root.callTool({
         name: "spawn_actor",
-        arguments: { charter, model_config: { class: "pool-class" }, context_mode: "ledger" },
+        arguments: { charter, model_config: { class: "pool-class" }, context_mode: "tail" },
       })) as CallToolResult;
       expect(spawned.isError).toBeFalsy();
     }
@@ -3966,7 +3984,7 @@ describe("runtime model-class management", () => {
 
     const spawn = (await root.callTool({
       name: "spawn_actor",
-      arguments: { charter: "w", model_config: { class: "class-a" }, context_mode: "ledger" },
+      arguments: { charter: "w", model_config: { class: "class-a" }, context_mode: "tail" },
     })) as CallToolResult;
     const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
 
@@ -4040,7 +4058,7 @@ describe("runtime model-class management", () => {
       arguments: {
         charter: "temp worker",
         model_config: { class: "temp-class" },
-        context_mode: "ledger",
+        context_mode: "tail",
       },
     })) as CallToolResult;
     const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
@@ -4345,7 +4363,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       arguments: {
         charter: "review the PR",
         model_config: [{ provider: "codex", model: "gpt-5.6-sol" }, { class: "review" }],
-        context_mode: "ledger",
+        context_mode: "tail",
       },
     })) as CallToolResult;
 
@@ -4384,7 +4402,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     registry.upsert({
       ...root,
       modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
@@ -4433,7 +4451,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     registry.upsert({
       ...root,
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
@@ -4521,7 +4539,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       charter: "portable worker",
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-opus-4-8" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     const nativeChild = mesh.spawn({
       charter: "native worker",
@@ -4573,7 +4591,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         charter: "portable child worker",
         parentId: parentId,
         modelConfig: [{ provider: "claude", model: "claude-sonnet-4-6", effort: "high" }],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       const childHandle = mesh.getActorHandle(childId);
@@ -4600,7 +4618,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       expect(child.model_config).toEqual([
         { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
       ]);
-      expect(child.context).toMatchObject({ type: "portable", mode: "ledger" });
+      expect(child.context).toMatchObject({ type: "portable", mode: "tail" });
 
       // 3. Authorized update preserving existing choices and optional effort (by handle)
       const updatedPool = [
@@ -4711,7 +4729,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /Cannot set a modelConfig pool of more than one entry on non-portable actor/
       );
       expect((poolRefusal.content[0] as { text: string }).text).toMatch(
-        /Only portable \(ledger\/tail\/brief\) actors can use a multi-candidate pool/
+        /Only portable \(tail\/brief\) actors can use a multi-candidate pool/
       );
 
       // Refusal 2: Cross-provider move on native actor
@@ -4727,7 +4745,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /Cannot change provider on non-portable actor/
       );
       expect((providerRefusal.content[0] as { text: string }).text).toMatch(
-        /Only portable \(ledger\/tail\/brief\) actors can be moved across providers/
+        /Only portable \(tail\/brief\) actors can be moved across providers/
       );
     });
 
@@ -4871,7 +4889,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         charter: "portable child",
         parentId,
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
       const childHandle = mesh.getActorHandle(childId);
       const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
@@ -4975,7 +4993,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       expect(res.isError).toBeFalsy();
       expect((res.content[0] as { text: string }).text).toMatch(
         new RegExp(
-          `applied context mode update for ${childId} \\(native -> brief\\); resumes retained ledger items and brief when present, starts empty only when no portable state exists, and never imports provider-session content`
+          `applied context mode update for ${childId} \\(native -> brief\\); resumes retained brief when present, starts empty only when no portable state exists, and never imports provider-session content`
         )
       );
       expect(registry.get(childId)?.context).toEqual({ type: "portable", mode: "brief" });
@@ -5006,7 +5024,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
       expect(res.isError).toBeFalsy();
       expect((res.content[0] as { text: string }).text).toMatch(
-        /applied context mode update for .* \(native -> tail\); resumes retained ledger items and brief when present/
+        /applied context mode update for .* \(native -> tail\); resumes retained brief when present/
       );
       expect(registry.get(childId)?.context).toEqual({ type: "portable", mode: "tail" });
     });
@@ -5138,7 +5156,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       expect(invalidRes.isError).toBe(true);
       expect((invalidRes.content[0] as { text: string }).text).toMatch(/unknown context selection/);
 
-      // Compaction model on non-ledger refused
+      // Compaction model refused (ledger mode retired)
       const invalidCompaction = (await client.callTool({
         name: "set_actor_context",
         arguments: {
@@ -5149,7 +5167,20 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       })) as CallToolResult;
       expect(invalidCompaction.isError).toBe(true);
       expect((invalidCompaction.content[0] as { text: string }).text).toMatch(
-        /compactionModel is meaningless for tail mode/
+        /compactionModel is not supported; portable ledger mode has been retired/
+      );
+
+      // Ledger mode refused
+      const invalidLedger = (await client.callTool({
+        name: "set_actor_context",
+        arguments: {
+          actor_id: childId,
+          context_mode: "ledger",
+        },
+      })) as CallToolResult;
+      expect(invalidLedger.isError).toBe(true);
+      expect((invalidLedger.content[0] as { text: string }).text).toMatch(
+        /portable ledger mode has been retired; use 'brief' or 'tail' mode instead/
       );
     });
 

@@ -33,6 +33,7 @@ const make = (content = "", log?: ReturnType<typeof recordingLogger>["log"]) => 
     {
       schedule: () => "1",
       list: () => [],
+      readJob: () => null,
       remove: () => undefined,
     },
     { ...OPTS, ...(log ? { log } : {}) }

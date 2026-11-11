@@ -417,7 +417,6 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     validateContext?: ActorMeshOptions["validateContext"];
-    ledgerCompactionAvailable?: boolean;
     onModelSet?: ActorMeshOptions["onModelSet"];
     onQueued?: ActorMeshOptions["onQueued"];
     createActor?: ActorMeshOptions["createActor"];
@@ -487,7 +486,6 @@ function setup(
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     validateContext: opts.validateContext,
-    ledgerCompactionAvailable: opts.ledgerCompactionAvailable,
     onModelSet: opts.onModelSet,
     onQueued: opts.onQueued,
     maxConcurrent: opts.maxConcurrent ?? 4,
@@ -669,6 +667,13 @@ class FakeScheduledMessageScheduler implements ScheduledMessageScheduler {
   }
   listMessageDeliveries(): ScheduledMessage[] {
     return [...this.messageDeliveries.values()].map((message) => structuredClone(message));
+  }
+  listKnownMessageDeliveries(): ScheduledMessage[] {
+    return this.listMessageDeliveries();
+  }
+  readMessageDelivery(id: string): ScheduledMessage | null {
+    const message = this.messageDeliveries.get(id);
+    return message ? structuredClone(message) : null;
   }
   listForRecipient(actorId: string): ScheduledMessage[] {
     return this.listMessageDeliveries().filter((message) => message.toId === actorId);
@@ -1072,7 +1077,7 @@ describe("ActorMesh", () => {
     const id = mesh.spawn({
       charter: "implement X",
       parentId: "root",
-      context: { type: "portable", mode: "ledger", compactionModel: "gemini-test" },
+      context: { type: "portable", mode: "tail" },
     });
     expect(id).toBe("t1");
     const rec = registry.get("t1");
@@ -1081,9 +1086,16 @@ describe("ActorMesh", () => {
     expect(rec?.parentId).toBe("root");
     expect(rec?.context).toEqual({
       type: "portable",
-      mode: "ledger",
-      compactionModel: "gemini-test",
+      mode: "tail",
     });
+
+    expect(() =>
+      mesh.spawn({
+        charter: "implement X",
+        parentId: "root",
+        context: { type: "portable", mode: "ledger" },
+      })
+    ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
 
     // Spawning is not an implicit message: the child is born idle with an empty
     // inbox and does not run until something messages it.
@@ -1217,6 +1229,67 @@ describe("ActorMesh", () => {
     mesh.rehydrateAll();
     expect(mesh.get("dead")).toBeUndefined(); // retired stays dead
     expect(mesh.get("root")).toBeDefined(); // root untouched (was already live)
+  });
+
+  it("reads, boots past and revives a stored retired ledger row without refusing it (#1266)", () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    const actorRepo = new SqliteActorRepository(db);
+    actorRepo.upsert({
+      id: "root",
+      charter: "Root",
+      parentId: null,
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+      context: { type: "native" },
+      status: "active",
+      createdAt: "2026-09-03T13:00:00.000Z",
+    });
+    // Written as raw SQL: the row predates the retirement, so no supported
+    // write path can produce it any more.
+    db.prepare(`
+      INSERT INTO actors (id, charter, parent_id, retired_at, execution_config, context_config, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "retired-ledger-worker",
+      "archived worker from ledger era",
+      "root",
+      "2026-01-02T00:00:00.000Z",
+      JSON.stringify({ schemaVersion: 1, unsandboxed: false }),
+      JSON.stringify({
+        schemaVersion: 1,
+        type: "portable",
+        mode: "ledger",
+        compactionModel: "claude-test-model",
+      }),
+      "2026-01-01T00:00:00.000Z"
+    );
+    const storedContext = {
+      type: "portable",
+      mode: "ledger",
+      compactionModel: "claude-test-model",
+    };
+
+    const { mesh } = setup({ actors: actorRepo });
+    // Boot: rehydrateAll skips the retired row instead of refusing it.
+    expect(() => mesh.rehydrateAll()).not.toThrow();
+    expect(mesh.get("retired-ledger-worker")).toBeUndefined();
+    expect(mesh.get("root")).toBeDefined();
+
+    // List and view reads keep the stored shape.
+    const listed = mesh.actors.list().find((r) => r.id === "retired-ledger-worker");
+    expect(listed?.status).toBe("retired");
+    expect(listed?.context).toEqual(storedContext);
+    expect(mesh.actors.get("retired-ledger-worker")?.context).toEqual(storedContext);
+
+    // Revive does not check context: the actor comes back live, unchanged, and
+    // is refused at its first prompt build (covered in start.test.ts).
+    mesh.reviveThread("retired-ledger-worker");
+    expect(mesh.get("retired-ledger-worker")).toBeDefined();
+    expect(actorRepo.get("retired-ledger-worker")?.status).toBe("active");
+    expect(actorRepo.get("retired-ledger-worker")?.context).toEqual(storedContext);
+
+    db.close();
   });
 
   it("rehydrate is idempotent — a second call doesn't replace a live actor", () => {
@@ -5487,7 +5560,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "provider-a", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     // Move an idle worker to provider-b, then halt provider-b. The move applies
@@ -5537,7 +5610,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "provider-a", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     mesh.sendMessage(running, "go", "root");
     mesh.sendMessage(worker, "go", "root");
@@ -5584,7 +5657,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "provider-a", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     mesh.sendMessage(blocker, "hold the slot", "root");
@@ -6579,7 +6652,7 @@ describe("ActorMesh", () => {
     });
     replaceRecord(registry, "root", {
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     const child = mesh.spawn({
       charter: "child",
@@ -6654,31 +6727,31 @@ describe("ActorMesh", () => {
       },
     });
 
-    // 1. Portable ledger actor cross-provider move
-    const ledgerChild = mesh.spawn({
-      charter: "ledger child",
+    // 1. Portable tail actor cross-provider move
+    const portableChild = mesh.spawn({
+      charter: "portable child",
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-opus-4-8" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     mesh.setActorModel(
-      ledgerChild,
+      portableChild,
       { provider: "antigravity", model: "gemini-3.7-flash-high" },
       "root"
     );
-    expect(registry.get(ledgerChild)?.modelConfig).toEqual([
+    expect(registry.get(portableChild)?.modelConfig).toEqual([
       { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
     ]);
-    expect(registry.get(ledgerChild)?.desiredModelConfig).toBeUndefined();
+    expect(registry.get(portableChild)?.desiredModelConfig).toBeUndefined();
     expect(validations).toContainEqual({
-      recordId: ledgerChild,
+      recordId: portableChild,
       newModel: "gemini-3.7-flash-high",
       newProvider: "antigravity",
     });
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
-        actorId: ledgerChild,
+        actorId: portableChild,
         detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash @ high",
       })
     );
@@ -6697,9 +6770,9 @@ describe("ActorMesh", () => {
 
     // 3. Validation failure aborts cross-provider move
     expect(() =>
-      mesh.setActorModel(ledgerChild, { provider: "antigravity", model: "invalid-model" }, "root")
+      mesh.setActorModel(portableChild, { provider: "antigravity", model: "invalid-model" }, "root")
     ).toThrow(/invalid model for antigravity/);
-    expect(registry.get(ledgerChild)?.modelConfig?.[0]?.model).toBe("gemini-3.7-flash");
+    expect(registry.get(portableChild)?.modelConfig?.[0]?.model).toBe("gemini-3.7-flash");
 
     // 4. Non-portable (native context) actor rejects provider move
     const nativeChild = mesh.spawn({
@@ -6753,7 +6826,7 @@ describe("ActorMesh", () => {
       charter: "busy child",
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-opus-4-8" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     // Start a run so the actor is running
@@ -6828,7 +6901,7 @@ describe("ActorMesh", () => {
       charter: "queued child",
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     queuedMeshSetup.mesh.sendMessage(blocker, "hold the slot", "root");
     await queuedMeshSetup.tick();
@@ -6937,7 +7010,7 @@ describe("ActorMesh", () => {
       charter: "moving worker",
       parentId: "root",
       modelConfig: { provider: "provider-a", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
     // Move to provider-b
     dynamicMeshSetup.mesh.setActorModel(
@@ -7038,10 +7111,8 @@ describe("ActorMesh", () => {
       expect(() => mesh.setActorContext("unknown-id", "brief", "root")).toThrow(/unknown thread/);
     });
 
-    it("enforces validation: unknown mode, compaction model on non-ledger, ledger without compaction, native with multi-entry or class", () => {
-      const { mesh, registry } = setup({
-        ledgerCompactionAvailable: false,
-      });
+    it("enforces validation: unknown mode, compaction model unsupported, retired ledger mode, native with multi-entry or class", () => {
+      const { mesh, registry } = setup();
 
       const singleModel = mesh.spawn({
         charter: "single model",
@@ -7055,20 +7126,20 @@ describe("ActorMesh", () => {
         /unknown context selection/
       );
 
-      // 2. Compaction model on non-ledger mode
+      // 2. Compaction model unsupported
       expect(() =>
         mesh.setActorContext(singleModel, "native", "root", { compactionModel: "gemini-model" })
-      ).toThrow(/compactionModel is meaningless for native context/);
+      ).toThrow(/compactionModel is not supported; portable ledger mode has been retired/);
       expect(() =>
         mesh.setActorContext(singleModel, "tail", "root", { compactionModel: "gemini-model" })
-      ).toThrow(/compactionModel is meaningless for tail mode/);
+      ).toThrow(/compactionModel is not supported; portable ledger mode has been retired/);
       expect(() =>
         mesh.setActorContext(singleModel, "brief", "root", { compactionModel: "gemini-model" })
-      ).toThrow(/compactionModel is meaningless for brief mode/);
+      ).toThrow(/compactionModel is not supported; portable ledger mode has been retired/);
 
-      // 3. Ledger without compaction
+      // 3. Retired ledger mode
       expect(() => mesh.setActorContext(singleModel, "ledger", "root")).toThrow(
-        /portable ledger mode needs a Gemini API key for compaction/
+        /portable ledger mode has been retired; use 'brief' or 'tail' mode instead/
       );
 
       // 4. Native with multi-entry pool
@@ -7202,8 +7273,10 @@ describe("ActorMesh", () => {
     });
 
     it("keeps context validation when the configured root switches itself", () => {
-      const { mesh, registry } = setup({ ledgerCompactionAvailable: false });
-      expect(() => mesh.setActorContext("root", "ledger", "root")).toThrow(/Gemini API key/);
+      const { mesh, registry } = setup();
+      expect(() => mesh.setActorContext("root", "ledger", "root")).toThrow(
+        /portable ledger mode has been retired; use 'brief' or 'tail' mode instead/
+      );
       registry.setModelSelection("root", { modelClass: "root-tier" });
       expect(() => mesh.setActorContext("root", "native", "root")).toThrow(
         /holds a model class reference/
@@ -7691,7 +7764,6 @@ describe("ActorMesh", () => {
         parentId: "root",
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
         context: { type: "portable", mode: "tail" },
-        conversationId: "portable-session-a",
       });
       mesh.sendMessage(workerA, "run A", "root");
       await tick();
@@ -7706,7 +7778,6 @@ describe("ActorMesh", () => {
         parentId: "root",
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
         context: { type: "portable", mode: "tail" },
-        conversationId: "portable-session-b",
       });
       mesh.sendMessage(workerB, "run B", "root");
       await tick();
@@ -7881,7 +7952,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "brief" },
       });
 
       const initialSnapshot = {
@@ -7926,22 +7997,29 @@ describe("ActorMesh", () => {
         meshChat: { listReceivedForActor: () => [] } as unknown as Repositories["meshChat"],
       };
 
-      // 1. Initial portable ledger mode: prompt injection includes durable intent ledger
+      // Persisted legacy actor with mode: "ledger" is rejected before run launch
+      const legacyActor: ActorRecord = {
+        id: "legacy-worker",
+        charter: "legacy",
+        parentId: "root",
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+        context: { type: "portable", mode: "ledger" },
+        status: "active",
+        createdAt: "2026-10-01T00:00:00.000Z",
+      };
+      expect(() =>
+        assembleConfiguredPortableInjection(legacyActor, contextStore, mockRepos)
+      ).toThrow(/portable ledger mode has been retired; use 'brief' or 'tail' mode instead/);
+
+      // 1. Initial portable brief mode: prompt injection includes brief
       const workerBefore = actorRepo.get(worker);
       expect(workerBefore).toBeDefined();
-      const ledgerInj = workerBefore
-        ? assembleConfiguredPortableInjection(
-            workerBefore,
-            "dummy-api-key",
-            contextStore,
-            "window",
-            undefined,
-            mockRepos
-          )
+      const initialBriefInj = workerBefore
+        ? assembleConfiguredPortableInjection(workerBefore, contextStore, mockRepos)
         : undefined;
-      expect(ledgerInj?.priorContext).toContain("### Durable intent");
-      expect(ledgerInj?.priorContext).toContain("Durable knowledge");
-      const ledgerPrompt = buildWorkerPrompt(
+      expect(initialBriefInj?.priorContext).toContain("### Durable brief");
+      expect(initialBriefInj?.priorContext).toContain("Persistent guidance");
+      const initialBriefPrompt = buildWorkerPrompt(
         workerBefore?.charter ?? "",
         {
           threadId: worker,
@@ -7951,9 +8029,9 @@ describe("ActorMesh", () => {
             email: "siliconfamiliar@gmail.com",
           }),
         },
-        ledgerInj?.priorContext
+        initialBriefInj?.priorContext
       );
-      expect(ledgerPrompt).toContain("Durable knowledge");
+      expect(initialBriefPrompt).toContain("Persistent guidance");
 
       // 2. Switch to native: prompt injection is omitted
       mesh.setActorContext(worker, "native", "root");
@@ -7967,14 +8045,7 @@ describe("ActorMesh", () => {
       const workerInNative = actorRepo.get(worker);
       expect(workerInNative).toBeDefined();
       const nativeInj = workerInNative
-        ? assembleConfiguredPortableInjection(
-            workerInNative,
-            "dummy-api-key",
-            contextStore,
-            "window",
-            undefined,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerInNative, contextStore, mockRepos)
         : undefined;
       expect(nativeInj).toBeUndefined();
       const nativePrompt = buildWorkerPrompt(
@@ -8002,14 +8073,7 @@ describe("ActorMesh", () => {
       const workerInBrief = actorRepo.get(worker);
       expect(workerInBrief).toBeDefined();
       const briefInj = workerInBrief
-        ? assembleConfiguredPortableInjection(
-            workerInBrief,
-            "dummy-api-key",
-            contextStore,
-            "window",
-            undefined,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerInBrief, contextStore, mockRepos)
         : undefined;
       expect(briefInj?.priorContext).toContain("## Durable brief");
       expect(briefInj?.priorContext).toContain("Persistent guidance");
@@ -8068,14 +8132,7 @@ describe("ActorMesh", () => {
       const workerNative = actorRepo.get(worker);
       expect(workerNative).toBeDefined();
       const nativeInj = workerNative
-        ? assembleConfiguredPortableInjection(
-            workerNative,
-            "dummy-api-key",
-            contextStore,
-            "window",
-            undefined,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerNative, contextStore, mockRepos)
         : undefined;
       expect(nativeInj).toBeUndefined();
 
@@ -8090,14 +8147,7 @@ describe("ActorMesh", () => {
       const workerTail = actorRepo.get(worker);
       expect(workerTail).toBeDefined();
       const tailInj = workerTail
-        ? assembleConfiguredPortableInjection(
-            workerTail,
-            "dummy-api-key",
-            contextStore,
-            "window",
-            undefined,
-            mockRepos
-          )
+        ? assembleConfiguredPortableInjection(workerTail, contextStore, mockRepos)
         : undefined;
       expect(tailInj?.priorContext).toBeUndefined();
     });
@@ -8196,7 +8246,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "delayed-old", model: "old" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       mesh.sendMessage(worker, "work", "root");
@@ -8284,7 +8334,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "test-provider", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Idle, no unhandled inbox: the update applies now (#652) and must not
@@ -8332,7 +8382,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "deferred", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       mesh.sendMessage(blocker, "hold the slot", "root");
@@ -8377,7 +8427,7 @@ describe("ActorMesh", () => {
           charter: "worker",
           parentId: "root",
           modelConfig: { provider: "deferred", model: "model-a" },
-          context: { type: "portable", mode: "ledger" },
+          context: { type: "portable", mode: "tail" },
         });
 
         mesh.sendMessage(blocker, "hold the one slot", "root");
@@ -8434,7 +8484,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "deferred", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       mesh.sendMessage(worker, "run 1", "root");
@@ -8470,7 +8520,7 @@ describe("ActorMesh", () => {
         charter: "unlaunched worker",
         parentId: "root",
         modelConfig: { provider: "deferred", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
       const unlaunchedLive = mesh.get(unlaunched);
       if (!unlaunchedLive) throw new Error("unlaunched worker not live");
@@ -8502,7 +8552,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "deferred", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
       const live = mesh.get(worker);
       if (!live) throw new Error("worker not live");
@@ -8555,7 +8605,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "test-provider", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root");
@@ -8591,7 +8641,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "test-provider", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       mesh.sendMessage(worker, "work", "root");
@@ -8722,7 +8772,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "provider-a", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Occupy the mesh's one concurrency slot.
@@ -8867,7 +8917,7 @@ describe("ActorMesh", () => {
         charter: "worker",
         parentId: "root",
         modelConfig: { provider: "provider-a", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Occupy the mesh's one concurrency slot.
@@ -9041,7 +9091,7 @@ describe("ActorMesh", () => {
           { provider: "pool-a", model: "model-a" },
           { provider: "pool-b", model: "model-b" },
         ],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Occupy the mesh's one concurrency slot.
@@ -9174,7 +9224,7 @@ describe("ActorMesh", () => {
           { provider: "pool-a", model: "model-a" },
           { provider: "pool-b", model: "model-b" },
         ],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Place a provider-wide halt on pool-a before the message arrives.
@@ -9249,7 +9299,7 @@ describe("ActorMesh", () => {
           { provider: "pool-a", model: "model-1" },
           { provider: "pool-a", model: "model-2" },
         ],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Halt only model-1 from pool-a
@@ -9319,7 +9369,7 @@ describe("ActorMesh", () => {
           { provider: "pool-a", model: "model-a" },
           { provider: "pool-b", model: "model-b" },
         ],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Halt both providers in the pool
@@ -9399,7 +9449,7 @@ describe("ActorMesh", () => {
           { provider: "pool-b", model: "model-b" },
           { provider: "pool-c", model: "model-c" },
         ],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Halt only pool-a; both pool-b and pool-c are available
@@ -9542,7 +9592,7 @@ describe("ActorMesh", () => {
           { provider: "pool-a", model: "model-a" },
           { provider: "pool-b", model: "model-b" },
         ],
-        context: { type: "portable", mode: "ledger" },
+        context: { type: "portable", mode: "tail" },
       });
 
       // Occupy the mesh's one concurrency slot.
@@ -9634,7 +9684,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "test-provider", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     // Queue a run that fails.
@@ -9675,7 +9725,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "test-provider", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     expect(mesh.activeRunState(worker)).toBeNull();
@@ -9708,7 +9758,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "deferred", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     mesh.sendMessage(worker, "work", "root");
@@ -9753,7 +9803,7 @@ describe("ActorMesh", () => {
       charter: "worker",
       parentId: "root",
       modelConfig: { provider: "deferred", model: "model-a" },
-      context: { type: "portable", mode: "ledger" },
+      context: { type: "portable", mode: "tail" },
     });
 
     // Blocker occupies the concurrency slot.
@@ -12063,6 +12113,10 @@ describe("ActorMesh", () => {
             return id;
           },
           list: () => jobs.map((job) => ({ ...job })),
+          readJob: (id) => {
+            const job = jobs.find((entry) => entry.id === id);
+            return job ? { ...job } : null;
+          },
           remove: (id) => {
             const index = jobs.findIndex((job) => job.id === id);
             if (index >= 0) jobs.splice(index, 1);
@@ -12096,7 +12150,7 @@ describe("ActorMesh", () => {
           undefined,
           futureDeliverAt()
         );
-        return { mesh, scheduler, inboxStore, recipient };
+        return { mesh, scheduler, inboxStore, recipient, sender };
       }
 
       it.each([
@@ -12155,6 +12209,74 @@ describe("ActorMesh", () => {
         expect(events).toEqual([]);
         expect(chatRows.size).toBe(0);
         expect(scheduler.listMessageDeliveries()).toEqual([]);
+      });
+
+      it("bounds a scheduled send and its cancel by this instance's own message jobs, not the shared queue (#1274)", () => {
+        const { at, jobs } = sharedAtQueue();
+        // Host processes, priced as execAtIo spends them.
+        let spawns = 0;
+        const counted: AtIo = {
+          schedule: (script, date) => {
+            spawns++;
+            return at.schedule(script, date);
+          },
+          list: () => {
+            spawns += 1 + jobs.length;
+            return at.list();
+          },
+          readJob: (id) => {
+            spawns++;
+            return at.readJob(id);
+          },
+          remove: (id) => {
+            spawns++;
+            at.remove(id);
+          },
+        };
+        const staging = bootInstance("/srv/rusa/staging", at);
+        for (let i = 0; i < 50; i++) {
+          staging.scheduler.scheduleMessageDelivery({
+            id: `staging-${i}`,
+            toId: staging.recipient,
+            fromId: staging.sender,
+            body: "foreign",
+            deliverAt: futureDeliverAt(),
+          });
+        }
+        const prod = bootInstance("/srv/rusa/prod", counted);
+        for (let i = 0; i < 30; i++) {
+          prod.scheduler.scheduleObligationActivation(`ob-${i}`, {
+            kind: "at",
+            date: new Date(futureDeliverAt()),
+          });
+        }
+        // Start-up's one full read.
+        prod.mesh.reconcilePendingDeliveries();
+        // 1 legacy + 51 staging messages + 30 prod activations + 1 prod message.
+        expect(jobs).toHaveLength(83);
+        const before = new Set(jobs.map((job) => job.id));
+
+        spawns = 0;
+        prod.mesh.sendMessage(prod.recipient, "bounded", prod.sender, undefined, futureDeliverAt());
+        // Cap: 1 `at -c` for the one message prod knows it has pending. Write:
+        // no stale job under a fresh id, then 1 `at` and 1 confirming `at -c`.
+        expect(spawns).toBe(1 + 2);
+
+        const sent = jobs.find((job) => !before.has(job.id));
+        if (!sent) throw new Error("the scheduled send queued no job");
+        const sentId = JSON.parse(
+          Buffer.from(
+            /payload=([A-Za-z0-9_-]+)/.exec(sent.script)?.[1] ?? "",
+            "base64url"
+          ).toString()
+        ).id as string;
+
+        spawns = 0;
+        prod.mesh.cancelScheduledMessage(sentId, prod.sender);
+        // 1 `at -c` to look it up, 1 to re-verify its tag, 1 `atrm`.
+        expect(spawns).toBe(3);
+        expect(jobs).toHaveLength(83);
+        expect(jobs.some((job) => job.id === sent.id)).toBe(false);
       });
 
       it("still cancels its own job for a recipient it does not know, and only that one", () => {

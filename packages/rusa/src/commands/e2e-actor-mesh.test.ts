@@ -160,8 +160,8 @@ describe("external root E2E control server", () => {
     );
   });
 
-  it("enables portable ledger context through the shared spawn surface", async () => {
-    const spawnChild = vi.fn(() => "child-ledger");
+  it("enables portable context through the shared spawn surface and rejects retired ledger mode", async () => {
+    const spawnChild = vi.fn(() => "child-brief");
     const handles = {
       externalRoot: new ExternalRootDriver("root", vi.fn()),
       rootControl: { spawnChild },
@@ -180,27 +180,38 @@ describe("external root E2E control server", () => {
         charter: "implement the fixture",
         provider: "agy",
         model: "gemini-3.5-flash-medium",
-        contextMode: "ledger",
-        compactionModel: "gemini-test-compactor",
+        contextMode: "brief",
       }),
     });
 
     expect(spawned.status).toBe(201);
     expect(await spawned.json()).toEqual({
-      id: "child-ledger",
-      contextMode: "ledger",
-      compactionModel: "gemini-test-compactor",
+      id: "child-brief",
+      contextMode: "brief",
     });
     expect(spawnChild).toHaveBeenCalledWith(
       expect.objectContaining({
         context: {
           type: "portable",
-          mode: "ledger",
-          compactionModel: "gemini-test-compactor",
+          mode: "brief",
         },
       }),
       "e2e-controller"
     );
+
+    const rejectedLedger = await fetch(`http://127.0.0.1:${port}/actors`, {
+      method: "POST",
+      body: JSON.stringify({
+        charter: "implement the fixture",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        contextMode: "ledger",
+      }),
+    });
+    expect(rejectedLedger.status).toBe(400);
+    expect(await rejectedLedger.json()).toEqual({
+      error: "portable ledger mode has been retired; use 'brief' or 'tail' mode instead",
+    });
   });
 
   it("exposes queued root wakes and acknowledges them explicitly", async () => {

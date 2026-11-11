@@ -237,6 +237,7 @@ class DashboardApi {
     String? title,
     String? provider,
     String? model,
+    bool? unsandboxed,
   }) async {
     final uri = _u('/api/mesh/actors');
     final res = await _client.post(
@@ -251,6 +252,7 @@ class DashboardApi {
         'title': ?title,
         'provider': ?provider,
         'model': ?model,
+        'unsandboxed': ?unsandboxed,
       }),
     );
     if (res.statusCode != 201) {

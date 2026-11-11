@@ -202,6 +202,13 @@ export interface SpawnRequest {
   conversationId?: string;
   /** A brief one-line description of what this actor is tasked with, shown under its name in the dashboard. */
   title?: string;
+  /**
+   * Record the new actor as running outside managed sandboxing (#550). Spawn's
+   * default is sandboxed and every existing caller omits this; the operator
+   * dashboard's first-actor bootstrap is the only path that may pass `true`,
+   * and root control gates that case (empty mesh) before it reaches spawn.
+   */
+  unsandboxed?: boolean;
 }
 
 export type MessageDeliveryResult =
@@ -610,11 +617,6 @@ export interface ActorMeshOptions {
    * Synchronous validator before staging or applying an actor's context mode change.
    */
   validateContext?: (record: ActorRecord, context: ContextConfig) => void;
-  /**
-   * Whether ledger compaction is available (Gemini API key present).
-   * Defaults to true when omitted and validateContext is unset.
-   */
-  ledgerCompactionAvailable?: boolean;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -928,7 +930,6 @@ export class ActorMesh {
     modelConfig: ModelConfigInput
   ) => ProviderModelConfig[];
   private readonly validateContext?: (record: ActorRecord, context: ContextConfig) => void;
-  private readonly ledgerCompactionAvailable: boolean;
   /** The execution coordinator: live actors, construction, dispatch, admission. */
   private readonly runs: RunManager;
   private readonly isHalted: (provider?: string, model?: string) => boolean;
@@ -1089,7 +1090,6 @@ export class ActorMesh {
     this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
     this.validateContext = opts.validateContext;
-    this.ledgerCompactionAvailable = opts.ledgerCompactionAvailable ?? true;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
     this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
@@ -3297,6 +3297,7 @@ export class ActorMesh {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
     this.assertPlacementSupported(req.executionTarget);
+    assertSpawnContextSupported(req);
     const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
     if (modelConfig.length === 0) {
       throw new Error("modelConfig must declare at least one provider/model entry");
@@ -3319,10 +3320,18 @@ export class ActorMesh {
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
-      // A spawned child is sandboxed: the default, since spawn never asks
-      // for `unsandboxed` (#550).
-      ...(req.executionTarget !== undefined
-        ? { executionConfig: { executionTarget: req.executionTarget } }
+      // A spawned child is sandboxed by default. `unsandboxed: true` is only
+      // ever passed by the operator first-actor bootstrap (root control gates
+      // the empty-mesh case); every other caller omits it (#550).
+      ...(req.executionTarget !== undefined || req.unsandboxed === true
+        ? {
+            executionConfig: {
+              ...(req.unsandboxed === true ? { unsandboxed: true } : {}),
+              ...(req.executionTarget !== undefined
+                ? { executionTarget: req.executionTarget }
+                : {}),
+            },
+          }
         : {}),
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can
@@ -4378,7 +4387,14 @@ export class ActorMesh {
       if (!this.scheduledMessages) {
         throw new Error("Scheduled-message OS scheduler is not configured");
       }
-      if (this.pendingScheduledMessages().filter((message) => message.toId === toId).length >= 10) {
+      // Only this instance's own known message jobs are read back here, so
+      // the cost of a send follows its own pending messages rather than the
+      // length of the shared host queue (#1274).
+      const pendingForRecipient = this.scheduledMessages
+        .listKnownMessageDeliveries()
+        .map((message) => this.resolveScheduledMessage(message))
+        .filter((message) => message.toId === toId).length;
+      if (pendingForRecipient >= 10) {
         throw new Error(
           `Cannot schedule message: recipient ${toId} has reached the cap of 10 pending deliveries.`
         );
@@ -4961,7 +4977,10 @@ export class ActorMesh {
     reason?: string
   ): { messageId: string; fromId: string; toId: string; deliverAt: string } {
     by = this.resolveThreadId(by);
-    const message = this.pendingScheduledMessages().find((entry) => entry.id === messageId);
+    // One read of the jobs known under this message's own tag, not a scan of
+    // the host queue (#1274).
+    const found = this.scheduledMessages?.readMessageDelivery(messageId) ?? null;
+    const message = found ? this.resolveScheduledMessage(found) : null;
     if (!message) {
       throw new Error(
         `unknown pending message id: ${messageId} — it may have already been delivered or cancelled`
@@ -5293,7 +5312,7 @@ export class ActorMesh {
    * any thread in its subtree, itself included; any other caller may only set
    * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
-   * portable (ledger/tail/brief) actor — a native provider session can't move.
+   * portable (tail/brief) actor — a native provider session can't move.
    * The replacement is atomic (the whole pool or nothing). A run already in
    * flight keeps its launched pool and the replacement applies when that run
    * ends; an idle or queued actor has it applied and persisted now (#652), so
@@ -5339,7 +5358,7 @@ export class ActorMesh {
     const portable = effectiveContext?.type === "portable";
     if (validated.length > 1 && !portable) {
       throw new Error(
-        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (tail/brief) actors can use a multi-candidate pool.`
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
@@ -5359,7 +5378,7 @@ export class ActorMesh {
       validated[0].provider !== currentProvider
     ) {
       throw new Error(
-        `Cannot change provider on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
+        `Cannot change provider on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (tail/brief) actors can be moved across providers.`
       );
     }
     if (isModelClassReference(modelConfig) && record.desiredContextConfig?.type === "native") {
@@ -5617,10 +5636,7 @@ export class ActorMesh {
     if (this.validateContext) {
       this.validateContext(record, validated);
     } else {
-      assertSpawnContextSupported(
-        { context: validated },
-        { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
-      );
+      assertSpawnContextSupported({ context: validated });
     }
 
     if (validated.type === "native") {
@@ -5984,10 +6000,7 @@ export class ActorMesh {
         }
       } else if (targetContext.type === "portable") {
         try {
-          assertSpawnContextSupported(
-            { context: targetContext },
-            { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
-          );
+          assertSpawnContextSupported({ context: targetContext });
         } catch {
           return false;
         }
@@ -6261,11 +6274,17 @@ export class ActorMesh {
   }
 
   private pendingScheduledMessages(): ScheduledMessage[] {
-    return (this.scheduledMessages?.listMessageDeliveries() ?? []).map((message) => ({
+    return (this.scheduledMessages?.listMessageDeliveries() ?? []).map((message) =>
+      this.resolveScheduledMessage(message)
+    );
+  }
+
+  private resolveScheduledMessage(message: ScheduledMessage): ScheduledMessage {
+    return {
       ...message,
       fromId: this.resolveThreadId(message.fromId),
       toId: this.resolveThreadId(message.toId),
-    }));
+    };
   }
 
   /**

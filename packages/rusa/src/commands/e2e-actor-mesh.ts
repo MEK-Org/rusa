@@ -551,13 +551,7 @@ export function startRootControlServer(opts: {
           // Echo back what was actually stored on the record, read out of the
           // resolved config rather than off the request, so the rig asserts on
           // the spawn's real shape instead of on its own input.
-          send(
-            res,
-            201,
-            context?.type === "portable"
-              ? { id, contextMode: context.mode, compactionModel: context.compactionModel }
-              : { id }
-          );
+          send(res, 201, context?.type === "portable" ? { id, contextMode: context.mode } : { id });
           return;
         }
         if (url.pathname === "/root/wakes/ack") {
@@ -813,7 +807,7 @@ function printDriveHelp(opts: {
     console.log(`  curl -s ${rootControl}/root/wakes | jq`);
     console.log(`\nSpawn a root child without invoking a root provider:`);
     console.log(
-      `  curl -s -XPOST ${rootControl}/actors -d '{"charter":"...","provider":"<configured key>","model":"<model>","contextMode":"ledger"}'`
+      `  curl -s -XPOST ${rootControl}/actors -d '{"charter":"...","provider":"<configured key>","model":"<model>","contextMode":"brief"}'`
     );
     console.log(`\nMessage it and inspect its durable context:`);
     console.log(`  curl -s -XPOST ${rootControl}/actors/<id>/messages -d '{"body":"..."}'`);

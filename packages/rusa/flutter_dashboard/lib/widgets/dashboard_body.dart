@@ -11,6 +11,7 @@ import '../theme.dart';
 import 'actor_tree.dart';
 import 'chat_room.dart';
 import 'detail_panel.dart';
+import 'first_actor_bootstrap.dart';
 import 'header.dart';
 import 'mobile_nav_drawer.dart';
 import 'overview_tab.dart';
@@ -380,7 +381,10 @@ class _DashboardBodyState extends State<DashboardBody> {
               builder: (context) => MediaQuery.removePadding(
                 context: context,
                 removeTop: !hideRoomHeader,
-                child: bodyContent,
+                child: FirstActorBootstrap(
+                  store: widget.store,
+                  child: bodyContent,
+                ),
               ),
             ),
           ),

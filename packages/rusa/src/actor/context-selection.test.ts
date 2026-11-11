@@ -19,53 +19,51 @@ describe("resolveContextSelection", () => {
     expect(resolveContextSelection("native")).toEqual({ type: "native" });
   });
 
-  it("maps each portable mode to itself", () => {
-    expect(resolveContextSelection("ledger")).toEqual({
-      type: "portable",
-      mode: "ledger",
-      compactionModel: undefined,
-    });
+  it("maps each supported portable mode to itself", () => {
     expect(resolveContextSelection("tail")).toEqual({ type: "portable", mode: "tail" });
     expect(resolveContextSelection("brief")).toEqual({ type: "portable", mode: "brief" });
   });
 
+  it("rejects retired ledger mode immediately at configuration boundaries (#1266)", () => {
+    expect(() => resolveContextSelection("ledger")).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
+    expect(() => resolveContextSelection("ledger", { compactionModel: "gemini-x" })).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
+    expect(() => resolveContextConfig({ type: "portable", mode: "ledger" })).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
+    expect(() =>
+      resolveContextConfig({ type: "portable", mode: "ledger", compactionModel: "gemini-x" })
+    ).toThrow("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
+  });
+
   it("has no bare portable selection", () => {
-    // Per Operator on 2026-08-08: `ledger` and `tail` ARE the portable modes, so a
-    // word naming their family would sit at a different level than the rest of
-    // the vocabulary. Asking for it is an unknown selection, not a silent ledger.
     expect(() => resolveContextSelection("portable")).toThrow("unknown context selection");
   });
 
-  it("carries a compaction model onto ledger", () => {
-    expect(resolveContextSelection("ledger", { compactionModel: " gemini-x " })).toMatchObject({
-      compactionModel: "gemini-x",
-    });
-  });
-
-  it("refuses a compaction model for modes that never compact", () => {
-    // A knob that is accepted, stored, and never consulted is the failure this
-    // arc keeps finding. Each of these must be an error, not an ignored field.
+  it("refuses compactionModel with clear retirement error (#1266)", () => {
     expect(() => resolveContextSelection("tail", { compactionModel: "gemini-x" })).toThrow(
-      "never compacts"
+      "compactionModel is not supported; portable ledger mode has been retired"
     );
     expect(() => resolveContextSelection("native", { compactionModel: "gemini-x" })).toThrow(
-      "meaningless for native"
+      "compactionModel is not supported; portable ledger mode has been retired"
     );
     expect(() => resolveContextSelection(undefined, { compactionModel: "gemini-x" })).toThrow(
-      "requires a portable context selection"
+      "compactionModel is not supported; portable ledger mode has been retired"
     );
-    // Nothing compacts a brief, so a configured model would be inert.
     expect(() => resolveContextSelection("brief", { compactionModel: "gemini-x" })).toThrow(
-      "meaningless for brief mode"
+      "compactionModel is not supported; portable ledger mode has been retired"
     );
     expect(() =>
       resolveContextConfig({ type: "portable", mode: "brief", compactionModel: "gemini-x" })
-    ).toThrow("meaningless for brief mode");
+    ).toThrow("compactionModel is not supported; portable ledger mode has been retired");
   });
 
   it("names the valid values when the selection is unknown", () => {
     expect(() => resolveContextSelection("portible")).toThrow("portible");
-    expect(() => resolveContextSelection("portible")).toThrow("native, ledger, tail, brief");
+    expect(() => resolveContextSelection("portible")).toThrow("native, tail, brief");
     expect(() => resolveContextSelection(7)).toThrow("unknown context selection");
   });
 
@@ -80,20 +78,12 @@ describe("resolveContextSelection", () => {
 });
 
 describe("assertSpawnContextSupported", () => {
-  const available = { ledgerCompactionAvailable: true };
-  const unavailable = { ledgerCompactionAvailable: false };
-
   it("ignores native and unspecified spawns", () => {
-    expect(() => assertSpawnContextSupported({}, unavailable)).not.toThrow();
-    expect(() =>
-      assertSpawnContextSupported({ context: { type: "native" } }, unavailable)
-    ).not.toThrow();
+    expect(() => assertSpawnContextSupported({})).not.toThrow();
+    expect(() => assertSpawnContextSupported({ context: { type: "native" } })).not.toThrow();
     // A native spawn may still seed a conversation — that path is untouched.
     expect(() =>
-      assertSpawnContextSupported(
-        { context: { type: "native" }, conversationId: "conv-1" },
-        unavailable
-      )
+      assertSpawnContextSupported({ context: { type: "native" }, conversationId: "conv-1" })
     ).not.toThrow();
   });
 
@@ -101,34 +91,25 @@ describe("assertSpawnContextSupported", () => {
     // Portable actors never resume, so the id would be written to the record and
     // silently never used — the caller would think it promoted a conversation.
     expect(() =>
-      assertSpawnContextSupported(
-        { context: { type: "portable", mode: "tail" }, conversationId: "conv-1" },
-        available
-      )
+      assertSpawnContextSupported({
+        context: { type: "portable", mode: "tail" },
+        conversationId: "conv-1",
+      })
     ).toThrow("never resumes a provider conversation");
   });
 
-  it("refuses ledger when compaction is unavailable", () => {
+  it("refuses retired ledger context immediately (#1266)", () => {
     expect(() =>
-      assertSpawnContextSupported({ context: { type: "portable", mode: "ledger" } }, unavailable)
-    ).toThrow("geminiApiKey");
+      assertSpawnContextSupported({ context: { type: "portable", mode: "ledger" } })
+    ).toThrow("portable ledger mode has been retired; use 'brief' or 'tail' mode instead");
   });
 
-  it("allows ledger when compaction is available, and tail and brief either way", () => {
+  it("allows tail and brief modes", () => {
     expect(() =>
-      assertSpawnContextSupported({ context: { type: "portable", mode: "ledger" } }, available)
+      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } })
     ).not.toThrow();
     expect(() =>
-      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, available)
-    ).not.toThrow();
-    // The actor writes its own brief; no Gemini call is involved.
-    expect(() =>
-      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, unavailable)
-    ).not.toThrow();
-    // Tail never calls the compactor, so a missing key must NOT block it —
-    // otherwise the guard would be refusing a configuration that works.
-    expect(() =>
-      assertSpawnContextSupported({ context: { type: "portable", mode: "tail" } }, unavailable)
+      assertSpawnContextSupported({ context: { type: "portable", mode: "tail" } })
     ).not.toThrow();
   });
 });

@@ -47,8 +47,7 @@ Minimal example:
     # effort: high                    # optional provider-native reasoning level
     # context:                       # optional; omit for native provider sessions
     #   type: portable
-    #   mode: ledger                # ledger (requires geminiApiKey) or tail
-    #   compactionModel: gemini-3.5-flash-lite
+    #   mode: tail                  # tail or brief (ledger mode retired)
     # handle: ember-familiar           # optional; a secondary instance's own display handle 
     # avatar: /path/to/ember.jpg       # optional; overrides the bundled root avatar image
 
@@ -126,7 +125,7 @@ Top-level fields:
   providers                Required. Coding providers available to tasks.
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
   mesh                     Optional. Mesh concurrency settings.
-  geminiApiKey             Optional. Enables Gemini features (portable compaction, quota parsing, avatar generation, understanding retrieval/distill, Google speech); each skips gracefully when absent.
+  geminiApiKey             Optional. Enables Gemini features (quota parsing, avatar generation, understanding retrieval/distill, Google speech); each skips gracefully when absent.
   jevApiKeyFile            Optional basename of a credential file directly under RUSA_HOME/secrets. Opts into JEV responsive-interruption classification; invalid or unavailable credentials keep the existing scheduler and post no prediction reaction.
   jevMode                  Optional mode for JEV responsive-interruption ("shadow" or "active"). Defaults to shadow. When active, conditionally suppresses preemption for running actors holding selected work.
   elevenlabsApiKey         Optional. Enables ElevenLabs walkie-talkie transcription and actor speech.
@@ -162,7 +161,7 @@ providers:
   providers is a map from provider name to provider configuration. The provider name is the
   logical name used by model routing, while cliCommand selects the executable for CLI providers.
 
-  cliCommand               Required. The CLI executable. Example: claude, codex, agy, kimi, copilot.
+  cliCommand               Required. The CLI executable. Example: claude, codex, agy, kimi, copilot, pi (OpenRouter).
   dailyCap                 Optional string budget marker, for example "$50".
 
 quota:
@@ -190,8 +189,7 @@ rootActor:
                            level (e.g. "low", "high"), stored independently from model. Omit for other providers
                            when no effort is passed to the provider.
   context                  Optional. Working-memory policy. Omit for native provider sessions, or set
-                           {type: portable, mode: ledger|tail}. Ledger mode requires geminiApiKey and
-                           optionally accepts compactionModel; tail mode never compacts.
+                           {type: portable, mode: tail|brief}.
   charter                  Optional. The root actor's standing charter, prepended to every wake. Built-in
                            default if omitted.
   handle                   Optional. Overrides the root actor's display handle (default: derived, "root-actor").
