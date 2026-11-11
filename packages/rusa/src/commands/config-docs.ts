@@ -40,17 +40,6 @@ Minimal example:
   # Branch used by the root self-update tool (optional; defaults to master).
   deployBranch: master
 
-  # The explicit provider/model pin the root actor runs on.
-  rootActor:
-    provider: antigravity
-    model: "Gemini 3.1 Pro (High)"
-    # effort: high                    # optional provider-native reasoning level
-    # context:                       # optional; omit for native provider sessions
-    #   type: portable
-    #   mode: tail                  # tail or brief (ledger mode retired)
-    # handle: ember-familiar           # optional; a secondary instance's own display handle 
-    # avatar: /path/to/ember.jpg       # optional; overrides the bundled root avatar image
-
   webhook:
     port: 9742
     secret: GENERATED_SECRET
@@ -134,8 +123,6 @@ Top-level fields:
                            user.*, author.* and committer.* overrides so the configured identity wins
                            without touching Git config files.
   webhook                  Required. Local webhook listener settings.
-  rootActor                Required. Explicit provider/model pin the root actor runs on; identity defaults to
-                           root-actor.
   chat                     Optional. Google Chat Workspace Events ingestion and REST write settings.
   slack                    Optional. Slack Socket Mode ingestion and bot REST settings.
   dashboard                Optional. Dashboard listener and Tailscale settings.
@@ -180,26 +167,6 @@ quota.throttle:
   manualHardStaleSeconds   Optional positive integer for manual reading mode only; defaults to 7200. Past it
                            the published interval widens to maxIntervalSeconds. Manual soft stale is
                            min(3600, this). Scrape-mode thresholds are unaffected.
-
-rootActor:
-
-  provider                 Required. Provider key (in providers) the root actor runs on.
-  model                    Required nonblank model id passed to the provider CLI's --model.
-  effort                   Required for antigravity (agy); optional otherwise. Provider-native reasoning
-                           level (e.g. "low", "high"), stored independently from model. Omit for other providers
-                           when no effort is passed to the provider.
-  context                  Optional. Working-memory policy. Omit for native provider sessions, or set
-                           {type: portable, mode: tail|brief}.
-  charter                  Optional. The root actor's standing charter, prepended to every wake. Built-in
-                           default if omitted.
-  handle                   Optional. Overrides the root actor's display handle (default: derived, "root-actor").
-                           Lets a secondary instance sharing the bot account (e.g. staging) present under its own
-                           identity in GitHub signing bylines, the dashboard, and its avatar .
-                           Also titles the dashboard page and names the installed PWA ("Ember Familiar").
-  avatar                   Optional. Path to a root avatar image, overriding the bundled default. Falls back to
-                           the bundled image when unset or the path doesn't resolve to an existing file.
-                           A root image — this or one uploaded from the dashboard — also becomes the dashboard's
-                           favicon and app icon (#48).
 
 webhook:
 

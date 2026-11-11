@@ -94,6 +94,7 @@ import { scanVendorPaths, snapshotWorkdir } from "../harness/workdir-capture.js"
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import { e2eHarnessActor } from "./e2e-actor-mesh.js";
 import { resolveQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
@@ -580,10 +581,6 @@ async function runProviderContextABBody(
   const instance = provisionE2EInstance({
     root: instanceRoot,
     baseConfigHome: opts.baseConfigHome,
-    rootActor: {
-      provider: rootProvider,
-      model: rootProvider === "kimi" ? "kimi-for-coding" : "claude-sonnet-5",
-    },
     chat: {
       projectId: "ab",
       subscription: "ab",
@@ -675,6 +672,12 @@ async function runProviderContextABBody(
       e2e: {
         chatClient,
         chatSource,
+        // The rig's own actor, created through the ordinary creation path on
+        // this fresh home (#1261); the arms are adopted beneath it.
+        harnessActor: e2eHarnessActor(instanceRoot, {
+          provider: rootProvider,
+          model: rootProvider === "kimi" ? "kimi-for-coding" : "claude-sonnet-5",
+        }),
         onReady: (handles) => {
           emitGitHubEvent = handles.emitGitHubEvent;
           resolve(handles);
@@ -685,7 +688,7 @@ async function runProviderContextABBody(
   const handles = await ready;
   const { mesh } = handles;
   const rootId = handles.rootControl.rootId;
-  if (!rootId) throw new Error("ab-context requires an imported root actor");
+  if (!rootId) throw new Error("ab-context requires its harness actor");
 
   // Adopt the rig's own holder BEFORE spawning the arms — see RIG_HOLDER_ID for why the
   // arms must not be root's DIRECT children (an issue).

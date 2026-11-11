@@ -58,8 +58,6 @@ export function buildE2EConfig(opts: {
   dashboardPort?: number;
   scratchPath: string;
   baseConfig?: RusaConfig | null;
-  /** Actor-mesh root config (provider/charter). */
-  rootActor?: RusaConfig["rootActor"];
   /** Chat config; set (with fakes injected at runtime) to exercise the chat edge. */
   chat?: RusaConfig["chat"];
   slack?: RusaConfig["slack"];
@@ -80,7 +78,6 @@ export function buildE2EConfig(opts: {
         }
       : undefined;
   return {
-    rootActor: opts.rootActor ?? base?.rootActor ?? { provider: "fake", model: "fake-model" },
     ...(opts.chat ? { chat: opts.chat } : {}),
     ...(opts.slack ? { slack: opts.slack } : {}),
     // The scratch repo is this instance's configured GitHub event source, as a
@@ -132,7 +129,6 @@ export function provisionE2EInstance(opts: {
   dashboardPort?: number;
   root?: string;
   baseConfigHome?: string;
-  rootActor?: RusaConfig["rootActor"];
   chat?: RusaConfig["chat"];
   slack?: RusaConfig["slack"];
 }): E2EInstance {
@@ -195,7 +191,6 @@ export function provisionE2EInstance(opts: {
     dashboardPort: opts.dashboardPort,
     scratchPath,
     baseConfig,
-    rootActor: opts.rootActor,
     chat: opts.chat,
     slack: opts.slack,
   });

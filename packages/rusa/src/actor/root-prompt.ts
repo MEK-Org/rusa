@@ -1,6 +1,6 @@
 /**
  * The built-in **default** root charter. This is per-instance customization, not
- * system identity — an instance overrides it via `rootActor.charter` in config
+ * system identity — an instance overrides it via its charter on its actor record
  * (the identity is the specific instance, not the "rusa" system). Kept as a
  * code constant (not a personas/*.md file — personas are a retired v2 concept) so
  * there's a sensible default that ships with the bundle.

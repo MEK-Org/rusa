@@ -1,4 +1,12 @@
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -94,19 +102,37 @@ describe("legacy actor import", () => {
     expect(existsSync(join(home, "threads.json"))).toBe(false);
   });
 
-  it("defers a session-only install until startup creates the first root", () => {
+  it("refuses a session-only install with no root, leaving its files in place (#1261)", () => {
     const sessionPath = join(home, "root-agent", "session.json");
     writeFileSync(sessionPath, JSON.stringify({ sessionId: "root-session" }));
 
-    const result = importState();
+    expect(() => importState()).toThrow(
+      /root-agent\/session\.json names a root session but no actor exists to carry it.*boot the last release that carries the configured-actor import once/
+    );
+    expect(existsSync(sessionPath)).toBe(true);
 
-    expect(result).toMatchObject({
+    // The message's other way out: move the session file aside and the home
+    // boots empty, ready for a first actor from the dashboard.
+    expect(() => importState()).toThrow(
+      /Otherwise, to give up that session: move root-agent\/session\.json out of this home/
+    );
+    renameSync(sessionPath, join(home, "session.json.aside"));
+    expect(importState()).toEqual({
       importedActors: 0,
       importedScheduledMessages: 0,
-      deferredRootSessionId: "root-session",
+      backupFiles: [],
     });
-    expect(result.backupFiles).toEqual([]);
+  });
+
+  it("refuses an empty threads.json beside a root session, leaving both files in place (#1261)", () => {
+    const sessionPath = join(home, "root-agent", "session.json");
+    const threadsPath = join(home, "threads.json");
+    writeFileSync(sessionPath, JSON.stringify({ sessionId: "root-session" }));
+    writeFileSync(threadsPath, JSON.stringify({ threads: [] }));
+
+    expect(() => importState()).toThrow(/names a root session but no actor exists to carry it/);
     expect(existsSync(sessionPath)).toBe(true);
+    expect(existsSync(threadsPath)).toBe(true);
   });
 
   it("imports and archives the legacy sources", () => {

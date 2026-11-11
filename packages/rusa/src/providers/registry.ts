@@ -15,8 +15,6 @@ import {
 import type { CodingProvider } from "./types.js";
 
 export {
-  DEFAULT_ROOT_EFFORT,
-  DEFAULT_ROOT_PROVIDER,
   providerCapabilityName,
   validateProviderSelection,
 } from "./provider-selection.js";
@@ -108,27 +106,8 @@ export const QUOTA_THROTTLE_PROVIDERS = ["claude", "codex", "agy", "kimi"] as co
 export type QuotaThrottleProvider = (typeof QUOTA_THROTTLE_PROVIDERS)[number];
 
 /**
- * Resolve the provider the root actor runs on. Config-driven and intentionally
- * independent of the DB enabled-models / persona quota routing — the root model
- * is just config. Config loading passes this same selection through the shared model
- * config validator. Throws if the provider or model is blank.
- */
-export function resolveRootProvider(config: RusaConfig): CodingProvider {
-  const rootActor = config.rootActor;
-  if (!rootActor) throw new Error("rootActor must specify an explicit provider and model");
-  const providerName = typeof rootActor.provider === "string" ? rootActor.provider.trim() : "";
-  if (!providerName) throw new Error("rootActor.provider must be a non-empty string");
-  const model = typeof rootActor.model === "string" ? rootActor.model.trim() : "";
-  if (!model) throw new Error("rootActor.model must be a non-empty string");
-  const selection = validateProviderSelection(config, providerName, model, rootActor.effort);
-  return instantiateProvider(providerName, selection.model, selection.effort, config);
-}
-
-/**
  * Resolve an arbitrary configured provider by name (a key under `providers`),
- * with an optional model. Used to run a worker actor on a different harness than
- * the root (e.g. an agy root delegating to a claude worker) — config-driven, like
- * {@link resolveRootProvider}, and independent of the DB persona/quota routing.
+ * with an optional model. Config-driven and independent of the DB persona/quota routing.
  * Throws if the provider isn't declared under `providers`, or if a model was
  * requested but is blank — silently dropping a requested model would hand the
  * run to the provider's default, a ISSUE_NUM-class silent substitution .
@@ -145,9 +124,8 @@ export function resolveProvider(
 
 /**
  * Instantiate a provider directly from its config, given an already-resolved
- * (or absent) model. Shared by {@link resolveRootProvider} and
- * {@link resolveProvider} (both config-driven). For CLI providers `modelName`
- * may be undefined → the CLI's own default model runs.
+ * (or absent) model, for the config-driven {@link resolveProvider}. For CLI
+ * providers `modelName` may be undefined → the CLI's own default model runs.
  */
 function instantiateProvider(
   providerName: string,

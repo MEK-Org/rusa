@@ -205,8 +205,8 @@ describe("quickstart command", () => {
     });
   });
 
-  it("writes quickstart config without the removed targets field", async () => {
-    promptMocks.state.inputs = ["codex", "my-root-entity", "gpt-5.6-sol"];
+  it("writes quickstart config without the removed targets field or rootActor", async () => {
+    promptMocks.state.inputs = ["codex"];
     promptMocks.state.passwords = ["test-gemini-key"];
     await runQuickstartConfigure({
       home,
@@ -214,21 +214,21 @@ describe("quickstart command", () => {
     });
 
     const configPath = join(home, "config.yaml");
-    const config = parseYaml(readFileSync(configPath, "utf8")) as RusaConfig;
+    const rawYaml = readFileSync(configPath, "utf8");
+    const config = parseYaml(rawYaml) as RusaConfig;
 
     expect(config.profile).toBe("quickstart");
     expect(readFileSync(join(home, "secrets", "gemini-api-key"), "utf8")).toBe("test-gemini-key\n");
     expect(config.github).toEqual({});
     expect(config).not.toHaveProperty("targets");
-    expect(config.rootActor?.provider).toBe("codex");
-    expect(config.rootActor?.model).toBe("gpt-5.6-sol");
-    expect(config.rootActor?.handle).toBe("my-root-entity");
+    expect(config).not.toHaveProperty("rootActor");
+    expect(rawYaml).not.toContain("rootActor:");
     expect(config.dashboard?.port).toBe(8080);
     expect(config.providers).toEqual({ codex: { cliCommand: "codex" } });
   });
 
   it("generates a valid config for antigravity that loadConfig accepts", async () => {
-    promptMocks.state.inputs = ["antigravity", "my-root-entity", "Gemini 3.7 Flash"];
+    promptMocks.state.inputs = ["antigravity"];
     promptMocks.state.passwords = ["test-gemini-key"];
     await runQuickstartConfigure({
       home,
@@ -236,59 +236,8 @@ describe("quickstart command", () => {
     });
 
     const loadedConfig = loadConfig(home);
-    expect(loadedConfig.rootActor?.provider).toBe("antigravity");
-    expect(loadedConfig.rootActor?.effort).toBe("high");
-  });
-
-  it("keeps the generated root handle when a fresh-install handle prompt is blank", async () => {
-    promptMocks.state.inputs = ["codex", "", "gpt-5.6-sol"];
-    promptMocks.state.passwords = ["test-gemini-key"];
-
-    await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
-
-    const configPath = join(home, "config.yaml");
-    const config = parseYaml(readFileSync(configPath, "utf8")) as RusaConfig;
-
-    expect(readFileSync(join(home, "secrets", "gemini-api-key"), "utf8")).toBe("test-gemini-key\n");
-    expect(config.github).toEqual({});
-    expect(config).not.toHaveProperty("targets");
-    expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
-    expect(promptMocks.input).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: `Root entity handle/name (leave blank for suggested: "${config.rootActor?.handle}"):`,
-        default: config.rootActor?.handle,
-      })
-    );
-  });
-
-  // The runtime resolves the stored handle byte-for-byte, so a padded handle
-  // must survive both a blank answer and acceptance of the displayed default.
-  it.each([
-    ["my-root", ""],
-    [" my-root ", ""],
-    [" my-root ", " my-root "],
-  ])("keeps the existing root handle %j on reconfigure when the answer is %j (#833)", async (handle, answer) => {
-    writeFileSync(
-      join(home, "config.yaml"),
-      toYaml({
-        profile: "quickstart",
-        providers: { codex: { cliCommand: "codex" } },
-        rootActor: { provider: "codex", model: "gpt-5.6-sol", handle },
-      })
-    );
-    promptMocks.state.inputs = ["codex", answer, "gpt-5.6-sol"];
-    promptMocks.state.passwords = ["test-gemini-key"];
-
-    await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
-
-    const config = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as RusaConfig;
-    expect(config.rootActor?.handle).toBe(handle);
-    expect(promptMocks.input).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: `Root entity handle/name (leave blank to keep current: "${handle}"):`,
-        default: handle,
-      })
-    );
+    expect(loadedConfig.providers).toHaveProperty("antigravity");
+    expect(loadedConfig).not.toHaveProperty("rootActor");
   });
 
   it("carries github.repos forward when configure rewrites an existing config", async () => {
@@ -568,7 +517,6 @@ describe("quickstart command", () => {
               createTestConfig({
                 github: { repos: [res.repoKey as string] },
                 providers: { codex: { cliCommand: "codex" } },
-                rootActor: { provider: "codex", model: "gpt-5.6-sol", handle: "root" },
               })
             )
           );

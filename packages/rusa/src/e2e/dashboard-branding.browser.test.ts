@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,13 +40,14 @@ it.skipIf(!process.env.RUSA_BRANDING_BROWSER_TEST)(
     );
     const home = mkdtempSync(join(tmpdir(), "rusa-branding-browser-"));
     vi.stubEnv("RUSA_HOME", home);
-    const avatarPath = join(home, "custom.png");
+    const avatarPath = join(home, "avatars", "root.png");
+    mkdirSync(join(home, "avatars"), { recursive: true });
     const image = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5WQAAAAASUVORK5CYII=",
       "base64"
     );
     writeFileSync(avatarPath, image);
-    const rootIdentity = { handle: "ember-familiar", avatarPath };
+    const rootIdentity = { handle: "ember-familiar" };
     const server = createServer(
       createDashboardRequestHandler(
         { port: 0, mesh: { rootIdentity } as DashboardMeshRefs },

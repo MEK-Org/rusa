@@ -451,7 +451,6 @@ describe("shared startup, role authority, and local database (#1019)", () => {
   it("validates conflicting and invalid configurations before side effects", async () => {
     const leader = { type: "leader", url: "http://127.0.0.1:8190", token: "secret" };
     const gateway = { bind: "127.0.0.1", port: 8190, tokenFile: "/path/to/token" };
-    const rootActor = { provider: "codex", model: "gpt-5.6-sol" };
     const cases: Array<{ config: Record<string, unknown>; error: RegExp }> = [
       // Removed top-level role key
       { config: { role: "follower" }, error: /top-level role and peer are not supported/ },
@@ -462,19 +461,19 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       },
       // Leader entry alongside follower entries
       {
-        config: { rootActor, peers: [leader, { id: "follower-a", type: "follower" }] },
+        config: { peers: [leader, { id: "follower-a", type: "follower" }] },
         error: /cannot contain both a leader entry and follower entries/,
       },
       // More than one leader
       { config: { peers: [leader, { ...leader }] }, error: /at most one leader entry/ },
       // True peers are not supported yet
       {
-        config: { rootActor, peers: [{ id: "other", type: "peer" }] },
+        config: { peers: [{ id: "other", type: "peer" }] },
         error: /type peer is not supported yet/,
       },
       // Followers gateway without the required follower allowlist
       {
-        config: { rootActor, github: { account: "x" }, followers: gateway },
+        config: { github: { account: "x" }, followers: gateway },
         error: /followers gateway requires at least one peers entry with type: follower/,
       },
       // Leader entry configuring both token and tokenFile

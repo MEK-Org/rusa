@@ -213,9 +213,8 @@ export interface DashboardDataDeps {
    */
   selectedInboxItemsForActor?: (actorId: string) => InboxEntry[] | null;
   /**
-   * This instance's configured root identity  — the resolved display
-   * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
-   * set in config. Optional: absent (or fields unset) reproduces today's
+   * This instance's configured root identity — the resolved display
+   * handle and avatar override, if available. Optional: absent (or fields unset) reproduces today's
    * default (`root-actor`, the bundled image) everywhere it's read.
    */
   rootIdentity?: RootAvatarIdentity;

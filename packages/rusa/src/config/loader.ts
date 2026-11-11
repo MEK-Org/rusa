@@ -3,11 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
 import { resolveErrorSink } from "../observability/error-sink.js";
-import { validateModelConfigPool } from "../providers/model-config.js";
-import { providerCapabilityName } from "../providers/provider-selection.js";
-import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import { isSafeFollowerBind } from "../remote-instances/safe-bind.js";
 import { parseVoiceDefinitions } from "../voice/voice-catalog.js";
 import { validateDashboardAuth } from "./dashboard-auth.js";
@@ -32,6 +28,12 @@ import {
 } from "./types.js";
 
 export { resolveHome } from "./secrets.js";
+
+export const ROOT_ACTOR_REMOVAL_ERROR =
+  "config.yaml: rootActor configuration has been removed. " +
+  "If this installation never completed the one-time configured-actor import, first boot the last release that carries it once, with the rootActor block still in place. " +
+  "Then delete the rootActor block from config.yaml and upgrade. " +
+  "Actor identity now lives in the mesh database; create a first actor from the dashboard or POST /api/mesh/actors.";
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends Array<infer U>
@@ -306,54 +308,8 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
   }
-  if (parsed.rootActor !== undefined) {
-    if (
-      !parsed.rootActor ||
-      typeof parsed.rootActor !== "object" ||
-      Array.isArray(parsed.rootActor)
-    ) {
-      throw new Error("config.yaml: rootActor must be a mapping when set");
-    }
-    if (parsed.rootActor.context !== undefined) {
-      try {
-        parsed.rootActor.context = resolveContextConfig(parsed.rootActor.context);
-      } catch (err) {
-        throw new Error(
-          `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-    }
-    const rootActor = parsed.rootActor;
-    if ("fallbackModel" in rootActor) {
-      throw new Error(
-        "config.yaml: rootActor.fallbackModel has been removed; for portable roots (context.type: portable), configure the ordered root model pool with set_actor_model instead. Native-session roots do not support multi-entry model pools."
-      );
-    }
-    const provider = rootActor.provider?.trim();
-    if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
-    const capabilityName = providerCapabilityName(provider, parsed);
-    if (capabilityName === "agy" && rootActor.effort === undefined) {
-      const { effort: parsedEffort } = normalizeModelEffortSelection(
-        capabilityName,
-        rootActor.model,
-        undefined
-      );
-      if (parsedEffort === undefined) {
-        console.warn(
-          `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${rootActor.model || ""}"`
-        );
-        rootActor.effort = "high";
-      }
-    }
-    const [selection] = validateModelConfigPool(
-      parsed,
-      { provider, model: rootActor.model, effort: rootActor.effort },
-      { portable: rootActor.context?.type === "portable" }
-    );
-    if (!selection) throw new Error("config.yaml: rootActor requires one provider/model entry");
-    rootActor.provider = selection.provider;
-    rootActor.model = selection.model;
-    rootActor.effort = selection.effort;
+  if ((parsed as { rootActor?: unknown }).rootActor !== undefined) {
+    throw new Error(ROOT_ACTOR_REMOVAL_ERROR);
   }
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
@@ -891,14 +847,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
 
   applySecretFiles(parsed, mcHome);
-
-  try {
-    assertSpawnContextSupported({ context: parsed.rootActor?.context });
-  } catch (err) {
-    throw new Error(
-      `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
 
   return parsed;
 }

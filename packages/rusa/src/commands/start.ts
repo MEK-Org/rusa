@@ -89,7 +89,7 @@ import {
   RESUME_SYNTAX_HELP,
   type ResumeCommand,
 } from "../actor/halt-switch.js";
-import { generateHandle, resolveRootHandle } from "../actor/handle-generator.js";
+import { generateHandle } from "../actor/handle-generator.js";
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
@@ -126,11 +126,10 @@ import {
 } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { ShadowResponsiveInterruptionClassifier } from "../actor/responsive-interruption.js";
-import { RootControlService } from "../actor/root-control.js";
+import { type RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
   RootModelConfigStartupError,
   resolveRootBootModelConfig,
-  seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
@@ -151,7 +150,6 @@ import {
   sweepOrphanedWorkspaces,
   unattributedCheckouts,
 } from "../actor/workspace-sweep.js";
-import { avatarCachePath } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
 import { GchatOAuth } from "../chat/gchat-oauth.js";
@@ -182,9 +180,7 @@ import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import {
   ConfiguredActorImportError,
-  type ConfiguredActorImportResult,
-  importConfiguredActor,
-  planConfiguredActorImport,
+  resolveConfiguredActor,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
@@ -793,7 +789,31 @@ export interface RunStartE2EHooks {
   /** Stands in for the Slack Web API client; the socket source still needs real config. */
   slackClient?: SlackClient;
   chatSource?: ChatSource;
+  /**
+   * Which actor `rootDriver` drives. Only applies to `harnessActor` (below);
+   * other actors keep their ordinary driver.
+   */
   rootDriver?: "provider" | "external";
+  /**
+   * The harness's own explicit actor choice (#1261). It gets the E2E external
+   * driver (when `rootDriver` is `"external"`), the forced E2E sandbox, and
+   * the control server. A legacy import receipt never selects it; it stays
+   * historical provenance.
+   *
+   * - `id`: an actor this harness created earlier (a resumed home). It must be
+   *   active.
+   * - `create`: with no `id`, startup creates the actor through the ordinary
+   *   creation path ({@link RootControlService.spawnChild}, #1262) as
+   *   `e2e-controller`, before `onReady`. It refuses a home that already has
+   *   active actors. `onCreated` receives the new id so the harness can save it.
+   *
+   * Without this field, no actor gets E2E harness treatment.
+   */
+  harnessActor?: {
+    id?: string;
+    create?: RootChildRequest;
+    onCreated?: (id: string) => void;
+  };
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
@@ -829,12 +849,6 @@ export interface RunStartOptions {
   noDashboardServer?: boolean;
   /** Raw `--profile` CLI flag; validated into a {@link ConfigProfile} by loadConfig. */
   profile?: string;
-  /**
-   * Raw `--import-actor` CLI flag: the operator's explicit choice of which
-   * existing actor `rootActor` describes, consulted only while the one-time
-   * configured-actor import has not completed (#1002).
-   */
-  importActor?: string;
   e2e?: RunStartE2EHooks;
   /** Raw `--leader` CLI flag: shorthand for the single `leader` peer entry's url. */
   leader?: string;
@@ -862,27 +876,11 @@ export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boole
 }
 
 /**
- * The configured root actor runs unsandboxed by default (#465, #550). The e2e
- * harness has always sandboxed its root independently of deployment mode; retain
- * that harness-only exception, including container-boundary mode. Its record
- * states the same requested builder intent, not an isolation/authorization claim.
- * Both values derive from one flag, so stored intent and builder option agree.
- */
-export function rootExecutionIntent(params: { e2eMode: boolean }): {
-  sandbox: boolean;
-  executionConfig: ExecutionConfig;
-} {
-  return params.e2eMode
-    ? { sandbox: true, executionConfig: {} }
-    : { sandbox: false, executionConfig: { unsandboxed: true } };
-}
-
-/**
  * The builder `sandbox` flag for the configured actor, read from the execution
  * config stored on its row (#1002) so the two cannot disagree once the import
  * has made the row authoritative: the same deployment mapping as every worker.
- * The e2e harness keeps the exception {@link rootExecutionIntent} describes
- * and sandboxes its root whatever the row says.
+ * The e2e harness has always sandboxed its root independently of deployment
+ * mode, and keeps that harness-only exception whatever the row says.
  */
 export function configuredActorSandbox(params: {
   e2eMode: boolean;
@@ -1163,7 +1161,6 @@ async function composeStart(
     await composeFollowerStart(config, opts, resources, bootLog);
     return;
   }
-  const rootActor = config.rootActor;
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
@@ -1509,44 +1506,16 @@ async function composeStart(
     log.warn("inbox_listener_failed", { err: error });
   });
   const workersDir = join(mcHome, "workers");
-  const rootBootstrapTuple: RawProviderModelConfig | undefined = rootActor
-    ? {
-        provider: rootActor.provider,
-        model: rootActor.model,
-        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
-      }
-    : undefined;
   const rootPreflight = (entry: ProviderModelConfig) => {
     resolveProvider(config, entry.provider, entry.model, entry.effort);
   };
-  const rootIntent = rootExecutionIntent({ e2eMode: Boolean(opts?.e2e) });
-  // ── Configured-actor import (#1002) ── `rootActor` describes one actor, and
-  // it is read for that actor exactly once: the import resolves which actor it
-  // is (refusing ambiguous state unless the operator names one), fills only
-  // what that actor genuinely lacks, and records the binding in a receipt. Every
-  // later boot finds the actor through the receipt and runs it from its own
-  // row; config edits or removal never reach it again. Resolved before any
-  // server is bound so a refusal stops boot with nothing to unwind.
-  let configuredImport: ConfiguredActorImportResult;
+  let importedRoot: ActorRecord | undefined;
   try {
-    const configuredPlan = planConfiguredActorImport({
-      hasConfiguration: rootActor !== undefined,
-      actors,
+    importedRoot = resolveConfiguredActor({
       receipts: getRepositories().legacyImportReceipts,
-      workersDir,
-      selectedActorId: opts?.importActor,
-      legacyRootSession: legacyActorImport.deferredRootSessionId !== undefined,
+      actors,
     });
-    // Import retired JSON against the old identity first; the configured import
-    // then moves all durable state together. Receipt-backed importers archive
-    // a stale source unread on subsequent boots.
-    // An empty store has no root, so no config-implied legacy row can match.
-    const legacyRootId =
-      configuredPlan.kind === "adopt"
-        ? (configuredPlan.previousActorId ?? configuredPlan.actorId)
-        : configuredPlan.kind === "none"
-          ? ""
-          : configuredPlan.actorId;
+    const legacyRootId = importedRoot?.id ?? "";
     const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
       mcHome,
       db: database,
@@ -1604,47 +1573,12 @@ async function composeStart(
         backups: legacyPortableContextImport.backupFiles,
       });
     }
-    configuredImport = importConfiguredActor({
-      db: database,
-      actors,
-      receipts: getRepositories().legacyImportReceipts,
-      seed:
-        rootActor && rootBootstrapTuple
-          ? {
-              charter: rootActor.charter,
-              context: rootActor.context,
-              handle: resolveRootHandle(config),
-              avatarPath: rootActor.avatar,
-              executionConfig: rootIntent.executionConfig,
-              sessionId: legacyActorImport.deferredRootSessionId,
-              modelConfig: (portable, actorId) =>
-                seedRootModelConfig({
-                  config,
-                  rootId: actorId,
-                  bootstrap: rootBootstrapTuple,
-                  portable,
-                  preflight: rootPreflight,
-                }),
-            }
-          : undefined,
-      workersDir,
-      avatarCachePath: avatarCachePath("root"),
-      selectedActorId: opts?.importActor,
-      legacyRootSession: legacyActorImport.deferredRootSessionId !== undefined,
-      idgen: () => {
-        if (configuredPlan.kind === "none") {
-          throw new Error("an empty store mints no configured actor");
-        }
-        return configuredPlan.actorId;
-      },
-    });
   } catch (err) {
     if (err instanceof ConfiguredActorImportError) {
       log.error("configured_actor_import_refused", {
         error: err.name,
         reason: err.message,
         action: err.action,
-        candidates: err.candidates,
       });
     } else if (err instanceof RootModelConfigStartupError) {
       log.error("root_model_config_invalid", {
@@ -1655,7 +1589,14 @@ async function composeStart(
     }
     throw err;
   }
-  const rootId = configuredImport.actorId;
+  const rootId = importedRoot?.id;
+  // The E2E harness's actor (see RunStartE2EHooks.harnessActor). It is chosen
+  // by the harness, never by an import receipt. `e2eHarnessCreating` is set
+  // only around the one synchronous spawn that creates it, so the factory can
+  // recognise that actor while building it.
+  let e2eHarnessActorId = opts?.e2e ? opts.e2e.harnessActor?.id : undefined;
+  let e2eHarnessCreating = false;
+
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
   // the subscription store is constructed; tests and multi-instance shutdowns
@@ -1664,46 +1605,15 @@ async function composeStart(
     ["event_source_subscribed", "event_source_unsubscribed"],
     { bodyKinds: [] }
   );
-  if (configuredImport.plan.kind === "none") {
-    // Q1 of #1003: an empty store boots the service and dashboard with no
-    // actor; the first actor is the operator's to create, never config's.
-    if (!configuredImport.plan.recorded) {
-      log.info("configured_actor_import_empty", {
-        action: "no actor was synthesized; config.yaml's rootActor is not read again",
-      });
-    }
-  } else if (configuredImport.plan.kind !== "completed") {
-    log.info("configured_actor_imported", {
-      actorId: rootId,
-      plan: configuredImport.plan.kind,
-      selected: configuredImport.plan.kind === "adopt" && configuredImport.plan.selected,
-      filled: configuredImport.filled,
-      avatarImported: configuredImport.avatarImported,
-    });
-  }
-  if (configuredImport.avatarMissing !== undefined) {
-    log.warn("configured_actor_avatar_missing", {
-      actorId: rootId,
-      path: configuredImport.avatarMissing,
-      action: `rootActor.avatar named no file, and the import does not read it again; copy the image to ${avatarCachePath("root")} or upload one from the dashboard`,
-    });
-  }
-  const importedRoot = rootId === undefined ? undefined : actors.get(rootId);
-  if (rootId !== undefined && !importedRoot) {
-    throw new Error(`configured actor ${rootId} has no actor record after its import`);
-  }
+
   // The configured actor's display handle: what every root-identity surface
   // (signing byline, dashboard, avatar, commitment ledger) routes through.
-  // Stored on its row by the import, so a later `rootActor.handle` edit does
-  // not rename it.
+  // Stored on its row in the database.
   const rootHandle =
     rootId === undefined ? undefined : (importedRoot?.displayHandle ?? generateHandle(rootId));
   // The root's durable pool lives on its actor record, where `set_actor_model`
-  // writes it. The import seeded it from the `rootActor` tuple if the record
-  // had none; from here on the file never steers it. Resolved before any
-  // server is bound so an unrunnable persisted pool stops boot with nothing to
-  // unwind. What is checked here is the pool root will actually run on,
-  // instantiated entry by entry the way worker spawn preflights its own pool.
+  // writes it. Resolved before any server is bound so an unrunnable persisted
+  // pool stops boot with nothing to unwind.
   let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig> | undefined;
   let rootModelConfigDescription: string | undefined;
   if (rootId !== undefined && importedRoot?.status === "active") {
@@ -1726,32 +1636,12 @@ async function composeStart(
       }
       throw err;
     }
-    const rootModelConfigSeeded = configuredImport.filled.includes("modelConfig");
     rootModelConfigDescription = describeModelConfigPool(rootBootModelConfig.modelConfig);
     log.info("root_model_config_resolved", {
       rootId,
-      source: rootModelConfigSeeded ? "bootstrap" : rootBootModelConfig.source,
+      source: rootBootModelConfig.source,
       modelConfig: rootModelConfigDescription,
     });
-    // The file tuple stops steering root once its pool is durable. Say so
-    // whenever the two differ: a healthy boot on a model the operator just
-    // edited away from would otherwise be the only signal.
-    const configuredRootDescription = rootBootstrapTuple
-      ? describeModelConfigPool([rootBootstrapTuple])
-      : undefined;
-    if (
-      configuredRootDescription &&
-      !rootModelConfigSeeded &&
-      rootModelConfigDescription !== configuredRootDescription
-    ) {
-      log.warn("root_model_config_file_ignored", {
-        rootId,
-        configured: configuredRootDescription,
-        persisted: rootModelConfigDescription,
-        action:
-          "root's model is durable on its actor record; change it with set_actor_model. config.yaml's rootActor tuple is read only by the one-time configured-actor import",
-      });
-    }
   }
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
@@ -3741,10 +3631,12 @@ async function composeStart(
         // The flag selects inner sandboxing; container-boundary mode relies on its
         // deployment boundary. The Actor derives the sandbox (rooted at cwd, git+gh);
         // each provider mounts its own auth dir rw (see providerWritableStateDirs).
+        if (e2eHarnessCreating) e2eHarnessActorId = id;
+        const isE2eHarness = Boolean(opts?.e2e) && id === e2eHarnessActorId;
         const sandbox = configuredActorSandbox({
-          // E2E's forced sandboxing is only the imported actor's harness
-          // exception. Ordinary workers retain their stored deployment intent.
-          e2eMode: id === rootId && Boolean(opts?.e2e),
+          // E2E's forced sandboxing applies only to the harness's selected
+          // actor. Ordinary workers retain their stored deployment intent.
+          e2eMode: isE2eHarness,
           executionConfig: rec.executionConfig,
           sandboxMode: config.sandbox,
         });
@@ -3765,9 +3657,9 @@ async function composeStart(
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
           prepareRunMcp: (runId) => prepareRunMcp(runId),
-          // E2E preserves the external-driver transport for the imported actor,
-          // but its durable construction and tool surface stay ordinary.
-          isE2eRoot: id === rootId && Boolean(opts?.e2e),
+          // E2E preserves the external-driver transport for the harness's
+          // actor, but its durable construction and tool surface stay ordinary.
+          isE2eRoot: isE2eHarness,
           isComputerUseAdmitted: computerUseAdmission.isAdmitted,
           // Keep the legacy configured workspace available to the imported
           // record. This is a stored workspace mapping, not a privileged
@@ -4014,7 +3906,7 @@ async function composeStart(
           },
         });
         const externalRoot =
-          id === rootId && opts?.e2e?.rootDriver === "external"
+          isE2eHarness && opts?.e2e?.rootDriver === "external"
             ? new ExternalRootDriver(id, undefined, (state) =>
                 mesh.actorRuntimeStateChanged(id, state)
               )
@@ -4030,24 +3922,22 @@ async function composeStart(
         addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
-        if (id === rootId) {
-          configuredRootActor = actor;
-          configuredExternalRoot = externalRoot;
-          if (externalRoot) rootControl.recordDriverAttached("e2e-controller");
-          if (externalRoot) {
-            console.log(
-              `[root] driver=external tools=${workerMcp.map((server) => server.name).join(",")}`
-            );
-          } else {
-            const rootContext = actors.get(id)?.context;
-            const sessionDescription =
-              rootContext?.type === "portable"
-                ? `portable/${rootContext.mode} (stateless)`
-                : (actors.get(id)?.sessionId ?? "(new)");
-            console.log(
-              `[root] model_config=${rootModelConfigDescription ?? describeModelConfigPool(modelConfigPool)} (${rootBootModelConfig?.source ?? "durable"}) session=${sessionDescription} tools=${workerMcp.map((server) => server.name).join(",")}`
-            );
-          }
+        if (id === rootId) configuredRootActor = actor;
+        if (isE2eHarness) configuredExternalRoot = externalRoot;
+        if (externalRoot) {
+          rootControl.recordDriverAttached("e2e-controller");
+          console.log(
+            `[root] driver=external tools=${workerMcp.map((server) => server.name).join(",")}`
+          );
+        } else if (id === rootId) {
+          const rootContext = actors.get(id)?.context;
+          const sessionDescription =
+            rootContext?.type === "portable"
+              ? `portable/${rootContext.mode} (stateless)`
+              : (actors.get(id)?.sessionId ?? "(new)");
+          console.log(
+            `[root] model_config=${rootModelConfigDescription ?? describeModelConfigPool(modelConfigPool)} (${rootBootModelConfig?.source ?? "durable"}) session=${sessionDescription} tools=${workerMcp.map((server) => server.name).join(",")}`
+          );
         }
         // Implied event ownership begins only after successful construction.
         if (impliedOwnerId === undefined && defaultGrantRecipient(actors.list())?.id === id) {
@@ -4165,7 +4055,13 @@ async function composeStart(
 
   const rootControl = new RootControlService({
     mesh,
-    rootId: importedRoot?.status === "active" ? rootId : undefined,
+    // An E2E harness selection replaces the imported actor here: the control
+    // server acts for the actor the harness chose (#1261).
+    rootId: opts?.e2e?.harnessActor
+      ? () => e2eHarnessActorId
+      : importedRoot?.status === "active"
+        ? rootId
+        : undefined,
     providers: Object.keys(config.providers),
     availabilityHolds,
     releaseHalts: () => releaseHalts(),
@@ -4300,6 +4196,32 @@ async function composeStart(
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
+  }
+
+  // E2E: settle the harness's actor now that the stored actors are live.
+  const harnessSelection = opts?.e2e?.harnessActor;
+  if (harnessSelection) {
+    if (e2eHarnessActorId !== undefined) {
+      if (actors.get(e2eHarnessActorId)?.status !== "active" || !mesh.get(e2eHarnessActorId)) {
+        throw new Error(
+          `e2e harness actor ${e2eHarnessActorId} is not an active actor in this home`
+        );
+      }
+    } else if (harnessSelection.create) {
+      const active = actors.list().filter((r) => r.status === "active");
+      if (active.length > 0) {
+        throw new Error(
+          `e2e harness actor creation refused: this home already has ${active.length} active actor(s); pass harnessActor.id to select one`
+        );
+      }
+      e2eHarnessCreating = true;
+      try {
+        e2eHarnessActorId = rootControl.spawnChild(harnessSelection.create, "e2e-controller");
+      } finally {
+        e2eHarnessCreating = false;
+      }
+      harnessSelection.onCreated?.(e2eHarnessActorId);
+    }
   }
 
   if (followerHub) {
@@ -5435,7 +5357,11 @@ async function composeStart(
     process.off("SIGTERM", onShutdownSignal);
   });
 
-  console.log("\n✓ Root actor live. Waiting for events...\n");
+  console.log(
+    rootId !== undefined && importedRoot?.status === "active"
+      ? "\n✓ Root actor live. Waiting for events...\n"
+      : "\n✓ Mesh live. Waiting for events...\n"
+  );
 
   // Every successful boot creates durable root work. The file records the boot
   // before this append; if this process dies between them, the next boot retries

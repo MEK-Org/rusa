@@ -5,8 +5,7 @@ import type { ActorRecord } from "../actor/actor-record.js";
 import { resolveHome } from "../config/index.js";
 import {
   ConfiguredActorImportError,
-  type ConfiguredActorImportPlan,
-  planConfiguredActorImport,
+  resolveConfiguredActor,
 } from "../db/configured-actor-import.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
 import { planLegacyCapabilityGrantImport } from "../db/legacy-capability-grant-import.js";
@@ -26,11 +25,10 @@ export interface DbCheckResult {
   plannedHostJobs: number;
   plannedPortableContextSnapshots: number;
   /**
-   * What boot's one-time configured-actor import would do (#1002): nothing
-   * (`completed`), create the actor, or adopt an existing one. A home that
-   * boot would refuse fails the check instead, naming the candidates.
+   * Whether the configured actor was imported in an earlier release (`completed`)
+   * or not (`none`) (#1002, #1261). A home that boot would refuse throws instead.
    */
-  configuredActor: ConfiguredActorImportPlan["kind"];
+  configuredActor: "completed" | "none";
 }
 
 /**
@@ -117,28 +115,19 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       },
     });
 
-    // The configured actor, resolved the way boot's one-time import resolves
-    // it, over the actors boot would have committed by then. A home that boot
-    // would refuse (ambiguous, retired or missing) throws here with the same
-    // diagnostic, so a deploy learns it before restarting. An empty home
-    // imports no actor (#1003); a session-only legacy home gets a minted id,
-    // which has never appeared in a legacy document, so it matches no
-    // config-implied row either.
-    const configuredActorPlan = planConfiguredActorImport({
+    // The configured actor, resolved from its import receipt the way boot resolves
+    // it. A home that boot would refuse (corrupted receipt or missing actor row)
+    // throws here with the same diagnostic, so a deploy learns it before restarting.
+    // An empty home or a home without a receipt imports no actor (#1003, #1261).
+    const allVisibleActors = actorsVisibleToGrantPlan(repositories.actors.list(), pendingActors);
+    const visibleActorsById = new Map(allVisibleActors.map((actor) => [actor.id, actor]));
+    const configuredActor = resolveConfiguredActor({
       actors: {
-        list: () => actorsVisibleToGrantPlan(repositories.actors.list(), pendingActors),
+        get: (actorId) => visibleActorsById.get(actorId),
       },
       receipts: repositories.legacyImportReceipts,
-      workersDir: join(home, "workers"),
-      legacyRootSession:
-        plan.plan.kind === "deferred-root-session" || plan.plan.kind === "deferred-empty-threads",
     });
-    const rootId =
-      configuredActorPlan.kind === "create" || configuredActorPlan.kind === "none"
-        ? undefined
-        : configuredActorPlan.kind === "adopt"
-          ? (configuredActorPlan.previousActorId ?? configuredActorPlan.actorId)
-          : configuredActorPlan.actorId;
+    const rootId = configuredActor?.id;
     const subscriptionPlan = planLegacyEventSubscriptionImport({
       mcHome: home,
       repositories,
@@ -172,7 +161,7 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
       plannedHostJobs: hostJobPlan.plannedJobs,
       plannedPortableContextSnapshots: portableContextPlan.plannedSnapshots,
-      configuredActor: configuredActorPlan.kind,
+      configuredActor: configuredActor ? "completed" : "none",
     };
   } finally {
     db.close();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ADJECTIVES, ANIMALS, generateHandle, resolveRootHandle } from "./handle-generator.js";
+import { ADJECTIVES, ANIMALS, generateHandle } from "./handle-generator.js";
 
 describe("Handle Generator", () => {
   it("displays the root as root-actor by default", () => {
@@ -37,21 +37,5 @@ describe("Handle Generator", () => {
     expect(h1).not.toBe(h2);
     expect(h1).not.toBe(h3);
     expect(h2).not.toBe(h3);
-  });
-});
-
-describe("resolveRootHandle", () => {
-  it("defaults to root-actor when no config is given", () => {
-    expect(resolveRootHandle()).toBe("root-actor");
-    expect(resolveRootHandle({})).toBe("root-actor");
-    expect(resolveRootHandle({ rootActor: {} })).toBe("root-actor");
-  });
-
-  it("uses the configured handle when set (e.g. a staging instance)", () => {
-    expect(resolveRootHandle({ rootActor: { handle: "ember-familiar" } })).toBe("ember-familiar");
-  });
-
-  it("treats an empty configured handle as unset", () => {
-    expect(resolveRootHandle({ rootActor: { handle: "" } })).toBe("root-actor");
   });
 });
