@@ -991,11 +991,12 @@ export class ObligationRepository {
           try {
             await wakeDue(row.id, "system:mesh");
           } catch (err) {
-            console.warn(
-              `[obligations] overdue wake for ${row.id} failed at boot: ${
-                err instanceof Error ? err.message : String(err)
-              }`
-            );
+            // A wake that failed, or committed but could not deliver, still
+            // leaves the row's next activation to be scheduled below.
+            obligationLogger().warn("obligation_overdue_wake_failed", {
+              obligationId: row.id,
+              err,
+            });
           }
           row = this.db
             .prepare(
@@ -1139,7 +1140,9 @@ export class ObligationRepository {
    * effect off `(dependentId, prerequisiteId)` and reconcile at boot from
    * {@link listPrerequisiteCancellationAttention}.
    */
-  private cancellationAttentionListener?: (attention: PrerequisiteAttention) => void | Promise<void>;
+  private cancellationAttentionListener?: (
+    attention: PrerequisiteAttention
+  ) => void | Promise<void>;
 
   /**
    * Obligation ids whose prerequisite just landed on `cancelled` this
