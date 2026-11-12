@@ -91,6 +91,8 @@ export class ActorHandle implements MeshActor {
   private interruptedWatermark: Date | null = null;
   /** The run that watermark interrupted; its own late `runStart` must not clear it. */
   private interruptedRunId: string | undefined;
+  /** The run currently finalizing its terminal outcome (#1303). */
+  private finalizingRunId: string | undefined;
   /** A queued start was cancelled; {@link resumeCancelledRun} replays it. */
   private cancelledQueuedRun = false;
   private cancelledQueuedNudge: RunNudge | undefined;
@@ -333,6 +335,16 @@ export class ActorHandle implements MeshActor {
     return this.state === "queued";
   }
 
+  /**
+   * True while the current opportunity has claimed its terminal outcome and is
+   * awaiting its `onEnd` fanout or the follower's transition to idle / subsequent
+   * admission (#1303). That opportunity is finished: interrupting or preempting
+   * it would only set a false watermark that strands work delivered during the run.
+   */
+  private get finalizing(): boolean {
+    return this.isRunning && this.finalizingRunId !== undefined;
+  }
+
   requestRun(nudge?: RunNudge): void {
     // A responsive wake raises the admission the leader holds for a queued
     // run, as a local Actor promotes its pending start, without asking the
@@ -474,6 +486,7 @@ export class ActorHandle implements MeshActor {
     const now = new Date();
     const admitted = [...this.gates.values()].some((gate) => gate.handle.started);
     if (this.isRunning || admitted) {
+      if (this.finalizing) return { interrupted: false };
       if (this.closed || !this.send({ type: "interrupt", by })) return { interrupted: false };
       // The follower's prompt is the admission reply's snapshot, built just
       // after admittedAt, so that instant bounds what the run saw. runStartedAt
@@ -634,6 +647,7 @@ export class ActorHandle implements MeshActor {
   private disconnect(): void {
     if (this.closed) return;
     this.closed = true;
+    this.finalizingRunId = undefined;
     clearTimeout(this.startupTimer);
     clearTimeout(this.stateStaleTimer);
     this.stateStaleTimer = undefined;
@@ -841,6 +855,9 @@ export class ActorHandle implements MeshActor {
     const runId = this.startedRunId;
     if (!this.runOpen || !runId) return;
     this.runOpen = false;
+    if (!this.closed) {
+      this.finalizingRunId = runId;
+    }
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
     const elapsedMs =
@@ -895,6 +912,7 @@ export class ActorHandle implements MeshActor {
 
   /** Displace whatever the follower's latest state report says is in the way. */
   private applyPreempt(): void {
+    if (this.finalizing) return;
     if (this.stateUnconfirmed) {
       // Nothing reported since reattach: promote a ticket the leader holds, or
       // let the follower's own Actor decide whether a run is in the way.
@@ -1019,6 +1037,9 @@ export class ActorHandle implements MeshActor {
         this.state = wireState;
         this.stateStale = false;
         this.stateUnconfirmed = false;
+        if (wireState !== "running") {
+          this.finalizingRunId = undefined;
+        }
         if (wireState !== "queued") {
           this.pendingQueuedPromotion = false;
           this.pendingQueuedCancel = false;
@@ -1066,6 +1087,7 @@ export class ActorHandle implements MeshActor {
         this.opts.saveSession(message.sessionId);
         break;
       case "queued":
+        this.finalizingRunId = undefined;
         this.queuedRunId = message.runId ?? randomUUID();
         this.queuedMode = message.mode;
         return ctx.lifecycle.emit("onQueued", {
@@ -1088,6 +1110,7 @@ export class ActorHandle implements MeshActor {
         break;
       }
       case "runStart":
+        this.finalizingRunId = undefined;
         // Older followers do not send `providerAttempt`, but their run-start
         // tuple is still the leader-admitted attempt. Keep that attribution;
         // current followers refine it with the tuple they instantiated.
@@ -1246,6 +1269,7 @@ export class ActorHandle implements MeshActor {
               });
               break;
             case "admit": {
+              this.finalizingRunId = undefined;
               if (request.resume) {
                 // A follower re-announcing its pending admission is claiming the
                 // ticket this handle kept for it. The reply still comes from the

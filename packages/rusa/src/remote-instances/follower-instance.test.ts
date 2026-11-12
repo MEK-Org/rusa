@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import type { ActorLifecycleListener } from "../actor/actor-lifecycle.js";
 import type { ActorFactoryContext } from "../actor/actor-mesh.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
 import { ProviderPacer } from "../actor/provider-pacer.js";
@@ -26,6 +27,7 @@ function setup(
     onEvent?: (actorId: string, event: ActorEvent) => void;
     maxConcurrent?: number;
     obligationClosure?: boolean;
+    lifecycle?: (actorId: string) => ActorLifecycleListener;
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -40,6 +42,7 @@ function setup(
     onEvent: options.onEvent,
     maxConcurrent: options.maxConcurrent,
     obligationClosure: options.obligationClosure,
+    lifecycle: options.lifecycle,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -2594,6 +2597,303 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       await waitUntil(() => started(h, id).length === 2);
       expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
     });
+  });
+
+  describe("finalizing remote run interrupt and preemption guard (#1303)", () => {
+    const started = (h: ReturnType<typeof setup>, id: string) =>
+      h.events.filter((e) => e.actorId === id && e.event.type === "runStart");
+
+    it("ignores interrupt during held leader onEnd without advancing watermark or auditing (#1303)", async () => {
+      let release = () => {};
+      const hold = new Promise<void>((r) => {
+        release = r;
+      });
+      let gateOnEnd = true;
+      let inOnEnd = 0;
+      const h = setup({
+        delayMs: 250,
+        lifecycle: () => ({
+          onEnd: async () => {
+            if (!gateOnEnd) return;
+            inOnEnd++;
+            await hold;
+            inOnEnd--;
+          },
+        }),
+      });
+      const id = h.spawn("Run long");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      // Deliver work during the run, strictly after run start.
+      const until = Date.now() + 5;
+      while (Date.now() < until) {}
+      h.dispatchNormal(id, "test:during-run");
+
+      await waitUntil(() => inOnEnd === 1, 5000);
+
+      const rt = h.runtime(id);
+      expect(rt.isRunning).toBe(true);
+
+      const res = h.mesh.interrupt(id, h.user.id);
+      expect(res).toEqual({ interrupted: false, status: "idle" });
+      expect(rt.getInterruptedWatermark()).toBeNull();
+      expect(
+        h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
+      ).toHaveLength(0);
+
+      gateOnEnd = false;
+      release();
+
+      // Follow-up run starts and processes the work delivered during the run.
+      await waitUntil(() => started(h, id).length === 2, 5000);
+      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+      expect(h.failures).toEqual([]);
+    }, 15000);
+
+    it("ignores interrupt during completion-reply-to-idle gap without advancing watermark (#1303)", async () => {
+      let holdReply: Promise<void> | undefined;
+      let releaseReply = () => {};
+      let completeRequestId: number | undefined;
+      let replyHeld = false;
+
+      const h = setup({ delayMs: 100 });
+      const id = h.spawn("Run long");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      h.dispatchNormal(id, "test:during-run");
+
+      // Intercept the complete request from follower to record its requestId
+      const origReceive = h.remote.receive.bind(h.remote);
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "complete") {
+          completeRequestId = event.message.requestId;
+        }
+        origReceive(event);
+      };
+
+      // Hold the reply in flight from leader to follower.
+      holdReply = new Promise<void>((r) => {
+        releaseReply = r;
+      });
+      const origFlush = h.remote.flush.bind(h.remote);
+      h.remote.flush = () => {
+        if (completeRequestId !== undefined && !replyHeld) {
+          for (let i = 0; i < h.remote.commands.length; i++) {
+            const cmd = h.remote.commands[i];
+            if (
+              "actorId" in cmd &&
+              cmd.message.type === "reply" &&
+              cmd.message.requestId === completeRequestId
+            ) {
+              replyHeld = true;
+              void holdReply?.then(() => {
+                origFlush();
+              });
+              return;
+            }
+          }
+        }
+        origFlush();
+      };
+
+      await waitUntil(() => replyHeld, 5000);
+
+      const rt = h.runtime(id);
+      expect(rt.isRunning).toBe(true);
+
+      const res = h.mesh.interrupt(id, h.user.id);
+      expect(res).toEqual({ interrupted: false, status: "idle" });
+      expect(rt.getInterruptedWatermark()).toBeNull();
+      expect(
+        h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
+      ).toHaveLength(0);
+
+      releaseReply();
+
+      await waitUntil(() => started(h, id).length === 2, 5000);
+      expect(h.failures).toEqual([]);
+    }, 15000);
+
+    it("allows genuine subsequent queued admission to be cancelled by interrupt (#1303)", async () => {
+      const pacer = new ProviderPacer(0);
+      const h = setup({ pacer });
+      const id = h.spawn("Run 1");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      // Defer pacer so Run 2 queues in admission pacing rather than starting immediately.
+      pacer.deferUntil(Date.now() + 1000);
+      h.dispatchNormal(id, "test:run2");
+
+      // Wait until Run 2 is waiting in the pacer queue.
+      await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1, 5000);
+
+      // Interrupt while queued. Must succeed with wasQueued cancellation.
+      const res = h.mesh.interrupt(id, h.user.id);
+      expect(res).toEqual({ interrupted: true });
+      expect(h.runtime(id).isQueued).toBe(false);
+      expect(pacer.waiting).toBe(0);
+      expect(h.runtime(id).getInterruptedWatermark()).not.toBeNull();
+      expect(
+        h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
+      ).toHaveLength(1);
+
+      await waitUntil(
+        () =>
+          h.meshEvents.some(
+            (e) => e.kind === "run_abandoned" && e.actorId === id && e.detail === "start-cancelled"
+          ),
+        5000
+      );
+
+      // Releasing pacer does not run the cancelled opportunity.
+      pacer.deferUntil(0);
+      await delay(100);
+      expect(started(h, id)).toHaveLength(1);
+
+      // Fresh work delivered after the interrupt starts Run 2 cleanly.
+      h.dispatchNormal(id, "test:after-interrupt");
+      await waitUntil(() => started(h, id).length === 2, 5000);
+      expect(h.failures).toEqual([]);
+    }, 15000);
+
+    it("allows genuine subsequent active execution to be cancelled by interrupt (#1303)", async () => {
+      let holdRun2: Promise<void> | undefined;
+      let releaseRun2 = () => {};
+      let run2Started = false;
+      const h = setup({
+        delayMs: 50,
+        providerFactory: (_bridge, _options, selected) => ({
+          name: "test",
+          providerName: "test",
+          model: selected?.model,
+          async run() {
+            if (started(h, id).length >= 2) {
+              run2Started = true;
+              if (holdRun2) await holdRun2;
+            }
+            return { success: true, output: "ok", exitCode: 0 };
+          },
+        }),
+      });
+      const id = h.spawn("Run 1");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      // Deliver work so a second run starts.
+      holdRun2 = new Promise<void>((r) => {
+        releaseRun2 = r;
+      });
+      h.dispatchNormal(id, "test:run2");
+
+      await waitUntil(() => run2Started, 5000);
+
+      // Now Run 2 is executing. An interrupt must succeed and advance the watermark.
+      const res = h.mesh.interrupt(id, h.user.id);
+      expect(res).toEqual({ interrupted: true });
+      expect(h.runtime(id).getInterruptedWatermark()).not.toBeNull();
+      expect(
+        h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
+      ).toHaveLength(1);
+
+      holdRun2 = undefined;
+      releaseRun2();
+      expect(h.failures).toEqual([]);
+    }, 15000);
+
+    it("clears finalizing state when an actor moves to idle (#1303)", async () => {
+      const h = setup({ delayMs: 25 });
+      const id = h.spawn("Run normal");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      await waitUntil(() => !h.runtime(id).isRunning, 5000);
+      expect(h.runtime(id).isRunning).toBe(false);
+      expect((h.runtime(id) as unknown as { finalizing: boolean }).finalizing).toBe(false);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("ignores responsive preemption during held onEnd (#1303)", async () => {
+      let release = () => {};
+      const hold = new Promise<void>((r) => {
+        release = r;
+      });
+      let gateOnEnd = true;
+      let inOnEnd = 0;
+      const h = setup({
+        delayMs: 250,
+        lifecycle: () => ({
+          onEnd: async () => {
+            if (!gateOnEnd) return;
+            inOnEnd++;
+            await hold;
+            inOnEnd--;
+          },
+        }),
+      });
+
+      const sentCommands: unknown[] = [];
+      const origFlush = h.remote.flush.bind(h.remote);
+      h.remote.flush = () => {
+        sentCommands.push(...h.remote.commands);
+        origFlush();
+      };
+
+      const id = h.spawn("Run long");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      h.dispatchNormal(id, "test:during-run");
+      await waitUntil(() => inOnEnd === 1, 5000);
+
+      const rt = h.runtime(id);
+      const res = rt.preemptForResponsive();
+      expect(res).toEqual({ preempted: false });
+      expect(
+        sentCommands.filter(
+          (cmd) =>
+            typeof cmd === "object" &&
+            cmd !== null &&
+            "message" in cmd &&
+            (cmd as { message?: { type?: string } }).message?.type === "preempt"
+        )
+      ).toHaveLength(0);
+      expect(
+        h.meshEvents.filter((e) => e.kind === "run_preempted" && e.actorId === id)
+      ).toHaveLength(0);
+
+      gateOnEnd = false;
+      release();
+
+      await waitUntil(() => started(h, id).length === 2, 5000);
+      expect(h.failures).toEqual([]);
+    }, 15000);
   });
 
   it.each([
