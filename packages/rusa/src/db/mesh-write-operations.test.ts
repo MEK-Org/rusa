@@ -93,7 +93,9 @@ describe("delivery order", () => {
 
   it("delivers writes' effects in commit order", async () => {
     const heads: string[] = [];
-    repository.setReadyHeadListener((change) => heads.push(change.head?.id ?? "none"));
+    repository.setReadyHeadListener((change) => {
+      heads.push(change.head?.id ?? "none");
+    });
 
     const first = writer.write("obligations.create", {
       obligation: { id: "first", ownerId: "actor-a", title: "first" },
@@ -138,9 +140,9 @@ describe("ready-head sequences", () => {
       (effect) => deliverMeshEffect(repos, effect)
     );
     const sequences: Array<[string, number]> = [];
-    repository.setReadyHeadListener((change) =>
-      sequences.push([change.head?.id ?? "none", change.sequence])
-    );
+    repository.setReadyHeadListener((change) => {
+      sequences.push([change.head?.id ?? "none", change.sequence]);
+    });
     repository.create({ id: "base", ownerId: "actor-a", title: "base" });
     expect(sequences).toEqual([["base", 1]]);
 

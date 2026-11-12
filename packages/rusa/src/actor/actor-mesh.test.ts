@@ -2812,7 +2812,7 @@ describe("ActorMesh", () => {
           (entry.payload as { type?: string }).type === "obligation.ready_head"
       );
     const wire = (mesh: ActorMesh, repo: ObligationRepository) =>
-      repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+      repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) => {
         mesh.deliverReadyHeadAttention(
           ownerId,
           head === null
@@ -2821,8 +2821,8 @@ describe("ActorMesh", () => {
           previousHeadId,
           sequence,
           epoch
-        )
-      );
+        );
+      });
 
     // Process 1: A arrives, B displaces it, then B leaves and returns, leaving
     // B as the head. Transition #3 is B -> A at sequence 3; the actor handles
@@ -2900,15 +2900,15 @@ describe("ActorMesh", () => {
 
     // Same generation, live path: X displaces H and the epoch-scoped live
     // entry delivers; the actor handles it too.
-    repo1.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+    repo1.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) => {
       mesh1.mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
     repo1.create({ id: "ob-x", title: "Displacer", ownerId: "root", priority: 0 });
     expect(headEntries()).toHaveLength(2);
     expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-x" });
@@ -2971,15 +2971,15 @@ describe("ActorMesh", () => {
 
     // Same generation, live path: X displaces H and the epoch-scoped live
     // entry delivers; the actor handles it too.
-    repo1.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+    repo1.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) => {
       mesh1.mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
     repo1.create({ id: "ob-x", title: "Displacer", ownerId: "root", priority: 0 });
     expect(headEntries()).toHaveLength(2);
     expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-x" });
@@ -14740,15 +14740,15 @@ describe("strict obligation handling (#382, #917)", () => {
   /** Route repository head transitions the way runStart's readyHeadSink does. */
   function wireLiveReadyHeads(mesh: ActorMesh): void {
     repo.setActorExists((id) => mesh.isLiveActor(id));
-    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) => {
       mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
   }
 
   function headEntries(actorId: string, obligationId: string) {
@@ -15198,15 +15198,15 @@ describe("strict obligation handling (#382, #917)", () => {
     // mesh's attention delivery. Without this, no repository mutation could
     // ever append an entry and the "no early notification" assertion below
     // would hold even if head routing were broken.
-    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) => {
       mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
     const headEntries = () =>
       inboxStore.entries.filter(
         (entry) => entry.actorId === subject && entry.payload.type === "obligation.ready_head"
@@ -16834,7 +16834,7 @@ describe("ready-head attention while the owner is only queued (#1071)", () => {
             : undefined
     );
     // The production sinks, as start.ts installs them.
-    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) => {
       mesh.deliverReadyHeadAttention(
         ownerId,
         head === null
@@ -16843,15 +16843,15 @@ describe("ready-head attention while the owner is only queued (#1071)", () => {
         previousHeadId,
         sequence,
         epoch
-      )
-    );
-    repo.setResponsiveReadyListener((obligation, actingPrincipal) =>
+      );
+    });
+    repo.setResponsiveReadyListener((obligation, actingPrincipal) => {
       mesh.deliverResponsiveReadyAttention(
         obligation.ownerId,
         { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
         actingPrincipal === obligation.ownerId
-      )
-    );
+      );
+    });
 
     const owner = mesh.spawn({
       charter: "owner",
@@ -17162,7 +17162,9 @@ describe("obligation manage policy at the write (#1289)", () => {
     repo.setActorExists((id) => registry.get(id)?.status === "active");
     repo.create({ id: "target", title: "target", ownerId: worker });
     const effects: string[] = [];
-    repo.setReadyHeadListener((change) => effects.push(`ready-head:${change.ownerId}`));
+    repo.setReadyHeadListener((change) => {
+      effects.push(`ready-head:${change.ownerId}`);
+    });
     const revokeAdmin = () =>
       capabilityGrants.revoke(admin, OBLIGATIONS_ADMIN_CAPABILITY, "2026-11-12T00:01:00.000Z");
     return { mesh, manager, worker, elsewhere, admin, effects, revokeAdmin };

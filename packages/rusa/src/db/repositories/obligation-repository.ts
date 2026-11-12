@@ -46,6 +46,11 @@ import type { PrincipalKind } from "../../principals/principal-ref.js";
 import { asGitHubIssue } from "../../references/reference.js";
 
 let _obligationLogger: Logger | undefined;
+/** A listener's answer that must be awaited before delivery moves on (#1289 C2). */
+function isPromiseLike(value: unknown): value is PromiseLike<void> {
+  return typeof (value as PromiseLike<void> | null)?.then === "function";
+}
+
 function obligationLogger(): Logger {
   _obligationLogger ??= createLogger({ context: { component: "obligations" } });
   return _obligationLogger;
@@ -1028,7 +1033,7 @@ export class ObligationRepository {
    * Set after construction rather than injected: the mesh that consumes this
    * does not exist yet when the repository container is built.
    */
-  private readyHeadListener?: (change: ReadyHeadChange) => void;
+  private readyHeadListener?: (change: ReadyHeadChange) => void | Promise<void>;
 
   /**
    * Lifetime marker for in-memory ready-head sequences (#513). It belongs to
@@ -1086,7 +1091,9 @@ export class ObligationRepository {
     }
   }
 
-  setReadyHeadListener(listener: ((change: ReadyHeadChange) => void) | undefined): void {
+  setReadyHeadListener(
+    listener: ((change: ReadyHeadChange) => void | Promise<void>) | undefined
+  ): void {
     this.readyHeadListener = listener;
   }
 
@@ -1116,7 +1123,7 @@ export class ObligationRepository {
    * effect off `(dependentId, prerequisiteId)` and reconcile at boot from
    * {@link listPrerequisiteCancellationAttention}.
    */
-  private cancellationAttentionListener?: (attention: PrerequisiteAttention) => void;
+  private cancellationAttentionListener?: (attention: PrerequisiteAttention) => void | Promise<void>;
 
   /**
    * Obligation ids whose prerequisite just landed on `cancelled` this
@@ -1161,7 +1168,7 @@ export class ObligationRepository {
   }
 
   setCancellationAttentionListener(
-    listener: ((attention: PrerequisiteAttention) => void) | undefined
+    listener: ((attention: PrerequisiteAttention) => void | Promise<void>) | undefined
   ): void {
     this.cancellationAttentionListener = listener;
   }
@@ -1179,7 +1186,10 @@ export class ObligationRepository {
    * mutation caused the transition, so a consumer can tell "this actor made
    * its own work ready" from "someone else did".
    */
-  private responsiveReadyListener?: (obligation: Obligation, actingPrincipal: EntityId) => void;
+  private responsiveReadyListener?: (
+    obligation: Obligation,
+    actingPrincipal: EntityId
+  ) => void | Promise<void>;
 
   /**
    * Obligation ids that transitioned to `ready` or newly resolved responsive
@@ -1201,7 +1211,9 @@ export class ObligationRepository {
   private failedResponsiveReadyDeliveries = new Map<string, EntityId>();
 
   setResponsiveReadyListener(
-    listener: ((obligation: Obligation, actingPrincipal: EntityId) => void) | undefined
+    listener:
+      | ((obligation: Obligation, actingPrincipal: EntityId) => void | Promise<void>)
+      | undefined
   ): void {
     this.responsiveReadyListener = listener;
   }
@@ -1517,8 +1529,33 @@ export class ObligationRepository {
     for (const [ownerId, sequence] of committedSequences) {
       this.previousHeadSequences.set(ownerId, sequence);
     }
-    this.deliverMutationEffect(effect);
+    this.deliveringDirect = true;
+    try {
+      void this.deliverMutationEffect(effect);
+    } finally {
+      this.deliveringDirect = false;
+    }
     return result;
+  }
+
+  /**
+   * Set while a mutation made outside the writer delivers its own effect.
+   * Nothing awaits that delivery, so an attention listener that answers with
+   * a promise there is reported: the runtime mutates through the mesh writer
+   * (#1289 C2), and only repositories used directly, as in their own tests,
+   * take this path.
+   */
+  private deliveringDirect = false;
+
+  private awaitListener(pending: PromiseLike<void>): PromiseLike<void> {
+    if (this.deliveringDirect) {
+      obligationLogger().warn("obligation_listener_unawaited", {
+        err: new Error(
+          "an obligation listener returned a promise for a mutation made outside the mesh writer; nothing awaits it"
+        ),
+      });
+    }
+    return pending;
   }
 
   /**
@@ -1571,9 +1608,16 @@ export class ObligationRepository {
    * attention and timer steps re-read committed rows, so this must run after
    * the commit, on any connection that can see it. A listener failure is
    * logged and kept for retry from committed state on a later delivery; it
-   * never throws, because the write it describes has already committed.
+   * never rejects, because the write it describes has already committed.
+   *
+   * The attention listeners may return a promise (#1289 C2): an attention
+   * sink appends through the mesh writer, and that nested write and its own
+   * effects are awaited before the next listener, so later steps and the
+   * write's caller see the row. A promise is awaited only when a listener
+   * returns one, so while every listener returns synchronously the whole
+   * delivery runs inside this call.
    */
-  deliverMutationEffect(effect: ObligationMutationEffect): void {
+  async deliverMutationEffect(effect: ObligationMutationEffect): Promise<void> {
     if (effect.kind !== OBLIGATION_MUTATION_EFFECT) {
       throw new Error(`not an obligation mutation effect: ${String(effect.kind)}`);
     }
@@ -1584,7 +1628,8 @@ export class ObligationRepository {
     if (listener) {
       for (const change of effect.readyHeadChanges) {
         try {
-          listener(change);
+          const pending = listener(change);
+          if (isPromiseLike(pending)) await this.awaitListener(pending);
         } catch (err) {
           console.warn(
             `[obligations] ready-head listener failed for ${change.ownerId}: ${
@@ -1622,7 +1667,8 @@ export class ObligationRepository {
       for (const attention of toDeliver) {
         const key = this.cancellationAttentionKey(attention);
         try {
-          cancellationAttentionListener(attention);
+          const pending = cancellationAttentionListener(attention);
+          if (isPromiseLike(pending)) await this.awaitListener(pending);
           this.failedCancellationAttentionKeys.delete(key);
         } catch (err) {
           this.failedCancellationAttentionKeys.add(key);
@@ -1672,7 +1718,8 @@ export class ObligationRepository {
 
       for (const { obligation, actingPrincipal: cause } of toDeliver.values()) {
         try {
-          responsiveReadyListener(obligation, cause);
+          const pending = responsiveReadyListener(obligation, cause);
+          if (isPromiseLike(pending)) await this.awaitListener(pending);
           this.failedResponsiveReadyDeliveries.delete(obligation.id);
         } catch (err) {
           this.failedResponsiveReadyDeliveries.set(obligation.id, cause);

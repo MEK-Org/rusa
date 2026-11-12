@@ -399,9 +399,9 @@ describe("ObligationRepository", () => {
 
       beforeEach(() => {
         announced = [];
-        repository.setResponsiveReadyListener((obligation, actingPrincipal) =>
-          announced.push({ id: obligation.id, actingPrincipal })
-        );
+        repository.setResponsiveReadyListener((obligation, actingPrincipal) => {
+          announced.push({ id: obligation.id, actingPrincipal });
+        });
       });
 
       it("promotes a responsive obligation ahead of a non-responsive ready head", () => {
@@ -411,13 +411,13 @@ describe("ObligationRepository", () => {
           previousHeadId: string | null;
           responsive: boolean;
         }> = [];
-        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        repository.setReadyHeadListener(({ head, previousHeadId }) => {
           heads.push({
             id: head?.id ?? null,
             previousHeadId,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
         repository.create({
           title: "hotfix",
           id: "hotfix",
@@ -444,12 +444,12 @@ describe("ObligationRepository", () => {
 
       it("announces a re-released responsive head through the head change, responsively", () => {
         const headChanges: Array<{ headId: string | null; responsive: boolean }> = [];
-        repository.setReadyHeadListener(({ head }) =>
+        repository.setReadyHeadListener(({ head }) => {
           headChanges.push({
             headId: head?.id ?? null,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
         repository.create({
           title: "parent",
           id: "parent",
@@ -474,13 +474,13 @@ describe("ObligationRepository", () => {
           previousHeadId: string | null;
           responsive: boolean;
         }> = [];
-        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        repository.setReadyHeadListener(({ head, previousHeadId }) => {
           heads.push({
             id: head?.id ?? null,
             previousHeadId,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
         repository.create({
           title: "gate",
           id: "gate",
@@ -580,13 +580,13 @@ describe("ObligationRepository", () => {
           previousHeadId: string | null;
           responsive: boolean;
         }> = [];
-        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        repository.setReadyHeadListener(({ head, previousHeadId }) => {
           heads.push({
             id: head?.id ?? null,
             previousHeadId,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
 
         // Reassignment promotes responsive work ahead of actor-b's ordinary
         // head, so the established ready-head path produces the one wake.
@@ -639,12 +639,12 @@ describe("ObligationRepository", () => {
 
       it("announces inherited responsive head via ready-head change and behind-head obligations via responsiveReadyListener", () => {
         const headChanges: Array<{ headId: string | null; responsive: boolean }> = [];
-        repository.setReadyHeadListener(({ head }) =>
+        repository.setReadyHeadListener(({ head }) => {
           headChanges.push({
             headId: head?.id ?? null,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
         repository.create({
           title: "retiring-top",
           id: "r-top",
@@ -678,13 +678,13 @@ describe("ObligationRepository", () => {
           previousHeadId: string | null;
           responsive: boolean;
         }> = [];
-        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        repository.setReadyHeadListener(({ head, previousHeadId }) => {
           heads.push({
             id: head?.id ?? null,
             previousHeadId,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
         repository.create({
           title: "responsive root",
@@ -728,13 +728,13 @@ describe("ObligationRepository", () => {
           previousHeadId: string | null;
           responsive: boolean;
         }> = [];
-        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        repository.setReadyHeadListener(({ head, previousHeadId }) => {
           heads.push({
             id: head?.id ?? null,
             previousHeadId,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
 
         repository.markResponsive("hotfix", "system:mesh");
 
@@ -751,13 +751,13 @@ describe("ObligationRepository", () => {
           previousHeadId: string | null;
           responsive: boolean;
         }> = [];
-        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        repository.setReadyHeadListener(({ head, previousHeadId }) => {
           headChanges.push({
             id: head?.id ?? null,
             previousHeadId,
             responsive: head?.effectiveResponsive ?? false,
-          })
-        );
+          });
+        });
         repository.create({ title: "owner-z head", id: "z-head", ownerId: "actor-c", priority: 1 });
         repository.create({ title: "ancestor", id: "ancestor", ownerId: "actor-a", priority: 10 });
         repository.create({
@@ -945,14 +945,16 @@ describe("ObligationRepository", () => {
     beforeEach(() => {
       announced = [];
       headChanges = [];
-      repository.setResponsiveReadyListener((obligation) => announced.push(obligation.id));
-      repository.setReadyHeadListener(({ ownerId, head }) =>
+      repository.setResponsiveReadyListener((obligation) => {
+        announced.push(obligation.id);
+      });
+      repository.setReadyHeadListener(({ ownerId, head }) => {
         headChanges.push({
           ownerId,
           headId: head?.id ?? null,
           responsive: head?.effectiveResponsive ?? false,
-        })
-      );
+        });
+      });
     });
 
     it("makes direct and transitive prerequisites responsive, and escalates a ready head in place", () => {
@@ -1068,9 +1070,9 @@ describe("ObligationRepository", () => {
 
     it("carries the prerequisite-edge author to responsive delivery", () => {
       const causes: Array<{ id: string; actingPrincipal: string }> = [];
-      repository.setResponsiveReadyListener((obligation, actingPrincipal) =>
-        causes.push({ id: obligation.id, actingPrincipal })
-      );
+      repository.setResponsiveReadyListener((obligation, actingPrincipal) => {
+        causes.push({ id: obligation.id, actingPrincipal });
+      });
       repository.create({ title: "owner head", id: "owner-head", ownerId: "actor-b", priority: 1 });
       repository.create({ title: "blocker", id: "blocker", ownerId: "actor-b", priority: 2 });
       repository.create({
@@ -1219,9 +1221,9 @@ describe("ObligationRepository", () => {
 
     beforeEach(() => {
       heads = [];
-      repository.setReadyHeadListener(({ ownerId, head }) =>
-        heads.push({ ownerId, headId: head?.id ?? null })
-      );
+      repository.setReadyHeadListener(({ ownerId, head }) => {
+        heads.push({ ownerId, headId: head?.id ?? null });
+      });
     });
 
     it("announces a head on create, and not again for work that lands behind it", () => {
@@ -1284,9 +1286,9 @@ describe("ObligationRepository", () => {
 
     it("carries the head it displaced, so a restored head is not a repeat", () => {
       const transitions: Array<{ from: string | null; to: string | null }> = [];
-      repository.setReadyHeadListener(({ head, previousHeadId }) =>
-        transitions.push({ from: previousHeadId, to: head?.id ?? null })
-      );
+      repository.setReadyHeadListener(({ head, previousHeadId }) => {
+        transitions.push({ from: previousHeadId, to: head?.id ?? null });
+      });
 
       repository.create({
         title: "first",
@@ -4244,11 +4246,13 @@ describe("ObligationRepository", () => {
       scheduler = new FakeObligationScheduler();
       repository.setOsScheduler(scheduler);
       heads = [];
-      repository.setReadyHeadListener(({ ownerId, head }) =>
-        heads.push({ ownerId, headId: head?.id ?? null })
-      );
+      repository.setReadyHeadListener(({ ownerId, head }) => {
+        heads.push({ ownerId, headId: head?.id ?? null });
+      });
       responsive = [];
-      repository.setResponsiveReadyListener((obligation) => responsive.push(obligation.id));
+      repository.setResponsiveReadyListener((obligation) => {
+        responsive.push(obligation.id);
+      });
     });
 
     const snooze = (id: string, until: string | null, principal = "actor-a") => {
@@ -4761,9 +4765,9 @@ describe("ObligationRepository", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
 
       const heads: Array<{ ownerId: string; headId: string | null }> = [];
-      repository.setReadyHeadListener(({ ownerId, head }) =>
-        heads.push({ ownerId, headId: head?.id ?? null })
-      );
+      repository.setReadyHeadListener(({ ownerId, head }) => {
+        heads.push({ ownerId, headId: head?.id ?? null });
+      });
 
       const dependent = repository.create({
         title: "dependent",
@@ -4849,7 +4853,9 @@ describe("ObligationRepository", () => {
 
     it("queues durable cancellation-repair attention for each affected dependent, and delivers it after commit", () => {
       const delivered: Array<{ dependentId: string; prerequisiteId: string }> = [];
-      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+      repository.setCancellationAttentionListener((attention) => {
+        delivered.push(attention);
+      });
 
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       repository.create({
@@ -4963,7 +4969,9 @@ describe("ObligationRepository", () => {
       repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       const delivered: Array<{ dependentId: string; prerequisiteId: string }> = [];
-      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+      repository.setCancellationAttentionListener((attention) => {
+        delivered.push(attention);
+      });
 
       repository.create({
         title: "dependent",
@@ -4992,7 +5000,9 @@ describe("ObligationRepository", () => {
         dependentOwnerId: string;
         prerequisiteId: string;
       }> = [];
-      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+      repository.setCancellationAttentionListener((attention) => {
+        delivered.push(attention);
+      });
 
       repository.addPrerequisite("dependent", "prereq", "system:mesh");
 
@@ -5202,7 +5212,9 @@ describe("ObligationRepository", () => {
         dependentOwnerId: string;
         prerequisiteId: string;
       }> = [];
-      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+      repository.setCancellationAttentionListener((attention) => {
+        delivered.push(attention);
+      });
 
       repository.reassign("dependent", "actor-b", "system:mesh");
 
@@ -5226,7 +5238,9 @@ describe("ObligationRepository", () => {
         dependentOwnerId: string;
         prerequisiteId: string;
       }> = [];
-      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+      repository.setCancellationAttentionListener((attention) => {
+        delivered.push(attention);
+      });
 
       repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a", "system:mesh");
 
@@ -5251,7 +5265,9 @@ describe("ObligationRepository", () => {
         dependentOwnerId: string;
         prerequisiteId: string;
       }> = [];
-      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+      repository.setCancellationAttentionListener((attention) => {
+        delivered.push(attention);
+      });
 
       repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 

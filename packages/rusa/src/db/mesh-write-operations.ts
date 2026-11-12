@@ -11,7 +11,11 @@ import {
 import type { CompletionMatcher, CompletionMatcherInput } from "../obligations/obligation.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
-import type { InboxEntry, MarkHandledResult } from "../repositories/inbox-repository.js";
+import type {
+  InboxAppendInput,
+  InboxEntry,
+  MarkHandledResult,
+} from "../repositories/inbox-repository.js";
 import { InProcessMeshWriter, type MeshWriter } from "./mesh-writer.js";
 import type { ActorRunRepository } from "./repositories/actor-run-repository.js";
 import type {
@@ -212,6 +216,16 @@ export const MESH_WRITE_OPERATIONS = {
     input: { readonly closure: HeadClosureQuery }
   ): HeadClosureShortfall[] =>
     mutating(context, () => inboxClosureShortfalls(context.repos, input.closure)),
+
+  /**
+   * Append inbox entries, answering only the rows this call inserted: an id
+   * already present is left as it is (#1289 C2). The inserted rows are
+   * delivered to the append listeners once this commits.
+   */
+  "inbox.append": (
+    context: Context,
+    input: { readonly entries: readonly InboxAppendInput[] }
+  ): InboxEntry[] => writing(context, (repos) => repos.inbox.append([...input.entries])),
 
   /**
    * Mark an actor's entries seen: the receipt that a queued run has taken them
@@ -538,11 +552,13 @@ export type MeshObligationWriter = MeshWriter<MeshWriteOperations>;
 
 /**
  * Deliver one committed effect on the main thread, to the main thread's
- * repository: its listeners, retry state and host scheduler live there.
+ * repository: its listeners, retry state and host scheduler live there. An
+ * obligation effect's attention sinks append through the writer, so its
+ * delivery settles once those nested writes and their effects have (#1289 C2).
  */
-export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): void {
+export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): Promise<void> | void {
   if (effect.kind === INBOX_MUTATION_EFFECT) repos.inbox.deliverMutationEffect(effect);
-  else repos.obligations.deliverMutationEffect(effect);
+  else return repos.obligations.deliverMutationEffect(effect);
 }
 
 /**
