@@ -3870,6 +3870,23 @@ describe("handleMeshApiRequest", () => {
       expect(inbox.countUnhandled(UUID_A)).toBe(1);
     });
 
+    it("shows the operator the shortfalls of a refused mark (#1289)", async () => {
+      // This route asks no closure question, so only a writer answering one
+      // could refuse; the operator then sees why rather than an opaque error.
+      appendEntry("refused");
+      const bound = deps.obligationWriter;
+      const message = 'selected head obligation h ("h") was not finished or decomposed.';
+      deps.obligationWriter = {
+        write: async () => ({ refused: [{ obligationId: "h", title: "h", reason: "r", message }] }),
+      } as unknown as typeof bound;
+      const res = await post(UUID_A, { entryId: "refused" });
+      deps.obligationWriter = bound;
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toBe(`Cannot mark handled: ${message}`);
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
     it("503s when no inbox is bound", async () => {
       const bound = deps.inbox;
       deps.inbox = undefined;

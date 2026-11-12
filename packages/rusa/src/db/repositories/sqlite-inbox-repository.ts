@@ -292,6 +292,12 @@ export class SqliteInboxRepository implements InboxRepository {
     at = this.now(),
     handledNote?: string
   ): MarkHandledResult[] {
+    // As for replaceEntries: inside an enclosing transaction that is not a
+    // write operation's, the handled notification would fire before the
+    // outer caller decided the write's fate.
+    if (this.db.inTransaction && !this.writeContext) {
+      throw new Error("inbox markHandled must not run inside an enclosing transaction");
+    }
     if (
       entryIds.length < 1 ||
       entryIds.length > 100 ||

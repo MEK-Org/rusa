@@ -2450,9 +2450,12 @@ export class ActorMesh {
 
   /**
    * Release the selection lock on exhausted inbox entries for a child thread.
-   * Marks the exhausted entries handled with an attributed audit note,
-   * appends fresh replacement entries so the work returns to ordinary unhandled work,
-   * and dispatches the child.
+   * Marks the exhausted entries handled with an attributed audit note and
+   * appends fresh replacement entries so the work returns to ordinary
+   * unhandled work. The child is woken by the replacements' committed append
+   * effect, the one dispatch {@link scheduleAppendedWork} owes it; that runs
+   * before this method's continuation, so a dispatch here would be a second
+   * one, which can cancel and re-queue the run the first just admitted.
    */
   async releaseChildInboxSelectionLock(
     callerId: string,
@@ -2468,8 +2471,6 @@ export class ActorMesh {
       "note cannot be empty — explain why these inbox items are being released for re-handling"
     );
     const result = await writer.write("inbox.releaseChildSelectionLock", input);
-    this.inboxHandled(result.childId);
-    this.dispatch(result.childId);
     return {
       released: result.released,
       replacements: result.replacements.map((r) => r.id),

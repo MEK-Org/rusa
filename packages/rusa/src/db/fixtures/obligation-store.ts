@@ -10,7 +10,13 @@ import { ActorRunRepository } from "../repositories/actor-run-repository.js";
 import { ObligationRepository } from "../repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "../repositories/sqlite-inbox-repository.js";
 
-const writers = new WeakMap<ObligationRepository, MeshObligationWriter>();
+interface CachedWriter {
+  readonly db: Database.Database;
+  readonly repos: Omit<MeshWriteRepos, "obligations">;
+  readonly writer: MeshObligationWriter;
+}
+
+const writers = new WeakMap<ObligationRepository, CachedWriter>();
 
 /**
  * The writer production gives a repository's callers (#1289), for tests: one
@@ -18,23 +24,35 @@ const writers = new WeakMap<ObligationRepository, MeshObligationWriter>();
  * test builds over the same repository shares its delivery order. A test that
  * listens to an inbox, or reads actors or runs through its own repositories,
  * passes those so the writer's effects reach the same listeners; the first
- * call for a repository decides them.
+ * call for a repository decides them, and a later call that names different
+ * ones throws rather than silently getting a writer that ignores them.
  */
 export function meshWriterFor(
   db: Database.Database,
   repository: ObligationRepository,
   repos: Partial<Omit<MeshWriteRepos, "obligations">> = {}
 ): MeshObligationWriter {
-  let writer = writers.get(repository);
-  if (!writer) {
-    writer = createInProcessMeshWriter(db, {
-      obligations: repository,
-      inbox: repos.inbox ?? new SqliteInboxRepository(db),
-      actors: repos.actors ?? { get: () => undefined },
-      actorRuns: repos.actorRuns ?? new ActorRunRepository(db),
-    });
-    writers.set(repository, writer);
+  const cached = writers.get(repository);
+  if (cached) {
+    const differs = (Object.keys(repos) as Array<keyof typeof repos>).filter(
+      (key) => repos[key] !== undefined && repos[key] !== cached.repos[key]
+    );
+    if (cached.db !== db || differs.length > 0) {
+      throw new Error(
+        `meshWriterFor: this repository's writer was already built over other ${
+          cached.db !== db ? "db" : differs.join(", ")
+        }`
+      );
+    }
+    return cached.writer;
   }
+  const built: Omit<MeshWriteRepos, "obligations"> = {
+    inbox: repos.inbox ?? new SqliteInboxRepository(db),
+    actors: repos.actors ?? { get: () => undefined },
+    actorRuns: repos.actorRuns ?? new ActorRunRepository(db),
+  };
+  const writer = createInProcessMeshWriter(db, { obligations: repository, ...built });
+  writers.set(repository, { db, repos: built, writer });
   return writer;
 }
 

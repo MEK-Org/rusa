@@ -370,6 +370,22 @@ describe("SqliteInboxRepository", () => {
       expect(db.inTransaction).toBe(false);
     });
 
+    it.each([
+      ["markHandled", () => store.markHandled("actor-a", ["held"])],
+      ["replaceEntries", () => store.replaceEntries("actor-a", ["held"], "replaced", [])],
+    ])("refuses %s inside an enclosing transaction that is not a write's (#1289)", (_, mark) => {
+      // The outer caller would decide the write's fate after its handled
+      // notice had already fired.
+      store.append([entry("held")]);
+      const listener = vi.fn();
+      store.onItemsHandled(listener);
+
+      expect(() => db.transaction(mark)()).toThrow(/enclosing transaction/);
+      expect(listener).not.toHaveBeenCalled();
+      expect(store.read("actor-a", "held")?.handledAt).toBeNull();
+      expect(db.inTransaction).toBe(false);
+    });
+
     it("stops notifying an unsubscribed listener while others keep receiving", () => {
       const stays = vi.fn();
       const leaves = vi.fn();

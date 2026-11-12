@@ -15561,7 +15561,10 @@ describe("accountRun token accounting (#443)", () => {
      * and focus counts the mesh does.
      */
     function clearanceMesh(
-      opts: Pick<Parameters<typeof setup>[0] & object, "completedFocusEntryCounts"> = {}
+      opts: Pick<
+        Parameters<typeof setup>[0] & object,
+        "completedFocusEntryCounts" | "sharedProvider" | "events"
+      > = {}
     ) {
       const db = new Database(":memory:");
       runMigrations(db);
@@ -15574,7 +15577,14 @@ describe("accountRun token accounting (#443)", () => {
         actors,
         actorRuns: { completedFocusEntryCounts: (actorId) => counts(actorId) },
       });
-      const fixture = setup({ inboxStore, actors, writer, completedFocusEntryCounts: counts });
+      const fixture = setup({
+        inboxStore,
+        actors,
+        writer,
+        completedFocusEntryCounts: counts,
+        sharedProvider: opts.sharedProvider,
+        events: opts.events,
+      });
       return { ...fixture, inboxStore, db };
     }
 
@@ -15792,6 +15802,56 @@ describe("accountRun token accounting (#443)", () => {
 
       // The entry is gone from the unhandled selection set after handling.
       expect(mesh.hasOnlyExhaustedWork(child)).toBe(false);
+    });
+
+    it.each([
+      ["idle", 0],
+      ["running other work", 1],
+    ] as const)("wakes a released child %s with exactly one dispatch (#1289)", async (state, preemptions) => {
+      let child = "";
+      const events: MeshEventInput[] = [];
+      const d = deferredProvider();
+      const { mesh, tick, inboxStore } = clearanceMesh({
+        completedFocusEntryCounts: (actorId) =>
+          actorId === child ? new Map([["item-1", 2]]) : new Map(),
+        sharedProvider: d.provider,
+        events: (event) => events.push(event),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      child = mesh.spawn({ charter: "child", parentId: parent });
+      await tick();
+      if (state === "running other work") {
+        inboxStore.append([
+          { id: "other", actorId: child, source: "chat", payload: payload("mesh.message") },
+        ]);
+        mesh.dispatch(child);
+        await tick();
+        expect(d.pending()).toBe(1);
+      }
+      // Responsive work, so every extra dispatch that finds it unseen would
+      // preempt whatever run the previous one admitted.
+      inboxStore.append([
+        {
+          id: "item-1",
+          actorId: child,
+          source: "chat",
+          payload: { ...payload("mesh.message"), priority: "responsive" },
+        },
+      ]);
+      const dispatched = vi.spyOn(mesh, "dispatch");
+
+      await mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "released");
+      await tick();
+
+      // The replacement's committed append effect is the only wake. A busy
+      // child's unrelated run is preempted once by the arriving responsive
+      // work; the run admitted for the replacement is never preempted.
+      expect(dispatched.mock.calls).toEqual([[child]]);
+      const childEvents = events.filter((event) => event.actorId === child);
+      expect(childEvents.filter((event) => event.kind === "run_preempted")).toHaveLength(
+        preemptions
+      );
+      expect(d.pending()).toBe(1);
     });
 
     it("preserves unhandled entries if atomic replacement fails during release (#748)", async () => {

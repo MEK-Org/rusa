@@ -46,15 +46,21 @@ export interface HeadClosureBaseline {
 
 /**
  * Everything closure needs that is not in the database: whose run it is, the
- * heads being judged, the run's baseline, and the mesh's thread aliasing and
- * retirement state. All of it is plain data, so it can be handed to a writer.
+ * heads being judged, the run's baseline, the configured root's actor id, and
+ * the mesh's retirement state. All of it is plain data, so it can be handed to a writer.
  */
 export interface HeadClosureQuery {
   /** The run's actor, already resolved. */
   readonly actorId: string;
   readonly heads: readonly string[];
   readonly baseline: HeadClosureBaseline;
-  /** The thread the legacy `root` alias names, if any. */
+  /**
+   * The configured root's actor id, which the legacy `root` alias names. The
+   * mesh resolves `actorId` before asking; the alias is resolved here only
+   * for the owner ids closure reads from durable rows inside the write, which
+   * may predate resolution (the alias dates from the first commit) and so
+   * cannot be resolved before the write reads them.
+   */
   readonly rootId: string | null;
   /** Actors being retired right now, which the durable record cannot show. */
   readonly retiring: ReadonlySet<string>;

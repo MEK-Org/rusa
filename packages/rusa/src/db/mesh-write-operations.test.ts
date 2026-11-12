@@ -629,6 +629,31 @@ describe("inbox marks and the checks they depend on (#1289)", () => {
     expect(committedSnooze("gated")).toBe(until);
   });
 
+  it.each([
+    ["a missing entry", ["missing"], "inbox entry not found"],
+    ["another actor's entry", ["for-b"], "inbox entry not found"],
+    ["a repeated id", ["for-lapsed", "for-lapsed"], "1 to 100 unique entry ids"],
+  ])("throws for %s before closure could refuse and commit (#1289)", async (_, entryIds, message) => {
+    // Closure would refuse here and commit the cleared snooze, so the ids
+    // must be checked first for an invalid request to commit nothing.
+    obligations.create({ id: "lapsed", ownerId: "actor-a", title: "lapsed" });
+    const until = new Date(clock + HOUR).toISOString();
+    obligations.writeSnooze("lapsed", until, "actor-a");
+    appendTo("actor-a", "for-lapsed");
+    appendTo("actor-b", "for-b");
+    clock += 2 * HOUR;
+
+    await expect(
+      inboxWriter.write("inbox.markHandled", {
+        actorId: "actor-a",
+        entryIds,
+        closure: closureOf("lapsed"),
+      })
+    ).rejects.toThrow(message);
+
+    expect(committedSnooze("lapsed")).toBe(until);
+  });
+
   it("delivers a mark's handled notice after it commits, before its caller continues", async () => {
     appendTo("actor-a", "plain");
     const order: string[] = [];
@@ -700,6 +725,33 @@ describe("inbox marks and the checks they depend on (#1289)", () => {
         inboxWriter.write("inbox.markChildHandled", clearance("too late", ["spent"]))
       ).rejects.toThrow("Only the parent thread (other-parent) can clear exhausted inbox work");
       expect(inbox.read("child", "spent")?.handledAt).toBeFalsy();
+    });
+
+    it.each([
+      ["by its id", "configured-root"],
+      ["by the legacy alias", "root"],
+    ])("refuses clearing the configured root %s even when its record names a parent (#1289)", async (_, childId) => {
+      // Nothing makes the configured root's durable record carry a null
+      // parentId, so the rootId comparison is what refuses this, not the
+      // parentless check: without it the named parent would clear root's work.
+      actors.upsert({
+        id: "configured-root",
+        charter: "root",
+        parentId: "parent",
+        status: "active",
+        createdAt: "2026-07-01T00:00:00.000Z",
+      });
+      appendTo("configured-root", "root-spent");
+      focusCounts.set("configured-root", new Map([["root-spent", 2]]));
+
+      await expect(
+        inboxWriter.write("inbox.markChildHandled", {
+          ...clearance("not root's parent", ["root-spent"]),
+          childId,
+          rootId: "configured-root",
+        })
+      ).rejects.toThrow(/Root has no parent in the mesh/);
+      expect(inbox.read("configured-root", "root-spent")?.handledAt).toBeFalsy();
     });
 
     it("refuses entries that have not exhausted bounded recovery", async () => {

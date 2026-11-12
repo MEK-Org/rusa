@@ -12,16 +12,21 @@ export interface ParentInboxAuthorityReader {
   readEntry(actorId: string, entryId: string): InboxEntry | null;
   /**
    * How many completed runs focused each entry; an entry counted twice has
-   * exhausted bounded recovery. Absent, no entry counts as exhausted.
+   * exhausted bounded recovery.
    */
-  completedFocusEntryCounts?(actorId: string): ReadonlyMap<string, number>;
+  completedFocusEntryCounts(actorId: string): ReadonlyMap<string, number>;
 }
 
 export interface ParentInboxAuthorityQuery {
   readonly callerId: string;
   readonly childId: string;
   readonly entryIds: readonly string[];
-  /** The thread the legacy `root` alias names, if any. */
+  /**
+   * The configured root's actor id, which the legacy `root` alias names. It
+   * is resolved here because the child's durable `parentId`, read inside the
+   * write, may predate resolution; and it refuses the root as a child even
+   * when root's record names a parent, which nothing prevents.
+   */
   readonly rootId: string | null;
 }
 
@@ -65,7 +70,7 @@ export function assertParentExhaustedInboxAuthority(
     throw new Error("Provide between 1 and 100 unique inbox entry ids");
   }
 
-  const counts = reader.completedFocusEntryCounts?.(childId);
+  const counts = reader.completedFocusEntryCounts(childId);
   const entries: InboxEntry[] = [];
   for (const id of uniqueIds) {
     const entry = reader.readEntry(childId, id);
@@ -75,7 +80,7 @@ export function assertParentExhaustedInboxAuthority(
     if (entry.handledAt) {
       throw new Error(`inbox entry already handled: ${id}`);
     }
-    if ((counts?.get(id) ?? 0) < 2) {
+    if ((counts.get(id) ?? 0) < 2) {
       throw new Error(
         `Cannot clear entry ${id}: entry has not exhausted bounded recovery; parent clearance is restricted to exhausted entries`
       );

@@ -1667,8 +1667,13 @@ async function routeMeshApiRequest(
               entryIds: [entryId],
               note: operatorHandledNote(reason),
             });
-            // No closure question was asked, so nothing can be refused.
-            if (written.refused) throw new Error("inbox mark was refused");
+            // No closure question is asked here, so this only narrows the
+            // type; a route that does ask must still show the operator why.
+            if (written.refused) {
+              throw new Error(
+                `Cannot mark handled: ${written.refused.map((shortfall) => shortfall.message).join(" ")}`
+              );
+            }
             const [result] = written.entries;
             // `alreadyHandled` is reported rather than treated as an error: the
             // store leaves an existing note alone, so a double-click cannot

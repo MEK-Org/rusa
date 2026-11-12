@@ -4,7 +4,10 @@ import {
   type HeadClosureQuery,
   type HeadClosureShortfall,
 } from "../actor/head-closure.js";
-import { assertParentExhaustedInboxAuthority } from "../actor/parent-inbox-authority.js";
+import {
+  assertParentExhaustedInboxAuthority,
+  type ParentInboxAuthorityReader,
+} from "../actor/parent-inbox-authority.js";
 import type { CompletionMatcher, CompletionMatcherInput } from "../obligations/obligation.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
@@ -126,7 +129,7 @@ export function inboxClosureShortfalls(
 }
 
 /** The parent-clearance check's durable reads, over the writing connection. */
-function parentAuthorityReader(repos: MeshWriteRepos) {
+function parentAuthorityReader(repos: MeshWriteRepos): ParentInboxAuthorityReader {
   return {
     actor: (id: string) => repos.actors.get(id),
     readEntry: (actorId: string, entryId: string) => repos.inbox.read(actorId, entryId),
@@ -146,6 +149,23 @@ interface ParentClearance {
   readonly rootId: string | null;
 }
 
+/**
+ * The entry-id checks markHandled makes, made before anything is written: one
+ * to 100 unique ids, each an entry of `actorId`.
+ */
+function assertMarkableEntryIds(
+  repos: MeshWriteRepos,
+  actorId: string,
+  entryIds: readonly string[]
+): void {
+  if (entryIds.length < 1 || entryIds.length > 100 || new Set(entryIds).size !== entryIds.length) {
+    throw new Error("markHandled requires 1 to 100 unique entry ids");
+  }
+  for (const id of entryIds) {
+    if (!repos.inbox.read(actorId, id)) throw new Error("inbox entry not found");
+  }
+}
+
 export const MESH_WRITE_OPERATIONS = {
   /**
    * Mark an actor's inbox entries handled. With `closure`, the heads those
@@ -154,6 +174,8 @@ export const MESH_WRITE_OPERATIONS = {
    * no other write can land between the verdict and the mark. A refusal still
    * commits the cleared snoozes, as clearing them did before the check moved
    * in here, and is returned rather than thrown so it does not roll them back.
+   * Entry ids that markHandled itself would reject are rejected before the
+   * closure check, so an invalid request always throws and commits nothing.
    */
   "inbox.markHandled": (
     context: Context,
@@ -169,6 +191,7 @@ export const MESH_WRITE_OPERATIONS = {
     writing(context, (repos) => {
       const { closure } = input;
       if (closure && closure.heads.length > 0) {
+        assertMarkableEntryIds(repos, input.actorId, input.entryIds);
         const shortfalls = inboxClosureShortfalls(repos, closure);
         if (shortfalls.length > 0) return { refused: shortfalls };
       }
