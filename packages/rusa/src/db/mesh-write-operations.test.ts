@@ -654,6 +654,58 @@ describe("inbox marks and the checks they depend on (#1289)", () => {
     expect(committedSnooze("lapsed")).toBe(until);
   });
 
+  it("commits the due snoozes a run-end closure check cleared with its answer (r4547468384)", async () => {
+    obligations.create({ id: "lapsed", ownerId: "actor-a", title: "lapsed" });
+    obligations.writeSnooze("lapsed", new Date(clock + HOUR).toISOString(), "actor-a");
+    clock += 2 * HOUR;
+
+    const shortfalls = await inboxWriter.write("obligations.closureShortfalls", {
+      closure: closureOf("lapsed"),
+    });
+
+    expect(shortfalls).toEqual([
+      expect.objectContaining({ obligationId: "lapsed", reason: "obligation is still ready" }),
+    ]);
+    expect(committedSnooze("lapsed")).toBeNull();
+    expect(obligations.listHistory("lapsed")[0]).toMatchObject({
+      mutationKind: "snooze",
+      actingPrincipal: "system:mesh",
+    });
+  });
+
+  it("rolls a run-end closure check's cleared snoozes back when it throws (r4547468384)", async () => {
+    obligations.create({ id: "lapsed", ownerId: "actor-a", title: "lapsed" });
+    const until = new Date(clock + HOUR).toISOString();
+    obligations.writeSnooze("lapsed", until, "actor-a");
+    clock += 2 * HOUR;
+    // Evaluation fails after the snoozes are cleared, inside the write.
+    const expire = obligations.expireDueSnoozes.bind(obligations);
+    vi.spyOn(obligations, "expireDueSnoozes").mockImplementation((...args) => {
+      expire(...args);
+      throw new Error("closure evaluation failed");
+    });
+
+    await expect(
+      inboxWriter.write("obligations.closureShortfalls", { closure: closureOf("lapsed") })
+    ).rejects.toThrow("closure evaluation failed");
+
+    expect(committedSnooze("lapsed")).toBe(until);
+  });
+
+  it("carries a seen mark's named entries across the writer boundary (r4547468362)", async () => {
+    appendTo("actor-a", "named");
+    appendTo("actor-a", "unnamed");
+
+    const seen = await inboxWriter.write("inbox.markSeen", {
+      actorId: "actor-a",
+      entryIds: ["named"],
+    });
+
+    // The repository's own filters are pinned in sqlite-inbox-repository.test.ts.
+    expect(seen.map((entry) => entry.id)).toEqual(["named"]);
+    expect(inbox.read("actor-a", "unnamed")?.seenAt).toBeNull();
+  });
+
   it("delivers a mark's handled notice after it commits, before its caller continues", async () => {
     appendTo("actor-a", "plain");
     const order: string[] = [];

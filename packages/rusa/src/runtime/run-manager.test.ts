@@ -307,7 +307,7 @@ describe("RunManager", () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
-      inbox.markSeen("a1");
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
       append("a1", { type: "github.issue" }, new Date(2_000));
 
       // The quick-start and coalesce-kill belong to the memo's own delivery.
@@ -340,7 +340,7 @@ describe("RunManager", () => {
         append("a1", { type: "mesh.message", priority: "responsive" }, new Date(2_000 + i));
       }
       // 2. Mark them seen so unseen is false on the first page
-      inbox.markSeen("a1");
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
 
       // 3. Append older unseen entries with older timestamps (t=1000..1004)
       append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
@@ -613,7 +613,7 @@ describe("RunManager", () => {
       // handled at the end.
       expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(1);
-      inbox.markSeen("a1");
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
 
       // Ordinary traffic arriving mid-run — a child reporting in — must not
       // abort the run it is arriving behind. Left unguarded, the replacement
@@ -767,7 +767,7 @@ describe("RunManager", () => {
 
       // A subscriber copy keeps its join only through the after-commit seam. The
       // human row is seen first, so only the copy's own policy can preempt here.
-      inbox.markSeen("a1");
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
       append("a1", { type: "event.copy", priority: "responsive", deliveryRole: "subscriber" });
       h.manager.dispatch("a1");
       expect(actor.preemptions).toBe(2);
@@ -806,7 +806,7 @@ describe("RunManager", () => {
       const actor = live(h, "a1");
       append("a1", { type: "human.voice", priority: "responsive" });
       expect(await h.manager.dispatch("a1")).toBe(true);
-      inbox.markSeen("a1");
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
 
       // The memo is still unhandled, so the actor's durable priority is still
       // responsive — but nothing responsive has *arrived*. Admitting an
@@ -848,15 +848,27 @@ describe("RunManager", () => {
   });
 
   describe("a join waits for its seen mark (#1289 C1b)", () => {
-    /** A seen mark held open until the test answers it: a real suspension. */
+    /**
+     * A seen mark held open until the test answers it: a real suspension. Like
+     * the mesh's, it names the entries unseen when requested, and resolving it
+     * commits by stamping exactly those; rejecting it stamps nothing.
+     */
     function heldMarks() {
       const marks: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
       return {
         marks,
-        markInboxSeen: () =>
-          new Promise<void>((resolve, reject) => {
-            marks.push({ resolve, reject });
-          }),
+        markInboxSeen: (actorId: string) => {
+          const entryIds = inbox.unseenEntryIds(actorId);
+          return new Promise<void>((resolve, reject) => {
+            marks.push({
+              resolve: () => {
+                inbox.markSeen(actorId, entryIds);
+                resolve();
+              },
+              reject,
+            });
+          });
+        },
       };
     }
 
@@ -977,8 +989,8 @@ describe("RunManager", () => {
       ordinary.queued = false;
       responsive.queued = false;
       voice = true;
-      inbox.markSeen("a1");
-      inbox.markSeen("a2");
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
+      inbox.markSeen("a2", inbox.unseenEntryIds("a2"));
       for (const mark of held.marks) mark.resolve();
 
       // The session-end dispatch releases ordinary work.
@@ -991,7 +1003,47 @@ describe("RunManager", () => {
       expect(responsive.nudges).toEqual([{ priority: "responsive" }]);
     });
 
-    it("never requests a run of an actor replaced during the wait; the replacement gets its own dispatch", async () => {
+    it("keeps the delivery time of a voice memo it brought, though the mark has made it seen (r4547468362)", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = live(h, "a1");
+      actor.queued = true;
+      const at = new Date("2026-03-04T05:06:07.000Z");
+      append("a1", { type: "human.voice", priority: "responsive" }, at);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      // The mark stamps the memo, as the mesh's does, before it answers.
+      inbox.markSeen("a1", inbox.unseenEntryIds("a1"));
+      held.marks[0].resolve();
+
+      expect(await dispatched).toBe(true);
+      // As the request made without waiting carried it.
+      expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: at.getTime() }]);
+    });
+
+    it("drops the voice time once the memo it brought is handled, though other responsive work remains (r4547960510)", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = live(h, "a1");
+      actor.queued = true;
+      const at = new Date("2026-03-04T05:06:07.000Z");
+      const memo = append("a1", { type: "human.voice", priority: "responsive" }, at);
+      append("a1", { type: "mesh.message", priority: "responsive" });
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      // The opportunity runs and ends during the wait, handling only the memo.
+      inbox.markHandled("a1", [memo.id], new Date(), "answered");
+      actor.queued = false;
+      held.marks[0].resolve();
+
+      expect(await dispatched).toBe(true);
+      // A later memo's coalesce age must not run from the handled one.
+      expect(actor.nudges).toEqual([{ priority: "responsive" }]);
+    });
+
+    it("never requests a run of an actor replaced during the wait; the replacement takes the work over", async () => {
       const held = heldMarks();
       const h = setup({ markInboxSeen: held.markInboxSeen });
       const original = queuedWithWork(h);
@@ -1009,6 +1061,55 @@ describe("RunManager", () => {
       expect(inbox.list("a1", { status: "unhandled" }).entries).toHaveLength(1);
       await vi.waitFor(() => expect(replacement.runs).toHaveLength(1));
       expect(original.runs).toEqual([]);
+    });
+
+    it("a replacement built during the wait keeps the voice memo's time and passes a voice hold (r4547755787, r4547802251)", async () => {
+      let voice = false;
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen, isVoiceSessionActive: () => voice });
+      const original = live(h, "a1");
+      original.queued = true;
+      const at = new Date("2026-03-04T05:06:07.000Z");
+      append("a1", { type: "human.voice", priority: "responsive" }, at);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      h.manager.release("a1");
+      const replacement = live(h, "a1");
+      voice = true;
+      // The mark commits, so the re-read finds the memo seen and undated.
+      held.marks[0].resolve();
+
+      expect(await dispatched).toBe(true);
+      expect(inbox.list("a1", { status: "unhandled" }).entries[0]?.seenAt).not.toBeNull();
+      expect(original.nudges).toEqual([]);
+      // The voice time bounds the trigger runner's coalescing, so it is kept,
+      // and the memo is not left for a session end that would not wake it.
+      expect(replacement.nudges).toEqual([
+        { priority: "responsive", voiceTimestamp: at.getTime() },
+      ]);
+      expect(h.logs).not.toContain("dispatch(a1) held — active voice session");
+      expect(h.preempted).toEqual([]);
+    });
+
+    it("adds no follow-up when the replacement's run began during the wait", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const original = live(h, "a1");
+      original.queued = true;
+      append("a1", { type: "mesh.message", priority: "responsive" });
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      h.manager.release("a1");
+      // Its run began after the entry became durable, so it lists the entry.
+      const replacement = live(h, "a1");
+      Object.defineProperty(replacement, "isRunning", { get: () => true });
+      held.marks[0].resolve();
+
+      expect(await dispatched).toBe(true);
+      expect(replacement.nudges).toEqual([]);
+      expect(h.preempted).toEqual([]);
     });
 
     it("ends without a request when the actor is released, retired, or its work handled during the wait", async () => {
@@ -1051,6 +1152,8 @@ describe("RunManager", () => {
       let nestedSettled = false;
       const h = setup({
         markInboxSeen: (actorId) => {
+          // The mark names its entries when requested.
+          const mark = held.markInboxSeen(actorId);
           // A committed effect delivered while the mark is outstanding
           // notifies this same actor. The mark never waits on that dispatch,
           // so the one it queues behind can finish.
@@ -1061,7 +1164,7 @@ describe("RunManager", () => {
               nestedSettled = true;
             });
           }
-          return held.markInboxSeen();
+          return mark;
         },
       });
       const actor = queuedWithWork(h);
@@ -1089,7 +1192,8 @@ describe("RunManager", () => {
     it("never makes another actor wait on one actor's mark", async () => {
       const held = heldMarks();
       const h = setup({
-        markInboxSeen: (actorId) => (actorId === "a1" ? held.markInboxSeen() : Promise.resolve()),
+        markInboxSeen: (actorId) =>
+          actorId === "a1" ? held.markInboxSeen(actorId) : Promise.resolve(),
       });
       const blocked = queuedWithWork(h, "a1");
       const other = queuedWithWork(h, "a2");

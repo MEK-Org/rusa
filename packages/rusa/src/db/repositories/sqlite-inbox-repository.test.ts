@@ -214,14 +214,37 @@ describe("SqliteInboxRepository", () => {
     ]);
 
     const firstAt = new Date("2026-07-13T13:00:00Z");
-    expect(store.markSeen("a", firstAt)).toMatchObject([
+    expect(store.markSeen("a", store.unseenEntryIds("a"), firstAt)).toMatchObject([
       { id: "a1", actorId: "a", seenAt: firstAt, handledAt: null },
     ]);
-    expect(store.markSeen("a", new Date("2026-07-13T14:00:00Z"))).toEqual([]);
+    expect(store.markSeen("a", ["a1"], new Date("2026-07-13T14:00:00Z"))).toEqual([]);
     expect(store.read("a", "a1")?.seenAt).toEqual(firstAt);
     expect(store.read("a", "a2")?.seenAt).toBeNull();
     expect(store.read("b", "b1")?.seenAt).toBeNull();
     expect(store.actorsWithUnseen()).toEqual([{ actorId: "b", priority: "normal" }]);
+  });
+
+  it("lists an actor's unseen unhandled ids in delivery order, and stamps only named ones", () => {
+    store.append([
+      { id: "late", actorId: "a", source: "chat", payload: { type: "message.created" } },
+      {
+        id: "early",
+        actorId: "a",
+        source: "chat",
+        deliveredAt: new Date("2026-07-13T11:00:00Z"),
+        payload: { type: "message.created" },
+      },
+      { id: "done", actorId: "a", source: "chat", payload: { type: "message.created" } },
+      { id: "theirs", actorId: "b", source: "chat", payload: { type: "message.created" } },
+    ]);
+    store.markHandled("a", ["done"]);
+    expect(store.unseenEntryIds("a")).toEqual(["early", "late"]);
+
+    expect(store.markSeen("a", ["late", "done", "theirs"]).map((e) => e.id)).toEqual(["late"]);
+    expect(store.unseenEntryIds("a")).toEqual(["early"]);
+    expect(store.unseenEntryIds("b")).toEqual(["theirs"]);
+    expect(store.markSeen("a", [])).toEqual([]);
+    expect(store.unseenEntryIds("a")).toEqual(["early"]);
   });
 
   it("promotes recovery priority when any qualifying entry is responsive", () => {

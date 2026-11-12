@@ -259,9 +259,19 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
             right.id.localeCompare(left.id)
         )
         .slice(0, limit),
-    markSeen: (actorId, seenAt = new Date("2026-01-01T00:00:00Z")) => {
+    unseenEntryIds: (actorId) =>
+      entries
+        .filter(
+          (entry) => entry.actorId === actorId && entry.seenAt === null && entry.handledAt === null
+        )
+        .map((entry) => entry.id),
+    markSeen: (actorId, entryIds, seenAt = new Date("2026-01-01T00:00:00Z")) => {
       const unseen = entries.filter(
-        (entry) => entry.actorId === actorId && entry.seenAt === null && entry.handledAt === null
+        (entry) =>
+          entry.actorId === actorId &&
+          entry.seenAt === null &&
+          entry.handledAt === null &&
+          entryIds.includes(entry.id)
       );
       for (const entry of unseen) entry.seenAt = seenAt;
       return unseen;
@@ -402,8 +412,10 @@ function memoryMeshWriter(
 ): Pick<MeshObligationWriter, "write"> {
   const write = async (op: string, input: unknown): Promise<unknown> => {
     switch (op) {
-      case "inbox.markSeen":
-        return inbox.markSeen((input as { actorId: string }).actorId);
+      case "inbox.markSeen": {
+        const mark = input as { actorId: string; entryIds: readonly string[] };
+        return inbox.markSeen(mark.actorId, mark.entryIds);
+      }
       case "obligations.closureShortfalls":
         if (!closure) throw new Error("this test mesh has no obligations to decide closure on");
         return inboxClosureShortfalls(
@@ -1381,6 +1393,7 @@ describe("ActorMesh", () => {
       ],
       countUnhandled: (actorId: string) => (actorId === "t1" ? 1 : 0),
       list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
+      unseenEntryIds: () => [],
       markSeen: () => [],
       // Partial fake: it never notifies, so the only wake here is whatever the
       // mesh path under test sends itself.
@@ -5332,12 +5345,16 @@ describe("ActorMesh", () => {
       let gate: Promise<void> | null = null;
       let open = () => {};
       let held = 0;
+      const made: string[][] = [];
       return {
         writer: {
           write: async (op: string, input: unknown) => {
-            if (op === "inbox.markSeen" && gate) {
-              held += 1;
-              await gate;
+            if (op === "inbox.markSeen") {
+              made.push([...(input as { entryIds: readonly string[] }).entryIds]);
+              if (gate) {
+                held += 1;
+                await gate;
+              }
             }
             return base.write(op as never, input as never);
           },
@@ -5352,6 +5369,8 @@ describe("ActorMesh", () => {
           open();
         },
         held: () => held,
+        /** Every seen mark requested, as the entry ids it names. */
+        made: () => made,
       };
     }
 
@@ -5360,12 +5379,14 @@ describe("ActorMesh", () => {
       const inboxStore = createMemoryInboxStore();
       const actors = new InMemoryActorRepository();
       const marks = heldSeenWriter(inboxStore, actors);
+      const events: MeshEventInput[] = [];
       const harness = setup({
         maxConcurrent: 1,
         sharedProvider: d.provider,
         inboxStore,
         actors,
         writer: marks.writer,
+        events: (event) => events.push(event),
       });
       const { mesh, tick } = harness;
       const w1 = mesh.spawn({ charter: "w1", parentId: "root" });
@@ -5378,7 +5399,10 @@ describe("ActorMesh", () => {
       expect(d.pending()).toBe(1);
       const unhandled = (actorId: string) =>
         inboxStore.list(actorId, { status: "unhandled" }).entries;
-      return { ...harness, d, inboxStore, marks, w1, w2, unhandled };
+      /** The id of an actor's nth inbox entry, in delivery order. */
+      const nthId = (actorId: string, n: number) =>
+        inboxStore.entries.filter((entry) => entry.actorId === actorId)[n]?.id;
+      return { ...harness, d, inboxStore, marks, events, w1, w2, unhandled, nthId };
     }
 
     it("keeps an interrupt made during the mark, and recovers the seen work on the next delivery", async () => {
@@ -5427,8 +5451,9 @@ describe("ActorMesh", () => {
       // This pins what only the real path shows: through the mesh's append
       // notifications and the actor's concurrency gate, the notifications
       // make one provider run, admitted after every entry is seen.
-      const { mesh, tick, d, marks, w2, unhandled } = await queuedBehindConcurrency();
+      const { mesh, tick, d, marks, w2, unhandled, nthId } = await queuedBehindConcurrency();
 
+      const before = marks.made().length;
       marks.hold();
       mesh.sendMessage(w2, "more", "root");
       mesh.sendMessage(w2, "and more", "root");
@@ -5441,6 +5466,13 @@ describe("ActorMesh", () => {
       marks.release();
       await tick();
       expect(unhandled(w2).every((entry) => entry.seenAt !== null)).toBe(true);
+      // Each notification's mark names only the entry unseen when it was
+      // requested: two marks in all, and none that had nothing to stamp
+      // (r4547468372).
+      expect(marks.made().slice(before)).toEqual([[nthId(w2, 1)], [nthId(w2, 2)]]);
+      // A dispatch finding nothing unseen has no mark to make.
+      await mesh.dispatch(w2);
+      expect(marks.made().slice(before)).toHaveLength(2);
       d.releaseAll();
       await tick();
       // w2's one queued run is admitted with every entry already seen.
@@ -5449,6 +5481,52 @@ describe("ActorMesh", () => {
       d.releaseAll();
       await tick();
       expect(d.pending()).toBe(0);
+    });
+
+    it("never stamps work delivered after its mark was requested, so a later interrupting arrival still preempts (r4547468362)", async () => {
+      const { mesh, tick, d, marks, events, w2, unhandled, inboxStore, nthId } =
+        await queuedBehindConcurrency();
+
+      marks.hold();
+      mesh.sendMessage(w2, "more", "root");
+      await tick();
+      expect(marks.held()).toBe(1);
+
+      // While that mark is outstanding, w1 finishes and w2's queued run is
+      // admitted: it lists its inbox now, before the next arrival.
+      d.releaseAll();
+      await tick();
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "running" });
+      expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+
+      // Responsive work whose policy interrupts arrives behind the held mark.
+      const [late] = inboxStore.append([
+        {
+          actorId: w2,
+          source: "mesh:root",
+          payload: { type: "mesh.message", priority: "responsive" } as InboxPayload,
+        },
+      ]);
+      await tick();
+
+      marks.release();
+      await tick();
+      // The held mark stamped only what it named; the late entry kept its
+      // arrival, so its own dispatch replaced the run that never listed it.
+      expect(marks.made()).toContainEqual([nthId(w2, 1)]);
+      expect(marks.made().some((ids) => ids.includes(late?.id ?? "") && ids.length > 1)).toBe(
+        false
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({ kind: "run_preempted", actorId: w2 })
+      );
+      expect(unhandled(w2).find((entry) => entry.id === late?.id)?.seenAt).toBeNull();
+      // The replacement's own queue gate takes it in.
+      d.releaseAll();
+      await tick();
+      expect(unhandled(w2).find((entry) => entry.id === late?.id)?.seenAt).not.toBeNull();
+      d.releaseAll();
+      await tick();
     });
 
     it("rejects a join whose mark fails, and the next delivery joins normally", async () => {
@@ -10791,6 +10869,7 @@ describe("ActorMesh", () => {
           for (const listener of appendListeners) listener(inserted);
           return inserted;
         },
+        unseenEntryIds: () => appended.map((_, index) => `entry-${index}`),
         markSeen: () => {
           order.push("seen");
           return appended.map((input, index) => ({
@@ -10947,6 +11026,7 @@ describe("ActorMesh", () => {
         },
         countUnhandled: () => appended.length,
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
+        unseenEntryIds: () => [],
         markSeen: () => [],
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
