@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { defineConfig } from "tsup";
 
 // Output dir is overridable via RUSA_DIST_DIR so the `update` tool  can
@@ -14,7 +15,15 @@ export default defineConfig({
   entry: {
     cli: "src/cli.ts",
     "commands/e2e.cli": "src/commands/e2e.cli.ts",
+    // Started by DbReadPool, which resolves it beside the shared chunk that
+    // carries the pool; a built run whose worker is missing or fails to load
+    // fails DbReadPool.open at startup rather than a later read (#1289).
+    "db-read-worker": "src/db/read-worker.ts",
   },
+  // One id per tsup run, compiled into its output: a read worker started after
+  // an update swapped `dist` reports the build of the code it actually loaded,
+  // and DbReadPool refuses one that differs from its own (#1289).
+  define: { __RUSA_BUILD_ID__: JSON.stringify(randomUUID()) },
   format: ["esm"],
   target: "node20",
   outDir,

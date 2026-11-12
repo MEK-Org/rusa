@@ -2723,7 +2723,7 @@ describe("ObligationRepository", () => {
       repository.create({ title: "o2", id: "o2", ownerId: "actor-c", priority: 30 });
       repository.create({ title: "s", id: "s", ownerId: "actor-c", priority: 40 });
       repository.markResponsive("s", "system:mesh");
-      repository.setSnooze("s", "2100-01-01T00:00:00.000Z", "actor-c");
+      repository.writeSnooze("s", "2100-01-01T00:00:00.000Z", "actor-c");
 
       // The snoozed responsive row sorts after every actionable row.
       expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
@@ -4055,9 +4055,12 @@ describe("ObligationRepository", () => {
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh")
       ).not.toThrow();
       expect(attempts).toBe(1);
+      expect(repository.scheduleErrorFor("rec-1")).toMatch(/crontab write failed/);
       vi.runAllTimers();
       expect(attempts).toBe(2);
       vi.useRealTimers();
+      // The retry that armed the timer also retires the failure it reported.
+      expect(repository.scheduleErrorFor("rec-1")).toBeNull();
 
       // The database write is not an OS side effect and must not roll back
       // with it; a bounded post-commit retry re-derives the scheduler job from
@@ -4080,6 +4083,7 @@ describe("ObligationRepository", () => {
       // One committed mutation plus the two explicitly bounded retries.
       expect(attempts).toBe(3);
       vi.useRealTimers();
+      expect(repository.scheduleErrorFor("rec-1")).toMatch(/persistent crontab failure/);
     });
 
     it("replaces a switched-away completion_interval `at` job with the new cron job outside the transaction", () => {
@@ -4247,8 +4251,10 @@ describe("ObligationRepository", () => {
       repository.setResponsiveReadyListener((obligation) => responsive.push(obligation.id));
     });
 
-    const snooze = (id: string, until: string | null, principal = "actor-a") =>
-      repository.setSnooze(id, until, principal).obligation;
+    const snooze = (id: string, until: string | null, principal = "actor-a") => {
+      repository.assertSnoozeSchedulable(until);
+      return repository.writeSnooze(id, until, principal);
+    };
 
     /** A completion_interval obligation completed at T0, next due at T0 + 1h. */
     function intervalScheduled(id = "rec", priority?: number): void {
@@ -4648,7 +4654,7 @@ describe("ObligationRepository", () => {
         expect(() => snooze("a", iso(T0 + HOUR))).toThrow(/no working `at` scheduler/);
         // A process with no scheduler attached at all, like the standalone dashboard.
         const bare = new ObligationRepository(db, undefined, () => t);
-        expect(() => bare.setSnooze("a", iso(T0 + HOUR), "actor-a")).toThrow(
+        expect(() => bare.assertSnoozeSchedulable(iso(T0 + HOUR))).toThrow(
           /no host activation scheduler/
         );
         expect(repository.require("a").snoozedUntil).toBeNull();
@@ -4658,16 +4664,17 @@ describe("ObligationRepository", () => {
       it("still clears a snooze where no scheduler is attached", () => {
         snooze("a", iso(T0 + HOUR));
         const bare = new ObligationRepository(db, undefined, () => t);
-        expect(bare.setSnooze("a", null, "actor-a").obligation.snoozedUntil).toBeNull();
+        expect(() => bare.assertSnoozeSchedulable(null)).not.toThrow();
+        expect(bare.writeSnooze("a", null, "actor-a").snoozedUntil).toBeNull();
       });
 
       it("surfaces this call's post-commit timer failure, and an identical rewrite retries it", () => {
         scheduler.failAt = true;
-        const result = repository.setSnooze("a", iso(T0 + HOUR), "actor-a");
-        expect(result.obligation.snoozedUntil).toBe(iso(T0 + HOUR));
-        expect(result.scheduleError).toMatch(/queue write failed/);
+        expect(snooze("a", iso(T0 + HOUR)).snoozedUntil).toBe(iso(T0 + HOUR));
+        expect(repository.scheduleErrorFor("a")).toMatch(/queue write failed/);
         scheduler.failAt = false;
-        expect(repository.setSnooze("a", iso(T0 + HOUR), "actor-a").scheduleError).toBeNull();
+        snooze("a", iso(T0 + HOUR));
+        expect(repository.scheduleErrorFor("a")).toBeNull();
         expect(scheduler.activations.get("a")).toEqual({ kind: "at", date: new Date(T0 + HOUR) });
       });
     });
@@ -6000,7 +6007,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
 
     const before = boot();
     before.create({ title: "Snoozed", id: "snoozed", ownerId: "actor-a", intent: "snoozed" });
-    before.setSnooze("snoozed", new Date(now + 3_600_000).toISOString(), "actor-a");
+    before.writeSnooze("snoozed", new Date(now + 3_600_000).toISOString(), "actor-a");
     expect(jobs).toHaveLength(1);
 
     // Each start-up's boot reconciliation re-arms the row before it reads the

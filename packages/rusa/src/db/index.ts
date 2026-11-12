@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { InstanceRole } from "../config/types.js";
+import { createInProcessMeshWriter, type MeshObligationWriter } from "./mesh-write-operations.js";
 import { runMigrations } from "./migrations/runner.js";
 import {
   createFollowerRepositories,
@@ -15,6 +16,7 @@ let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
 let followerRepositories: FollowerRepositories | null = null;
 let currentRepositoriesRole: InstanceRole | null = null;
+let meshWriter: MeshObligationWriter | null = null;
 
 export type TaskStatus = "queued" | "in_progress" | "done" | "blocked";
 
@@ -40,6 +42,11 @@ export interface TaskRow {
   result: string | null;
 }
 
+/** Where an instance's mesh database lives: `<mcHome>/data/mesh.db`. */
+export function meshDbPath(mcHome: string): string {
+  return join(mcHome, "data", "mesh.db");
+}
+
 /**
  * Open (and migrate) the SQLite database under `<mcHome>/data/mesh.db`.
  * Idempotent: returns the existing handle if already open.
@@ -47,11 +54,8 @@ export interface TaskRow {
 export function initDb(mcHome: string): Database.Database {
   if (db) return db;
 
-  const dataDir = join(mcHome, "data");
-  mkdirSync(dataDir, { recursive: true });
-
-  const dbPath = join(dataDir, "mesh.db");
-  db = new Database(dbPath);
+  mkdirSync(join(mcHome, "data"), { recursive: true });
+  db = new Database(meshDbPath(mcHome));
 
   // WAL for better concurrent read performance; enforce relational constraints.
   // The conversion goes through `widenToWal` rather than the bare pragma: a
@@ -106,6 +110,18 @@ export function getRepositories(
 }
 
 /**
+ * The leader's one writer (#1289), over the main connection and the leader's
+ * repositories. Every converted caller shares it: one writer is what keeps
+ * their notifications in commit order.
+ */
+export function getMeshWriter(): MeshObligationWriter {
+  if (!meshWriter) {
+    meshWriter = createInProcessMeshWriter(getDb(), getRepositories().meshWriteRepos());
+  }
+  return meshWriter;
+}
+
+/**
  * Close the database connection.
  */
 export function closeDb(): void {
@@ -116,6 +132,7 @@ export function closeDb(): void {
   repositories = null;
   followerRepositories = null;
   currentRepositoriesRole = null;
+  meshWriter = null;
 }
 
 const SQLITE_UTC_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z?$/;

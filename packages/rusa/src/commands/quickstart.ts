@@ -15,7 +15,6 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { input, password } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as toYaml } from "yaml";
-import { generateRandomRootHandle } from "../actor/handle-generator.js";
 import { GEMINI_API_KEY_SECRET_FILENAME, writeHostSecret } from "../config/secrets.js";
 import type { RusaConfig } from "../config/types.js";
 import { seedBareRepoFromLocalPath } from "../gitops/worktree.js";
@@ -60,13 +59,6 @@ export const PROVIDER_CLI_COMMANDS: Record<string, string> = {
   codex: "codex",
   antigravity: "agy",
   kimi: "kimi",
-};
-
-const QUICKSTART_ROOT_MODELS: Record<string, string> = {
-  claude: "claude-sonnet-5",
-  codex: "gpt-5.6-sol",
-  antigravity: "Gemini 3.7 Flash",
-  kimi: "kimi-for-coding",
 };
 
 const UNSUPPORTED_QUICKSTART_LOGIN_PROVIDERS = new Set(["kimi"]);
@@ -648,12 +640,6 @@ function reposFromConfig(config: RusaConfig | null): string[] {
   return Array.isArray(repos) ? repos.filter((repo) => typeof repo === "string") : [];
 }
 
-function rootHandleFromConfig(config: RusaConfig | null): string | undefined {
-  const handle = config?.rootActor?.handle;
-  // Kept verbatim: the runtime resolves the stored handle byte-for-byte.
-  return typeof handle === "string" && handle.trim() ? handle : undefined;
-}
-
 export interface QuickstartConfigureOptions {
   home?: string;
   executeProviderCommand?: ProviderCommandExecutor;
@@ -664,7 +650,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
   const configPath = join(mcHome, "config.yaml");
   const existingConfig = readExistingConfig(configPath);
   const existingRepos = reposFromConfig(existingConfig);
-  const existingRootHandle = rootHandleFromConfig(existingConfig);
 
   console.log("\nRusa quickstart configuration\n");
   console.log("This writes configuration inside the container.\n");
@@ -706,30 +691,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
 
   writeHostSecret(GEMINI_API_KEY_SECRET_FILENAME, geminiApiKey.trim(), mcHome);
 
-  // A reconfigure offers the current handle so accepting the default never
-  // renames root; only a fresh install gets a random suggestion.
-  const suggestedRootHandle = existingRootHandle ?? generateRandomRootHandle();
-  const rootHandleAnswer = await input({
-    message: existingRootHandle
-      ? `Root entity handle/name (leave blank to keep current: "${existingRootHandle}"):`
-      : `Root entity handle/name (leave blank for suggested: "${suggestedRootHandle}"):`,
-    default: suggestedRootHandle,
-  });
-  // Accepting the displayed default returns it untrimmed; only a new answer
-  // is normalized.
-  const rootHandle =
-    rootHandleAnswer === suggestedRootHandle || !rootHandleAnswer.trim()
-      ? suggestedRootHandle
-      : rootHandleAnswer.trim();
-  const rootProvider = providers[0];
-  const rootModel = (
-    await input({
-      message: `Exact root model pin for ${rootProvider}:`,
-      default: QUICKSTART_ROOT_MODELS[rootProvider],
-      validate: (value) => (value.trim() ? true : "Root model is required"),
-    })
-  ).trim();
-
   // Quickstart is meant to run against a local repository through the Git
   // bridge; nothing here subscribes to GitHub. The webhook stanza below is the
   // only GitHub ingestion edge, and it stays idle until an operator adds
@@ -741,12 +702,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
     providers: Object.fromEntries(
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
     ),
-    rootActor: {
-      provider: rootProvider,
-      model: rootModel,
-      handle: rootHandle,
-      ...(rootProvider === "antigravity" ? { effort: "high" } : {}),
-    },
     webhook: {
       port: QUICKSTART_WEBHOOK_PORT,
       secret: randomBytes(32).toString("hex"),

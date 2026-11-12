@@ -92,29 +92,12 @@ export function avatarCachePath(id: string): string {
 }
 
 /**
- * Absolute path to the configured root avatar override (`rootActor.avatar`) when
- * it resolves to a file that exists, else null. Split out of {@link
- * rootAvatarPath} because dashboard branding (#48) has to tell an image this
- * instance's operator actually chose apart from the bundled default that every
- * install shares — the latter is generic rusa artwork, not this root's face.
+ * Absolute path to the bundled System Root avatar image, or null if it cannot
+ * be found. An uploaded or generated root image is cached separately under
+ * {@link avatarCachePath}("root") and takes precedence where it is read.
  */
-export function configuredRootAvatarPath(configuredPath?: string): string | null {
-  if (!configuredPath) return null;
-  const resolved = resolve(configuredPath);
-  return existsSync(resolved) ? resolved : null;
-}
-
-/**
- * Absolute path to the root avatar image: the configured override
- * (`rootActor.avatar`) if it resolves to a file that exists, else the bundled
- * System Root image, or null if neither can be found.
- */
-export function rootAvatarPath(configuredPath?: string): string | null {
-  return (
-    configuredRootAvatarPath(configuredPath) ??
-    ROOT_AVATAR_CANDIDATES.find((p) => existsSync(p)) ??
-    null
-  );
+export function rootAvatarPath(): string | null {
+  return ROOT_AVATAR_CANDIDATES.find((p) => existsSync(p)) ?? null;
 }
 
 /**
@@ -127,8 +110,7 @@ export function rootAvatarPath(configuredPath?: string): string | null {
  * the root. No worker uuid can map to `"silicon-familiar"`, so renaming root's
  * display can't make a worker masquerade as root / steal the bundled dog image.
  *
- * `rootHandle` is the resolved configured handle (`resolveRootHandle(config)`,
- * ISSUE_NUM) — when a root is configured to present as e.g. `ember-familiar`,
+ * `rootHandle` is the resolved root handle — when a root presents as e.g. `ember-familiar`,
  * that display handle must ALSO resolve to root, in addition to the
  * `"root"`/`"silicon-familiar"` default mapping above (which is unaffected by
  * config and always resolves the plumbing id).
@@ -408,17 +390,15 @@ export interface ServedAvatar {
 export interface RootAvatarIdentity {
   /** The durable root thread id; generated for fresh installs. */
   id?: string;
-  /** The resolved display handle (`resolveRootHandle(config)`), if configured. */
+  /** The display handle stored on its actor row, if any. */
   handle?: string;
-  /** `rootActor.avatar` — an override image path, if configured. */
-  avatarPath?: string;
 }
 
 /**
  * Resolve the avatar to serve for a request key, the **thread id** (with any
  * file extension already stripped). Worker files are keyed by id, so the UI
  * requests by id; the root is served an uploaded image if available, else its fixed
- * bundled image (or the configured override, see {@link RootAvatarIdentity}).
+ * bundled image.
  */
 export function readAvatar(id: string, rootIdentity?: RootAvatarIdentity): ServedAvatar | null {
   const isRoot = id === rootIdentity?.id || isRootHandle(id, rootIdentity?.handle);
@@ -431,7 +411,7 @@ export function readAvatar(id: string, rootIdentity?: RootAvatarIdentity): Serve
   }
 
   if (isRoot) {
-    const rootPath = rootAvatarPath(rootIdentity?.avatarPath);
+    const rootPath = rootAvatarPath();
     if (!rootPath) return null;
     return {
       body: readFileSync(rootPath),
@@ -477,18 +457,14 @@ export interface RootBrandingImage {
  * dashboard needs an avatar to draw. Branding is the opposite — the bundled
  * robot is generic rusa artwork shared by every install, so falling back to it
  * would replace the crafted actor-mesh favicon with an equally generic but worse
- * one. Only an uploaded/generated root image, or a configured `rootActor.avatar`,
- * counts. Never throws: a missing or racing file just means "no branding image".
+ * one. Only an uploaded/generated root image counts. Never throws: a missing or racing file just means "no branding image".
  */
-export function rootBrandingImage(rootIdentity?: RootAvatarIdentity): RootBrandingImage | null {
+export function rootBrandingImage(): RootBrandingImage | null {
   try {
     // Root images always cache under the literal `root` key — `uploadAvatar` and
     // `generateAvatarForce` both canonicalize the durable root id to it.
-    const uploaded = avatarCachePath("root");
-    const path = existsSync(uploaded)
-      ? uploaded
-      : configuredRootAvatarPath(rootIdentity?.avatarPath);
-    if (!path) return null;
+    const path = avatarCachePath("root");
+    if (!existsSync(path)) return null;
     const stats = statSync(path);
     return {
       path,

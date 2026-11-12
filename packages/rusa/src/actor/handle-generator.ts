@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { RootActorConfig } from "../config/types.js";
 
 export const ADJECTIVES = [
   "active",
@@ -522,19 +521,21 @@ export const ANIMALS = [
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
+ * The handle the configured-actor import stored when `rootActor.handle` was
+ * omitted. Dashboard branding and the Android application id read it as
+ * "unbranded", and an installed app's id can never change, so this value is
+ * fixed independently of how {@link generateHandle} treats the legacy id.
+ */
+export const DEFAULT_ROOT_HANDLE = "root-actor";
+
+/**
  * Generates a deterministic, friendly display handle for a thread UUID.
  *
  * The grandfathered root id `"root"` displays as `root-actor` by default. Fresh
- * roots have opaque ids; production wiring supplies their configured root handle.
+ * roots have opaque ids; their display handle is stored on the actor row.
  */
-export function generateRandomRootHandle(): string {
-  const adjIndex = Math.floor(Math.random() * ADJECTIVES.length);
-  const animIndex = Math.floor(Math.floor(Math.random() * ANIMALS.length));
-  return `${ADJECTIVES[adjIndex]}-${ANIMALS[animIndex]}`;
-}
-
 export function generateHandle(uuid: string): string {
-  if (uuid === "root") return "root-actor";
+  if (uuid === "root") return DEFAULT_ROOT_HANDLE;
   if (!UUID_REGEX.test(uuid)) return uuid;
 
   const hash = createHash("sha256").update(uuid).digest();
@@ -547,21 +548,3 @@ export function generateHandle(uuid: string): string {
 
   return `${adjective}-${animal}`;
 }
-
-/**
- * Resolve the root actor's display handle: the configured override
- * (`rootActor.handle`) if set, else default `generateHandle("root")`
- * (`root-actor`). An empty override is unset: there is no empty handle to
- * sign, show or store (#1002).
- */
-export function resolveRootHandle(config?: {
-  rootActor?: Pick<RootActorConfig, "handle">;
-}): string {
-  return config?.rootActor?.handle || generateHandle("root");
-}
-
-/**
- * Default standing charter for the root actor when `rootActor.charter` is not explicitly set.
- */
-export const DEFAULT_ROOT_CHARTER =
-  "Root Orchestrator: Coordinates worker subagents, triages incoming events, maintains project goals, and oversees codebase tasks.";

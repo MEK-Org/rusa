@@ -10,7 +10,7 @@ import { ActorMesh, type ActorMeshOptions } from "./actor-mesh.js";
  * Actor in the leader's own process — the actor ran, on the wrong machine,
  * silently. These tests pin the opposite: no record, no handle, no Actor.
  */
-function setup(options?: Partial<ActorMeshOptions>) {
+function setup(options?: Pick<ActorMeshOptions, "supportsExecutionTarget">) {
   const registry = new InMemoryActorRepository();
   registry.upsert({
     id: "root",

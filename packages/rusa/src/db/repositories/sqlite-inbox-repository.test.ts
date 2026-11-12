@@ -5,10 +5,13 @@ import { ActorMesh } from "../../actor/actor-mesh.js";
 import { FakeProvider } from "../../providers/fake-provider.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import type { InboxEntry, InboxPayload } from "../../repositories/inbox-repository.js";
+import { meshWriterFor } from "../fixtures/obligation-store.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
+import { runMigrations } from "../migrations/runner.js";
 import { Repositories } from "./index.js";
+import { ObligationRepository } from "./obligation-repository.js";
 import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
 describe("SqliteInboxRepository", () => {
@@ -211,14 +214,37 @@ describe("SqliteInboxRepository", () => {
     ]);
 
     const firstAt = new Date("2026-07-13T13:00:00Z");
-    expect(store.markSeen("a", firstAt)).toMatchObject([
+    expect(store.markSeen("a", store.unseenEntryIds("a"), firstAt)).toMatchObject([
       { id: "a1", actorId: "a", seenAt: firstAt, handledAt: null },
     ]);
-    expect(store.markSeen("a", new Date("2026-07-13T14:00:00Z"))).toEqual([]);
+    expect(store.markSeen("a", ["a1"], new Date("2026-07-13T14:00:00Z"))).toEqual([]);
     expect(store.read("a", "a1")?.seenAt).toEqual(firstAt);
     expect(store.read("a", "a2")?.seenAt).toBeNull();
     expect(store.read("b", "b1")?.seenAt).toBeNull();
     expect(store.actorsWithUnseen()).toEqual([{ actorId: "b", priority: "normal" }]);
+  });
+
+  it("lists an actor's unseen unhandled ids in delivery order, and stamps only named ones", () => {
+    store.append([
+      { id: "late", actorId: "a", source: "chat", payload: { type: "message.created" } },
+      {
+        id: "early",
+        actorId: "a",
+        source: "chat",
+        deliveredAt: new Date("2026-07-13T11:00:00Z"),
+        payload: { type: "message.created" },
+      },
+      { id: "done", actorId: "a", source: "chat", payload: { type: "message.created" } },
+      { id: "theirs", actorId: "b", source: "chat", payload: { type: "message.created" } },
+    ]);
+    store.markHandled("a", ["done"]);
+    expect(store.unseenEntryIds("a")).toEqual(["early", "late"]);
+
+    expect(store.markSeen("a", ["late", "done", "theirs"]).map((e) => e.id)).toEqual(["late"]);
+    expect(store.unseenEntryIds("a")).toEqual(["early"]);
+    expect(store.unseenEntryIds("b")).toEqual(["theirs"]);
+    expect(store.markSeen("a", [])).toEqual([]);
+    expect(store.unseenEntryIds("a")).toEqual(["early"]);
   });
 
   it("promotes recovery priority when any qualifying entry is responsive", () => {
@@ -367,6 +393,22 @@ describe("SqliteInboxRepository", () => {
       expect(listener).not.toHaveBeenCalled();
       expect(store.list("actor-a", { status: "all" }).entries).toEqual([]);
       expect(store.actorsWithUnhandled()).toEqual([]);
+      expect(db.inTransaction).toBe(false);
+    });
+
+    it.each([
+      ["markHandled", () => store.markHandled("actor-a", ["held"])],
+      ["replaceEntries", () => store.replaceEntries("actor-a", ["held"], "replaced", [])],
+    ])("refuses %s inside an enclosing transaction that is not a write's (#1289)", (_, mark) => {
+      // The outer caller would decide the write's fate after its handled
+      // notice had already fired.
+      store.append([entry("held")]);
+      const listener = vi.fn();
+      store.onItemsHandled(listener);
+
+      expect(() => db.transaction(mark)()).toThrow(/enclosing transaction/);
+      expect(listener).not.toHaveBeenCalled();
+      expect(store.read("actor-a", "held")?.handledAt).toBeNull();
       expect(db.inTransaction).toBe(false);
     });
 
@@ -530,6 +572,10 @@ describe("SqliteInboxRepository", () => {
 
   it("handled_at changes only through actor mark_handled", async () => {
     vi.useFakeTimers();
+    // The mesh marks seen through its writer, which needs the whole schema.
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"));
     store.append([
       { id: "entry", actorId: "actor", source: "chat", payload: { type: "message.created" } },
     ]);
@@ -546,6 +592,7 @@ describe("SqliteInboxRepository", () => {
     const mesh = new ActorMesh({
       actors: registry,
       inboxStore: store,
+      writer: meshWriterFor(db, new ObligationRepository(db), { inbox: store, actors: registry }),
       createActor: () => {
         throw new Error("not used");
       },

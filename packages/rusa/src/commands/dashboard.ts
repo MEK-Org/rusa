@@ -2,11 +2,11 @@ import { join } from "node:path";
 import openBrowser from "open";
 import { haltIndicator } from "../actor/availability-holds.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
-import { generateHandle, resolveRootHandle } from "../actor/handle-generator.js";
+import { generateHandle } from "../actor/handle-generator.js";
 import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
-import { CONFIGURED_ACTOR_IMPORT_SOURCE } from "../db/configured-actor-import.js";
-import { getRepositories, initDb } from "../db/index.js";
+import { resolveConfiguredActor } from "../db/configured-actor-import.js";
+import { getMeshWriter, getRepositories, initDb } from "../db/index.js";
 import { collectConfigSecrets, collectEnvSecrets } from "../observability/log-secrets.js";
 import { createLogger } from "../observability/logger.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
@@ -57,26 +57,18 @@ ${"━".repeat(26)}
     logger: log.child({ component: "reference-cache" }),
   });
   const actors = getRepositories().actors;
-  // The configured actor is the one its import receipt names (#1002), shown
-  // with the handle stored on its row. This viewer never runs that import: on
-  // a home `rusa start` has not yet upgraded it keeps the daemon's historical
-  // first parentless-record selection and reads the handle and avatar from
-  // `rootActor`, as the daemon did. Forest boot owns any future plurality
-  // semantics; this read-only viewer does not.
-  const importedRootId = getRepositories().legacyImportReceipts.actorFor(
-    CONFIGURED_ACTOR_IMPORT_SOURCE
-  );
-  const rootIdentity =
-    importedRootId === undefined
-      ? {
-          id: actors.list().find((record) => record.parentId === null)?.id,
-          handle: resolveRootHandle(config),
-          avatarPath: config.rootActor?.avatar,
-        }
-      : {
-          id: importedRootId,
-          handle: actors.get(importedRootId)?.displayHandle ?? generateHandle(importedRootId),
-        };
+  // The configured actor is the one its import receipt names (#1002, #1261),
+  // shown with the handle stored on its row. No receipt means no root.
+  const rootActor = resolveConfiguredActor({
+    receipts: getRepositories().legacyImportReceipts,
+    actors,
+  });
+  const rootIdentity = rootActor
+    ? {
+        id: rootActor.id,
+        handle: rootActor.displayHandle ?? generateHandle(rootActor.id),
+      }
+    : undefined;
   // The HALT sentinel is a plain file against the same home, so this read-only
   // viewer can surface the halt state even though no mesh runs in this process.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
@@ -91,6 +83,7 @@ ${"━".repeat(26)}
       meshEvents: getRepositories().meshEvents,
       meshChat: getRepositories().meshChat,
       obligations: getRepositories().obligations,
+      obligationWriter: getMeshWriter(),
       portableContext: getRepositories().portableContext,
       referenceCache,
       // No mesh runs here, so this emitter never fires live_output; it exists so

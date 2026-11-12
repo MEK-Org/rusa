@@ -194,15 +194,27 @@ describe("db-check", () => {
     ).toBe("root-session");
   });
 
-  it("plans no configured actor on a fresh home, and creation only for a session-only legacy home (#1003)", () => {
+  it("reports configuredActor as none on a fresh home, and completed with an import receipt (#1003, #1261)", () => {
     expect(runDbCheckAgainstHome(home).configuredActor).toBe("none");
 
-    mkdirSync(join(home, "root-agent"), { recursive: true });
-    writeFileSync(
-      join(home, "root-agent", "session.json"),
-      JSON.stringify({ sessionId: "root-session" })
-    );
-    expect(runDbCheckAgainstHome(home).configuredActor).toBe("create");
+    runDbCheckAgainstHome(home);
+    const dbPath = join(home, "data", "mesh.db");
+    const db = new Database(dbPath);
+    const repos = new Repositories(db);
+    repos.actors.upsert({
+      id: "root-actor",
+      charter: "root charter",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES ('config.yaml:rootActor', '2026-01-01T00:00:00Z', 1, 'root-actor')`
+    ).run();
+    db.close();
+
+    expect(runDbCheckAgainstHome(home).configuredActor).toBe("completed");
   });
 
   it("plans the event-subscription import against actors the same run has only planned", () => {
@@ -702,7 +714,7 @@ describe("db-check", () => {
     consoleLog.mockRestore();
   });
 
-  it("adopts legacy root actor even when workers/root exists with e2e-verify", () => {
+  it("reports completed when a legacy import receipt names an existing actor (#1261)", () => {
     runDbCheckAgainstHome(home);
     const dbPath = join(home, "data", "mesh.db");
     const db = new Database(dbPath);
@@ -714,35 +726,28 @@ describe("db-check", () => {
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES ('config.yaml:rootActor', '2026-01-01T00:00:00Z', 1, 'root')`
+    ).run();
     db.close();
 
-    const workersRoot = join(home, "workers", "root");
-    mkdirSync(workersRoot, { recursive: true });
-    writeFileSync(join(workersRoot, "e2e-verify"), "legacy e2e harness artifact");
-
     const result = runDbCheckAgainstHome(home);
-    expect(result.configuredActor).toBe("adopt");
+    expect(result.configuredActor).toBe("completed");
   });
 
-  it("refuses a non-root sole top-level candidate if it has a spawned-actor workspace under workers/", () => {
+  it("refuses when an import receipt names an actor missing from actors table (#1261)", () => {
     runDbCheckAgainstHome(home);
     const dbPath = join(home, "data", "mesh.db");
     const db = new Database(dbPath);
-    const repos = new Repositories(db);
-    repos.actors.upsert({
-      id: "worker-top",
-      charter: "some charter",
-      parentId: null,
-      status: "active",
-      createdAt: "2026-01-01T00:00:00Z",
-    });
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES ('config.yaml:rootActor', '2026-01-01T00:00:00Z', 1, 'missing-actor')`
+    ).run();
     db.close();
 
-    const workersDir = join(home, "workers", "worker-top");
-    mkdirSync(workersDir, { recursive: true });
-
     expect(() => runDbCheckAgainstHome(home)).toThrow(
-      /it has a spawned-actor workspace at workers\/worker-top/
+      /the imported configured actor missing-actor has no actor record/
     );
   });
 });

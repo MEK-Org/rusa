@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { meshWriterFor } from "../db/fixtures/obligation-store.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -26,10 +28,15 @@ import {
 
 const TEST_USER_ID = "usr_test_operator";
 
+// Each test inbox's database, so the mesh's writer commits into the same one.
+const inboxDatabases = new WeakMap<SqliteInboxRepository, Database.Database>();
+
 function createTestInbox(): SqliteInboxRepository {
   const db = new Database(":memory:");
   runMigrations(db);
-  return new SqliteInboxRepository(db);
+  const inbox = new SqliteInboxRepository(db);
+  inboxDatabases.set(inbox, db);
+  return inbox;
 }
 
 const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-active-interruption-secrets-"));
@@ -38,6 +45,12 @@ writeFileSync(join(defaultTestSecretsDir, "gemini-api-key"), "test-gemini-key");
 afterAll(() => {
   rmSync(defaultTestSecretsDir, { recursive: true, force: true });
 });
+
+function writerFor(inbox: SqliteInboxRepository, actors: InMemoryActorRepository) {
+  const db = inboxDatabases.get(inbox);
+  if (!db) throw new Error("test inbox was not made by createTestInbox");
+  return meshWriterFor(db, new ObligationRepository(db), { inbox, actors });
+}
 
 function setup(opts: {
   responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
@@ -71,6 +84,7 @@ function setup(opts: {
     capabilityGrants,
     maxConcurrent: 2,
     inboxStore,
+    writer: writerFor(inboxStore, registry),
     eventSourceOwners,
     eventSourceSubscriptions,
     events: (e) => events.push(e),
@@ -322,7 +336,7 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       await tick();
 
       // Run 1 finishes before the decision resolves.
-      mesh.finishInboxRun(worker, { successful: true });
+      await mesh.finishInboxRun(worker, { successful: true });
       resolveFirstRun({});
       await tick();
       expect(runCount).toBe(2);

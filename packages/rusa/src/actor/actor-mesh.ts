@@ -2,18 +2,19 @@ import { randomUUID } from "node:crypto";
 import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { MESH_SYSTEM } from "../mcp/stamp.js";
 import {
-  isBlockingObligationStatus,
   isReadyForAttention,
-  isTerminalObligationStatus,
   type Obligation,
   type ObligationReassignment,
   type ObligationStatus,
   prerequisiteEdgeKey,
 } from "../obligations/obligation.js";
+import { canManageObligation } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   assertConcreteModelConfig,
@@ -75,6 +76,7 @@ import {
   EXPERIMENT_ADMIN_CAPABILITY,
   HOST_GLOBAL_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
+  OBLIGATIONS_ADMIN_CAPABILITY,
   OPERATOR_PROVISIONED_CAPABILITIES,
 } from "./administrative-capabilities.js";
 import {
@@ -108,6 +110,13 @@ import {
   isKnownExperiment,
 } from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
+import {
+  type HeadClosureQuery,
+  type HeadClosureShortfall,
+  headClosureShortfall,
+  type SelectedHeadSnapshot,
+  STRICT_HEAD_CLOSURE_EXITS,
+} from "./head-closure.js";
 import {
   DROPPED_MESSAGE_DETAIL,
   type MeshEventSink,
@@ -284,11 +293,6 @@ export interface MeshObligationPort {
   listPrerequisiteEdges?(
     dependentId: string
   ): Array<{ prerequisiteId: string; status: ObligationStatus }>;
-  /**
-   * Clear the already-expired snoozes among `ids` in one transaction (#722),
-   * so strict closure judges an expired snooze by the ordinary rules.
-   */
-  expireDueSnoozes?(ids: readonly string[]): readonly string[];
   /** The latest reassignment's message (#947), carried on ready-head attention. */
   latestReassignment?(id: string): ObligationReassignment | null;
 }
@@ -304,19 +308,28 @@ export interface MeshObligationPort {
  * rather than arming a run whose heads it could not read.
  */
 export type MeshObligationClosurePort = MeshObligationPort &
-  Required<
-    Pick<
-      MeshObligationPort,
-      "get" | "listDirectChildEdges" | "listPrerequisiteEdges" | "expireDueSnoozes"
-    >
-  >;
+  Required<Pick<MeshObligationPort, "get" | "listDirectChildEdges" | "listPrerequisiteEdges">>;
 
 /** Whether a wired port can answer every read strict closure needs. */
 export function supportsObligationClosureReads(
   port: MeshObligationPort | undefined
 ): port is MeshObligationClosurePort {
-  return Boolean(
-    port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges && port.expireDueSnoozes
+  return Boolean(port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges);
+}
+
+/**
+ * Every head in `heads` refused as unverifiable. Selection refuses to arm a
+ * run without the closure reads, so this is the second half of the same
+ * fail-closed rule: an armed head never counts as closed on evidence the mesh
+ * cannot read.
+ */
+function unreadableClosure(heads: ReadonlySet<string>): HeadClosureShortfall[] {
+  return [...heads].map((obligationId) =>
+    headClosureShortfall(
+      obligationId,
+      null,
+      "the mesh obligation closure port is unavailable, so closure cannot be verified"
+    )
   );
 }
 
@@ -588,7 +601,7 @@ export interface RetireCleanup {
   run: (record: ActorRecord) => void | Promise<void>;
 }
 
-export interface ActorMeshOptions {
+interface ActorMeshBaseOptions {
   actors: ActorRepository;
   principals?: PrincipalRepository;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
@@ -686,6 +699,13 @@ export interface ActorMeshOptions {
     actorId: string,
     excludeRunId?: string
   ) => ReadonlyMap<string, number>;
+  /**
+   * The process's shared writer (#1289). A parent's clearance of its child's
+   * exhausted inbox work goes through it, so the authority check and the write
+   * it authorizes run in one transaction. Required with an inbox; see
+   * {@link ActorMeshOptions}.
+   */
+  writer?: Pick<MeshObligationWriter, "write">;
   /**
    * Called once per actor at genuine birth — inside {@link spawn}, after the live
    * actor is registered — for out-of-band side effects the mesh doesn't own (e.g.
@@ -836,11 +856,15 @@ export interface ActorMeshOptions {
 }
 
 /**
- * The exits a strict head-obligation run has, worded once: the discipline a
- * run is told when its selection arms it.
+ * A mesh with a durable inbox marks it seen, decides run-end closure and
+ * clears a child's exhausted work through the writer (#1289), so one needs
+ * the other.
  */
-const STRICT_HEAD_CLOSURE_EXITS =
-  "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+export type ActorMeshOptions = ActorMeshBaseOptions &
+  (
+    | { inboxStore?: undefined }
+    | { inboxStore: InboxRepository; writer: Pick<MeshObligationWriter, "write"> }
+  );
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
@@ -888,23 +912,6 @@ interface HeadClosureRunState {
    * heads still falls short of closure.
    */
   headsByEntryId: Map<string, Set<string>>;
-}
-
-/** Why one armed head does not count as closed, as returned to the run and recorded. */
-export interface HeadClosureShortfall {
-  obligationId: string;
-  title: string | null;
-  reason: string;
-  /** The actionable sentence the actor is shown. */
-  message: string;
-}
-
-/** The fields of a selected strict head that a handoff is judged against. */
-interface SelectedHeadSnapshot {
-  ownerId: string;
-  checkpoint: string | null;
-  checkpointAt: string | null;
-  checkpointBy: string | null;
 }
 
 /**
@@ -984,7 +991,7 @@ export class ActorMesh {
   private readonly inboxStore?: InboxRepository;
   private unsubscribeInboxAppends?: () => void;
   private unsubscribeInboxHandled?: () => void;
-  private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
+  private dispatchJoiningActiveRunPort?: (actorId: string) => Promise<boolean>;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet, with
    * the strongest wake their rows are owed. See {@link scheduleAppendedWork}.
@@ -1079,10 +1086,12 @@ export class ActorMesh {
     actorId: string,
     excludeRunId?: string
   ) => ReadonlyMap<string, number>;
+  private readonly writer?: Pick<MeshObligationWriter, "write">;
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
     this.completedFocusEntryCounts = opts.completedFocusEntryCounts;
+    this.writer = opts.writer;
     this.principals = opts.principals;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
@@ -1130,8 +1139,10 @@ export class ActorMesh {
       constructActor: (record) => this.createActor(this.factoryContext(record)),
       recordStatus: (actorId) => this.actors.get(actorId)?.status,
       isVoiceSessionActive: (actorId) => this.isVoiceSessionActive(actorId),
-      markInboxSeen: (actorId) => {
-        this.markInboxSeen(actorId);
+      // The dispatch that joins a queued run awaits this before requesting
+      // it (#1289 C1b), and owns its failure.
+      markInboxSeen: async (actorId) => {
+        await this.markInboxSeen(actorId);
       },
       onPreempted: (actorId, phase) => {
         this.recordEvent({
@@ -1339,28 +1350,35 @@ export class ActorMesh {
     const lifecycle = createActorLifecycle(
       [
         {
-          onQueued: (event) => {
-            this.actorQueued(event.actorId, event);
+          onQueued: async (event) => {
+            await this.actorQueued(event.actorId, event);
           },
           onStart: (event) => {
             this.actorStarted(event.actorId);
           },
           onEnd: (event) => {
-            if (event.terminal.kind === "result") {
-              this.finishInboxRun(event.actorId, {
-                successful: event.terminal.result.success,
+            // Only a result waits on a write (its closure check), so only it
+            // returns a promise; an abandoned run ends synchronously, and the
+            // listeners after this one see it at once.
+            const { terminal } = event;
+            if (terminal.kind === "result") {
+              return this.finishInboxRun(event.actorId, {
+                successful: terminal.result.success,
                 runId: event.runId,
+              }).finally(() => {
+                // The run happened even if finishing it failed: it is
+                // accounted, and a selection is run-scoped regardless of its
+                // terminal shape. A failure still reaches the lifecycle.
+                this.accountRun(event.actorId, terminal.result, event.runId);
+                this.clearSelection(event.actorId);
               });
-              this.accountRun(event.actorId, event.terminal.result, event.runId);
-            } else {
-              this.abandonInboxRun(event.actorId);
-              // A launched run that ended without a result still ended: a pool
-              // staged while it ran is due now, not at some later dispatch (#652).
-              if (event.terminal.started) {
-                this.applyPendingTarget(event.actorId);
-              }
             }
-            // A selection is run-scoped regardless of its terminal shape.
+            this.abandonInboxRun(event.actorId);
+            // A launched run that ended without a result still ended: a pool
+            // staged while it ran is due now, not at some later dispatch (#652).
+            if (terminal.started) {
+              this.applyPendingTarget(event.actorId);
+            }
             this.clearSelection(event.actorId);
           },
         },
@@ -1455,7 +1473,12 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
-        this.reconcileActorInbox(work.actorId);
+        const actorId = work.actorId;
+        this.reconcileActorInbox(actorId).catch((err) =>
+          this.log(
+            `inbox reconciliation for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+          )
+        );
       }
     } catch (err) {
       // Recovery is a nudge over durable state, not the durability boundary.
@@ -1471,7 +1494,7 @@ export class ActorMesh {
    * calls this when it drops an admission its follower did not reclaim, since
    * no delivery is coming to wake the work that admission was for (#613).
    */
-  reconcileActorInbox(actorId: string): boolean {
+  async reconcileActorInbox(actorId: string): Promise<boolean> {
     const record = this.actors.get(actorId);
     if (record && record.status !== "active") return false;
     if (this.hasOnlyExhaustedWork(actorId)) return false;
@@ -1485,7 +1508,7 @@ export class ActorMesh {
       for (const work of this.inboxStore.actorsWithUnseen()) {
         const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
-        this.dispatch(work.actorId);
+        this.wake(work.actorId, "unseen inbox reconciliation");
       }
     } catch (err) {
       this.log(
@@ -1553,10 +1576,34 @@ export class ActorMesh {
    * {@link dispatchJoiningActiveRun}, so no caller of this method can turn
    * preemption off.
    */
-  dispatch(actorId: string): boolean {
+  async dispatch(actorId: string): Promise<boolean> {
     const resolved = this.resolveThreadId(actorId);
     this.appendWakesOwed.delete(resolved);
     return this.runs.dispatch(resolved);
+  }
+
+  /**
+   * A {@link dispatch} its caller does not wait for, because the caller's own
+   * answer is about the work it already made durable, not about the run
+   * (#1289 C1b). Its failure is reported here, so it is never silently
+   * dropped, and costs only latency: the work stays unhandled, so the next
+   * dispatch of this actor or reconciliation still finds it.
+   */
+  private wake(actorId: string, context: string): void {
+    this.dispatch(actorId).catch((err) => this.reportWakeFailure(actorId, context, err));
+  }
+
+  /** {@link wake} through {@link dispatchJoiningActiveRun}. */
+  private wakeJoining(actorId: string, context: string): void {
+    this.dispatchJoiningActiveRun(actorId).catch((err) =>
+      this.reportWakeFailure(actorId, context, err)
+    );
+  }
+
+  private reportWakeFailure(actorId: string, context: string, err: unknown): void {
+    this.log(
+      `${context} dispatch for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   isPreemptionSuppressed(actorId: string): boolean {
@@ -1815,7 +1862,7 @@ export class ActorMesh {
    * active run replaced. Self-caused mid-run ready attention is deferred to
    * run end (#632).
    */
-  private dispatchJoiningActiveRun(dest: string): boolean {
+  private async dispatchJoiningActiveRun(dest: string): Promise<boolean> {
     const resolved = this.resolveThreadId(dest);
     const dispatchJoiningActiveRun = this.dispatchJoiningActiveRunPort;
     if (!dispatchJoiningActiveRun) return false;
@@ -1872,28 +1919,31 @@ export class ActorMesh {
     queueMicrotask(() => {
       const unpaid = [...this.appendWakesOwed];
       this.appendWakesOwed.clear();
+      // An advisory wake is never allowed to become the appender's problem,
+      // and is not awaited here: this drain runs after the append's effect
+      // delivery has returned and holds nothing a dispatch needs (#1289 C1b).
+      // A failure is logged, and boot reconciliation still covers it.
       for (const [actorId, wake] of unpaid) {
-        try {
-          if (wake === "join") this.dispatchJoiningActiveRun(actorId);
-          else this.dispatch(actorId);
-        } catch (err) {
-          // An advisory wake is never allowed to become the appender's
-          // problem, and boot reconciliation still covers what it missed.
-          this.log(
-            `inbox notification dispatch for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        if (wake === "join") this.wakeJoining(actorId, "inbox notification");
+        else this.wake(actorId, "inbox notification");
       }
     });
   }
 
-  /** Lifecycle boundary after the halt gate and before scheduler admission. */
-  actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
+  /**
+   * Lifecycle boundary after the halt gate and before scheduler admission.
+   * The run-scoped state is reset before the seen mark is awaited; the run
+   * itself waits on this, so it starts with its entries seen.
+   */
+  async actorQueued(
+    actorId: string,
+    context: { responsive: boolean; mode: ActorRunMode }
+  ): Promise<InboxEntry[]> {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
+    const entries = context.mode === "ordinary" ? await this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
     } catch (err) {
@@ -1915,9 +1965,28 @@ export class ActorMesh {
     this.runResponsiveReadyAttention.delete(actorId);
   }
 
-  private markInboxSeen(actorId: string): InboxEntry[] {
+  /**
+   * Mark the entries this actor has unseen now seen through the writer. The
+   * mark names them when requested, so one that commits later never stamps an
+   * entry delivered meanwhile: that entry's own dispatch still finds it
+   * arriving (#1289 C1b). With none unseen there is nothing to write. A mark
+   * that committed counts as made even if its answer was lost on the way back:
+   * its entries are then reported to no receipt listener, but they are seen.
+   * One that did not commit, or may not have, rejects and is not retried here.
+   */
+  private async markInboxSeen(actorId: string): Promise<InboxEntry[]> {
     if (!this.inboxStore) return [];
-    const entries = this.inboxStore.markSeen(actorId);
+    if (!this.writer) throw new Error("this mesh has no writer configured");
+    const entryIds = this.inboxStore.unseenEntryIds(actorId);
+    if (entryIds.length === 0) return [];
+    let entries: InboxEntry[];
+    try {
+      entries = await this.writer.write("inbox.markSeen", { actorId, entryIds });
+    } catch (err) {
+      if (!(err instanceof MeshWriteCommittedError)) throw err;
+      this.log(`inbox seen mark for ${actorId}: ${err.message}`);
+      entries = Array.isArray(err.result) ? (err.result as InboxEntry[]) : [];
+    }
     if (entries.length > 0 && this.onInboxEntriesSeen) {
       try {
         this.onInboxEntriesSeen(actorId, entries);
@@ -1985,7 +2054,7 @@ export class ActorMesh {
     const closure = this.obligations;
     if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
-        `Cannot select head attention for ${actorId}: this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired, and every head selection is held to strict closure. Wire the closure port.`
+        `Cannot select head attention for ${actorId}: this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges) wired, and every head selection is held to strict closure. Wire the closure port.`
       );
     }
     // Status is a selection-time fact. Keeping only ready focuses in the run
@@ -2101,178 +2170,74 @@ export class ActorMesh {
   }
 
   /**
-   * Every armed head of this actor's current run that is not yet closed, or
-   * none when the run armed nothing (#382, #828). A head is closed when it is
-   * terminal, snoozed, handed off with this run's checkpoint, or waiting on a
-   * new live direct child or a new unmet prerequisite.
+   * The closure question for every armed head of this actor's current run, or
+   * null when the run armed nothing (#382, #828): what its return is judged
+   * by. A head is closed when it is terminal, snoozed, handed off with this
+   * run's checkpoint, or waiting on a new live direct child or a new unmet
+   * prerequisite.
+   *
+   * Test-facing: {@link recordReturnRejections} builds the same question at
+   * return. Tests use this to probe closure mid-run without ending the run,
+   * which {@link inboxHandlingClosure} cannot stand in for: it covers only the
+   * latest selection's entries, while a run's armed heads accumulate across
+   * its selections.
    */
-  headClosureShortfalls(actorId: string): HeadClosureShortfall[] {
+  runClosureQuery(actorId: string): HeadClosureQuery | null {
     actorId = this.resolveThreadId(actorId);
     const runState = this.headClosureRuns.get(actorId);
-    if (!runState) return [];
-    return this.closureShortfalls(actorId, runState, runState.headObligationIds);
+    if (!runState || runState.headObligationIds.size === 0) return null;
+    return this.headClosureQuery(actorId, runState, runState.headObligationIds);
   }
 
   /**
-   * Refuse to mark selected entries handled while a head they are attention
-   * for falls short of closure. handled_at only moves forward, so this is
-   * where "the attention stays unhandled" is decided; a return that still
-   * falls short is then recorded and rides the ordinary bounded retry.
+   * The closure question marking `entryIds` handled must pass, or null when
+   * they are attention for no armed head of this actor's run. Selected
+   * entries are refused handling while a head they are attention for falls
+   * short of closure; handled_at only moves forward, so that refusal is where
+   * "the attention stays unhandled" is decided, and a return that still falls
+   * short is then recorded and rides the ordinary bounded retry.
+   *
+   * The writer answers the question inside the transaction that marks the
+   * entries (#1289), so nothing can land between the verdict and the mark.
+   * Without the closure reads it is refused here instead, fail closed, as
+   * {@link closureShortfalls} refuses it at return.
    */
-  assertInboxEntriesHandleable(actorId: string, entryIds: readonly string[]): void {
+  inboxHandlingClosure(actorId: string, entryIds: readonly string[]): HeadClosureQuery | null {
     actorId = this.resolveThreadId(actorId);
     const runState = this.headClosureRuns.get(actorId);
-    if (!runState) return;
+    if (!runState) return null;
     const heads = new Set(entryIds.flatMap((id) => [...(runState.headsByEntryId.get(id) ?? [])]));
-    if (heads.size === 0) return;
-    const shortfalls = this.closureShortfalls(actorId, runState, heads);
-    if (shortfalls.length > 0) {
+    if (heads.size === 0) return null;
+    if (!supportsObligationClosureReads(this.obligations)) {
+      const shortfalls = unreadableClosure(heads);
       throw new Error(`Cannot mark handled: ${shortfalls.map((s) => s.message).join(" ")}`);
     }
+    return this.headClosureQuery(actorId, runState, heads);
   }
 
-  private closureShortfalls(
+  /**
+   * The closure question for `heads` of this actor's run, as plain data: what
+   * a write operation needs to decide closure inside its own transaction. It
+   * refers to the run's live baseline and the mesh's retirement set; the
+   * writer copies its input when the write is submitted, on the main thread
+   * where they live, so later changes to either do not reach a submitted write.
+   */
+  private headClosureQuery(
     actorId: string,
     runState: HeadClosureRunState,
     heads: ReadonlySet<string>
-  ): HeadClosureShortfall[] {
-    const shortfalls: HeadClosureShortfall[] = [];
-    const fallShort = (obligationId: string, title: string | null, reason: string) =>
-      shortfalls.push({
-        obligationId,
-        title,
-        reason,
-        message: `selected head obligation ${obligationId} ("${title ?? obligationId}") was not finished or decomposed. Reason: ${reason}. Every selected head must ${STRICT_HEAD_CLOSURE_EXITS}.`,
-      });
-    const closure = this.obligations;
-    // Selection already refused to arm a run without these reads, so this is
-    // the second half of the same fail-closed rule rather than a soft skip: an
-    // armed head never counts as closed on evidence the mesh cannot read.
-    if (!supportsObligationClosureReads(closure)) {
-      for (const obligationId of heads) {
-        fallShort(
-          obligationId,
-          null,
-          "the mesh obligation closure port is unavailable, so closure cannot be verified"
-        );
-      }
-      return shortfalls;
-    }
-
-    // A snooze is the owner's explicit, time-bounded decision to defer this
-    // work, so it closes the head whether it was set during the run or before
-    // (#722). One whose deadline already passed is cleared first, through the
-    // normal mutation path, and the obligation then answers to the ordinary
-    // ready/waiting rules below.
-    closure.expireDueSnoozes([...heads]);
-
-    for (const obligationId of heads) {
-      const obligation = closure.get(obligationId);
-      if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
-      if (obligation.snoozedUntil !== null) continue;
-
-      if (obligation.status === "ready") {
-        const shortfall = this.strictHandoffShortfall(
-          actorId,
-          obligation,
-          runState.selectedHeads.get(obligationId) ?? null
-        );
-        if (shortfall !== null) fallShort(obligationId, obligation.title, shortfall);
-        continue;
-      }
-
-      const preExistingChildren =
-        runState.preExistingChildIds.get(obligationId) ?? new Set<string>();
-      const hasNewlyCreatedLiveChild = closure
-        .listDirectChildEdges(obligationId)
-        .some(
-          (child) =>
-            child.creatorId === actorId &&
-            !isTerminalObligationStatus(child.status) &&
-            !preExistingChildren.has(child.id)
-        );
-      const preExistingPrerequisites =
-        runState.preExistingPrerequisiteIds.get(obligationId) ?? new Set<string>();
-      const hasNewlyAddedUnmetPrerequisite = closure
-        .listPrerequisiteEdges(obligationId)
-        .some(
-          (prerequisite) =>
-            !preExistingPrerequisites.has(prerequisite.prerequisiteId) &&
-            !isTerminalObligationStatus(prerequisite.status)
-        );
-      if (!hasNewlyCreatedLiveChild && !hasNewlyAddedUnmetPrerequisite) {
-        fallShort(
-          obligationId,
-          obligation.title,
-          "obligation is waiting on pre-existing work but gained neither a newly created live direct child nor a newly added unmet prerequisite during this run"
-        );
-      }
-    }
-    return shortfalls;
-  }
-
-  /**
-   * Why a still-ready strict head does not count as handed off by this run, or
-   * null when it does (#420).
-   *
-   * A handoff is the outgoing owner's own act: the run started with this actor
-   * owning the head, the head now belongs to a distinct actor that can be
-   * woken, and the checkpoint it carries was written by this actor during the
-   * run. The selection-time owner is load-bearing rather than a restatement of
-   * `actorId`: head attention is delivered to the owner, but ownership can move
-   * between delivery and selection (an ancestor reassigns it elsewhere), and
-   * without the snapshot such a run could return closed on a transfer it never
-   * performed. The checkpoint is compared against the same snapshot so a
-   * standing left from an earlier run cannot stand in for this one.
-   *
-   * The obligation row and the ready-head transition are already committed by
-   * the repository before this runs, which is what makes the disposition
-   * durable: the live listener delivers the recipient's attention in-process,
-   * and boot reconciliation restores it if the process is interrupted between
-   * that commit and the wake.
-   */
-  private strictHandoffShortfall(
-    outgoingActorId: string,
-    obligation: Obligation,
-    selected: SelectedHeadSnapshot | null
-  ): string | null {
-    const recipientId = this.resolveThreadId(obligation.ownerId);
-    if (recipientId === outgoingActorId) return "obligation is still ready";
-    const moved = `obligation is still ready and moved to ${obligation.ownerId}`;
-    if (!selected) {
-      return `${moved}, but it could not be read when selected, so the transfer cannot be attributed to this run`;
-    }
-    if (this.resolveThreadId(selected.ownerId) !== outgoingActorId) {
-      return `${moved}, but this actor did not own it when selected, so the transfer is not this run's handoff`;
-    }
-    if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) {
-      return `${moved} without a checkpoint written by this actor`;
-    }
-    if (
-      obligation.checkpoint === selected.checkpoint &&
-      obligation.checkpointAt === selected.checkpointAt &&
-      obligation.checkpointBy === selected.checkpointBy
-    ) {
-      return `${moved} with a checkpoint left over from before this run rather than rewritten during it`;
-    }
-    if (!this.isWakeableRecipient(obligation.ownerId)) {
-      return `${moved}, which is not an active actor that can be woken`;
-    }
-    return null;
-  }
-
-  /**
-   * Whether a handoff recipient will ever be woken for the work: an actor in
-   * the tree — not a human or system principal, which no inbox serves — whose
-   * durable record is active and which is not mid-retirement. The durable
-   * record is used rather than `live` on purpose: an active recipient may be
-   * between process restart and rehydration, when the committed ready-head
-   * transition is exactly what restores its queue. Retirement is the one
-   * non-restart state that record cannot show (see {@link isActiveActor}).
-   */
-  private isWakeableRecipient(ownerId: string): boolean {
-    if (ownerId.startsWith("system:")) return false;
-    return this.isActiveActor(this.resolveThreadId(ownerId));
+  ): HeadClosureQuery {
+    return {
+      actorId,
+      heads: [...heads],
+      baseline: {
+        selectedHeads: runState.selectedHeads,
+        preExistingChildIds: runState.preExistingChildIds,
+        preExistingPrerequisiteIds: runState.preExistingPrerequisiteIds,
+      },
+      rootId: this.rootId ?? null,
+      retiring: this.retiring,
+    };
   }
 
   /**
@@ -2282,14 +2247,20 @@ export class ActorMesh {
    * that throws is recorded as a rejection of every armed head rather than
    * allowed to abort the rest of run finishing.
    */
-  private recordReturnRejections(
-    actorId: string
-  ): Array<{ obligationId: string; title: string | null; reason: string }> {
-    const runState = this.headClosureRuns.get(actorId);
-    if (!runState) return [];
+  private async recordReturnRejections(
+    actorId: string,
+    runState: HeadClosureRunState | undefined
+  ): Promise<Array<{ obligationId: string; title: string | null; reason: string }>> {
+    if (!runState || runState.headObligationIds.size === 0) return [];
     let shortfalls: Array<Pick<HeadClosureShortfall, "obligationId" | "title" | "reason">>;
     try {
-      shortfalls = this.closureShortfalls(actorId, runState, runState.headObligationIds);
+      // The writer clears the heads' due snoozes and decides closure in one
+      // transaction (#1289), as the inbox mark does. Without it the return
+      // is refused fail closed, like a closure read that throws.
+      if (!this.writer) throw new Error("this mesh has no writer configured");
+      shortfalls = await this.writer.write("obligations.closureShortfalls", {
+        closure: this.headClosureQuery(actorId, runState, runState.headObligationIds),
+      });
     } catch (err) {
       const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
       shortfalls = [...runState.headObligationIds].map((obligationId) => ({
@@ -2317,12 +2288,24 @@ export class ActorMesh {
     return this.selectedInboxEntryIds.get(actorId) ?? [];
   }
 
-  finishInboxRun(actorId: string, outcome: { successful?: boolean; runId?: string } = {}): void {
+  async finishInboxRun(
+    actorId: string,
+    outcome: { successful?: boolean; runId?: string } = {}
+  ): Promise<void> {
     actorId = this.resolveThreadId(actorId);
+    // The run's state is read before the closure write is awaited, and the
+    // rest of finishing follows it with nothing else awaited. While it waits,
+    // this actor's next run cannot be queued: the run's own onEnd is still
+    // settling, and neither the local actor nor a remote handle admits the
+    // next run before it has (#1289 C1b). So the run state cleared below is
+    // still this run's, and attention arriving meanwhile is buffered with the
+    // rest of this run's and flushed with it.
     const selectedIds = [...this.selectedInboxEntries(actorId)];
+    const runState = this.headClosureRuns.get(actorId);
     // A failed run is not a return the actor chose, so it keeps the ordinary
     // failure route below rather than a closure rejection.
-    const rejections = outcome.successful !== false ? this.recordReturnRejections(actorId) : [];
+    const rejections =
+      outcome.successful !== false ? await this.recordReturnRejections(actorId, runState) : [];
     try {
       this.deliverReturnedRunResult(actorId, selectedIds, outcome);
     } catch (err) {
@@ -2366,7 +2349,8 @@ export class ActorMesh {
         // An older exhausted entry must not consume a later entry's one
         // recovery attempt when a multi-item selection contains both.
         if (hasRetryableUnhandled) {
-          this.dispatch(actorId);
+          // Not awaited: this run's end must not wait on the run after it.
+          this.wake(actorId, "selected work retry");
         } else {
           this.log(
             `actor ${actorId} exhausted selected work retries for entries: ${unhandledIds.join(", ")}`
@@ -2457,17 +2441,6 @@ export class ActorMesh {
     );
   }
 
-  hasExhaustedSelectedWork(actorId: string): boolean {
-    actorId = this.resolveThreadId(actorId);
-    const entries = this.unhandledInboxEntries(actorId);
-    return (
-      this.exhaustedInboxEntryIds(
-        actorId,
-        entries.map((entry) => entry.id)
-      ).size > 0
-    );
-  }
-
   hasOnlyExhaustedWork(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
     const entries = this.unhandledInboxEntries(actorId);
@@ -2505,146 +2478,90 @@ export class ActorMesh {
   }
 
   /**
-   * Validate authority and preconditions for parent clearance of exhausted inbox work.
+   * The writer a parent's clearance of exhausted child work goes through, and
+   * the validated note it carries. The authority check runs inside the write
+   * (#1289), against the transaction's state, so a reparent or a handling that
+   * commits first is seen by the check rather than overwritten by its write.
    */
-  assertParentExhaustedInboxAuthority(
+  private parentClearance(
     callerId: string,
     childId: string,
-    entryIds: readonly string[]
-  ): { childId: string; entries: InboxEntry[] } {
-    callerId = this.resolveThreadId(callerId);
-    childId = this.resolveThreadId(childId);
-
-    if (callerId === childId) {
-      throw new Error(
-        "Actors cannot self-clear exhausted inbox work; escalation resolves through the parent"
-      );
-    }
-
-    const childRecord = this.actors.get(childId);
-    if (!childRecord) {
-      throw new Error(`unknown thread id: ${childId}`);
-    }
-
-    if (childId === this.rootId || !childRecord.parentId) {
-      throw new Error(
-        "Root has no parent in the mesh; root inbox work must be dismissed by the operator via the dashboard"
-      );
-    }
-
-    if (this.resolveThreadId(childRecord.parentId) !== callerId) {
-      throw new Error(
-        `Only the parent thread (${childRecord.parentId}) can clear exhausted inbox work for thread ${childId}`
-      );
-    }
-
-    const uniqueIds = [...new Set(entryIds)];
-    if (uniqueIds.length === 0 || uniqueIds.length > 100) {
-      throw new Error("Provide between 1 and 100 unique inbox entry ids");
-    }
-
-    if (!this.inboxStore) {
-      throw new Error("Inbox is not configured");
-    }
-
-    const exhaustedIds = this.exhaustedInboxEntryIds(childId, uniqueIds);
-    const entries: InboxEntry[] = [];
-
-    for (const id of uniqueIds) {
-      const entry = this.inboxStore.read(childId, id);
-      if (!entry) {
-        throw new Error(`inbox entry not found: ${id}`);
-      }
-      if (entry.handledAt) {
-        throw new Error(`inbox entry already handled: ${id}`);
-      }
-      if (!exhaustedIds.has(id)) {
-        throw new Error(
-          `Cannot clear entry ${id}: entry has not exhausted bounded recovery; parent clearance is restricted to exhausted entries`
-        );
-      }
-      entries.push(entry);
-    }
-
-    return { childId, entries };
+    entryIds: readonly string[],
+    note: string,
+    emptyNote: string
+  ): {
+    writer: Pick<MeshObligationWriter, "write">;
+    input: {
+      callerId: string;
+      childId: string;
+      entryIds: string[];
+      note: string;
+      rootId: string | null;
+    };
+  } {
+    const trimmedNote = note.trim();
+    if (!trimmedNote) throw new Error(emptyNote);
+    if (!this.inboxStore || !this.writer) throw new Error("Inbox is not configured");
+    return {
+      writer: this.writer,
+      input: {
+        callerId,
+        childId,
+        entryIds: [...entryIds],
+        note: trimmedNote,
+        rootId: this.rootId ?? null,
+      },
+    };
   }
 
   /**
    * Release the selection lock on exhausted inbox entries for a child thread.
-   * Marks the exhausted entries handled with an attributed audit note,
-   * appends fresh replacement entries so the work returns to ordinary unhandled work,
-   * and dispatches the child.
+   * Marks the exhausted entries handled with an attributed audit note and
+   * appends fresh replacement entries so the work returns to ordinary
+   * unhandled work. The child is woken by the replacements' committed append
+   * effect, the one dispatch {@link scheduleAppendedWork} owes it; that runs
+   * before this method's continuation, so a dispatch here would be a second
+   * one, which can cancel and re-queue the run the first just admitted.
    */
-  releaseChildInboxSelectionLock(
+  async releaseChildInboxSelectionLock(
     callerId: string,
     childId: string,
     entryIds: readonly string[],
     note: string
-  ): { released: string[]; replacements: string[] } {
-    const trimmedNote = note.trim();
-    if (!trimmedNote) {
-      throw new Error(
-        "note cannot be empty — explain why these inbox items are being released for re-handling"
-      );
-    }
-    const { childId: resolvedChildId, entries } = this.assertParentExhaustedInboxAuthority(
+  ): Promise<{ released: string[]; replacements: string[] }> {
+    const { writer, input } = this.parentClearance(
       callerId,
       childId,
-      entryIds
+      entryIds,
+      note,
+      "note cannot be empty — explain why these inbox items are being released for re-handling"
     );
-    const inboxStore = this.inboxStore;
-    if (!inboxStore) {
-      throw new Error("Inbox is not configured");
-    }
-
-    const ids = entries.map((e) => e.id);
-    const auditNote = `Released by parent (${callerId}) for re-handling: ${trimmedNote}`;
-    const { replacements } = inboxStore.replaceEntries(
-      resolvedChildId,
-      ids,
-      auditNote,
-      entries.map((e) => ({
-        actorId: resolvedChildId,
-        source: e.source,
-        payload: e.payload,
-      }))
-    );
-
-    this.inboxHandled(resolvedChildId);
-    this.dispatch(resolvedChildId);
+    const result = await writer.write("inbox.releaseChildSelectionLock", input);
     return {
-      released: ids,
-      replacements: replacements.map((r) => r.id),
+      released: result.released,
+      replacements: result.replacements.map((r) => r.id),
     };
   }
 
   /**
    * Mark exhausted inbox entries handled on behalf of a child thread with an audit note.
    */
-  markChildInboxHandled(
+  async markChildInboxHandled(
     callerId: string,
     childId: string,
     entryIds: readonly string[],
     note: string
-  ): { handled: MarkHandledResult[] } {
-    const trimmedNote = note.trim();
-    if (!trimmedNote) {
-      throw new Error(
-        "note cannot be empty — explain how this inbox item was handled or why no action was needed"
-      );
-    }
-    const { childId: resolvedChildId, entries } = this.assertParentExhaustedInboxAuthority(
+  ): Promise<{ handled: MarkHandledResult[] }> {
+    const { writer, input } = this.parentClearance(
       callerId,
       childId,
-      entryIds
+      entryIds,
+      note,
+      "note cannot be empty — explain how this inbox item was handled or why no action was needed"
     );
-    const ids = entries.map((e) => e.id);
-    const auditNote = `Marked handled by parent (${callerId}): ${trimmedNote}`;
-    const inboxStore = this.inboxStore;
-    if (!inboxStore) throw new Error("inbox store not configured");
-    const handled = inboxStore.markHandled(resolvedChildId, ids, undefined, auditNote);
-    this.inboxHandled(resolvedChildId);
-    return { handled };
+    const result = await writer.write("inbox.markChildHandled", input);
+    this.inboxHandled(result.childId);
+    return { handled: result.handled };
   }
 
   /**
@@ -2836,7 +2753,7 @@ export class ActorMesh {
     if (entries.length === 0) {
       return false;
     }
-    this.dispatch(actorId);
+    this.wake(actorId, "ready-head attention");
     return true;
   }
 
@@ -3005,7 +2922,7 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) return false;
-    this.dispatch(actorId);
+    this.wake(actorId, "prerequisite-cancelled attention");
     return true;
   }
 
@@ -3076,7 +2993,7 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) return false;
-    this.dispatch(actorId);
+    this.wake(actorId, "completion-matcher attention");
     return true;
   }
 
@@ -3107,22 +3024,24 @@ export class ActorMesh {
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
-      this.dispatch(actorId);
+      this.wake(actorId, "handled-entry follow-up");
     }
   }
 
   /**
    * Called once by the leased voice registry on explicit end or lease expiry.
    * The durable inbox remains the source of truth; this is only the one
-   * ordinary nudge that lets held background work resume.
+   * ordinary nudge that lets held background work resume. It returns whether
+   * that nudge was asked for; the nudge itself is a {@link wake}.
    */
   notifyVoiceSessionEnded(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
     if (!this.inboxStore) return false;
     const total = this.inboxStore.countUnhandled(actorId);
     const responsive = this.inboxStore.countUnhandled(actorId, { responsiveOnly: true });
-    if (total > responsive) return this.dispatch(actorId);
-    return false;
+    if (total <= responsive) return false;
+    this.wake(actorId, "voice session end");
+    return true;
   }
 
   /**
@@ -3203,13 +3122,7 @@ export class ActorMesh {
     // existing session-end path preserves normal-work deferral semantics.
     this.notifyVoiceSessionEnded(fromActorId);
     if (inserted.length > 0) {
-      try {
-        this.dispatch(target.id);
-      } catch (error) {
-        this.log(
-          `voice transfer recipient nudge failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
+      this.wake(target.id, "voice transfer recipient (after durable handoff)");
     }
     // The control is intentionally last: the recipient has durable work before
     // the browser changes selection/reconnects to it.
@@ -4464,7 +4377,7 @@ export class ActorMesh {
       ]);
       this.introduceMessageSender(toId, fromId);
     }
-    if (this.inboxStore) this.dispatch(toId);
+    if (this.inboxStore) this.wake(toId, "message delivery");
     else target.requestRun(responsive ? { priority: "responsive" } : {});
     return { delivered: true };
   }
@@ -4514,8 +4427,8 @@ export class ActorMesh {
       },
     ]);
     if (inserted.length === 0) return { delivered: true };
-    if (delivery.responsive) this.dispatchJoiningActiveRun(toId);
-    else this.dispatch(toId);
+    if (delivery.responsive) this.wakeJoining(toId, "message delivery");
+    else this.wake(toId, "message delivery");
     return { delivered: true };
   }
 
@@ -4584,7 +4497,7 @@ export class ActorMesh {
         },
       },
     ]);
-    this.dispatch(resolvedId);
+    this.wake(resolvedId, "wake delivery");
     return true;
   }
 
@@ -4732,7 +4645,7 @@ export class ActorMesh {
         const unhandled = this.inboxStore.list(targetId, { status: "unhandled" }).entries;
         const hasNewWork = unhandled.some((e) => e.deliveredAt > runStartTime);
         if (hasNewWork) {
-          this.dispatch(targetId);
+          this.wake(targetId, "post-interrupt");
         }
       }
       return { interrupted: true };
@@ -4768,7 +4681,7 @@ export class ActorMesh {
         },
       ]);
     }
-    this.dispatch(targetId);
+    this.wake(targetId, "run-now");
     return { queued: true };
   }
 
@@ -5276,8 +5189,8 @@ export class ActorMesh {
   /**
    * Replace a thread's charter on an existing record — the post-spawn path the
    * spawn-time `charter` otherwise lacked (charter was immutable once spawned).
-   * Root-only at the tool layer; here it just validates the thread exists and
-   * patches the durable record. The charter is the actor's standing brief, read
+   * The tool layer confines it to the caller's strict descendants (#1284); here
+   * it just validates the thread exists and patches the durable record. The charter is the actor's standing brief, read
    * fresh from the record each run and re-injected into its prompt (see
    * `buildWorkerPrompt(r.charter, …)` in start.ts), so a new charter takes effect
    * on the actor's next wake. Use to re-scope a long-lived actor durably (e.g.
@@ -5417,7 +5330,7 @@ export class ActorMesh {
     if (this.inboxStore && this.runs.isLive(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
       if (unhandled.length > 0) {
-        this.dispatch(id);
+        this.wake(id, "model change");
       }
     }
     return staged ? "staged" : "applied";
@@ -5844,6 +5757,19 @@ export class ActorMesh {
     return this.runs.liveActor(this.resolveThreadId(id));
   }
 
+  /**
+   * Whether `callerId` may manage an obligation owned by `obligation.ownerId`
+   * through the obligations MCP: it holds an active obligations-admin grant,
+   * or it is the owner or one of the owner's ancestors. Decided from the
+   * grants and actor tree as they stand at the call.
+   */
+  canManageObligation(callerId: string, obligation: Pick<Obligation, "ownerId">): boolean {
+    return (
+      this.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
+      canManageObligation(callerId, obligation, this.isAncestorOf.bind(this))
+    );
+  }
+
   /** True if `ancestorId` is `id` itself or any ancestor up the ownership tree. */
   isAncestorOf(ancestorId: string, id: string): boolean {
     ancestorId = this.resolveThreadId(ancestorId);
@@ -6264,7 +6190,7 @@ export class ActorMesh {
         },
       ]);
       this.introduceMessageSender(toId, scheduled.fromId);
-      this.dispatch(toId);
+      this.wake(toId, "scheduled message");
       return;
     }
 

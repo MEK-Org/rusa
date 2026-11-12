@@ -2,13 +2,10 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { ActorFactoryContext, ActorMeshOptions } from "../actor/actor-mesh.js";
+import type { ActorFactoryContext } from "../actor/actor-mesh.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
 import { ProviderPacer } from "../actor/provider-pacer.js";
-import { runMigrations } from "../db/migrations/runner.js";
-import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { ClaudeProvider } from "../providers/claude.js";
 import type { FollowerEvent } from "./follower-hub.js";
 import { type FollowerFileOps, FollowerInstance } from "./follower-instance.js";
@@ -28,7 +25,7 @@ function setup(
     isHalted?: (provider?: string, model?: string) => boolean;
     onEvent?: (actorId: string, event: ActorEvent) => void;
     maxConcurrent?: number;
-    obligations?: ActorMeshOptions["obligations"];
+    obligationClosure?: boolean;
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -42,7 +39,7 @@ function setup(
     isHalted: options.isHalted,
     onEvent: options.onEvent,
     maxConcurrent: options.maxConcurrent,
-    obligations: options.obligations,
+    obligationClosure: options.obligationClosure,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -813,7 +810,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       const queued = h.spawn("Join before you admit me");
       await waitUntil(() => h.runtime(queued).isQueued && held.length === 1);
 
-      h.dispatchJoining(queued);
+      await h.dispatchJoining(queued);
       h.remote.receive = receive;
       for (const event of held.splice(0)) receive(event);
 
@@ -2603,22 +2600,8 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     ["leaves its selected head as found", false],
     ["closes its selected head", true],
   ] as const)("checks strict head closure when a follower run that %s returns (#828)", async (_label, closes) => {
-    const db = new Database(":memory:");
-    onTestFinished(() => {
-      db.close();
-    });
-    runMigrations(db);
-    const repo = new ObligationRepository(db);
-    const h = setup({
-      delayMs: 300,
-      obligations: {
-        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
-        get: (id) => repo.get(id),
-        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
-        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
-      },
-    });
+    const h = setup({ delayMs: 300, obligationClosure: true });
+    const repo = h.obligations;
     const id = h.mesh.spawn({
       charter: "strict follower",
       parentId: "root",
@@ -2635,13 +2618,20 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
     if (!entry) throw new Error("expected ready-head inbox entry");
     h.mesh.selectInboxEntries(id, [entry.id]);
+    // The inbox tool's write decides the mesh's closure question (#1289).
+    if (closes) repo.setTerminalStatus("remote-head", "done", null, null, "system:mesh");
+    const closure = h.mesh.inboxHandlingClosure(id, [entry.id]);
+    if (!closure) throw new Error("expected a closure question for the selected head");
+    const handled = await h.writer.write("inbox.markHandled", {
+      actorId: id,
+      entryIds: [entry.id],
+      closure,
+    });
     if (closes) {
-      repo.setTerminalStatus("remote-head", "done", null, null, "system:mesh");
-      h.mesh.assertInboxEntriesHandleable(id, [entry.id]);
-      h.inboxStore.markHandled(id, [entry.id]);
+      expect(handled.refused).toBeNull();
     } else {
-      expect(() => h.mesh.assertInboxEntriesHandleable(id, [entry.id])).toThrow(
-        /Cannot mark handled: selected head obligation remote-head/
+      expect(handled.refused?.map((shortfall) => shortfall.message).join(" ")).toMatch(
+        /selected head obligation remote-head/
       );
     }
 
@@ -2663,6 +2653,50 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
           ]
     );
     expect(Boolean(h.inboxStore.read(id, entry.id)?.handledAt)).toBe(closes);
+  });
+
+  it("queues a follower's next run only after the leader's run-end closure write settles (#1289)", async () => {
+    // The leader's run-end listener awaits the closure write before clearing
+    // that run's state. The follower's own run end waits on the leader's
+    // "complete" reply, and the leader's receive chain holds whatever it sends
+    // next, so the next run cannot be queued against the old run's state.
+    const h = setup({ delayMs: 300, obligationClosure: true });
+    const id = h.mesh.spawn({
+      charter: "strict follower",
+      parentId: "root",
+      modelConfig: { provider: "instance-fixture", model: "scripted" },
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let closureWrites = 0;
+    const write = h.writer.write.bind(h.writer);
+    vi.spyOn(h.writer, "write").mockImplementation((async (op: string, input: unknown) => {
+      if (op === "obligations.closureShortfalls") {
+        closureWrites++;
+        await held;
+      }
+      return write(op as never, input as never);
+    }) as typeof h.writer.write);
+    h.obligations.create({ id: "remote-head", title: "Remote head", ownerId: id });
+    h.mesh.deliverReadyHeadAttention(id, { id: "remote-head", intent: "handle it" }, null);
+    await waitUntil(() => h.runtime(id).isRunning);
+    const entry = h.inboxStore
+      .list(id)
+      .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
+    if (!entry) throw new Error("expected ready-head inbox entry");
+    h.mesh.selectInboxEntries(id, [entry.id]);
+    const queuedReports = () =>
+      h.events.filter((event) => event.actorId === id && event.event.type === "queued").length;
+
+    await waitUntil(() => closureWrites === 1);
+    h.dispatchNormal(id);
+    await delay(800);
+    expect(queuedReports()).toBe(1);
+    expect(h.mesh.selectedInboxEntries(id)).toEqual([entry.id]);
+
+    release();
+    await waitUntil(() => queuedReports() === 2);
+    expect(h.meshEvents.filter((event) => event.kind === "run_return_rejected")).toHaveLength(1);
   });
 
   it("normalizes an admitted v7/v8 follower's winding_down state to running (#828)", async () => {

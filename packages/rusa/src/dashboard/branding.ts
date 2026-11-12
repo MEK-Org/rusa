@@ -1,4 +1,4 @@
-import { generateHandle } from "../actor/handle-generator.js";
+import { DEFAULT_ROOT_HANDLE } from "../actor/handle-generator.js";
 import { type RootAvatarIdentity, rootBrandingImage } from "../avatar/avatars.js";
 
 /**
@@ -6,11 +6,11 @@ import { type RootAvatarIdentity, rootBrandingImage } from "../avatar/avatars.js
  *
  * The shipped UI is branded "Rusa" (or "Rusa Staging") at build time by
  * `scripts/build-dashboard-ui.mjs`, which is the right default for an instance
- * that has not been given its own identity. But `rootActor.handle` /
- * `rootActor.avatar` already name and picture *this* instance's root everywhere
+ * that has not been given its own identity. But root identity
+ * already names and pictures *this* instance's root everywhere
  * else — the GitHub signing byline, the actor tree — and
  * a bookmarked tab or an installed PWA reading "Rusa" is exactly the surface
- * where that identity matters most. So when a root actor has been configured,
+ * where that identity matters most. So when a root actor exists,
  * its name titles the page and the PWA, and its own image becomes the favicon
  * and the app icon.
  *
@@ -53,19 +53,19 @@ export function formatBrandName(handle: string): string {
 
 /**
  * Resolve the branding for one request from the root identity the server was
- * wired with (`rootActor.handle` / `rootActor.avatar` plus any uploaded image).
+ * wired with (durable handle plus any uploaded image).
  *
  * Called per request rather than once at startup: an operator can upload or
  * regenerate the root's image from the dashboard while the server runs, and the
  * `version` stamp in `iconUrl` is what makes the browser pick the new one up.
  */
 export function resolveDashboardBranding(rootIdentity?: RootAvatarIdentity): DashboardBranding {
-  // An unset `rootActor.handle` resolves to the default `root-actor`, which is
+  // An unset handle resolves to the default `root-actor`, which is
   // the plumbing name for "no identity configured" — not a name to brand with.
   const handle = rootIdentity?.handle;
-  const name = handle && handle !== generateHandle("root") ? formatBrandName(handle) : null;
+  const name = handle && handle !== DEFAULT_ROOT_HANDLE ? formatBrandName(handle) : null;
 
-  const image = rootBrandingImage(rootIdentity);
+  const image = rootBrandingImage();
   if (!image) return name === null ? NO_BRANDING : { ...NO_BRANDING, name };
 
   // Reuse the existing avatar route rather than adding a second way to serve the

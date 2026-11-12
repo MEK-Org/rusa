@@ -14,8 +14,11 @@ import {
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
+import { createInProcessMeshWriter } from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../observability/logger.js";
@@ -54,8 +57,11 @@ export function createHarness(options: {
   isHalted?: (provider?: string, model?: string) => boolean;
   /** Leader-side observer, called as each follower event is received, for race-window tests. */
   onEvent?: (actorId: string, event: ActorEvent) => void;
-  /** Obligation reads, for tests about strict head closure. */
-  obligations?: ActorMeshOptions["obligations"];
+  /**
+   * Wire the mesh's obligation reads to the harness's own obligations, for
+   * tests about strict head closure.
+   */
+  obligationClosure?: boolean;
   responsiveInterruption?: ActorMeshOptions["responsiveInterruption"];
   responsiveInterruptionMode?: ActorMeshOptions["responsiveInterruptionMode"];
   repositories?: FollowerRepositories;
@@ -141,6 +147,15 @@ export function createHarness(options: {
   const inboxDb = new Database(":memory:");
   runMigrations(inboxDb);
   const inboxStore = new SqliteInboxRepository(inboxDb);
+  // The leader's own writes commit through a writer over the same database,
+  // as in production, so obligations and inbox share it.
+  const obligations = new ObligationRepository(inboxDb);
+  const writer = createInProcessMeshWriter(inboxDb, {
+    obligations,
+    inbox: inboxStore,
+    actors,
+    actorRuns: new ActorRunRepository(inboxDb),
+  });
   const principals = new PrincipalRepository(inboxDb);
   const user = principals.createUser({ email: "operator@example.test", createdAt: "t" });
   // No event seam: these follower tests never route or deliver events, and a
@@ -158,7 +173,18 @@ export function createHarness(options: {
     grantableCapabilities: new Set([COMPUTER_USE_CAPABILITY]),
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
-    obligations: options.obligations,
+    writer,
+    ...(options.obligationClosure
+      ? {
+          obligations: {
+            findLiveByExternalRef: (ref: string) => obligations.findLiveByExternalRef(ref),
+            get: (id: string) => obligations.get(id),
+            listDirectChildEdges: (parentId: string) => obligations.listDirectChildEdges(parentId),
+            listPrerequisiteEdges: (dependentId: string) =>
+              obligations.listPrerequisiteEdges(dependentId),
+          },
+        }
+      : {}),
     responsiveInterruption: options.responsiveInterruption,
     responsiveInterruptionMode: options.responsiveInterruptionMode,
     ...(pacer
@@ -298,6 +324,8 @@ export function createHarness(options: {
     user,
     mesh,
     inboxStore,
+    obligations,
+    writer,
     dispatchResponsive,
     dispatchJoining,
     dispatchNormal,

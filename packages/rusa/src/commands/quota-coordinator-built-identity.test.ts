@@ -87,9 +87,6 @@ it("reports the shipped build from the default path and keeps startup identity i
       [
         "github:",
         "  account: synthetic-coordinator",
-        "rootActor:",
-        "  provider: claude",
-        "  model: synthetic-model",
         "providers:",
         "  claude:",
         "    cliCommand: synthetic-cli",

@@ -74,7 +74,12 @@ export interface RootControlMesh {
 
 export interface RootControlOptions {
   mesh: RootControlMesh;
-  rootId?: string;
+  /**
+   * The actor this service acts for. A function is read on every use, so a
+   * selection made after construction (an E2E harness actor created through
+   * {@link RootControlService.spawnChild}) is seen by later calls.
+   */
+  rootId?: string | (() => string | undefined);
   providers?: string[];
   /**
    * The live durable-hold service. Its release callback restores eligibility
@@ -102,7 +107,11 @@ export interface RootControlOptions {
  */
 export class RootControlService {
   get rootId(): string | undefined {
-    return this.options.rootId ?? defaultGrantRecipient(this.options.mesh.list())?.id;
+    const configured = this.options.rootId;
+    return (
+      (typeof configured === "function" ? configured() : configured) ??
+      defaultGrantRecipient(this.options.mesh.list())?.id
+    );
   }
   readonly providers: string[];
 

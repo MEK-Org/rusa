@@ -18,6 +18,9 @@ import {
   readAvatar,
   uploadAvatar,
 } from "../avatar/avatars.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
+import { DbReadUnavailableError } from "../db/read-pool.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type {
   AvailabilityHold,
@@ -98,6 +101,17 @@ export interface DashboardDataDeps {
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
+  /**
+   * Where obligation and inbox writes go (#1289): the process's one writer
+   * over the same database as {@link obligations} and {@link inbox}. Absent →
+   * those writes are unavailable.
+   */
+  obligationWriter?: MeshObligationWriter;
+  /**
+   * Standalone reads served off the main thread (#1289). Absent → the same
+   * operations run in-process against {@link obligations} and {@link inbox}.
+   */
+  reads?: DbReads;
   /**
    * Durable actor inbox. Read-only to the dashboard apart from a single write:
    * the operator clearing an entry the actor should not have to answer (#66).
@@ -213,9 +227,8 @@ export interface DashboardDataDeps {
    */
   selectedInboxItemsForActor?: (actorId: string) => InboxEntry[] | null;
   /**
-   * This instance's configured root identity  — the resolved display
-   * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
-   * set in config. Optional: absent (or fields unset) reproduces today's
+   * This instance's configured root identity — the resolved display
+   * handle and avatar override, if available. Optional: absent (or fields unset) reproduces today's
    * default (`root-actor`, the bundled image) everywhere it's read.
    */
   rootIdentity?: RootAvatarIdentity;
@@ -443,9 +456,6 @@ interface ThreadDto {
   compatibleLanes?: string[];
   /** The lane a claimed admission holds, else `null`. */
   claimedLane?: string | null;
-  /** Whether selected inbox work has exhausted bounded retries and requires attention. */
-  needsAttention?: boolean;
-  needsAttentionReason?: string | null;
 }
 
 /**
@@ -694,27 +704,21 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 }
 
 /**
- * The ancestors of a page's rows, each once and none that is itself a row.
- * Every ancestor is read at most once, so the reads stay within the page's
- * distinct ancestry however many rows share it, and a cycle ends the walk.
+ * Where a route's standalone reads run: the read workers when wired, otherwise
+ * in-process. Each route checks the repository it needs before reading.
  */
-function pageAncestors(
-  obligations: Pick<ObligationRepository, "get">,
-  rows: readonly Obligation[]
-): Obligation[] {
-  const seen = new Set(rows.map((row) => row.id));
-  const ancestors: Obligation[] = [];
-  for (const row of rows) {
-    let parentId = row.parentId;
-    while (parentId && !seen.has(parentId)) {
-      seen.add(parentId);
-      const parent = obligations.get(parentId);
-      if (!parent) break;
-      ancestors.push(parent);
-      parentId = parent.parentId;
-    }
-  }
-  return ancestors;
+function readsOf(deps: DashboardDataDeps): DbReads {
+  if (deps.reads) return deps.reads;
+  return inProcessReads({
+    get obligations() {
+      if (!deps.obligations) throw new Error("obligations data unavailable");
+      return deps.obligations;
+    },
+    get inbox() {
+      if (!deps.inbox) throw new Error("inbox data unavailable");
+      return deps.inbox;
+    },
+  });
 }
 
 /**
@@ -1015,6 +1019,23 @@ async function resolveReferenceBatch(
  * server) every mesh route 503s — the static UI is unaffected.
  */
 export async function handleMeshApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: DashboardDataDeps | null
+): Promise<boolean> {
+  try {
+    return await routeMeshApiRequest(req, res, url, deps);
+  } catch (err) {
+    // A full queue, a worker that stopped mid-read or a closed or failed pool
+    // is the service being unavailable, not the request being bad (#1289).
+    if (!(err instanceof DbReadUnavailableError) || res.headersSent) throw err;
+    sendJson(res, 503, { error: err.message });
+    return true;
+  }
+}
+
+async function routeMeshApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
@@ -1606,14 +1627,16 @@ export async function handleMeshApiRequest(
     // clear — and the (actor, entry) pair is checked by the store anyway.
     const inboxHandledMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/inbox\/handled$/);
     if (inboxHandledMatch) {
-      if (!deps?.inbox) {
+      // The mark goes through the process's one writer (#1289), so its
+      // committed effect reaches the inbox listeners in commit order.
+      const writer = deps?.obligationWriter;
+      if (!deps?.inbox || !writer) {
         sendJson(res, 503, { error: "inbox data unavailable" });
         return true;
       }
-      const inbox = deps.inbox;
       const actorId = decodeURIComponent(inboxHandledMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1639,12 +1662,19 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const [result] = inbox.markHandled(
+            const written = await writer.write("inbox.markHandled", {
               actorId,
-              [entryId],
-              undefined,
-              operatorHandledNote(reason)
-            );
+              entryIds: [entryId],
+              note: operatorHandledNote(reason),
+            });
+            // No closure question is asked here, so this only narrows the
+            // type; a route that does ask must still show the operator why.
+            if (written.refused) {
+              throw new Error(
+                `Cannot mark handled: ${written.refused.map((shortfall) => shortfall.message).join(" ")}`
+              );
+            }
+            const [result] = written.entries;
             // `alreadyHandled` is reported rather than treated as an error: the
             // store leaves an existing note alone, so a double-click cannot
             // overwrite an actor's own account, and the caller's view is simply
@@ -1781,12 +1811,13 @@ export async function handleMeshApiRequest(
     // POST /api/mesh/obligations — create obligation
     if (pathname === "/api/mesh/obligations") {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1827,14 +1858,16 @@ export async function handleMeshApiRequest(
           const creatorId = requireOperatorPrincipal(req, res, deps);
           if (!creatorId) return;
           try {
-            const obligation = obligations.create({
-              ownerId: owner.ownerId,
-              parentId,
-              title,
-              intent,
-              externalRef,
-              priority,
-              creatorId,
+            const obligation = await writer.write("obligations.create", {
+              obligation: {
+                ownerId: owner.ownerId,
+                parentId,
+                title,
+                intent,
+                externalRef,
+                priority,
+                creatorId,
+              },
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
@@ -1849,13 +1882,14 @@ export async function handleMeshApiRequest(
     const statusMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/status$/);
     if (statusMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(statusMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1889,13 +1923,13 @@ export async function handleMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.setTerminalStatus(
+            const obligation = await writer.write("obligations.setTerminalStatus", {
               id,
               status,
               note,
               resolutionRef,
-              actingPrincipal
-            );
+              principal: actingPrincipal,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1911,13 +1945,14 @@ export async function handleMeshApiRequest(
     const snoozeMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/snooze$/);
     if (snoozeMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(snoozeMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1948,7 +1983,16 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const { obligation, scheduleError } = obligations.setSnooze(id, until, actingPrincipal);
+            obligations.assertSnoozeSchedulable(until);
+            // Refused if the obligation changed hands since the check above.
+            const obligation = await writer.write("obligations.setSnooze", {
+              id,
+              until,
+              principal: actingPrincipal,
+              expectedOwnerId: actingPrincipal,
+            });
+            // Read after the write's effects were delivered, which armed the timer.
+            const scheduleError = obligations.scheduleErrorFor(id);
             sendJson(res, 200, {
               ok: true,
               obligation,
@@ -1961,7 +2005,12 @@ export async function handleMeshApiRequest(
           } catch (err) {
             // No timer here could end the snooze (the standalone dashboard
             // attaches none): the service is unavailable, not the request bad.
-            const status = err instanceof SnoozeTimerUnavailableError ? 503 : 400;
+            const status =
+              err instanceof SnoozeTimerUnavailableError
+                ? 503
+                : err instanceof Error && err.name === "ObligationChangedError"
+                  ? 409
+                  : 400;
             sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -1974,13 +2023,14 @@ export async function handleMeshApiRequest(
     const externalRefMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/external-ref$/);
     if (externalRefMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(externalRefMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2012,10 +2062,12 @@ export async function handleMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            sendJson(res, 200, {
-              ok: true,
-              obligation: obligations.setExternalRef(id, externalRef, actingPrincipal),
+            const obligation = await writer.write("obligations.setExternalRef", {
+              id,
+              ref: externalRef,
+              principal: actingPrincipal,
             });
+            sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
@@ -2028,13 +2080,14 @@ export async function handleMeshApiRequest(
     const reorderMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reorder$/);
     if (reorderMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(reorderMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2062,13 +2115,13 @@ export async function handleMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.movePriorityInternal(
+            const obligation = await writer.write("obligations.movePriority", {
               id,
               previousId,
               nextId,
-              actingPrincipal,
-              scope
-            );
+              principal: actingPrincipal,
+              scope,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -2082,13 +2135,14 @@ export async function handleMeshApiRequest(
     const reparentMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reparent$/);
     if (reparentMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(reparentMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2112,7 +2166,11 @@ export async function handleMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reparent(id, parentId, actingPrincipal);
+            const obligation = await writer.write("obligations.reparent", {
+              id,
+              parentId,
+              principal: actingPrincipal,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -2126,13 +2184,14 @@ export async function handleMeshApiRequest(
     const reassignMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reassign$/);
     if (reassignMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(reassignMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2167,7 +2226,12 @@ export async function handleMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal, message);
+            const obligation = await writer.write("obligations.reassign", {
+              id,
+              ownerId: owner.ownerId,
+              principal: actingPrincipal,
+              message,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -2547,13 +2611,6 @@ export async function handleMeshApiRequest(
           voiceConfig: r.voiceConfig ?? null,
           ...(selectedInboxItem ? { selectedInboxItem } : {}),
           ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
-          ...(typeof deps.mesh?.hasExhaustedSelectedWork === "function" &&
-          deps.mesh.hasExhaustedSelectedWork(r.id)
-            ? {
-                needsAttention: true,
-                needsAttentionReason: "Selected work exhausted retries without being handled",
-              }
-            : {}),
         };
       })
     );
@@ -2693,9 +2750,12 @@ export async function handleMeshApiRequest(
       res,
       200,
       await resolveInboxPage(
-        deps.inbox.list(actorId, {
-          status: status as "unhandled" | "handled" | "all" | undefined,
-          limit: clampLimit(url),
+        await readsOf(deps).read("inboxPage", {
+          actorId,
+          options: {
+            status: status as "unhandled" | "handled" | "all" | undefined,
+            limit: clampLimit(url),
+          },
         }),
         deps,
         viewerScope()
@@ -2742,22 +2802,19 @@ export async function handleMeshApiRequest(
       return true;
     }
 
-    const page = deps.obligations.listPage({
+    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
+    // page once each, so the client can draw each row's path from the page it
+    // already asked for instead of one detail read per row.
+    const rawAncestors = url.searchParams.get("ancestors");
+    const page = await readsOf(deps).read("obligationPage", {
       ownerId,
       status: status as ObligationStatus | undefined,
       queue: queue as ObligationQueue | undefined,
       rootsOnly,
       limit,
       offset,
+      ancestors: rawAncestors === "true" || rawAncestors === "1",
     });
-    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
-    // page once each, so the client can draw each row's path from the page it
-    // already asked for instead of one detail read per row.
-    const rawAncestors = url.searchParams.get("ancestors");
-    if (rawAncestors === "true" || rawAncestors === "1") {
-      sendJson(res, 200, { ...page, ancestors: pageAncestors(deps.obligations, page.obligations) });
-      return true;
-    }
     sendJson(res, 200, page);
     return true;
   }
@@ -2797,17 +2854,15 @@ export async function handleMeshApiRequest(
       url.searchParams.get("include_terminal_roots");
     const includeTerminalRoots =
       rawIncludeTerminalRoots === "true" || rawIncludeTerminalRoots === "1";
-    const page = deps.obligations.listPage({
-      rootsOnly: true,
-      excludeQuietTerminalRoots: !includeTerminalRoots,
-      limit,
-      offset,
-    });
-    const trees = deps.obligations.getForest(
-      page.obligations.map((obligation) => obligation.id),
-      { excludeQuietTerminalDescendants: !includeTerminalRoots }
+    sendJson(
+      res,
+      200,
+      await readsOf(deps).read("obligationForest", {
+        limit,
+        offset,
+        includeTerminalRoots,
+      })
     );
-    sendJson(res, 200, { trees, total: page.total, hasMore: page.hasMore });
     return true;
   }
 
@@ -2819,17 +2874,21 @@ export async function handleMeshApiRequest(
       return true;
     }
     const id = decodeURIComponent(obligationTreeMatch[1]);
-    const obligation = deps.obligations.get(id);
-    if (!obligation) {
+    let tree: ReadOutput<"obligationTree">;
+    try {
+      tree = await readsOf(deps).read("obligationTree", { id });
+    } catch (err) {
+      // Only the tree's own validation (a cycle) is the request's fault. Matched
+      // by name: a read worker carries back an error's name, not its class.
+      if (!(err instanceof Error) || err.name !== "ObligationValidationError") throw err;
+      sendJson(res, 400, { error: err.message });
+      return true;
+    }
+    if (!tree) {
       sendJson(res, 404, { error: "obligation not found" });
       return true;
     }
-    try {
-      const tree = deps.obligations.getTree(id);
-      sendJson(res, 200, tree);
-    } catch (err) {
-      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-    }
+    sendJson(res, 200, tree);
     return true;
   }
 
@@ -2841,51 +2900,35 @@ export async function handleMeshApiRequest(
       return true;
     }
     const id = decodeURIComponent(obligationMatch[1]);
-    const obligation = deps.obligations.get(id);
-    if (!obligation) {
+    const detail = await readsOf(deps).read("obligationDetail", {
+      id,
+      limit: clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT),
+      offset: parsePositiveInt(url, "offset") ?? 0,
+      completionsOffset: parsePositiveInt(url, "completions_offset") ?? 0,
+      blockedByOffset: parsePositiveInt(url, "blocked_by_offset") ?? 0,
+      blocksOffset: parsePositiveInt(url, "blocks_offset") ?? 0,
+      historyBefore: url.searchParams.get("history_before") ?? undefined,
+      historyLimit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
+    });
+    if (!detail) {
       sendJson(res, 404, { error: "obligation not found" });
       return true;
     }
-    const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
-    const offset = parsePositiveInt(url, "offset") ?? 0;
-    const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
-    const blockedByOffset = parsePositiveInt(url, "blocked_by_offset") ?? 0;
-    const blocksOffset = parsePositiveInt(url, "blocks_offset") ?? 0;
-    const children = deps.obligations.listChildrenPage(id, { limit, offset });
-    const blockingChildren = deps.obligations.listChildrenPage(id, {
-      limit,
-      offset: 0,
-      blockingOnly: true,
-    });
-    const completions = deps.obligations.listCompletionsPage(id, {
-      limit,
-      offset: completionsOffset,
-    });
-    const blockedBy = deps.obligations.listBlockedByPage(id, {
-      limit,
-      offset: blockedByOffset,
-    });
-    const blocks = deps.obligations.listUnblocksPage(id, {
-      limit,
-      offset: blocksOffset,
-    });
-    const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
-    const ancestors = [];
-    const seen = new Set([id]);
-    let ancestor = parent;
-    while (ancestor && !seen.has(ancestor.id)) {
-      seen.add(ancestor.id);
-      ancestors.unshift(ancestor);
-      ancestor = ancestor.parentId ? deps.obligations.get(ancestor.parentId) : null;
-    }
-    const history = deps.obligations.listHistoryPage(id, {
-      before: url.searchParams.get("history_before") ?? undefined,
-      limit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
-    });
+    const {
+      obligation,
+      parent,
+      ancestors,
+      history,
+      children,
+      blockingChildren,
+      completions,
+      blockedBy,
+      blocks,
+    } = detail;
     // Citations and the external reference go out as their keys alone: the
     // client resolves them through /api/mesh/references after the pane has
     // painted, so a cold GitHub or Chat read never holds the response (#940).
-    const artifacts = deps.obligations.listArtifacts(id).map((artifact) => ({ artifact }));
+    const artifacts = detail.artifacts.map((artifact) => ({ artifact }));
     sendJson(res, 200, {
       obligation,
       parent,

@@ -4,7 +4,7 @@ import { ActorRunRepository } from "../repositories/actor-run-repository.js";
 import { actorRuns } from "./0030_actor_runs.js";
 
 describe("0030_actor_runs", () => {
-  it("backfills run/yield state and keeps legacy cursors resolvable after events are truncated", () => {
+  it("backfills run/yield state and retains legacy event-id mappings after events are truncated", () => {
     const db = new Database(":memory:");
     db.exec(`
       CREATE TABLE mesh_events (
@@ -66,23 +66,30 @@ describe("0030_actor_runs", () => {
     });
 
     db.exec("DELETE FROM mesh_events");
+    expect(db.prepare("SELECT id, received_event_id FROM mesh_chat ORDER BY id").all()).toEqual([
+      { id: "chat-1", received_event_id: "message-event" },
+    ]);
     expect(
-      repository
-        .listLedgerSourcesAfter("actor-a", "message-event")
-        .sources.map((source) => [source.kind, source.body])
-    ).toEqual([["run_yielded", "waiting on review"]]);
-    expect(repository.listLedgerSourcesAfter("actor-a", "yield-event").sources).toEqual([]);
+      db
+        .prepare(
+          `SELECT id, legacy_yield_event_id FROM actor_runs
+           WHERE legacy_yield_event_id IS NOT NULL ORDER BY id`
+        )
+        .all()
+    ).toEqual([
+      { id: "abandoned-2", legacy_yield_event_id: "yield-abandoned" },
+      { id: "end-1", legacy_yield_event_id: "yield-event" },
+      { id: "start-3", legacy_yield_event_id: "yield-unterminated" },
+    ]);
     expect(repository.listRecentCompleted("actor-a", 10)[0]?.output).toBe("durable output");
     expect(repository.getById("abandoned-2")).toMatchObject({
       outcome: "abandoned",
       yieldNote: "durable abandoned yield",
     });
-    expect(repository.listLedgerSourcesAfter("actor-b", "yield-abandoned").sources).toEqual([]);
     expect(repository.getById("start-3")).toMatchObject({
       outcome: "abandoned",
       yieldNote: "durable unterminated yield",
       abandonReason: "legacy run ended without a terminal event",
     });
-    expect(repository.listLedgerSourcesAfter("actor-c", "yield-unterminated").sources).toEqual([]);
   });
 });

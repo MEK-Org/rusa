@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { generateHandle } from "../actor/handle-generator.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
@@ -105,7 +106,7 @@ describe("resolveDashboardBranding", () => {
   });
 
   it("treats the default root-actor handle as 'no name configured'", () => {
-    // `resolveRootHandle` returns `root-actor` when `rootActor.handle` is unset,
+    // Default root handle is `root-actor` when unset,
     // so an unconfigured instance must keep the built-in "Rusa" branding.
     expect(resolveDashboardBranding({ handle: "root-actor" }).name).toBeNull();
   });
@@ -118,7 +119,7 @@ describe("resolveDashboardBranding", () => {
   });
 
   it("keeps the bundled icons when the root still shows the bundled default", () => {
-    // Nothing uploaded and no `rootActor.avatar`: the only image available is the
+    // Nothing uploaded and no stored root avatar: the only image available is the
     // generic bundled one, which is not this root's face.
     expect(resolveDashboardBranding({ handle: "ember-familiar" }).iconUrl).toBeNull();
   });
@@ -144,17 +145,12 @@ describe("resolveDashboardBranding", () => {
     expect(branding.iconUrl).toContain("/api/mesh/avatar/root.jpg?v=");
   });
 
-  it("uses a configured rootActor.avatar when nothing has been uploaded", () => {
-    const configured = join(home, "custom-root.png");
-    writeFileSync(configured, PNG_BYTES);
-    const branding = resolveDashboardBranding({ avatarPath: configured });
+  it("brands the icon but not the name for a root image with no custom handle", () => {
+    cacheRootAvatar(PNG_BYTES);
+    const branding = resolveDashboardBranding({ handle: generateHandle("root") });
     expect(branding.iconUrl).toContain("/api/mesh/avatar/root.png?v=");
     // Image without a name: the built-in "Rusa" name stays.
     expect(branding.name).toBeNull();
-  });
-
-  it("ignores a rootActor.avatar path that does not exist", () => {
-    expect(resolveDashboardBranding({ avatarPath: join(home, "missing.png") }).iconUrl).toBeNull();
   });
 });
 

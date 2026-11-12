@@ -37,17 +37,10 @@ function deps(
 }
 
 /** A config.yaml that loads, carrying the providers block the check reads. */
-function configYaml(providers: string, rootProvider = "claude"): string {
-  return [
-    "github:",
-    "  account: test-bot",
-    "rootActor:",
-    `  provider: ${rootProvider}`,
-    "  model: claude-3-5-sonnet",
-    "providers:",
-    providers.replace(/\n$/, ""),
-    "",
-  ].join("\n");
+function configYaml(providers: string): string {
+  return ["github:", "  account: test-bot", "providers:", providers.replace(/\n$/, ""), ""].join(
+    "\n"
+  );
 }
 
 const tempDirs: string[] = [];
@@ -302,7 +295,7 @@ describe("resolveProviderCommands", () => {
 describe("runCoordinatorPathCheck", () => {
   it("runs from the configured home with no repo checkout and prints the report", () => {
     const home = tempDir();
-    writeFileSync(join(home, "config.yaml"), configYaml("  codex: {}\n", "codex"));
+    writeFileSync(join(home, "config.yaml"), configYaml("  codex: {}\n"));
     vi.stubEnv("RUSA_HOME", home);
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
 

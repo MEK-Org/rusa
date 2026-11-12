@@ -39,6 +39,7 @@ describe("remote actor run accounting", () => {
   let admits: Array<{ responsive: boolean; mode: string }>;
   let gateCalls: number;
   let snapshotCalls: number;
+  let placementHeld: boolean;
   let context: ActorFactoryContext;
   let providerAttempts: Array<{ providerName: string; model?: string; effort?: string }>;
 
@@ -75,6 +76,7 @@ describe("remote actor run accounting", () => {
     admits = [];
     gateCalls = 0;
     snapshotCalls = 0;
+    placementHeld = false;
     providerAttempts = [];
     const accounting = createRunAccounting(() => runs);
     remote = new RemoteInstance("test-follower", process.platform, process.pid);
@@ -136,6 +138,7 @@ describe("remote actor run accounting", () => {
           prompt: "remote accounting fixture",
         };
       },
+      isPlacementHeld: () => placementHeld,
       saveSession: () => {},
       onFailure: (error) => failures.push(error),
     });
@@ -153,6 +156,68 @@ describe("remote actor run accounting", () => {
     expect(failures).toHaveLength(1);
     expect(allRuns()).toEqual([]);
     expect(accountingErrors).toEqual([]);
+  });
+
+  it("defers admission when an update hold opens while provider pacing waits", async () => {
+    bootActor();
+    let launch!: () => void;
+    context.admitRun = ({ responsive, mode }) => {
+      admits.push({ responsive, mode });
+      return true;
+    };
+    context.gate = ((
+      invoke: (selected: RawProviderModelConfig) => Promise<void>,
+      candidates: readonly RawProviderModelConfig[]
+    ) => {
+      let started = false;
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const result = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      launch = () => {
+        started = true;
+        const selected = candidates[0];
+        if (!selected) {
+          reject(new Error("expected a provider candidate"));
+          return;
+        }
+        void invoke(selected).then(resolve, reject);
+      };
+      return {
+        result,
+        get started() {
+          return started;
+        },
+        promote: () => {},
+      };
+    }) as ActorFactoryContext["gate"];
+
+    followerSends({ type: "queued", responsive: false, mode: "ordinary" });
+    followerSends({
+      type: "request",
+      requestId: 44,
+      request: {
+        op: "admit",
+        candidates: [{ provider: "codex", model: "gpt-5.5" }],
+        responsive: false,
+        mode: "ordinary",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    placementHeld = true;
+    launch();
+
+    await vi.waitFor(() =>
+      expect(remote.commands).toContainEqual({
+        actorId: ACTOR_ID,
+        message: { type: "reply", requestId: 44, value: { deferred: true } },
+      })
+    );
+    expect(snapshotCalls).toBe(0);
+    expect(admits).toHaveLength(1);
   });
 
   it("installs the admitted and instantiated attempts only while the run is open", async () => {

@@ -34,7 +34,8 @@ export interface McpHttpServerOptions {
  */
 export interface WakeObligationHandler {
   token: string;
-  deliver: (id: string) => void;
+  /** Answered only once it settles, so a failed wake reads as a 500 (#1289). */
+  deliver: (id: string) => Promise<void>;
 }
 
 export interface WakeMessageHandler {
@@ -637,7 +638,7 @@ export class McpHttpServer {
         send(400, { error: "id required" });
         return;
       }
-      this.wakeObligation.deliver(id);
+      await this.wakeObligation.deliver(id);
       send(200, { ok: true });
     } catch {
       if (!res.headersSent) send(500, { error: "internal error" });

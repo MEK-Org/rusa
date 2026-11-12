@@ -21,7 +21,7 @@ export function instanceWorkerFactory(
     // (#608). The follower fills a tuple's unset fields from providerOptions,
     // so they carry no model or effort: the first candidate's would otherwise
     // leak into every other candidate's provider.
-    const name = options.modelConfig[0]?.provider ?? config.rootActor?.provider ?? "antigravity";
+    const name = options.modelConfig[0]?.provider ?? "antigravity";
     const host = hub.createHost(target, record.id);
     const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
     const runtime = new ActorHandle({
@@ -53,6 +53,7 @@ export function instanceWorkerFactory(
       },
       context,
       actorOptions: options,
+      isPlacementHeld: () => hub.isPlacementHeld(target),
       snapshot: () => {
         const current = context.getRecord();
         if (!current) throw new Error("Actor record is missing");

@@ -1,10 +1,18 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ContextConfig } from "../actor/actor-record.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { normalizeEventResource } from "../actor/event-subscriptions.js";
+import { ROOT_ACTOR_CHARTER } from "../actor/root-prompt.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { ChatMessage } from "../chat/types.js";
 import type { SlackConfig } from "../config/types.js";
@@ -30,7 +38,7 @@ import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { ActorHandle } from "../remote-instances/actor-handle.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
-import { type RunStartE2EHandles, runStart } from "./start.js";
+import { type RunStartE2EHandles, type RunStartE2EHooks, runStart } from "./start.js";
 
 /** Local issue tracker REST surface (the agent-facing "GitHub"). */
 const TRACKER_PORT = 8084;
@@ -106,6 +114,32 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
   };
 }
 
+/** File in an E2E instance root that records the harness's actor id. */
+export const E2E_HARNESS_ACTOR_FILE = "harness-actor-id";
+
+/**
+ * The harness's actor selection for the instance at `rootDir` (#1261). A
+ * home this harness already set up names its actor in
+ * {@link E2E_HARNESS_ACTOR_FILE}. A fresh home creates one through the
+ * ordinary creation path (built-in charter, `modelConfig`) and saves its id
+ * there. A home with actors but no such file (one set up before #1261) is
+ * refused at startup; write the chosen actor's id into the file to select it.
+ */
+export function e2eHarnessActor(
+  rootDir: string,
+  modelConfig: { provider: string; model: string } = { provider: "fake", model: "fake-model" }
+): NonNullable<RunStartE2EHooks["harnessActor"]> {
+  const file = join(rootDir, E2E_HARNESS_ACTOR_FILE);
+  if (existsSync(file)) {
+    const id = readFileSync(file, "utf8").trim();
+    if (id) return { id };
+  }
+  return {
+    create: { charter: ROOT_ACTOR_CHARTER, modelConfig, title: "e2e harness" },
+    onCreated: (id) => writeFileSync(file, `${id}\n`),
+  };
+}
+
 interface ResolveE2EInstanceOptions {
   root?: string;
   resume?: boolean;
@@ -146,9 +180,10 @@ export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2E
     opts.resume === true ||
     (opts.root !== undefined && missingResumeRequirements(instanceRoot).length === 0);
 
-  // Provision with the actor-mesh edges enabled: a root actor (agy, built-in
-  // charter) and a chat config (the real fields are unused — fakes are injected
-  // below — but their presence activates the chat MCP server + inbound path).
+  // Provision with the actor-mesh edges enabled: a chat config (the real
+  // fields are unused — fakes are injected below — but their presence activates
+  // the chat MCP server + inbound path). The harness's actor is created at
+  // startup (see e2eHarnessActor), not by config.
   const offset = opts.portOffset ?? 0;
   const instance = resumed
     ? resumeE2EInstance(instanceRoot)
@@ -156,12 +191,6 @@ export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2E
         dashboardPort: 8083 + offset,
         root: instanceRoot,
         baseConfigHome: opts.baseConfigHome,
-        // External control does not invoke a root provider, but children still
-        // use the real provider catalog and credentials seeded below.
-        rootActor: {
-          provider: opts.rootDriver === "external" ? "fake" : "claude",
-          model: opts.rootDriver === "external" ? "fake-model" : "claude-sonnet-5",
-        },
         chat: {
           projectId: "e2e",
           subscription: "e2e",
@@ -365,6 +394,7 @@ export async function runActorMeshE2EUp(opts: {
       chatClient,
       chatSource,
       rootDriver: opts.rootDriver,
+      harnessActor: e2eHarnessActor(rootDir),
       createWorkerActor: followerHub ? instanceWorkerFactory(config, followerHub) : undefined,
       dashboard: true,
       dashboardAuth,

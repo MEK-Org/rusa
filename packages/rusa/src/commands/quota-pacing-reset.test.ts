@@ -24,9 +24,6 @@ function writeHome(quotaBlock: string): string {
     `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude

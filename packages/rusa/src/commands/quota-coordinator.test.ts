@@ -139,9 +139,6 @@ describe("runQuotaCoordinator startup relocation", () => {
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude
@@ -160,9 +157,6 @@ quota:
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude
@@ -215,9 +209,6 @@ quota:
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude
@@ -264,9 +255,6 @@ describe("probe-off rollout mode", () => {
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude
@@ -407,9 +395,6 @@ quota:
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude
@@ -459,9 +444,6 @@ quota:
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude
@@ -514,9 +496,6 @@ describe("freshness thresholds (#690)", () => {
       `
 github:
   account: mock-bot
-rootActor:
-  provider: claude
-  model: claude-3-5-sonnet
 providers:
   claude:
     cliCommand: claude

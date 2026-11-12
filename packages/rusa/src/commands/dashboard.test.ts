@@ -33,17 +33,22 @@ const mockWebhookServerModule = vi.hoisted(() => ({
 const mockReferenceCacheRepo = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn() }));
 const mockPrincipals = vi.hoisted(() => ({ ensureImplicitUser: vi.fn() }));
 const mockReceipts = vi.hoisted(() => ({
+  has: vi.fn((_source: string): boolean => false),
   actorFor: vi.fn((_source: string): string | undefined => undefined),
+  rowCount: vi.fn((_source: string): number => 0),
 }));
 const mockAvailabilityHolds = vi.hoisted(() => ({
   list: vi.fn((_options?: { now?: number }): AvailabilityHold[] => []),
 }));
+
+const mockMeshWriter = vi.hoisted(() => ({ write: vi.fn() }));
 
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
   getRepositories: vi.fn(() => ({
     actors: {
       list: vi.fn((): { id: string; parentId: string | null }[] => []),
+      get: vi.fn(),
     },
     meshEvents: {},
     meshChat: {},
@@ -53,6 +58,7 @@ const mockDbModule = vi.hoisted(() => ({
     legacyImportReceipts: mockReceipts,
     availabilityHolds: mockAvailabilityHolds,
   })),
+  getMeshWriter: vi.fn(() => mockMeshWriter),
 }));
 
 const mockLegacyImport = vi.hoisted(() => ({
@@ -102,7 +108,11 @@ describe("runDashboard", () => {
     expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
       expect.objectContaining({
         port: 8080,
-        mesh: expect.objectContaining({ meshEvents: expect.anything() }),
+        mesh: expect.objectContaining({
+          meshEvents: expect.anything(),
+          // Obligation writes go through the process's one writer (#1289).
+          obligationWriter: mockMeshWriter,
+        }),
       })
     );
     expect(openMock.default).toHaveBeenCalledWith("http://localhost:8080");
@@ -159,13 +169,15 @@ describe("runDashboard", () => {
     expect(mockLegacyImport.importLegacyActorState).not.toHaveBeenCalled();
   });
 
-  it("names the sole parentless actor as root", async () => {
+  it("leaves rootIdentity undefined when no receipt exists (#1261)", async () => {
+    mockReceipts.has.mockReturnValue(false);
     mockDbModule.getRepositories.mockReturnValue({
       actors: {
         list: vi.fn(() => [
           { id: "the-real-root", parentId: null },
           { id: "worker", parentId: "the-real-root" },
         ]),
+        get: vi.fn(),
       },
       meshEvents: {},
       meshChat: {},
@@ -181,42 +193,16 @@ describe("runDashboard", () => {
     expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
       expect.objectContaining({
         mesh: expect.objectContaining({
-          rootIdentity: expect.objectContaining({ id: "the-real-root" }),
-        }),
-      })
-    );
-  });
-
-  it("keeps the first parentless actor as the dashboard root (#550)", async () => {
-    mockDbModule.getRepositories.mockReturnValue({
-      actors: {
-        list: vi.fn(() => [
-          { id: "parentless-a", parentId: null },
-          { id: "parentless-b", parentId: null },
-        ]),
-      },
-      meshEvents: {},
-      meshChat: {},
-      obligations: {},
-      principals: mockPrincipals,
-      referenceCache: mockReferenceCacheRepo,
-      legacyImportReceipts: mockReceipts,
-      availabilityHolds: mockAvailabilityHolds,
-    });
-
-    await runDashboard();
-
-    expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mesh: expect.objectContaining({
-          rootIdentity: expect.objectContaining({ id: "parentless-a" }),
+          rootIdentity: undefined,
         }),
       })
     );
   });
 
   it("names the imported configured actor with its stored handle once the import ran (#1002)", async () => {
-    mockReceipts.actorFor.mockReturnValueOnce("imported-actor");
+    mockReceipts.has.mockReturnValue(true);
+    mockReceipts.actorFor.mockReturnValue("imported-actor");
+    mockReceipts.rowCount.mockReturnValue(1);
     mockDbModule.getRepositories.mockReturnValue({
       actors: {
         // A second parentless row listed first: the receipt, not topology, decides.

@@ -39,6 +39,7 @@ import {
   handleUnderstandingStringsRequest,
   type UnderstandingOpsDeps,
 } from "../dashboard/understanding-ops-api.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -152,8 +153,12 @@ export interface DashboardMeshRefs {
   pushDeviceTokens?: PushDeviceTokenRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
+  /** The process's one writer, through which obligation writes go (#1289). */
+  obligationWriter?: MeshObligationWriter;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
   inbox?: InboxRepository;
+  /** Standalone reads served off the main thread; see `DashboardDataDeps`. */
+  reads?: DashboardDataDeps["reads"];
   resolveActorId?: DashboardDataDeps["resolveActorId"];
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
@@ -689,7 +694,9 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           timings: options.mesh.timings,
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
+          obligationWriter: options.mesh.obligationWriter,
           inbox: options.mesh.inbox,
+          reads: options.mesh.reads,
           resolveActorId: options.mesh.resolveActorId,
           actorRuns: options.mesh.actorRuns,
           runPrompts: options.mesh.runPrompts,

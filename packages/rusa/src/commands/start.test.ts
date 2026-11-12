@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -54,12 +55,13 @@ import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
-import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import * as readPool from "../db/read-pool.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
-import { buildE2EConfig } from "../e2e/provision.js";
+import { buildE2EConfig, provisionE2EInstance } from "../e2e/provision.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
@@ -78,6 +80,7 @@ import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SlackClient } from "../slack/slack-client.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
+import { BuildRunner } from "../update/runner.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -249,6 +252,11 @@ vi.mock("../observability/logger.js", async (importOriginal) => {
 });
 
 import {
+  E2E_HARNESS_ACTOR_FILE,
+  e2eHarnessActor,
+  startRootControlServer,
+} from "./e2e-actor-mesh.js";
+import {
   configuredActorSandbox,
   getShutdownExitCode,
   isLegacyWorktreeKey,
@@ -256,7 +264,6 @@ import {
   type RunStartE2EHandles,
   type RunStartOptions,
   reactToQueuedInboxEntries,
-  rootExecutionIntent,
   shouldAppendServiceBootWake,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
@@ -538,13 +545,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         : undefined,
     });
 
-  const legacyRootThread = {
-    id: rootId,
-    charter: "root",
-    parentId: null,
-    status: "active" as const,
-    createdAt: "2026-01-01T00:00:00.000Z",
-  };
   let homeDir = "";
   let originalEnv: string | undefined;
   let originalExit: typeof process.exit;
@@ -555,29 +555,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
   // installation. They are imported once and rekeyed with the actor record;
   // startup must never manufacture them from `rootActor` identity. Focused
   // no-grant tests remove this fixture before their first boot.
-  const legacyConfiguredGrants = [
-    "capability-admin",
-    "experiment-admin",
-    "model-admin",
-    "actor-admin",
-    "room-admin",
-    "obligation-responsive",
-    "pnpm-hardlinks",
-    "update",
-    "chat-write:*",
-    "slack-write:*",
-  ].map((capability) => ({
-    actorId: "root",
-    capability,
-    grantedBy: "operator:legacy-fixture",
-    grantedAt: "2026-01-01T00:00:00.000Z",
-  }));
+  const legacyConfiguredGrants = () =>
+    [
+      "capability-admin",
+      "experiment-admin",
+      "model-admin",
+      "actor-admin",
+      "room-admin",
+      "obligation-responsive",
+      "pnpm-hardlinks",
+      "update",
+      "chat-write:*",
+      "slack-write:*",
+    ].map((capability) => ({
+      actorId: rootId,
+      capability,
+      grantedBy: "operator:legacy-fixture",
+      grantedAt: "2026-01-01T00:00:00.000Z",
+    }));
   const clearLegacyConfiguredGrants = () => {
     rmSync(join(homeDir, "capability-grants.json"), { force: true });
   };
+  const withMeshDb = <T>(fn: (db: Database.Database) => T): T => {
+    const db = new Database(join(homeDir, "data", "mesh.db"));
+    try {
+      return fn(db);
+    } finally {
+      db.close();
+    }
+  };
+  const patchRootActor = (patch: Partial<ActorRecord>) =>
+    withMeshDb((db) => new SqliteActorRepository(db).patch(rootId, patch));
+  const upsertWorker = (record: Partial<ActorRecord> & { id: string }) =>
+    withMeshDb((db) =>
+      new SqliteActorRepository(db).upsert({
+        charter: "worker",
+        parentId: rootId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        ...record,
+      })
+    );
+  const clearDatabase = () => {
+    rmSync(join(homeDir, "data"), { recursive: true, force: true });
+    rmSync(join(homeDir, "threads.json"), { force: true });
+  };
 
   beforeEach(() => {
-    rootId = "root";
+    rootId = "00000000-0000-4000-8000-000000000001";
     homeDir = mkdtempSync(join(tmpdir(), "rusa-start-test-"));
     originalEnv = process.env.RUSA_HOME;
     process.env.RUSA_HOME = homeDir;
@@ -623,34 +648,31 @@ describe("runStart webhook event routing (Phase 4)", () => {
       providers: {
         antigravity: { cliCommand: "agy" },
       },
-      rootActor: {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash",
-        effort: "high",
-      },
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
     // Most startup tests exercise the upgrade/restart path used by current prod.
-    // Fresh-install creation is covered by the configured-actor import tests.
-    writeFileSync(
-      join(homeDir, "threads.json"),
-      JSON.stringify({
-        threads: [
-          {
-            id: rootId,
-            charter: "root",
-            parentId: null,
-            status: "active",
-            createdAt: "2026-01-01T00:00:00.000Z",
-          },
-        ],
-      }),
-      "utf8"
-    );
+    mkdirSync(join(homeDir, "data"), { recursive: true });
+    const db = initDb(homeDir);
+    const now = "2026-01-01T00:00:00.000Z";
+    new SqliteActorRepository(db).upsert({
+      id: rootId,
+      charter: "root",
+      parentId: null,
+      status: "active",
+      createdAt: now,
+      executionConfig: { unsandboxed: false },
+      displayHandle: "root-actor",
+      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+    });
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES (?, ?, ?, ?)`
+    ).run("config.yaml:rootActor", now, 1, rootId);
+    closeDb();
     writeFileSync(
       join(homeDir, "capability-grants.json"),
-      JSON.stringify({ grants: legacyConfiguredGrants }),
+      JSON.stringify({ grants: legacyConfiguredGrants() }),
       "utf8"
     );
   });
@@ -728,7 +750,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const configWithCoordinator = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       geminiApiKey: "fake-gemini-key",
       quota: {
         coordinator: { socketPath: "/tmp/mock-coordinator.sock" },
@@ -762,6 +783,60 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
+  it("hands the dashboard the read pool it opens on the mesh database (#1289)", async () => {
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    // A source run has no built worker; stand in for a built run's pool.
+    const workerSpy = vi
+      .spyOn(readPool, "bundledReadWorker")
+      .mockReturnValue("/dist/db-read-worker.js");
+    const pool = { read: vi.fn(), close: vi.fn(async () => {}), restore: vi.fn() };
+    const openSpy = vi
+      .spyOn(readPool.DbReadPool, "open")
+      .mockResolvedValue(pool as unknown as readPool.DbReadPool);
+    const rollbackSpy = vi.spyOn(BuildRunner.prototype, "rollback");
+    try {
+      const handles = await new Promise<RunStartE2EHandles>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (ready) => {
+              shutdownFn = ready.shutdown;
+              resolve(ready);
+            },
+          },
+        });
+      });
+
+      expect(openSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          dbPath: meshDbPath(homeDir),
+          worker: "/dist/db-read-worker.js",
+        })
+      );
+      expect(startDashboardServerSpy.mock.calls[0][0].mesh?.reads).toBe(pool);
+
+      // A failed update's rollback restores the pool only once dist is back.
+      const build = handles.updateToolDepsFor?.("self").deps.build;
+      rollbackSpy.mockRejectedValueOnce(new Error("cannot restore previous dist"));
+      await expect(build?.rollback?.()).rejects.toThrow("cannot restore previous dist");
+      expect(pool.restore).not.toHaveBeenCalled();
+      rollbackSpy.mockResolvedValueOnce(undefined);
+      await build?.rollback?.();
+      expect(pool.restore).toHaveBeenCalledOnce();
+
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      expect(pool.close).toHaveBeenCalled();
+    } finally {
+      startDashboardServerSpy.mockRestore();
+      workerSpy.mockRestore();
+      openSpy.mockRestore();
+      rollbackSpy.mockRestore();
+    }
+  });
+
   it("reads dashboard quota and history through the coordinator client with launch pacing disabled (#356)", async () => {
     // §12 item 4: the dashboard is a consumer of GET /v1/quota and GET /v1/history
     // whenever a coordinator socket is configured. `quota.throttle.enabled` governs
@@ -783,7 +858,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const configWithCoordinator = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       geminiApiKey: "fake-gemini-key",
       quota: {
         coordinator: { socketPath: "/tmp/mock-coordinator.sock" },
@@ -881,7 +955,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         quota: { coordinator: { socketPath } },
       }),
@@ -942,7 +1015,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   }, 15_000);
 
-  it("adopts the external E2E root through the configured-root construction path", async () => {
+  it("drives a receipt-imported actor externally only when the harness selects it by id (#1261)", async () => {
     let mesh: ActorMesh | undefined;
     let root: unknown;
     let externalRoot: unknown;
@@ -950,6 +1023,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({
         e2e: {
           rootDriver: "external",
+          harnessActor: { id: rootId },
           onReady: (handles) => {
             mesh = handles.mesh;
             root = handles.root;
@@ -964,6 +1038,164 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(externalRoot).not.toBeNull();
     expect(root).toBe(externalRoot);
     expect(mesh?.get(rootId)).toBe(externalRoot);
+  });
+
+  /**
+   * A newly provisioned e2e home, through the real provisioner: no actor row,
+   * no import receipt, no `rootActor` block (#1264). Provisioning repoints the
+   * process at the new home; the rest of the e2e environment is restored here
+   * and RUSA_HOME by the shared afterEach.
+   */
+  const provisionFreshE2EHome = () => {
+    closeDb();
+    const keys = ["GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "TMPDIR"] as const;
+    const saved = new Map(keys.map((key) => [key, process.env[key]]));
+    const root = mkdtempSync(join(tmpdir(), "rusa-e2e-fresh-"));
+    onTestFinished(() => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    });
+    // A missing base config keeps provisioning hermetic: fake + default providers.
+    return provisionE2EInstance({ root, baseConfigHome: join(root, "no-base-config") });
+  };
+
+  const getControl = async (handles: RunStartE2EHandles, path: string) => {
+    const server = startRootControlServer({ port: 0, handles });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}${path}`);
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
+
+  const bootE2E = async (e2e: Omit<NonNullable<RunStartOptions["e2e"]>, "onReady">) => {
+    let handles: RunStartE2EHandles | undefined;
+    await new Promise<void>((resolve, reject) => {
+      runStart({
+        e2e: {
+          ...e2e,
+          onReady: (h) => {
+            handles = h;
+            shutdownFn = h.shutdown;
+            resolve();
+          },
+        },
+      }).catch(reject);
+    });
+    if (!handles) throw new Error("mesh not ready");
+    return handles;
+  };
+  const harnessSpawnAudits = () =>
+    getRepositories()
+      .meshEvents.listByKinds(["root_control_action"], { bodyKinds: [] })
+      .map((event) => ({ actorId: event.actorId, ...JSON.parse(event.payload ?? "{}") }))
+      .filter((payload) => payload.action === "spawn_child");
+
+  it("a freshly provisioned e2e home creates its harness actor through ordinary creation and drives it externally (#1264)", async () => {
+    const instance = provisionFreshE2EHome();
+    expect(instance.config).not.toHaveProperty("rootActor");
+    const handles = await bootE2E({
+      rootDriver: "external",
+      harnessActor: e2eHarnessActor(instance.root),
+    });
+    // No import receipt selected anything: the harness chose its own actor.
+    expect(
+      getRepositories().legacyImportReceipts.actorFor("config.yaml:rootActor")
+    ).toBeUndefined();
+    const harnessId = handles.rootControl.rootId;
+    if (!harnessId) throw new Error("no harness actor");
+    expect(readFileSync(join(instance.root, E2E_HARNESS_ACTOR_FILE), "utf8").trim()).toBe(
+      harnessId
+    );
+    expect(handles.mesh.list().map((record) => [record.id, record.parentId])).toEqual([
+      [harnessId, null],
+    ]);
+    // Created by the #1262 creation path, attributed to the E2E controller.
+    expect(harnessSpawnAudits()).toEqual([
+      expect.objectContaining({
+        actorId: harnessId,
+        principal: "e2e-controller",
+        targetId: harnessId,
+        modelConfig: [{ provider: "fake", model: "fake-model" }],
+      }),
+    ]);
+    // External control reaches the created actor.
+    expect(handles.externalRoot).not.toBeNull();
+    expect(handles.mesh.get(harnessId)).toBe(handles.externalRoot);
+    expect(await getControl(handles, "/actors")).toMatchObject({ status: 200 });
+  });
+
+  it("a provider-driven harness actor on a fresh e2e home keeps the forced e2e sandbox (#1264)", async () => {
+    const instance = provisionFreshE2EHome();
+    const handles = await bootE2E({ harnessActor: e2eHarnessActor(instance.root) });
+    const harnessId = handles.rootControl.rootId;
+    if (!harnessId) throw new Error("no harness actor");
+    expect(handles.externalRoot).toBeNull();
+    const live = handles.mesh.get(harnessId) as unknown as {
+      opts: { sandbox?: boolean; isE2eRoot?: boolean };
+    };
+    expect(live).toBeInstanceOf(Actor);
+    expect(live.opts).toMatchObject({ sandbox: true, isE2eRoot: true });
+    // An ordinary child of the harness actor keeps its stored deployment intent.
+    const child = handles.mesh.spawn({
+      charter: "worker",
+      parentId: harnessId,
+      modelConfig: { provider: "fake", model: "fake-model" },
+    });
+    expect(
+      (handles.mesh.get(child) as unknown as { opts: { isE2eRoot?: boolean } }).opts.isE2eRoot
+    ).toBe(false);
+  });
+
+  it("a resumed e2e home reselects the harness actor it saved instead of creating another (#1264)", async () => {
+    const instance = provisionFreshE2EHome();
+    const first = await bootE2E({
+      rootDriver: "external",
+      harnessActor: e2eHarnessActor(instance.root),
+    });
+    const harnessId = first.rootControl.rootId;
+    await shutdownFn?.();
+    shutdownFn = undefined;
+    closeDb();
+
+    expect(e2eHarnessActor(instance.root)).toEqual({ id: harnessId });
+    const resumed = await bootE2E({
+      rootDriver: "external",
+      harnessActor: e2eHarnessActor(instance.root),
+    });
+    expect(resumed.rootControl.rootId).toBe(harnessId);
+    expect(resumed.mesh.list().map((record) => record.id)).toEqual([harnessId]);
+    expect(resumed.mesh.get(harnessId as string)).toBe(resumed.externalRoot);
+    expect(harnessSpawnAudits()).toHaveLength(1);
+  });
+
+  it("refuses to create a harness actor in a home that already has actors (#1264)", async () => {
+    // The shared fixture home holds a receipt-imported actor and no harness selection.
+    await expect(
+      bootE2E({
+        rootDriver: "external",
+        harnessActor: {
+          create: { charter: "harness", modelConfig: { provider: "fake", model: "fake-model" } },
+        },
+      })
+    ).rejects.toThrow(/already has 1 active actor/);
+    await expect(
+      bootE2E({ rootDriver: "external", harnessActor: { id: "ghost" } })
+    ).rejects.toThrow(/ghost is not an active actor/);
+  });
+
+  it("an import receipt alone does not select the e2e harness actor (#1264)", async () => {
+    const handles = await bootE2E({ rootDriver: "external" });
+    expect(getRepositories().legacyImportReceipts.actorFor("config.yaml:rootActor")).toBe(rootId);
+    expect(handles.externalRoot).toBeNull();
+    const live = handles.mesh.get(rootId) as unknown as { opts: { isE2eRoot?: boolean } };
+    expect(live.opts.isE2eRoot).toBe(false);
   });
 
   it("#367 selects greater weekly headroom through the live runStart provider gate and retains fresh evidence through a cold response", async () => {
@@ -1042,7 +1274,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         quota: {
           coordinator: { socketPath },
@@ -1170,7 +1401,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
             claude: { cliCommand: "claude" },
             codex: { cliCommand: "codex" },
           },
-          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
           geminiApiKey: "fake-gemini-key",
           quota: {
             coordinator: { socketPath },
@@ -1918,7 +2148,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const configWithCoordinator = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       geminiApiKey: "fake-gemini-key",
       quota: {
         coordinator: { socketPath },
@@ -2021,7 +2250,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const configWithCoordinator = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       geminiApiKey: "fake-gemini-key",
       quota: {
         coordinator: { socketPath },
@@ -2558,32 +2786,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           kimi: { cliCommand: "kimi" },
         },
-        rootActor: {
-          provider: "claude",
-          model: "claude-sonnet-5",
-        },
         geminiApiKey: "fake-key",
       };
       writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
-      const registryPath = join(homeDir, "threads.json");
-      writeFileSync(
-        registryPath,
-        JSON.stringify({
-          threads: [
-            legacyRootThread,
-            {
-              id: "test-kimi-worker",
-              charter: "test",
-              parentId: rootId,
-              provider: "kimi",
-              status: "active",
-              createdAt: "2026-01-01T00:00:01.000Z",
-            },
-          ],
-        }),
-        "utf8"
-      );
+      upsertWorker({
+        id: "test-kimi-worker",
+        charter: "test",
+      });
 
       let mesh: ActorMesh | undefined;
       const readyPromise = new Promise<void>((resolve) => {
@@ -2622,39 +2832,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // is built from a Database alone and nobody supplied one, so the guard
       // read as if it applied while never running. A test that constructed the
       // repository itself would have passed throughout.
-      writeFileSync(
-        join(homeDir, "threads.json"),
-        JSON.stringify({
-          threads: [
-            {
-              id: rootId,
-              charter: "root",
-              parentId: null,
-              executionConfig: { unsandboxed: true },
-              status: "active",
-              createdAt: "2026-01-01T00:00:00.000Z",
-            },
-            {
-              id: "live-worker",
-              charter: "worker",
-              parentId: rootId,
-              provider: "antigravity",
-              effort: "high",
-              status: "active",
-              createdAt: "2026-01-01T00:00:01.000Z",
-            },
-            {
-              id: "retired-worker",
-              charter: "worker",
-              parentId: rootId,
-              provider: "kimi",
-              status: "retired",
-              createdAt: "2026-01-01T00:00:02.000Z",
-            },
-          ],
-        }),
-        "utf8"
-      );
+      patchRootActor({ executionConfig: { unsandboxed: true } });
+      upsertWorker({
+        id: "live-worker",
+      });
+      upsertWorker({
+        id: "retired-worker",
+        status: "retired",
+        createdAt: "2026-01-01T00:00:02.000Z",
+      });
 
       await new Promise<void>((resolve) => {
         runStart({
@@ -2791,7 +2977,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
       }),
@@ -2828,7 +3013,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
       }),
@@ -2963,22 +3147,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("adds a live capability grant to the cached provider config for the next run", async () => {
-    writeFileSync(
-      join(homeDir, "threads.json"),
-      JSON.stringify({
-        threads: [
-          legacyRootThread,
-          {
-            id: "live-worker",
-            charter: "test live grants",
-            parentId: rootId,
-            status: "active",
-            createdAt: "2026-08-07T00:00:00.000Z",
-          },
-        ],
-      }),
-      "utf8"
-    );
+    upsertWorker({
+      id: "live-worker",
+      charter: "test live grants",
+      createdAt: "2026-08-07T00:00:00.000Z",
+    });
 
     let mesh: ActorMesh | undefined;
     await new Promise<void>((resolve) => {
@@ -3075,22 +3248,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   it("mounts the actor-bound obligations MCP for root and rehydrated workers", async () => {
     clearLegacyConfiguredGrants();
-    writeFileSync(
-      join(homeDir, "threads.json"),
-      JSON.stringify({
-        threads: [
-          legacyRootThread,
-          {
-            id: "obligation-worker",
-            charter: "test obligation reads",
-            parentId: rootId,
-            status: "active",
-            createdAt: "2026-08-14T00:00:00.000Z",
-          },
-        ],
-      }),
-      "utf8"
-    );
+    upsertWorker({
+      id: "obligation-worker",
+      charter: "test obligation reads",
+      createdAt: "2026-08-14T00:00:00.000Z",
+    });
 
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
@@ -3184,22 +3346,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
   it("wires lifecycle abandonment through both production actor factories", async () => {
     // The lifecycle listener only closes the mesh's in-flight accounting if both
     // factories receive the coordinator-owned lifecycle instance.
-    writeFileSync(
-      join(homeDir, "threads.json"),
-      JSON.stringify({
-        threads: [
-          legacyRootThread,
-          {
-            id: "abandon-worker",
-            charter: "test terminal wiring",
-            parentId: rootId,
-            status: "active",
-            createdAt: "2026-08-08T00:00:00.000Z",
-          },
-        ],
-      }),
-      "utf8"
-    );
+    upsertWorker({
+      id: "abandon-worker",
+      charter: "test terminal wiring",
+      createdAt: "2026-08-08T00:00:00.000Z",
+    });
 
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
@@ -3264,26 +3415,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
         toYaml({
           github: { account: "mock-bot" },
           providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         }),
         "utf8"
       );
-      writeFileSync(
-        join(homeDir, "threads.json"),
-        JSON.stringify({
-          threads: [
-            legacyRootThread,
-            {
-              id: workerId,
-              charter: "returning worker",
-              parentId: rootId,
-              status: "active",
-              createdAt: "2026-09-06T00:00:00.000Z",
-            },
-          ],
-        }),
-        "utf8"
-      );
+      upsertWorker({
+        id: workerId,
+        charter: "returning worker",
+        createdAt: "2026-09-06T00:00:00.000Z",
+      });
 
       let mesh: ActorMesh | undefined;
       await new Promise<void>((resolve) => {
@@ -4364,7 +4503,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         gitBridge: true,
         gitBridgePort: 9097,
@@ -4426,7 +4564,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         sandbox: "container-boundary",
       }),
@@ -4544,7 +4681,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Persistence alone is not a receipt. The first accepted inbox run claims
     // the entry and emits the best-effort reaction.
     expect(issueClient.commentReactionsAdded).toEqual([]);
-    mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "dummy-org/dummy-repo", commentId: 123, reaction: "eyes", scope: "issue" },
     ]);
@@ -4569,7 +4706,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(redelivery.entries).toHaveLength(1);
     expect(requestRunCalls).toHaveLength(1);
     // A retry cannot re-claim seen work and does not duplicate the reaction.
-    mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toHaveLength(1);
   });
 
@@ -4590,7 +4727,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           orgs: [{ org: "dummy-org" }],
         },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -4877,7 +5013,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           orgs: [{ org: "dummy-org", excludedRepos: ["dummy-org/private-repo"] }],
         },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -4942,7 +5077,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
         observability: {
@@ -5004,7 +5138,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
       }),
@@ -5148,7 +5281,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       sender: { login: "someone-else" },
     });
 
-    mesh.actorQueued(rootId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(rootId, { responsive: false, mode: "ordinary" });
 
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "dummy-org/dummy-repo", commentId: 124, reaction: "eyes", scope: "issue" },
@@ -5210,7 +5343,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -5262,7 +5394,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(entry?.payload).not.toHaveProperty("body");
     expect(chatClient.reactions).toEqual([]);
 
-    mesh.actorQueued(rootId, { responsive: true, mode: "ordinary" });
+    await mesh.actorQueued(rootId, { responsive: true, mode: "ordinary" });
     await vi.waitFor(() => {
       expect(chatClient.reactions).toEqual([{ messageName, emoji: "👀" }]);
     });
@@ -5281,7 +5413,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -5407,7 +5538,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         claude: { cliCommand: "claude" },
         codex: { cliCommand: "codex" },
       },
-      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       chat: {
         projectId: "test",
         subscription: "test",
@@ -5562,6 +5692,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("restores every configured actor lane through operator hold recovery without a model run (#539)", async () => {
+    patchRootActor({ modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }] });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -5570,7 +5701,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "claude", model: "claude-sonnet-5" },
       }),
       "utf8"
     );
@@ -5656,6 +5786,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("operator clear-all releases the brake and every hold's origin in one audited action (#1100)", async () => {
+    patchRootActor({ modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }] });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -5664,7 +5795,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "claude", model: "claude-sonnet-5" },
       }),
       "utf8"
     );
@@ -5741,6 +5871,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     closeDb();
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
+    patchRootActor({ modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }] });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -5750,7 +5881,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "claude", model: "claude-sonnet-5" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -5969,6 +6099,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   async function startClaudeChatHaltService() {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
+    patchRootActor({ modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }] });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -5977,7 +6108,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "claude", model: "claude-sonnet-5" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -6146,7 +6276,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const config = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
@@ -6177,31 +6306,17 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   it("runs a configured portable root stateless and injects its own recent context", async () => {
     let mesh: ActorMesh | undefined;
+    patchRootActor({ context: { type: "portable", mode: "tail" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "tail" },
-        },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
     );
-    // An upgraded portable root: the previous binary wrote `rootActor.context`
-    // onto its row, and since the configured-actor import (#1002) the row,
-    // not config, decides how it runs.
-    writeFileSync(
-      join(homeDir, "threads.json"),
-      JSON.stringify({
-        threads: [{ ...legacyRootThread, context: { type: "portable", mode: "tail" } }],
-      }),
-      "utf8"
-    );
+
     const rootAgentDir = join(homeDir, "root-agent");
     mkdirSync(rootAgentDir, { recursive: true });
     writeFileSync(
@@ -6398,17 +6513,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   it("seeds brief mode without a Gemini key and retains its window before and after delta enrollment", async () => {
     let mesh: ActorMesh | undefined;
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "brief" },
-        },
       }),
       "utf8"
     );
@@ -6497,17 +6607,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     "run end",
     "restart",
   ])("switches the configured root to brief through MCP at %s", async (boundary) => {
+    patchRootActor({ context: { type: "portable", mode: "tail" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "tail" },
-        },
       }),
       "utf8"
     );
@@ -6623,21 +6728,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("keeps the root brief mount from durable context after config is edited", async () => {
-    const writeConfig = (context: { type: "native" } | { type: "portable"; mode: "brief" }) =>
-      writeFileSync(
-        join(homeDir, "config.yaml"),
-        toYaml({
-          github: { account: "mock-bot" },
-          providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: {
-            provider: "antigravity",
-            model: "Gemini 3.7 Flash",
-            effort: "high",
-            context,
-          },
-        }),
-        "utf8"
-      );
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+      }),
+      "utf8"
+    );
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     const boot = async (): Promise<Actor> => {
       let root: Actor | undefined;
       await new Promise<void>((resolve) => {
@@ -6655,7 +6754,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return root;
     };
 
-    writeConfig({ type: "portable", mode: "brief" });
     const first = await boot();
     expect(
       (first as unknown as { opts: { mcpServers: Array<{ name: string }> } }).opts.mcpServers
@@ -6663,40 +6761,58 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await shutdownFn?.();
     shutdownFn = undefined;
 
-    writeConfig({ type: "native" });
+    // Config is edited
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot", orgs: [{ org: "another-org" }] },
+        providers: { antigravity: { cliCommand: "agy" } },
+      }),
+      "utf8"
+    );
+
     const restarted = await boot();
     expect(
       (restarted as unknown as { opts: { mcpServers: Array<{ name: string }> } }).opts.mcpServers
     ).toContainEqual(expect.objectContaining({ name: "brief" }));
   });
 
-  it("rejects retired ledger mode on rootActor at startup", async () => {
-    let ready = false;
+  it("boots the receipt-selected actor persisted with retired ledger mode and rejects it at run launch", async () => {
+    // Same contract #1271 gives every stored actor: the row rehydrates so an
+    // operator can still inspect it or switch its context, and the retired mode
+    // fails when a run assembles its prompt. No startup refusal for this one.
+    patchRootActor({ context: { type: "portable", mode: "ledger" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "ledger" },
-        },
+        geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
     );
 
-    await runStart({
-      e2e: {
-        onReady: () => {
-          ready = true;
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
         },
-      },
+      });
     });
 
-    expect(ready).toBe(false);
-    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(process.exit).not.toHaveBeenCalled();
+    if (!mesh) throw new Error("mesh not ready");
+    const root = mesh.get(rootId);
+    if (!root) throw new Error("root not rehydrated");
+    const rootOpts = (root as unknown as { opts: { buildPrompt: () => { prompt: string } } }).opts;
+    expect(() => rootOpts.buildPrompt()).toThrow(
+      "portable ledger mode has been retired; use 'brief' or 'tail' mode instead"
+    );
   });
 
   it("rejects an actor persisted with retired ledger mode at run launch before provider invocation", async () => {
@@ -6706,12 +6822,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "tail" },
-        },
+        geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
     );
@@ -6785,17 +6896,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   it("runs portable brief and tail mode actors cleanly without compaction", async () => {
     let mesh: ActorMesh | undefined;
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "brief" },
-        },
       }),
       "utf8"
     );
@@ -6846,6 +6952,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {
     let mesh: ActorMesh | undefined;
+    patchRootActor({ modelConfig: [{ provider: "claude", model: "claude-sonnet-4-6" }] });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -6853,10 +6960,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
-        },
-        rootActor: {
-          provider: "claude",
-          model: "claude-sonnet-4-6",
         },
       }),
       "utf8"
@@ -6997,11 +7100,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         antigravity: { cliCommand: "agy" },
         claude: { cliCommand: "claude" },
       },
-      rootActor: {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash",
-        effort: "high",
-      },
       chat: {
         projectId: "test",
         subscription: "test",
@@ -7127,7 +7225,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     expect(requestRunCalls).toEqual([{ actorId: workerId, reason: "{}" }]);
-    mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "uncovered-org/uncovered", commentId: 123, reaction: "eyes", scope: "issue" },
     ]);
@@ -7960,11 +8058,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         antigravity: { cliCommand: "agy" },
         claude: { cliCommand: "claude" },
       },
-      rootActor: {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash",
-        effort: "high",
-      },
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
@@ -8159,12 +8252,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         claude: { cliCommand: "claude" },
         openrouter: { cliCommand: "pi" },
       },
-      rootActor: {
-        provider: "claude",
-        model: "claude-sonnet-5",
-      },
       geminiApiKey: "fake-gemini-key",
     };
+    patchRootActor({ modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }] });
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
     const readyPromise = new Promise<void>((resolve) => {
@@ -8313,14 +8403,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         antigravity: { cliCommand: "agy" },
         claude: { cliCommand: "claude" },
       },
-      rootActor: {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash",
-        effort: "high",
-        context: { type: "portable", mode: "tail" },
-      },
       geminiApiKey: "fake-gemini-key",
     };
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
     let mesh: ActorMesh | undefined;
@@ -8407,14 +8492,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
         antigravity: { cliCommand: "agy" },
         claude: { cliCommand: "claude" },
       },
-      rootActor: {
-        provider: "claude",
-        model: "claude-sonnet-5",
-        effort: "high",
-        context: { type: "portable", mode: "tail" },
-      },
       geminiApiKey: "fake-gemini-key",
     };
+    patchRootActor({
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5", effort: "high" }],
+      context: { type: "portable", mode: "brief" },
+    });
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
     let mesh: ActorMesh | undefined;
@@ -8457,13 +8540,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   describe("configured-actor import at boot (#1002)", () => {
     /** Boots, reads what the import left while the database is open, and stops again. */
-    const boot = async (
-      opts: { importActor?: string; inspect?: (mesh: ActorMesh) => void } = {}
-    ) => {
+    const boot = async (opts: { inspect?: (mesh: ActorMesh) => void } = {}) => {
       let mesh: ActorMesh | undefined;
       await new Promise<void>((resolve, reject) => {
         runStart({
-          importActor: opts.importActor,
           e2e: {
             onReady: (handles) => {
               mesh = handles.mesh;
@@ -8494,33 +8574,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       shutdownFn = undefined;
       return state;
     };
-    const writeRootActorConfig = (rootActor: Record<string, unknown>) =>
-      writeFileSync(
-        join(homeDir, "config.yaml"),
-        toYaml({
-          github: { account: "mock-bot" },
-          providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: {
-            provider: "antigravity",
-            model: "Gemini 3.7 Flash",
-            effort: "high",
-            ...rootActor,
-          },
-          geminiApiKey: "fake-gemini-key",
-        }),
-        "utf8"
-      );
-    const withMeshDb = <T>(fn: (db: Database.Database) => T): T => {
-      const db = new Database(join(homeDir, "data", "mesh.db"));
-      try {
-        return fn(db);
-      } finally {
-        db.close();
-      }
-    };
 
     it("boots without rootActor and creates the first actor through operator control (#1087)", async () => {
-      rmSync(join(homeDir, "threads.json"));
+      clearDatabase();
       clearLegacyConfiguredGrants();
       writeFileSync(
         join(homeDir, "config.yaml"),
@@ -8592,7 +8648,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           toYaml({
             github: { account: "mock-bot", orgs: orgs.map((org) => ({ org })) },
             providers: { antigravity: { cliCommand: "agy" } },
-            rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
           })
         );
       writeSources(["first-org", "delegated-org", "released-org"]);
@@ -8662,7 +8717,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     it("boots an existing forest without rootActor and grants only its oldest active top-level actor (#1087)", async () => {
       clearLegacyConfiguredGrants();
-      rmSync(join(homeDir, "threads.json"));
+      clearDatabase();
       writeFileSync(
         join(homeDir, "config.yaml"),
         toYaml({
@@ -8705,22 +8760,37 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(state.live).toEqual(["child", "later", "oldest"]);
     });
 
-    it("boots an empty store without synthesizing an actor, even beside legacy rootActor syntax (#1003)", async () => {
-      // A fresh install: no legacy registry, only the legacy rootActor syntax.
-      rmSync(join(homeDir, "threads.json"));
+    it("boots an empty store without synthesizing an actor (#1003)", async () => {
+      // A fresh install: no legacy registry, no actors in DB.
+      clearDatabase();
       clearLegacyConfiguredGrants();
-      writeRootActorConfig({ charter: "configured charter", handle: "ember-familiar" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        }),
+        "utf8"
+      );
       const first = await boot();
       expect(first.importedActor).toBeUndefined();
       expect(first.topLevel).toEqual([]);
       expect(withMeshDb((db) => db.prepare("SELECT COUNT(*) AS n FROM actors").get())).toEqual({
         n: 0,
       });
+      // No receipt row after boot on an empty store (#1261)
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare("SELECT * FROM legacy_import_receipts WHERE source = ?")
+            .get("config.yaml:rootActor")
+        )
+      ).toBeUndefined();
       // A restart is still empty: the first actor comes from the operator, not config.
       expect(await boot()).toEqual(first);
 
       // An actor the operator creates later boots as an ordinary top-level
-      // actor; config never claims it, and the receipt still binds none.
+      // actor; config never claims it, and no receipt row is written.
       withMeshDb((db) =>
         new SqliteActorRepository(db).upsert({
           id: "first-actor",
@@ -8738,33 +8808,174 @@ describe("runStart webhook event routing (Phase 4)", () => {
         live: ["first-actor"],
       });
       expect(withActor.root).toBeUndefined();
+      // No receipt row after boot on a store with actors and no receipt (#1261)
       expect(
         withMeshDb((db) =>
           db
-            .prepare("SELECT row_count, actor_id FROM legacy_import_receipts WHERE source = ?")
+            .prepare("SELECT * FROM legacy_import_receipts WHERE source = ?")
             .get("config.yaml:rootActor")
         )
-      ).toEqual({ row_count: 0, actor_id: null });
+      ).toBeUndefined();
       expect(await boot()).toEqual(withActor);
     });
 
-    it("imports once; a restart with edited or removed config keeps the stored actor", async () => {
-      writeRootActorConfig({ charter: "configured charter", handle: "ember-familiar" });
-      const first = await boot();
-      expect(first.root).toMatchObject({ charter: "root", displayHandle: "ember-familiar" });
-      expect(first.importedActor).toMatch(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-      );
-      expect(first.topLevel).toEqual([first.importedActor]);
-      expect(first.root?.id).toBe(first.importedActor);
-
-      writeRootActorConfig({ charter: "edited charter", handle: "renamed-familiar" });
-      expect(await boot()).toEqual(first);
-
+    it("leaves a first actor created on an empty store ordinary across restart (#1261 acceptance)", async () => {
+      clearDatabase();
+      clearLegacyConfiguredGrants();
       writeFileSync(
         join(homeDir, "config.yaml"),
         toYaml({
           github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        }),
+        "utf8"
+      );
+
+      // Initial boot on empty store
+      const first = await boot();
+      expect(first.importedActor).toBeUndefined();
+      expect(first.root).toBeUndefined();
+      expect(first.topLevel).toEqual([]);
+      // No receipt row after boot on an empty store (#1261)
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare("SELECT * FROM legacy_import_receipts WHERE source = ?")
+            .get("config.yaml:rootActor")
+        )
+      ).toBeUndefined();
+
+      // Create an actor in the database (like #1262 first-actor modal does)
+      withMeshDb((db) => {
+        new SqliteActorRepository(db).upsert({
+          id: "first-ordinary-actor",
+          charter: "created via modal",
+          parentId: null,
+          modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+      });
+
+      // Restart: boot again
+      const restarted = await boot();
+
+      // Boot must NOT invent a root from the first parentless actor!
+      expect(restarted.root).toBeUndefined();
+      expect(restarted.importedActor).toBeUndefined();
+      expect(restarted.topLevel).toEqual(["first-ordinary-actor"]);
+      expect(restarted.live).toEqual(["first-ordinary-actor"]);
+      // No receipt row after boot on a store with actors and no receipt (#1261)
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare("SELECT * FROM legacy_import_receipts WHERE source = ?")
+            .get("config.yaml:rootActor")
+        )
+      ).toBeUndefined();
+    });
+
+    it("existing 0-row receipt still boots rootless (#1261 acceptance)", async () => {
+      clearDatabase();
+      clearLegacyConfiguredGrants();
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        }),
+        "utf8"
+      );
+      mkdirSync(join(homeDir, "data"), { recursive: true });
+      initDb(homeDir);
+      closeDb();
+      withMeshDb((db) => {
+        db.prepare(
+          `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+           VALUES ('config.yaml:rootActor', '2026-01-01T00:00:00Z', 0, NULL)`
+        ).run();
+        new SqliteActorRepository(db).upsert({
+          id: "actor-1",
+          charter: "synthetic",
+          parentId: null,
+          modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+      });
+
+      const booted = await boot();
+      expect(booted.root).toBeUndefined();
+      expect(booted.importedActor).toBeUndefined();
+      expect(booted.topLevel).toEqual(["actor-1"]);
+      expect(booted.live).toEqual(["actor-1"]);
+    });
+
+    it("imports once; a restart with edited or removed config keeps the stored actor", async () => {
+      clearDatabase();
+      clearLegacyConfiguredGrants();
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        })
+      );
+      mkdirSync(join(homeDir, "data"), { recursive: true });
+      initDb(homeDir);
+      closeDb();
+      const importedId = "c89b7fa8-892d-4560-8da1-96898d9ba880";
+      const childId = "7a8b9c0d-1e2f-4a5b-8c9d-0e1f2a3b4c5d";
+      const modelConfig = [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }];
+      const execConfig = { schemaVersion: 1, unsandboxed: false };
+      const avatarPath = join(homeDir, "avatars", "root.png");
+      mkdirSync(join(homeDir, "avatars"), { recursive: true });
+      writeFileSync(avatarPath, Buffer.from("fake-avatar"));
+
+      withMeshDb((db) => {
+        const actors = new SqliteActorRepository(db);
+        actors.upsert({
+          id: importedId,
+          charter: "configured charter",
+          parentId: null,
+          displayHandle: "ember-familiar",
+          status: "active",
+          createdAt: "2026-01-01T00:00:00Z",
+          modelConfig,
+          executionConfig: execConfig,
+        });
+        actors.upsert({
+          id: childId,
+          charter: "child actor",
+          parentId: importedId,
+          displayHandle: "swift-otter",
+          status: "active",
+          createdAt: "2026-01-02T00:00:00Z",
+          modelConfig,
+          executionConfig: execConfig,
+        });
+        db.prepare(
+          `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+           VALUES (?, ?, ?, ?)`
+        ).run("config.yaml:rootActor", "2026-01-01T00:00:00Z", 1, importedId);
+      });
+
+      const first = await boot();
+      expect(first.root).toMatchObject({
+        id: importedId,
+        charter: "configured charter",
+        displayHandle: "ember-familiar",
+        modelConfig,
+      });
+      expect(first.importedActor).toBe(importedId);
+      expect(first.topLevel).toEqual([importedId]);
+      expect(first.live).toEqual([childId, importedId].sort());
+
+      // Restart with edited config: keeps the stored actor, handle, charter, model config, avatar and subtree
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot", orgs: [{ org: "another-org" }] },
           providers: { antigravity: { cliCommand: "agy" } },
         })
       );
@@ -8931,57 +9142,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(demoted.live).toEqual([importedActor, "ordinary-top"].sort());
       expect(await boot()).toEqual(demoted);
     });
-
-    it("refuses an ambiguous upgraded home until the operator names the actor", async () => {
-      clearLegacyConfiguredGrants();
-      writeFileSync(
-        join(homeDir, "threads.json"),
-        JSON.stringify({
-          threads: [
-            {
-              id: "configured",
-              charter: "root",
-              parentId: null,
-              status: "active",
-              createdAt: "2026-01-01T00:00:00.000Z",
-            },
-          ],
-        }),
-        "utf8"
-      );
-      mkdirSync(join(homeDir, "workers", "configured"), { recursive: true });
-      let ready = false;
-
-      await expect(
-        runStart({
-          e2e: {
-            onReady: (handles) => {
-              ready = true;
-              shutdownFn = handles.shutdown;
-            },
-          },
-        })
-      ).rejects.toThrow(/spawned-actor workspace/);
-      expect(ready).toBe(false);
-      expect(withMeshDb((db) => db.prepare("SELECT * FROM legacy_import_receipts").all())).toEqual(
-        []
-      );
-
-      expect((await boot({ importActor: "configured" })).importedActor).toBe("configured");
-    });
   });
 
   describe("root model_config startup precedence (#333)", () => {
-    const portableRootConfig = (rootModel: { model: string; effort?: string }) => ({
+    const portableRootConfig = () => ({
       github: { account: "mock-bot" },
       providers: {
         antigravity: { cliCommand: "agy" },
         claude: { cliCommand: "claude" },
-      },
-      rootActor: {
-        provider: "antigravity",
-        ...rootModel,
-        context: { type: "portable", mode: "tail" },
       },
       geminiApiKey: "fake-gemini-key",
     });
@@ -9054,11 +9222,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       clearProviderModelCatalog("antigravity");
       clearProviderModelCatalog("claude");
       logCapture.lines.length = 0;
-      writeFileSync(
-        join(homeDir, "config.yaml"),
-        toYaml(portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" })),
-        "utf8"
-      );
+      patchRootActor({
+        context: { type: "portable", mode: "tail" },
+        modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+      });
+      writeFileSync(join(homeDir, "config.yaml"), toYaml(portableRootConfig()), "utf8");
     });
 
     it("preserves the persisted ordered pool across a restart on the record and the live root", async () => {
@@ -9076,16 +9244,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           level: "info",
           source: "persisted",
           modelConfig: "claude:claude-sonnet-5 @ high, antigravity:Gemini 4.1 Ultra @ low",
-        },
-      ]);
-      // The file still names the bootstrap tuple, so the operator is told it
-      // no longer steers root — with both values and what to do instead.
-      expect(bootRecords("root_model_config_file_ignored")).toMatchObject([
-        {
-          level: "warn",
-          configured: "antigravity:Gemini 3.7 Flash @ high",
-          persisted: "claude:claude-sonnet-5 @ high, antigravity:Gemini 4.1 Ultra @ low",
-          action: expect.stringMatching(/set_actor_model/),
         },
       ]);
     });
@@ -9106,7 +9264,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // The run ends and root stays idle: no further dispatch is needed for
       // the change to be live and durable.
       running.mockReturnValue(false);
-      mesh.finishInboxRun(rootId);
+      await mesh.finishInboxRun(rootId);
       expect(mesh.actors.get(rootId)?.modelConfig).toEqual(operatorPool);
       expect(mesh.actors.get(rootId)?.desiredModelConfig).toBeUndefined();
       expect(liveRootPool(mesh)).toEqual(operatorPool);
@@ -9119,36 +9277,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(restarted.actors.get(rootId)?.modelConfig).toEqual(operatorPool);
       expect(liveRootPool(restarted)).toEqual(operatorPool);
       expect(modelSetEvents()).toHaveLength(1);
-    });
-
-    it("keeps an upgraded database on the tuple its last boot wrote, not the tuple the file now says", async () => {
-      // Before #333 every boot wrote the file tuple onto the root row, so a
-      // database upgraded across this change already carries one — this is
-      // the common case, not the operator-pool one: boot once on the old
-      // file, edit the file, boot again.
-      const first = await boot();
-      expect(first.actors.get(rootId)?.modelConfig).toEqual([bootTuple]);
-      await shutdownFn?.();
-      shutdownFn = undefined;
-      writeFileSync(
-        join(homeDir, "config.yaml"),
-        toYaml(portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "low" })),
-        "utf8"
-      );
-      logCapture.lines.length = 0;
-
-      const restarted = await boot();
-
-      expect(restarted.actors.get(rootId)?.modelConfig).toEqual([bootTuple]);
-      expect(liveRootPool(restarted)).toEqual([bootTuple]);
-      expect(modelSetEvents()).toHaveLength(0);
-      expect(bootRecords("root_model_config_file_ignored")).toMatchObject([
-        {
-          level: "warn",
-          configured: "antigravity:Gemini 4.1 Ultra @ low",
-          persisted: "antigravity:Gemini 3.7 Flash @ high",
-        },
-      ]);
     });
 
     // Define or redefine a model class, touching `model_classes` and nothing
@@ -9265,21 +9393,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         },
       ]);
       expect(readRootModelConfigRow()).toEqual({ schemaVersion: 4, modelClass: "frontier" });
-    });
-
-    it("does not replace a persisted pool with a changed scalar rootActor tuple", async () => {
-      await persistOperatorPool();
-      writeFileSync(
-        join(homeDir, "config.yaml"),
-        toYaml(portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "high" })),
-        "utf8"
-      );
-
-      const mesh = await boot();
-
-      expect(mesh.actors.get(rootId)?.modelConfig).toEqual(operatorPool);
-      expect(liveRootPool(mesh)).toEqual(operatorPool);
-      expect(modelSetEvents()).toHaveLength(1);
     });
 
     // `runWithPoolFallback` is the production boundary that resolves the
@@ -9411,49 +9524,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
 
-    it("seeds a root record with no persisted pool from the configured tuple without a model-set event", async () => {
-      // The legacy root thread from beforeEach carries no model fields: the
-      // upgrade path lands a record with no pool, the same as a fresh install.
-      const mesh = await boot();
-
-      expect(mesh.actors.get(rootId)?.modelConfig).toEqual([bootTuple]);
-      expect(liveRootPool(mesh)).toEqual([bootTuple]);
-      expect(modelSetEvents()).toHaveLength(0);
-      expect(bootRecords("root_model_config_resolved")).toMatchObject([{ source: "bootstrap" }]);
-      expect(bootRecords("root_model_config_file_ignored")).toEqual([]);
-    });
-
-    it("seeds a session-only legacy home's minted root from the configured tuple", async () => {
-      // A fresh store synthesizes no actor (#1003); only a legacy home whose
-      // root kept just a session still gets its configured actor minted.
-      rmSync(join(homeDir, "threads.json"));
-      clearLegacyConfiguredGrants();
-      mkdirSync(join(homeDir, "root-agent"), { recursive: true });
-      writeFileSync(
-        join(homeDir, "root-agent", "session.json"),
-        JSON.stringify({ sessionId: "root-session" })
-      );
-
-      const mesh = await boot();
-
-      const roots = mesh.actors.list().filter((record) => record.parentId === null);
-      expect(roots).toHaveLength(1);
-      expect(roots[0]?.modelConfig).toEqual([bootTuple]);
-      expect(liveRootPool(mesh)).toEqual([bootTuple]);
-      expect(
-        getRepositories().meshEvents.listEventsByActors([roots[0]?.id ?? ""], {
-          kinds: ["actor_model_set"],
-          limit: 20,
-        }).events
-      ).toHaveLength(0);
-    });
-
     it("refuses to boot on a persisted pool that no longer validates, leaving the row untouched", async () => {
       await persistOperatorPool();
       // The operator pool leads with claude; drop claude from `providers` so
       // the persisted value can no longer be run. Falling back to the file
       // would boot successfully — and that is the outcome that must not happen.
-      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      const config = portableRootConfig();
       writeFileSync(
         join(homeDir, "config.yaml"),
         toYaml({ ...config, providers: { antigravity: config.providers.antigravity } }),
@@ -9483,7 +9559,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           level: "error",
           error: "RootModelConfigStartupError",
           reason: expect.stringMatching(/provider "claude" is not configured/),
-          action: expect.stringMatching(/clear the root row's model_config/),
+          action: expect.stringMatching(/replace the root row's model_config/),
         },
       ]);
       // Nothing rewrote the persisted pool on the way out.
@@ -9498,7 +9574,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       mesh.setActorModel(rootId, [{ provider: "claude", model: "claude-sonnet-5" }], rootId);
       await shutdownFn?.();
       shutdownFn = undefined;
-      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      const config = portableRootConfig();
       writeFileSync(
         join(homeDir, "config.yaml"),
         toYaml({
@@ -9572,7 +9648,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -9654,7 +9729,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -9726,7 +9800,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot", repos: ["custom-org/custom-repo"] },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -9777,7 +9850,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -9847,7 +9919,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -9918,7 +9989,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null", gchat: "all" },
         geminiApiKey: "fake-gemini-key",
       }),
@@ -9970,31 +10040,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("rehydrates active workers on boot and retires unresolvable ones without blocking others", async () => {
-    // Write the legacy file directly to simulate the one-time upgrade path on boot.
-    const threads = {
-      threads: [
-        legacyRootThread,
-        {
-          id: "t1",
-          charter: "bad rehydrate worker",
-          parentId: rootId,
-          provider: "unconfigured-provider",
-          model: "some-model",
-          status: "active",
-          createdAt: "2026-01-01T00:00:00Z",
-        },
-        {
-          id: "t2",
-          charter: "good rehydrate worker",
-          parentId: rootId,
-          provider: "antigravity",
-          effort: "high",
-          status: "active",
-          createdAt: "2026-01-01T00:00:00Z",
-        },
-      ],
-    };
-    writeFileSync(join(homeDir, "threads.json"), JSON.stringify(threads), "utf8");
+    upsertWorker({
+      id: "t1",
+      charter: "bad rehydrate worker",
+      modelConfig: [{ provider: "unconfigured-provider", model: "some-model" }],
+    });
+    upsertWorker({
+      id: "t2",
+      charter: "good rehydrate worker",
+      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+    });
 
     let mesh: ActorMesh | undefined;
 
@@ -10039,7 +10094,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         toYaml({
           github: { account: "mock-bot" },
           providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
           geminiApiKey: "fake-gemini-key",
           sandbox: configSandbox,
         }),
@@ -10047,7 +10101,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
     }
     // A database a pre-#550 binary left: root and a worker, no execution_config.
-    rmSync(join(homeDir, "threads.json"));
+    clearDatabase();
     mkdirSync(join(homeDir, "data"), { recursive: true });
     const legacy = new Database(join(homeDir, "data", "mesh.db"));
     runMigrations(legacy, { throughId: "0055_run_prompts" });
@@ -10060,12 +10114,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     insert.run(rootId, rootId, null, pool, "2026-01-01T00:00:00.000Z");
     insert.run("lead", "lead tasks", rootId, pool, "2026-01-01T00:01:00.000Z");
+    runMigrations(legacy, { throughId: "0060_configured_actor_import" });
+    legacy
+      .prepare(
+        "INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id) VALUES (?, ?, ?, ?)"
+      )
+      .run("config.yaml:rootActor", "2026-01-01T00:00:00.000Z", 1, rootId);
     legacy.close();
 
     let mesh: ActorMesh | undefined;
     await new Promise<void>((resolve) => {
       runStart({
         e2e: {
+          // The harness names its actor explicitly; the receipt does not (#1261).
+          harnessActor: { id: rootId },
           onReady: (handles) => {
             mesh = handles.mesh;
             shutdownFn = handles.shutdown;
@@ -10095,7 +10157,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(live.opts.sandbox, `${id} sandbox parity`).toBe(expectedWorkerSandbox(stored));
     }
 
-    // The configured root retains the existing e2e harness exception: it is
+    // The harness-selected actor retains the e2e harness exception: it is
     // sandboxed in both modes. Worker deployment mapping above remains unchanged.
     expect((booted.get(rootId) as unknown as { opts: { sandbox?: boolean } }).opts.sandbox).toBe(
       true
@@ -10105,11 +10167,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // boot-time intent on every start.
     expect(booted.actors.get(rootId)?.executionConfig).toEqual({ unsandboxed: true });
     // runStart cannot boot a non-e2e root here, so the production pairing is
-    // asserted on the helpers the composition reads: a created row stores the
-    // intent, and the builder flag is derived from whatever the row stores.
-    const productionRoot = rootExecutionIntent({ e2eMode: false });
-    expect(productionRoot.executionConfig).toEqual({ unsandboxed: true });
-    for (const stored of [productionRoot.executionConfig, {}, { unsandboxed: false }]) {
+    // asserted on the helper the composition reads: the builder flag is
+    // derived from whatever the row stores.
+    for (const stored of [{ unsandboxed: true }, {}, { unsandboxed: false }]) {
       expect(
         configuredActorSandbox({
           e2eMode: false,
@@ -10146,36 +10206,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         followers: { bind: "127.0.0.1", port, tokenFile },
         peers: [{ id: "mac-mini", type: "follower" }],
       }),
       "utf8"
     );
 
-    // Make SQLite, rather than the retired JSON importer, the source of the
-    // record that `runStart` restores. The follower is deliberately absent
-    // during rehydrateAll, which must leave this active record retryable.
-    rmSync(join(homeDir, "threads.json"));
-    initDb(homeDir);
-    getRepositories().actors.upsert({
-      id: rootId,
-      charter: "root",
-      parentId: null,
-      executionConfig: { unsandboxed: true },
-      status: "active",
-      createdAt: "2026-09-07T00:00:00.000Z",
-    });
-    getRepositories().actors.upsert({
+    // Make SQLite the source of the record that `runStart` restores.
+    // The follower is deliberately absent during rehydrateAll, which must leave
+    // this active record retryable.
+    patchRootActor({ executionConfig: { unsandboxed: true } });
+    upsertWorker({
       id: "placed-worker",
       charter: "wait for the Mac follower",
-      parentId: rootId,
-      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash (High)" }],
+      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
       executionConfig: { executionTarget: "mac-mini" },
-      status: "active",
       createdAt: "2026-09-07T00:01:00.000Z",
     });
-    closeDb();
 
     let mesh: ActorMesh | undefined;
     await new Promise<void>((resolve) => {
@@ -10371,7 +10418,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // recovered run responsive (#568). The dispatch is accepted, which it is
     // only because that durable work is there to find.
     expect(dispatchSpy).toHaveBeenCalledWith("placed-worker");
-    expect(dispatchSpy.mock.results.some((r) => r.value === true)).toBe(true);
+    const dispatched = await Promise.all(dispatchSpy.mock.results.map((r) => r.value));
+    expect(dispatched).toContain(true);
 
     // The follower's poll receives both the re-attached actor's fresh init
     // and the retired actor's stop command to prevent runtime orphaning
@@ -10548,18 +10596,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       null,
       2
     );
-    writeFileSync(join(legacyDir, "root.json"), legacyBytes, "utf8");
+    writeFileSync(join(legacyDir, `${rootId}.json`), legacyBytes, "utf8");
+    patchRootActor({ context: { type: "portable", mode: "brief" } });
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          context: { type: "portable", mode: "brief" },
-        },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -10585,7 +10628,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       (name) => name.startsWith("portable-context.imported-") && name.endsWith(".bak")
     );
     expect(backups).toHaveLength(1);
-    expect(readFileSync(join(homeDir, backups[0] ?? "", "root.json"), "utf8")).toBe(legacyBytes);
+    expect(readFileSync(join(homeDir, backups[0] ?? "", `${rootId}.json`), "utf8")).toBe(
+      legacyBytes
+    );
 
     const rootActor = mesh.get(rootId);
     if (!rootActor) throw new Error("root actor not ready");
@@ -10663,7 +10708,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -10735,7 +10779,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -11060,7 +11103,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" }, codex: { cliCommand: "codex" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -11334,11 +11376,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-        },
         elevenlabsApiKey: "fake-elevenlabs-key",
         voice: {
           supportedVoices: [
@@ -11378,11 +11415,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-        },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -11419,11 +11451,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const baseConfig = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash",
-        effort: "high",
-      },
       geminiApiKey: "fake-gemini-key",
       elevenlabsApiKey: "fake-elevenlabs-key",
       voice: {
@@ -11470,11 +11497,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-        },
         geminiApiKey: "fake-gemini-key",
         voice: {
           supportedVoices: [
@@ -11540,22 +11562,17 @@ describe("runStart webhook event routing (Phase 4)", () => {
       (actor as { opts: { mcpServers: McpSpec[] } }).opts.mcpServers;
 
     const withWorker = (workerId: string): void => {
-      writeFileSync(
-        join(homeDir, "threads.json"),
-        JSON.stringify({
-          threads: [
-            legacyRootThread,
-            {
-              id: workerId,
-              charter: "composition worker",
-              parentId: rootId,
-              status: "active",
-              createdAt: "2026-09-25T00:00:00.000Z",
-            },
-          ],
-        }),
-        "utf8"
-      );
+      withMeshDb((db) => {
+        new SqliteActorRepository(db).upsert({
+          id: workerId,
+          charter: "composition worker",
+          parentId: rootId,
+          status: "active",
+          createdAt: "2026-09-25T00:00:00.000Z",
+          executionConfig: { unsandboxed: false },
+          displayHandle: workerId,
+        });
+      });
     };
 
     const writeConfig = (extra: Record<string, unknown>): void => {
@@ -11564,7 +11581,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         toYaml({
           github: { account: "mock-bot" },
           providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
           geminiApiKey: "fake-gemini-key",
           ...extra,
         }),
@@ -11892,9 +11908,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     it("provides root-free scoped writes and obligation authority in memory across restart", async () => {
       clearLegacyConfiguredGrants();
-      rmSync(join(homeDir, "threads.json"));
+      withMeshDb((db) => {
+        db.prepare("DELETE FROM legacy_import_receipts").run();
+        db.prepare("DELETE FROM actors").run();
+      });
+      rmSync(join(homeDir, "threads.json"), { force: true });
       writeConfig({
-        rootActor: undefined,
         chat: { ...chatConfig.chat, gchat: ["spaces/A"] },
       });
       const chatClient = new FakeChatClient();
@@ -12473,13 +12492,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
       writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
       writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
+      patchRootActor({ displayHandle: "slack-root" });
       writeConfig({
-        rootActor: {
-          provider: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-          handle: "slack-root",
-        },
         slack: {
           botTokenPath: join(secretsDir, "slack-bot-token"),
           appTokenPath: join(secretsDir, "slack-app-token"),

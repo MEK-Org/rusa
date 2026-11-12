@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { HeadClosureQuery } from "../actor/head-closure.js";
 import { attachChatContext, type InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import type { ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import { attachInboxHints, type SelectedInboxEntry } from "../actor/inbox-hints.js";
@@ -7,6 +8,7 @@ import {
   attachOpenQuestions,
   type InboxOpenQuestionSources,
 } from "../actor/inbox-open-questions.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -30,8 +32,13 @@ export interface InboxMcpRunScope {
   select: (entryIds: string[], obligationId?: string) => InboxEntry[] | SelectedInboxRun;
   selected: () => readonly string[];
   onHandled?: () => void;
-  /** Refuse entries whose selected head obligation is not yet closed (#828). */
-  assertHandleable?: (entryIds: readonly string[]) => void;
+  /**
+   * The closure question entries must pass before they are marked handled
+   * (#828), or null when they are attention for no armed head. The writer
+   * decides it inside the transaction that marks them (#1289); a scope that
+   * cannot ask it throws instead, so the mark fails closed.
+   */
+  closureFor?: (entryIds: readonly string[]) => HeadClosureQuery | null;
   /** Explicit walkie authority hides and fences ordinary work for this actor. */
   isVoiceSessionActive?: () => boolean;
   /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
@@ -40,9 +47,19 @@ export interface InboxMcpRunScope {
   openQuestions?: InboxOpenQuestionSources;
 }
 
+/**
+ * Where the inbox tools read, and the writer their marks go through (#1289):
+ * the one the process shares, so their effects keep commit order with every
+ * other converted write.
+ */
+export interface InboxMcpStore {
+  readonly inbox: InboxRepository;
+  readonly writer: Pick<MeshObligationWriter, "write">;
+}
+
 /** Actor-bound durable notification tools. The model never supplies actor_id. */
 export function createInboxMcpServer(
-  store: InboxRepository,
+  { inbox: store, writer }: InboxMcpStore,
   actorId: string,
   runScope?: InboxMcpRunScope
 ): McpServer {
@@ -195,10 +212,21 @@ export function createInboxMcpServer(
         if (unselected.length > 0) {
           throw new Error(`entries must be selected in this run: ${unselected.join(", ")}`);
         }
-        scope.assertHandleable?.(ids);
-        const entries = store.markHandled(actorId, ids, undefined, note);
+        // Closure is decided with the mark, in one transaction, so no write
+        // can land between the verdict and the entries it lets through.
+        const result = await writer.write("inbox.markHandled", {
+          actorId,
+          entryIds: ids,
+          note,
+          closure: scope.closureFor?.(ids) ?? null,
+        });
+        if (result.refused) {
+          throw new Error(
+            `Cannot mark handled: ${result.refused.map((shortfall) => shortfall.message).join(" ")}`
+          );
+        }
         scope.onHandled?.();
-        return toolOk({ entries });
+        return toolOk({ entries: result.entries });
       } catch (err) {
         return toolError(err);
       }

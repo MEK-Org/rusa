@@ -14,7 +14,6 @@ import {
 const baseConfig = {
   github: { account: "mock-bot" },
   providers: { antigravity: { cliCommand: "agy" } },
-  rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
 } as unknown as RusaConfig;
 
 const withObservability = (observability: RusaConfig["observability"]): RusaConfig =>

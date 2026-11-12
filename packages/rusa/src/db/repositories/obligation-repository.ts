@@ -324,6 +324,38 @@ export interface ReadyHeadChange {
   sequence: number;
 }
 
+export const OBLIGATION_MUTATION_EFFECT = "obligations.mutation";
+
+/**
+ * Everything one committed mutation owes its listeners and the host scheduler
+ * (#1289), as plain data so a writer can hand it across a thread boundary and
+ * deliver it on the main thread in commit order. See
+ * {@link ObligationRepository.deliverMutationEffect}.
+ */
+export interface ObligationMutationEffect {
+  kind: typeof OBLIGATION_MUTATION_EFFECT;
+  actingPrincipal: EntityId;
+  readyHeadChanges: ReadyHeadChange[];
+  cancellationAttention: PrerequisiteAttention[];
+  /** Ids that became ready or newly resolved responsive; delivery re-reads them. */
+  responsiveReadyIds: string[];
+  /** Each owner's ready head after the commit, as `[ownerId, headId]`. */
+  afterHeads: [string, string][];
+  statusChanges: ObligationStatusChange["changes"];
+  /** Obligations whose host timer must be reconciled with the committed row. */
+  scheduleIds: string[];
+}
+
+/**
+ * The slice of a write operation's context a repository needs (#1289): where
+ * to hand each committed mutation's effect, and a hook that runs only once
+ * the operation's transaction has committed.
+ */
+export interface ObligationWriteContext {
+  emit(effect: ObligationMutationEffect): void;
+  afterCommit(callback: () => void): void;
+}
+
 export interface ObligationPage {
   obligations: Obligation[];
   total: number;
@@ -755,8 +787,12 @@ export class ObligationRepository {
    *
    * TEMP, so the capture table is per-connection scratch that cannot outlive the
    * process or collide between them, and so it needs no migration of its own.
+   *
+   * Public so a writer can install it once, outside any transaction, when it is
+   * built (#1289). Every write operation runs inside a transaction, where an
+   * install is not trusted to stand and so would be repeated per operation.
    */
-  private installHistoryCapture(): void {
+  installHistoryCapture(): void {
     if (this.historyCaptureInstalled) return;
     this.db.exec(`
       CREATE TEMP TABLE IF NOT EXISTS obligation_history_delta (
@@ -822,7 +858,10 @@ export class ObligationRepository {
         );
       END;
     `);
-    this.historyCaptureInstalled = true;
+    // Created inside a caller's transaction, the table and trigger are undone
+    // if it rolls back, as every rejected write-worker operation does (#1289).
+    // Re-creating them is idempotent, so trust them only once they stand alone.
+    this.historyCaptureInstalled = !this.db.inTransaction;
   }
 
   /**
@@ -844,12 +883,13 @@ export class ObligationRepository {
       for (const id of ids) {
         try {
           this.reconcileObligationSchedule(id);
+          this.scheduleErrors.delete(id);
         } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.scheduleErrors.set(id, message);
           failed.push(id);
           console.warn(
-            `[obligations] retry failed to reconcile scheduled activation for ${id}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
+            `[obligations] retry failed to reconcile scheduled activation for ${id}: ${message}`
           );
         }
       }
@@ -857,17 +897,30 @@ export class ObligationRepository {
     }, 0);
   }
 
+  /**
+   * Recorded whether or not this repository has a scheduler: in a write
+   * operation the scheduler belongs to the main thread that delivers the
+   * mutation's effect (#1289), and without one delivery's reconcile is a no-op.
+   */
   private markScheduleDirty(id: string): void {
-    if (this.scheduler) this.dirtyScheduleIds.add(id);
+    this.dirtyScheduleIds.add(id);
   }
 
   /**
-   * The scheduling failures of the most recent `mutate()` flush, by obligation.
-   * Replaced on every flush, so a caller reading it right after its own
-   * mutation learns whether *that* write's host timer armed — never a failure
-   * left behind by an earlier, unrelated write.
+   * Why each obligation's host timer failed to arm at its latest post-commit
+   * reconcile, including the bounded in-process retries; an id is removed when
+   * a reconcile or retry succeeds. A mutation always
+   * reconciles the ids it marked, so a caller reading this right after its own
+   * write is delivered learns whether *that* write's timer armed (or the state a
+   * later write of the same obligation left) — never a failure left behind by
+   * an earlier write that a later reconcile has since replaced.
    */
-  private lastFlushScheduleErrors = new Map<string, string>();
+  private scheduleErrors = new Map<string, string>();
+
+  /** See {@link scheduleErrors}. */
+  scheduleErrorFor(id: string): string | null {
+    return this.scheduleErrors.get(id) ?? null;
+  }
 
   /** Re-derive `id`'s OS scheduler job from its committed row. */
   private reconcileObligationSchedule(id: string): void {
@@ -988,6 +1041,15 @@ export class ObligationRepository {
    * after a mutation commits, so a rollback cannot consume a sequence.
    */
   private previousHeadSequences = new Map<string, number>();
+
+  /**
+   * Sequences taken by the current write operation's mutations (#1289), moved
+   * into {@link previousHeadSequences} only once its transaction commits.
+   */
+  private uncommittedSequences = new Map<string, number>();
+
+  /** Set while {@link inWriteOperation} runs. */
+  private writeContext: ObligationWriteContext | undefined;
 
   /**
    * Supply the actor-existence probe after construction.
@@ -1320,6 +1382,7 @@ export class ObligationRepository {
     if (this.isMutating) {
       throw new Error("ObligationRepository.mutate cannot be called re-entrantly");
     }
+    const context = this.writeContext;
     const changes: ReadyHeadChange[] = [];
     const committedSequences = new Map<string, number>();
     this.dirtyScheduleIds.clear();
@@ -1377,7 +1440,7 @@ export class ObligationRepository {
       for (const ownerId of before.keys()) {
         if (!after.has(ownerId) && this.isActorOwner(ownerId)) {
           const previousHeadId = before.get(ownerId) ?? null;
-          const sequence = (this.previousHeadSequences.get(ownerId) ?? 0) + 1;
+          const sequence = this.nextHeadSequence(ownerId, context);
           committedSequences.set(ownerId, sequence);
           changes.push({
             ownerId,
@@ -1396,7 +1459,7 @@ export class ObligationRepository {
         const head = this.get(headId);
         if (!head) continue;
 
-        const sequence = (this.previousHeadSequences.get(ownerId) ?? 0) + 1;
+        const sequence = this.nextHeadSequence(ownerId, context);
         committedSequences.set(ownerId, sequence);
         changes.push({ ownerId, epoch: this.readyHeadEpoch, head, previousHeadId, sequence });
       }
@@ -1413,7 +1476,7 @@ export class ObligationRepository {
         const head = this.get(headId);
         if (!head) continue;
 
-        const sequence = (this.previousHeadSequences.get(ownerId) ?? 0) + 1;
+        const sequence = this.nextHeadSequence(ownerId, context);
         committedSequences.set(ownerId, sequence);
         changes.push({
           ownerId,
@@ -1427,15 +1490,99 @@ export class ObligationRepository {
       return res;
     })();
 
+    const effect: ObligationMutationEffect = {
+      kind: OBLIGATION_MUTATION_EFFECT,
+      actingPrincipal,
+      readyHeadChanges: changes,
+      cancellationAttention: this.pendingCancellationAttention,
+      responsiveReadyIds: this.pendingResponsiveReady,
+      afterHeads: [...afterHeads],
+      statusChanges: this.pendingStatusChanges,
+      scheduleIds: [...this.dirtyScheduleIds],
+    };
+    this.pendingCancellationAttention = [];
+    this.pendingResponsiveReady = [];
+    this.pendingStatusChanges = [];
+    this.dirtyScheduleIds.clear();
+
+    if (context) {
+      for (const [ownerId, sequence] of committedSequences) {
+        this.uncommittedSequences.set(ownerId, sequence);
+      }
+      context.emit(effect);
+      return result;
+    }
     // A rolled-back mutation must not consume a sequence. Once committed, a
     // later listener failure can only leave a safe gap in the dedupe keys.
     for (const [ownerId, sequence] of committedSequences) {
       this.previousHeadSequences.set(ownerId, sequence);
     }
+    this.deliverMutationEffect(effect);
+    return result;
+  }
+
+  /**
+   * The sequence the next ready-head change for `ownerId` takes. Inside a
+   * write operation an earlier mutation of the same operation may have taken
+   * one that is not committed yet.
+   */
+  private nextHeadSequence(ownerId: string, context: ObligationWriteContext | undefined): number {
+    const latest =
+      (context ? this.uncommittedSequences.get(ownerId) : undefined) ??
+      this.previousHeadSequences.get(ownerId) ??
+      0;
+    return latest + 1;
+  }
+
+  /**
+   * Run `work` as part of a write operation (#1289): every mutation it makes
+   * hands its committed consequences to `context.emit` as one
+   * {@link ObligationMutationEffect} instead of delivering them, and the
+   * ready-head sequences it consumes are kept only once the operation's
+   * transaction commits, so a rolled-back operation consumes none. The writer
+   * that ran the operation delivers each effect through
+   * {@link deliverMutationEffect} on the main thread.
+   */
+  inWriteOperation<T>(context: ObligationWriteContext, work: () => T): T {
+    if (this.writeContext) {
+      throw new Error("ObligationRepository.inWriteOperation cannot be nested");
+    }
+    // Left behind only by an operation that rolled back.
+    this.uncommittedSequences.clear();
+    context.afterCommit(() => {
+      for (const [ownerId, sequence] of this.uncommittedSequences) {
+        this.previousHeadSequences.set(ownerId, sequence);
+      }
+      this.uncommittedSequences.clear();
+    });
+    this.writeContext = context;
+    try {
+      return work();
+    } finally {
+      this.writeContext = undefined;
+    }
+  }
+
+  /**
+   * Deliver one committed mutation's consequences to this repository's
+   * listeners and scheduler, in the order a mutation outside a write operation
+   * delivers them itself: ready-head changes, cancellation attention,
+   * responsive-ready attention, status changes, then host timers. The
+   * attention and timer steps re-read committed rows, so this must run after
+   * the commit, on any connection that can see it. A listener failure is
+   * logged and kept for retry from committed state on a later delivery; it
+   * never throws, because the write it describes has already committed.
+   */
+  deliverMutationEffect(effect: ObligationMutationEffect): void {
+    if (effect.kind !== OBLIGATION_MUTATION_EFFECT) {
+      throw new Error(`not an obligation mutation effect: ${String(effect.kind)}`);
+    }
+    const actingPrincipal = effect.actingPrincipal;
+    const afterHeads = new Map(effect.afterHeads);
 
     const listener = this.readyHeadListener;
     if (listener) {
-      for (const change of changes) {
+      for (const change of effect.readyHeadChanges) {
         try {
           listener(change);
         } catch (err) {
@@ -1450,7 +1597,7 @@ export class ObligationRepository {
 
     const cancellationAttentionListener = this.cancellationAttentionListener;
     if (cancellationAttentionListener) {
-      const toDeliver = [...this.pendingCancellationAttention];
+      const toDeliver = [...effect.cancellationAttention];
       const queuedKeys = new Set(toDeliver.map((a) => this.cancellationAttentionKey(a)));
 
       // A prior mutation's delivery may have thrown (e.g. a transient inbox
@@ -1487,12 +1634,11 @@ export class ObligationRepository {
         }
       }
     }
-    this.pendingCancellationAttention = [];
 
     const responsiveReadyListener = this.responsiveReadyListener;
     if (responsiveReadyListener) {
       const toDeliver = new Map<string, { obligation: Obligation; actingPrincipal: EntityId }>();
-      for (const id of new Set(this.pendingResponsiveReady)) {
+      for (const id of new Set(effect.responsiveReadyIds)) {
         const obligation = this.get(id);
         if (!obligation) continue;
         if (!isReadyForAttention(obligation) || !obligation.effectiveResponsive) continue;
@@ -1538,10 +1684,8 @@ export class ObligationRepository {
         }
       }
     }
-    this.pendingResponsiveReady = [];
 
-    const statusChanges = this.pendingStatusChanges;
-    this.pendingStatusChanges = [];
+    const statusChanges = effect.statusChanges;
     const statusChangeListener = this.statusChangeListener;
     if (statusChangeListener && statusChanges.length > 0) {
       try {
@@ -1554,24 +1698,21 @@ export class ObligationRepository {
     // OS scheduler side effects run only now, against the state the
     // transaction actually committed — never inside it, where a later
     // rollback couldn't take them back with it.
-    const toReconcile = Array.from(this.dirtyScheduleIds);
-    this.dirtyScheduleIds.clear();
-    const scheduleErrors = new Map<string, string>();
-    for (const id of toReconcile) {
+    const failed: string[] = [];
+    for (const id of effect.scheduleIds) {
       try {
         this.reconcileObligationSchedule(id);
+        this.scheduleErrors.delete(id);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        scheduleErrors.set(id, message);
+        this.scheduleErrors.set(id, message);
+        failed.push(id);
         console.warn(
           `[obligations] failed to reconcile scheduled activation for ${id}: ${message}`
         );
       }
     }
-    this.lastFlushScheduleErrors = scheduleErrors;
-    this.scheduleReconcileRetry([...scheduleErrors.keys()]);
-
-    return result;
+    this.scheduleReconcileRetry(failed);
   }
 
   /**
@@ -3728,43 +3869,44 @@ export class ObligationRepository {
   }
 
   /**
+   * Refuse a snooze nothing could end (#722), before anything is written:
+   * no scheduler is attached to this process (the standalone dashboard), or
+   * the host is known to lack `at`. Clearing (`until = null`) needs no timer and
+   * is always allowed. Callers run this on the main thread, which owns the
+   * scheduler, and then submit {@link writeSnooze} as a writer operation (#1289).
+   */
+  assertSnoozeSchedulable(until: string | null): void {
+    const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
+    if (snoozedUntil === null) return;
+    if (!this.scheduler) {
+      throw new SnoozeTimerUnavailableError(
+        "cannot snooze: this process has no host activation scheduler attached, so nothing would end the snooze"
+      );
+    }
+    if (!this.scheduler.canScheduleAt()) {
+      throw new SnoozeTimerUnavailableError(
+        "cannot snooze: this host has no working `at` scheduler, so nothing would end the snooze"
+      );
+    }
+  }
+
+  /**
    * Set, replace, or clear (`until = null`) an obligation's snooze (#722).
    *
    * Authorization belongs to the calling surface: snoozing is owner-only, and
-   * this method cannot tell an owner from anyone else. The deadline is
-   * normalized to UTC and must be in the future; rewriting the current value is
-   * a no-op. A snooze keeps the underlying status and every dependency and
-   * parent block. Setting one where nothing could end it — no scheduler is
-   * attached to this process (the standalone dashboard), or the host is known
-   * to lack `at` — is refused with {@link SnoozeTimerUnavailableError} before
-   * anything is written. Clearing needs no timer and is always allowed.
+   * this method cannot tell an owner from anyone else. The caller has already
+   * run {@link assertSnoozeSchedulable}. The deadline is normalized to UTC and
+   * must be in the future; rewriting the current value changes no row. A snooze
+   * keeps the underlying status and every dependency and parent block.
    *
-   * Returns the committed obligation, plus `scheduleError` when this call's
-   * write committed but its host timer did not arm. The mutation retries the
-   * timer in-process and boot reconciliation re-derives it, but the caller
-   * learns now rather than from a snooze that silently never ends. An identical
-   * rewrite changes no row but still re-derives the timer, so it doubles as a
-   * retry whose `scheduleError` reports the timer's current state.
+   * The host timer is reconciled when the mutation's effect is delivered; read
+   * its outcome with {@link scheduleErrorFor}, so the caller learns now rather
+   * than from a snooze that silently never ends. An identical rewrite still
+   * re-derives the timer, so it doubles as a retry.
    */
-  setSnooze(
-    id: string,
-    until: string | null,
-    principal: EntityId
-  ): { obligation: Obligation; scheduleError: string | null } {
+  writeSnooze(id: string, until: string | null, principal: EntityId): Obligation {
     const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
-    if (snoozedUntil !== null) {
-      if (!this.scheduler) {
-        throw new SnoozeTimerUnavailableError(
-          "cannot snooze: this process has no host activation scheduler attached, so nothing would end the snooze"
-        );
-      }
-      if (!this.scheduler.canScheduleAt()) {
-        throw new SnoozeTimerUnavailableError(
-          "cannot snooze: this host has no working `at` scheduler, so nothing would end the snooze"
-        );
-      }
-    }
-    const obligation = this.mutate(principal, () => {
+    return this.mutate(principal, () => {
       const existing = this.require(id);
       if (isTerminalObligationStatus(existing.status)) {
         throw new ObligationValidationError("terminal obligations cannot be snoozed");
@@ -3783,7 +3925,6 @@ export class ObligationRepository {
       }
       return this.require(id);
     });
-    return { obligation, scheduleError: this.lastFlushScheduleErrors.get(id) ?? null };
   }
 
   /**

@@ -9,4 +9,6 @@ export interface ActorChannel extends EventEmitter {
   exitCode: number | null;
   signalCode: NodeJS.Signals | null;
   send(message: LeaderCommand, callback: (error: Error | null) => void): boolean;
+  /** Whether the channel's exit is attributable to an active follower update restart. */
+  isUpdateRestart?: () => boolean;
 }
