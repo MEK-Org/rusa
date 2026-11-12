@@ -6,7 +6,7 @@ import { generateHandle } from "../actor/handle-generator.js";
 import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { resolveConfiguredActor } from "../db/configured-actor-import.js";
-import { getRepositories, initDb } from "../db/index.js";
+import { getMeshWriter, getRepositories, initDb } from "../db/index.js";
 import { collectConfigSecrets, collectEnvSecrets } from "../observability/log-secrets.js";
 import { createLogger } from "../observability/logger.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
@@ -83,6 +83,7 @@ ${"━".repeat(26)}
       meshEvents: getRepositories().meshEvents,
       meshChat: getRepositories().meshChat,
       obligations: getRepositories().obligations,
+      obligationWriter: getMeshWriter(),
       portableContext: getRepositories().portableContext,
       referenceCache,
       // No mesh runs here, so this emitter never fires live_output; it exists so

@@ -18,6 +18,7 @@ import {
   readAvatar,
   uploadAvatar,
 } from "../avatar/avatars.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
 import { DbReadUnavailableError } from "../db/read-pool.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
@@ -100,6 +101,12 @@ export interface DashboardDataDeps {
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
+  /**
+   * Where obligation writes go (#1289): the process's one writer over the
+   * same database as {@link obligations}. Absent → obligation writes are
+   * unavailable.
+   */
+  obligationWriter?: MeshObligationWriter;
   /**
    * Standalone reads served off the main thread (#1289). Absent → the same
    * operations run in-process against {@link obligations} and {@link inbox}.
@@ -1795,12 +1802,13 @@ async function routeMeshApiRequest(
     // POST /api/mesh/obligations — create obligation
     if (pathname === "/api/mesh/obligations") {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1841,14 +1849,16 @@ async function routeMeshApiRequest(
           const creatorId = requireOperatorPrincipal(req, res, deps);
           if (!creatorId) return;
           try {
-            const obligation = obligations.create({
-              ownerId: owner.ownerId,
-              parentId,
-              title,
-              intent,
-              externalRef,
-              priority,
-              creatorId,
+            const obligation = await writer.write("obligations.create", {
+              obligation: {
+                ownerId: owner.ownerId,
+                parentId,
+                title,
+                intent,
+                externalRef,
+                priority,
+                creatorId,
+              },
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
@@ -1863,13 +1873,14 @@ async function routeMeshApiRequest(
     const statusMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/status$/);
     if (statusMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(statusMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1903,13 +1914,13 @@ async function routeMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.setTerminalStatus(
+            const obligation = await writer.write("obligations.setTerminalStatus", {
               id,
               status,
               note,
               resolutionRef,
-              actingPrincipal
-            );
+              principal: actingPrincipal,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1925,13 +1936,14 @@ async function routeMeshApiRequest(
     const snoozeMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/snooze$/);
     if (snoozeMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(snoozeMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1962,7 +1974,16 @@ async function routeMeshApiRequest(
             return;
           }
           try {
-            const { obligation, scheduleError } = obligations.setSnooze(id, until, actingPrincipal);
+            obligations.assertSnoozeSchedulable(until);
+            // Refused if the obligation changed hands since the check above.
+            const obligation = await writer.write("obligations.setSnooze", {
+              id,
+              until,
+              principal: actingPrincipal,
+              expectedOwnerId: actingPrincipal,
+            });
+            // Read after the write's effects were delivered, which armed the timer.
+            const scheduleError = obligations.scheduleErrorFor(id);
             sendJson(res, 200, {
               ok: true,
               obligation,
@@ -1975,7 +1996,12 @@ async function routeMeshApiRequest(
           } catch (err) {
             // No timer here could end the snooze (the standalone dashboard
             // attaches none): the service is unavailable, not the request bad.
-            const status = err instanceof SnoozeTimerUnavailableError ? 503 : 400;
+            const status =
+              err instanceof SnoozeTimerUnavailableError
+                ? 503
+                : err instanceof Error && err.name === "ObligationChangedError"
+                  ? 409
+                  : 400;
             sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -1988,13 +2014,14 @@ async function routeMeshApiRequest(
     const externalRefMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/external-ref$/);
     if (externalRefMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(externalRefMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2026,10 +2053,12 @@ async function routeMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            sendJson(res, 200, {
-              ok: true,
-              obligation: obligations.setExternalRef(id, externalRef, actingPrincipal),
+            const obligation = await writer.write("obligations.setExternalRef", {
+              id,
+              ref: externalRef,
+              principal: actingPrincipal,
             });
+            sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
@@ -2042,13 +2071,14 @@ async function routeMeshApiRequest(
     const reorderMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reorder$/);
     if (reorderMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(reorderMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2076,13 +2106,13 @@ async function routeMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.movePriorityInternal(
+            const obligation = await writer.write("obligations.movePriority", {
               id,
               previousId,
               nextId,
-              actingPrincipal,
-              scope
-            );
+              principal: actingPrincipal,
+              scope,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -2096,13 +2126,14 @@ async function routeMeshApiRequest(
     const reparentMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reparent$/);
     if (reparentMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(reparentMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2126,7 +2157,11 @@ async function routeMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reparent(id, parentId, actingPrincipal);
+            const obligation = await writer.write("obligations.reparent", {
+              id,
+              parentId,
+              principal: actingPrincipal,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -2140,13 +2175,14 @@ async function routeMeshApiRequest(
     const reassignMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reassign$/);
     if (reassignMatch) {
       const obligations = deps?.obligations;
-      if (!obligations) {
+      const writer = deps?.obligationWriter;
+      if (!obligations || !writer) {
         sendJson(res, 503, { error: "obligations data unavailable" });
         return true;
       }
       const id = decodeURIComponent(reassignMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -2181,7 +2217,12 @@ async function routeMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal, message);
+            const obligation = await writer.write("obligations.reassign", {
+              id,
+              ownerId: owner.ownerId,
+              principal: actingPrincipal,
+              message,
+            });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

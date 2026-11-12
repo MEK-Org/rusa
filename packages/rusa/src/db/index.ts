@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { InstanceRole } from "../config/types.js";
+import { createInProcessMeshWriter, type MeshObligationWriter } from "./mesh-write-operations.js";
 import { runMigrations } from "./migrations/runner.js";
 import {
   createFollowerRepositories,
@@ -15,6 +16,7 @@ let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
 let followerRepositories: FollowerRepositories | null = null;
 let currentRepositoriesRole: InstanceRole | null = null;
+let meshWriter: MeshObligationWriter | null = null;
 
 export type TaskStatus = "queued" | "in_progress" | "done" | "blocked";
 
@@ -108,6 +110,18 @@ export function getRepositories(
 }
 
 /**
+ * The leader's one writer (#1289), over the main connection and the leader's
+ * repositories. Every converted caller shares it: one writer is what keeps
+ * their notifications in commit order.
+ */
+export function getMeshWriter(): MeshObligationWriter {
+  if (!meshWriter) {
+    meshWriter = createInProcessMeshWriter(getDb(), { obligations: getRepositories().obligations });
+  }
+  return meshWriter;
+}
+
+/**
  * Close the database connection.
  */
 export function closeDb(): void {
@@ -118,6 +132,7 @@ export function closeDb(): void {
   repositories = null;
   followerRepositories = null;
   currentRepositoriesRole = null;
+  meshWriter = null;
 }
 
 const SQLITE_UTC_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z?$/;

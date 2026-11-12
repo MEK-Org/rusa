@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeScheduledMessagePayload } from "../actor/os-scheduler.js";
 import { FakeChatClient } from "../chat/fake.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -893,7 +893,7 @@ describe("McpHttpServer", () => {
       let deliveredId = "";
       http.setWakeObligationHandler({
         token: TOKEN,
-        deliver: (id) => {
+        deliver: async (id) => {
           deliveredId = id;
         },
       });
@@ -904,8 +904,40 @@ describe("McpHttpServer", () => {
       expect(deliveredId).toBe("123");
     });
 
+    it("answers only once the wake's write settles, and 500s when it fails (#1289)", async () => {
+      let settle: (() => void) | undefined;
+      let answered = false;
+      http.setWakeObligationHandler({
+        token: TOKEN,
+        deliver: () =>
+          new Promise<void>((resolve) => {
+            settle = resolve;
+          }),
+      });
+      const pending = post({
+        body: "id=123",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      }).then((resp) => {
+        answered = true;
+        return resp;
+      });
+      await vi.waitFor(() => expect(settle).toBeDefined());
+      expect(answered).toBe(false);
+      settle?.();
+      expect((await pending).status).toBe(200);
+
+      http.setWakeObligationHandler({
+        token: TOKEN,
+        deliver: async () => {
+          throw new Error("write failed");
+        },
+      });
+      const failed = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(failed.status).toBe(500);
+    });
+
     it("401s on bad token", async () => {
-      http.setWakeObligationHandler({ token: TOKEN, deliver: () => {} });
+      http.setWakeObligationHandler({ token: TOKEN, deliver: async () => {} });
       const resp = await post({ body: "id=123", headers: { authorization: "Bearer bad" } });
       expect(resp.status).toBe(401);
     });

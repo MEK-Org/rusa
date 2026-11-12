@@ -6,10 +6,17 @@ import type { WorkerMessage, WorkerRequest } from "./worker-pool.js";
  * connection, and `emit`, which records an effect for the main thread to
  * deliver once the operation has committed. An operation that throws rolls
  * back, and the effects it emitted are dropped with it.
+ *
+ * `afterCommit` registers a callback that runs on the writing side once the
+ * transaction has committed, and never if it rolls back or its commit fails,
+ * so a repository can keep in-memory state, such as a sequence it handed out,
+ * only for writes that landed. A callback must not throw: it runs after the
+ * commit, so a throw would report a committed write as failed.
  */
 export interface WriteContext<R, E> {
   readonly repos: R;
   emit(effect: E): void;
+  afterCommit(callback: () => void): void;
 }
 
 /**
@@ -95,8 +102,14 @@ export function runWriteOperation<R, E>(
   const operation = Object.hasOwn(operations, op) ? operations[op] : undefined;
   if (!operation) throw new Error(`unknown write operation: ${op}`);
   const effects: E[] = [];
-  const context: WriteContext<R, E> = { repos, emit: (effect) => effects.push(effect) };
+  const committed: (() => void)[] = [];
+  const context: WriteContext<R, E> = {
+    repos,
+    emit: (effect) => effects.push(effect),
+    afterCommit: (callback) => committed.push(callback),
+  };
   const result = db.transaction(() => operation(context, input as never)).immediate();
+  for (const callback of committed) callback();
   return { result, effects };
 }
 

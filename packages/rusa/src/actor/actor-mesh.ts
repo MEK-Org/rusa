@@ -14,6 +14,7 @@ import {
   type ObligationStatus,
   prerequisiteEdgeKey,
 } from "../obligations/obligation.js";
+import { canManageObligation } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   assertConcreteModelConfig,
@@ -75,6 +76,7 @@ import {
   EXPERIMENT_ADMIN_CAPABILITY,
   HOST_GLOBAL_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
+  OBLIGATIONS_ADMIN_CAPABILITY,
   OPERATOR_PROVISIONED_CAPABILITIES,
 } from "./administrative-capabilities.js";
 import {
@@ -5831,6 +5833,19 @@ export class ActorMesh {
   /** The live actor for an id, if any. */
   get(id: string): MeshActor | undefined {
     return this.runs.liveActor(this.resolveThreadId(id));
+  }
+
+  /**
+   * Whether `callerId` may manage an obligation owned by `obligation.ownerId`
+   * through the obligations MCP: it holds an active obligations-admin grant,
+   * or it is the owner or one of the owner's ancestors. Decided from the
+   * grants and actor tree as they stand at the call.
+   */
+  canManageObligation(callerId: string, obligation: Pick<Obligation, "ownerId">): boolean {
+    return (
+      this.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
+      canManageObligation(callerId, obligation, this.isAncestorOf.bind(this))
+    );
   }
 
   /** True if `ancestorId` is `id` itself or any ancestor up the ownership tree. */

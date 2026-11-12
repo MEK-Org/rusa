@@ -41,6 +41,8 @@ const mockAvailabilityHolds = vi.hoisted(() => ({
   list: vi.fn((_options?: { now?: number }): AvailabilityHold[] => []),
 }));
 
+const mockMeshWriter = vi.hoisted(() => ({ write: vi.fn() }));
+
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
   getRepositories: vi.fn(() => ({
@@ -56,6 +58,7 @@ const mockDbModule = vi.hoisted(() => ({
     legacyImportReceipts: mockReceipts,
     availabilityHolds: mockAvailabilityHolds,
   })),
+  getMeshWriter: vi.fn(() => mockMeshWriter),
 }));
 
 const mockLegacyImport = vi.hoisted(() => ({
@@ -105,7 +108,11 @@ describe("runDashboard", () => {
     expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
       expect.objectContaining({
         port: 8080,
-        mesh: expect.objectContaining({ meshEvents: expect.anything() }),
+        mesh: expect.objectContaining({
+          meshEvents: expect.anything(),
+          // Obligation writes go through the process's one writer (#1289).
+          obligationWriter: mockMeshWriter,
+        }),
       })
     );
     expect(openMock.default).toHaveBeenCalledWith("http://localhost:8080");

@@ -1,3 +1,4 @@
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
@@ -10,13 +11,9 @@ import {
 export type CompletionMatcherEvaluation = "satisfied" | "pending" | "unchecked" | "closed_unmerged";
 
 export interface CompletionMatcherEvaluatorDeps {
-  obligations: Pick<
-    ObligationRepository,
-    | "get"
-    | "listLiveCompletionMatchers"
-    | "satisfyCompletionMatcher"
-    | "recordCompletionMatcherClosedUnmerged"
-  >;
+  obligations: Pick<ObligationRepository, "get" | "listLiveCompletionMatchers">;
+  /** Where the matcher transitions are written (#1289). */
+  writer: Pick<MeshObligationWriter, "write">;
   issueClient: Pick<IssueClient, "getPullRequestDetails">;
   deployedSha: () => string;
   isAncestor: (ancestor: string, descendant: string) => Promise<boolean>;
@@ -105,9 +102,9 @@ export class CompletionMatcherEvaluator {
       if (matcher === null) continue;
       try {
         if (input.merged) {
-          this.satisfyPr(obligation, matcher, input.number);
+          await this.satisfyPr(obligation, matcher, input.number);
         } else {
-          this.recordClosedUnmerged(obligation, matcher);
+          await this.recordClosedUnmerged(obligation, matcher);
         }
       } catch (error) {
         // Boot reconciliation re-reads the PR, so a failed write here is
@@ -127,11 +124,11 @@ export class CompletionMatcherEvaluator {
     try {
       const details = await this.deps.issueClient.getPullRequestDetails(target.repo, target.number);
       if (details.merged === true) {
-        this.satisfyPr(obligation, matcher, target.number);
+        await this.satisfyPr(obligation, matcher, target.number);
         return "satisfied";
       }
       if (details.state.toLowerCase() === "closed") {
-        this.recordClosedUnmerged(obligation, matcher);
+        await this.recordClosedUnmerged(obligation, matcher);
         return "closed_unmerged";
       }
       return "pending";
@@ -170,24 +167,42 @@ export class CompletionMatcherEvaluator {
       return "pending";
     }
     const resolutionRef = `github:${this.deps.repository}/commits/${deployed}`;
-    this.deps.obligations.satisfyCompletionMatcher(obligation.id, matcherKey(matcher), {
-      resolutionRef,
-      note: `Completion matcher satisfied: instance ${this.deps.instanceName} running ${deployed.slice(0, 7)} contains ${matcher.target.slice(0, 7)}`,
+    await this.deps.writer.write("obligations.satisfyCompletionMatcher", {
+      id: obligation.id,
+      expected: matcherKey(matcher),
+      satisfaction: {
+        resolutionRef,
+        note: `Completion matcher satisfied: instance ${this.deps.instanceName} running ${deployed.slice(0, 7)} contains ${matcher.target.slice(0, 7)}`,
+      },
     });
     return "satisfied";
   }
 
-  private satisfyPr(obligation: Obligation, matcher: CompletionMatcher, number: number): void {
-    this.deps.obligations.satisfyCompletionMatcher(obligation.id, matcherKey(matcher), {
-      resolutionRef: matcher.target,
-      note: `Completion matcher satisfied: PR #${number} merged`,
+  private async satisfyPr(
+    obligation: Obligation,
+    matcher: CompletionMatcher,
+    number: number
+  ): Promise<void> {
+    await this.deps.writer.write("obligations.satisfyCompletionMatcher", {
+      id: obligation.id,
+      expected: matcherKey(matcher),
+      satisfaction: {
+        resolutionRef: matcher.target,
+        note: `Completion matcher satisfied: PR #${number} merged`,
+      },
     });
   }
 
-  private recordClosedUnmerged(obligation: Obligation, matcher: CompletionMatcher): void {
-    const current = this.deps.obligations.recordCompletionMatcherClosedUnmerged(
-      obligation.id,
-      matcherKey(matcher)
+  private async recordClosedUnmerged(
+    obligation: Obligation,
+    matcher: CompletionMatcher
+  ): Promise<void> {
+    const current = await this.deps.writer.write(
+      "obligations.recordCompletionMatcherClosedUnmerged",
+      {
+        id: obligation.id,
+        expected: matcherKey(matcher),
+      }
     );
     if (!current?.completionMatcher?.closedUnmergedAt) return;
     // The durable fact is committed first. The notice is keyed by matcher
