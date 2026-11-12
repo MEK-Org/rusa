@@ -19,7 +19,9 @@ import { z } from "zod";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { CAPABILITY_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
 import type { CustomMcpServerConfig } from "../config/types.js";
+import { memoryGrantWriter } from "../db/fixtures/memory-grant-writer.js";
 import type { Logger } from "../observability/logger.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
@@ -800,6 +802,11 @@ describe("configured MCP service through the mesh grant boundary", () => {
       actors,
       rootId: "admin",
       capabilityGrants: grantStore,
+      writer: memoryGrantWriter({
+        actors,
+        grants: grantStore,
+        experiments: new InMemoryExperimentEnrollmentStore(),
+      }),
       grantableCapabilities: new Set(servers.keys()),
       customMcpUserIds: new Map([["glass_goals", config.userId]]),
       onCapabilityRevoked: (actorId, capability) =>
@@ -846,12 +853,12 @@ describe("configured MCP service through the mesh grant boundary", () => {
       "glass_goals:configured-user:admin",
       "glass_goals:configured-user:read:extra",
     ]) {
-      expect(() => mesh.grantCapability("reader", malformed, "admin")).toThrow(
+      await expect(mesh.grantCapability("reader", malformed, "admin")).rejects.toThrow(
         /glass_goals:configured-user:read or glass_goals:configured-user:write/
       );
     }
     expect(mesh.activeCapabilitiesFor("reader")).toEqual([]);
-    mesh.grantCapability("reader", "glass_goals:configured-user:read", "admin");
+    await mesh.grantCapability("reader", "glass_goals:configured-user:read", "admin");
 
     await mcpHttp.start();
     const token = randomBytes(32).toString("hex");

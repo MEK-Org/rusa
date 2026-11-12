@@ -72,8 +72,6 @@ import {
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   ACTOR_ADMIN_CAPABILITY,
-  CAPABILITY_ADMIN_CAPABILITY,
-  EXPERIMENT_ADMIN_CAPABILITY,
   HOST_GLOBAL_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
   OBLIGATIONS_ADMIN_CAPABILITY,
@@ -81,6 +79,7 @@ import {
 } from "./administrative-capabilities.js";
 import {
   type CapabilityGrantStore,
+  type CapabilityPolicy,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
@@ -109,6 +108,7 @@ import {
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
 } from "./experiments.js";
+import { assertGrantAuthority, type GrantAuthorityReader } from "./grant-authority.js";
 import { generateHandle } from "./handle-generator.js";
 import {
   type HeadClosureQuery,
@@ -772,6 +772,15 @@ interface ActorMeshBaseOptions {
    */
   capabilityGrants?: CapabilityGrantStore;
   /**
+   * Authority no grant row records (#1087): the default actor's role-derived
+   * capabilities, and the grantor whose rows confer nothing. Grant and
+   * experiment writes decide authority from it plus the transaction's grant
+   * rows (#1289 D1), so it must describe the same view as
+   * {@link capabilityGrants}' `activeFor`; the wiring builds both from one
+   * policy. Without it, every active grant row counts.
+   */
+  capabilityPolicy?: () => CapabilityPolicy;
+  /**
    * Durable store of per-actor experiment enrollments (#394). Defaults to an
    * in-memory store; the wiring supplies the SQLite-backed one, which is what
    * makes an enrollment survive a restart. Only an `experiment-admin` holder
@@ -987,6 +996,7 @@ export class ActorMesh {
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
+  private readonly capabilityPolicy: () => CapabilityPolicy | null;
   private readonly experimentRegistry: ExperimentRegistry;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
@@ -1107,6 +1117,7 @@ export class ActorMesh {
     this.validateContext = opts.validateContext;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
+    this.capabilityPolicy = opts.capabilityPolicy ?? (() => null);
     this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
@@ -3475,61 +3486,22 @@ export class ActorMesh {
   }
 
   /**
-   * Grantor authorization for {@link grantCapability}/{@link revokeCapability}.
-   * A `capability-admin` holder may grant/revoke anything grantable within its
-   * own subtree (itself included); a host-global capability is refused before
-   * this runs, for every grantor. Any other grantor may only touch
-   * capabilities in {@link PARENT_GRANTABLE_CAPABILITIES} and only where the
-   * grantee is its DIRECT child (the repository's `parentId` edge). Enforced
-   * HERE — the mesh layer — not just at the tool layer, so the invariant holds
-   * for any future caller. Fail-closed: an unknown grantor holds nothing.
+   * The grant and experiment authority checks' reads, as this mesh sees them
+   * now. The writes decide authority again inside their transaction; this
+   * view only orders a refusal ahead of checks that would otherwise disclose
+   * something to an unauthorized caller.
    */
-  private assertGrantAuthority(
-    grantorId: string,
-    granteeId: string,
-    capability: string,
-    verb: "grant" | "revoke"
-  ): void {
-    const grantee = this.actors.get(granteeId);
-    if (!grantee) {
-      throw new Error(`unknown thread id: ${granteeId}`);
-    }
-    if (this.hasActiveCapability(grantorId, CAPABILITY_ADMIN_CAPABILITY)) {
-      if (!this.isAncestorOf(grantorId, granteeId)) {
-        throw new Error(
-          `${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
-        );
-      }
-      return;
-    }
-    let baseCapability = capability;
-    if (capability.startsWith("chat-write:")) {
-      baseCapability = "chat-write";
-    } else if (capability.startsWith("calendar-read:")) {
-      baseCapability = "calendar-read";
-    } else if (capability.startsWith("calendar-write:")) {
-      baseCapability = "calendar-write";
-    } else if (capability.startsWith("email-send:")) {
-      baseCapability = "email-send";
-    } else if (capability.startsWith("drive-read:")) {
-      baseCapability = "drive-read";
-    }
-    // Secret capabilities are deliberately NOT reduced to their `secret` base
-    // here: a non-root parent may delegate only the exact
-    // `secret:<filename>` names in the allow-list (#542 security review), so a
-    // guessed infrastructure filename never rides through on the prefix.
-    if (!PARENT_GRANTABLE_CAPABILITIES.has(baseCapability)) {
-      throw new Error(
-        `only a ${CAPABILITY_ADMIN_CAPABILITY} holder may ${verb} ${capability}; a parent without it may only ${verb}: ${
-          [...PARENT_GRANTABLE_CAPABILITIES].join(", ") || "none"
-        }`
-      );
-    }
-    if (grantee.parentId !== grantorId) {
-      throw new Error(
-        `without ${CAPABILITY_ADMIN_CAPABILITY}, an actor may only ${verb} ${capability} to/from its direct children; ${granteeId} is not a child of ${grantorId}`
-      );
-    }
+  private grantAuthorityReader(): GrantAuthorityReader {
+    return {
+      actor: (id) => this.actors.get(id),
+      capabilities: (id) => this.grants.activeFor(id),
+    };
+  }
+
+  /** The writer, which every grant and experiment write goes through (#1289 D1). */
+  private requireWriter(): Pick<MeshObligationWriter, "write"> {
+    if (!this.writer) throw new Error("this mesh has no writer configured");
+    return this.writer;
   }
 
   /**
@@ -3544,7 +3516,7 @@ export class ActorMesh {
    * on a live actor's next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
-  grantCapability(actorId: string, capability: string, grantedBy: string): void {
+  async grantCapability(actorId: string, capability: string, grantedBy: string): Promise<void> {
     actorId = this.resolveThreadId(actorId);
     grantedBy = this.resolveThreadId(grantedBy);
     if (!actorId.trim()) throw new Error("actorId is required");
@@ -3625,12 +3597,23 @@ export class ActorMesh {
         `not a grantable capability: ${capability} (grantable: ${[...this.grantable].join(", ") || "none"})`
       );
     }
-    this.assertGrantAuthority(grantedBy, actorId, capability, "grant");
+    // Decided here first so an unauthorized grantor is refused before the
+    // secret check below can tell it whether a secret file exists. The write
+    // decides it again against its own transaction, which is what counts.
+    assertGrantAuthority(this.grantAuthorityReader(), {
+      grantorId: grantedBy,
+      granteeId: actorId,
+      capability,
+      verb: "grant",
+    });
     if (baseCapability === "secret") {
       const secretFilename = capability.slice("secret:".length);
       assertSecretContainment(secretFilename, this.secretsDir);
     }
-    this.grants.grant({ actorId, capability, grantedBy, grantedAt: this.now() });
+    await this.requireWriter().write("grants.grant", {
+      grant: { actorId, capability, grantedBy, grantedAt: this.now() },
+      policy: this.capabilityPolicy(),
+    });
     this.recordEvent({
       kind: "capability_granted",
       actorId,
@@ -3666,8 +3649,13 @@ export class ActorMesh {
         `${capability} is provisioned only by an authenticated operator; actor-facing revocations cannot change it`
       );
     }
-    this.assertGrantAuthority(revokedBy, actorId, capability, "revoke");
-    this.grants.revoke(actorId, capability, this.now());
+    await this.requireWriter().write("grants.revoke", {
+      actorId,
+      capability,
+      revokedBy,
+      at: this.now(),
+      policy: this.capabilityPolicy(),
+    });
     this.recordEvent({ kind: "capability_revoked", actorId, detail: capability });
     if (this.onCapabilityRevoked) {
       try {
@@ -3684,7 +3672,7 @@ export class ActorMesh {
    * column on `actors`.
    *
    * Authorized by the `experiment-admin` capability over the caller's own
-   * subtree (see {@link assertExperimentAuthority}). Enrollment is strictly post-spawn — the actor must
+   * subtree, decided inside the write. Enrollment is strictly post-spawn — the actor must
    * already exist — and a retired actor is refused, matching
    * {@link setActorModel}: enrolling a thread that is not going to run again
    * records an intent nothing will ever read.
@@ -3696,25 +3684,25 @@ export class ActorMesh {
    * Only a real change records an event. Throws if the experiment is not
    * registered, the actor is unknown or retired, or the caller lacks authority.
    */
-  enrollActorInExperiment(
+  async enrollActorInExperiment(
     actorId: string,
     experiment: string,
     enrolledBy: string
-  ): ExperimentEnrollmentChange {
+  ): Promise<ExperimentEnrollmentChange> {
     actorId = this.resolveThreadId(actorId);
     enrolledBy = this.resolveThreadId(enrolledBy);
     const name = assertKnownExperiment(experiment, this.experimentRegistry);
-    const record = this.assertExperimentAuthority(enrolledBy, actorId, "enroll");
-    if (record.status === "retired") {
-      throw new Error(`Cannot enroll a retired thread: ${actorId}`);
-    }
     const enrollment: ExperimentEnrollment = {
       actorId,
       experiment: name,
       enrolledBy,
       enrolledAt: this.now(),
     };
-    if (!this.experiments.enroll(enrollment)) return { actorId, changed: false };
+    const changed = await this.requireWriter().write("experiments.enroll", {
+      enrollment,
+      policy: this.capabilityPolicy(),
+    });
+    if (!changed) return { actorId, changed: false };
     this.recordEvent({
       kind: "experiment_enrolled",
       actorId,
@@ -3741,15 +3729,20 @@ export class ActorMesh {
    * without requiring manual SQL. The event's `detail` is then the stored
    * name, which no consumer checks against the registry.
    */
-  unenrollActorFromExperiment(
+  async unenrollActorFromExperiment(
     actorId: string,
     experiment: string,
     unenrolledBy: string
-  ): ExperimentEnrollmentChange {
+  ): Promise<ExperimentEnrollmentChange> {
     actorId = this.resolveThreadId(actorId);
     unenrolledBy = this.resolveThreadId(unenrolledBy);
-    this.assertExperimentAuthority(unenrolledBy, actorId, "unenroll");
-    if (!this.experiments.unenroll(actorId, experiment)) return { actorId, changed: false };
+    const changed = await this.requireWriter().write("experiments.unenroll", {
+      actorId,
+      experiment,
+      unenrolledBy,
+      policy: this.capabilityPolicy(),
+    });
+    if (!changed) return { actorId, changed: false };
     this.recordEvent({
       kind: "experiment_unenrolled",
       actorId,
@@ -3788,38 +3781,6 @@ export class ActorMesh {
     if (!actorId) return enrollments;
     const targetId = this.resolveThreadId(actorId);
     return enrollments.filter((enrollment) => enrollment.actorId === targetId);
-  }
-
-  /**
-   * Authority for experiment administration (#394, #549): an `experiment-admin`
-   * holder, over its own subtree (itself included), and only for an actor that
-   * exists. Fail-closed — an unknown caller holds nothing — and enforced HERE
-   * rather than only at the tool layer, so the boundary holds for any future
-   * caller. Returns the target's record, which both callers need next.
-   */
-  private assertExperimentAuthority(
-    callerId: string,
-    actorId: string,
-    verb: "enroll" | "unenroll"
-  ): ActorRecord {
-    const preposition = verb === "enroll" ? "in" : "from";
-    if (!this.hasActiveCapability(callerId, EXPERIMENT_ADMIN_CAPABILITY)) {
-      throw new Error(
-        `only an ${EXPERIMENT_ADMIN_CAPABILITY} holder may ${verb} an actor ${preposition} an experiment`
-      );
-    }
-    const record = this.actors.get(actorId);
-    if (!record) {
-      throw new Error(`unknown thread id: ${actorId}`);
-    }
-    // Holding the capability is not reach: another top-level tree is a legal
-    // shape this holder must not administer. `isAncestorOf` admits the holder itself.
-    if (!this.isAncestorOf(callerId, actorId)) {
-      throw new Error(
-        `${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
-      );
-    }
-    return record;
   }
 
   /** Every grant, active and revoked — for the `list_grants` tool + audit. */

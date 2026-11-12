@@ -6,6 +6,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { assembleConfiguredPortableInjection } from "../commands/start.js";
+import {
+  type GrantWriteRepos,
+  isGrantWrite,
+  memoryGrantWriter,
+  runGrantWrite,
+} from "../db/fixtures/memory-grant-writer.js";
 import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import {
@@ -98,6 +104,7 @@ import {
   InMemoryEventSourceSubscriptionStore,
   parentOf,
 } from "./event-subscriptions.js";
+import { InMemoryExperimentEnrollmentStore } from "./experiments.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import { GracefulShutdown } from "./graceful-shutdown.js";
@@ -410,9 +417,14 @@ const meshRegistries = new WeakMap<ActorMesh, TestActors>();
 function memoryMeshWriter(
   inbox: InboxRepository,
   actors: TestActors,
-  closure: ObligationRepository | undefined
+  closure: ObligationRepository | undefined,
+  stores: Omit<GrantWriteRepos, "actors"> = {
+    grants: new InMemoryCapabilityGrantStore(),
+    experiments: new InMemoryExperimentEnrollmentStore(),
+  }
 ): Pick<MeshObligationWriter, "write"> {
   const write = async (op: string, input: unknown): Promise<unknown> => {
+    if (isGrantWrite(op)) return runGrantWrite({ actors, ...stores }, op, input);
     switch (op) {
       case "inbox.markSeen": {
         const mark = input as { actorId: string; entryIds: readonly string[] };
@@ -461,6 +473,9 @@ function setup(
     writer?: ActorMeshOptions["writer"];
     /** The obligations the default writer decides head closure over. */
     closure?: ObligationRepository;
+    /** Shared with a test's own `writer`, which must make grants over the same store. */
+    capabilityGrants?: InMemoryCapabilityGrantStore;
+    experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     inboxStore?: InboxRepository;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -525,7 +540,9 @@ function setup(
     resolver: eventSourceResolver,
     log: (m) => logs.push(m),
   });
-  const capabilityGrants = new InMemoryCapabilityGrantStore();
+  const capabilityGrants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
+  const experimentEnrollments =
+    opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
   mesh = new ActorMesh({
     supportedVoices: opts.supportedVoices,
     actors: registry,
@@ -542,6 +559,7 @@ function setup(
     } as PrincipalRepository,
     rootId: opts.rootId ?? "root",
     capabilityGrants,
+    experimentEnrollments,
     handleForId: opts.handleForId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
@@ -555,7 +573,12 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    writer: opts.writer ?? memoryMeshWriter(inboxStore, registry, opts.closure),
+    writer:
+      opts.writer ??
+      memoryMeshWriter(inboxStore, registry, opts.closure, {
+        grants: capabilityGrants,
+        experiments: experimentEnrollments,
+      }),
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
@@ -2867,6 +2890,8 @@ describe("ActorMesh", () => {
         inbox: new SqliteInboxRepository(db),
         actors,
         actorRuns: { completedFocusEntryCounts: () => new Map<string, number>() },
+        grants: new InMemoryCapabilityGrantStore(),
+        experiments: new InMemoryExperimentEnrollmentStore(),
       });
       return {
         create: (obligation: { id: string; title: string; ownerId: string; priority: number }) =>
@@ -2930,13 +2955,17 @@ describe("ActorMesh", () => {
     const actors = new InMemoryActorRepository();
     const repo = new ObligationRepository(db);
     repo.setPrincipalKind((id) => (["root", "actor-b"].includes(id) ? "actor" : undefined));
+    const capabilityGrants = new InMemoryCapabilityGrantStore();
+    const experimentEnrollments = new InMemoryExperimentEnrollmentStore();
     const writer = createInProcessMeshWriter(db, {
       obligations: repo,
       inbox: inboxStore,
       actors,
       actorRuns: { completedFocusEntryCounts: () => new Map<string, number>() },
+      grants: capabilityGrants,
+      experiments: experimentEnrollments,
     });
-    const { mesh } = setup({ inboxStore, actors, writer });
+    const { mesh } = setup({ inboxStore, actors, writer, capabilityGrants, experimentEnrollments });
     repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
       await mesh.deliverReadyHeadAttention(
         ownerId,
@@ -6292,9 +6321,15 @@ describe("ActorMesh", () => {
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
+    const grants = capabilityAdminFor("root");
     const mesh = new ActorMesh({
       actors: registry,
-      capabilityGrants: capabilityAdminFor("root"),
+      capabilityGrants: grants,
+      writer: memoryGrantWriter({
+        actors: registry,
+        grants,
+        experiments: new InMemoryExperimentEnrollmentStore(),
+      }),
       createActor: () => ({}) as unknown as Actor,
       onCapabilityRevoked: (actorId, capability) => {
         revoked.push([actorId, capability]);
@@ -6306,7 +6341,7 @@ describe("ActorMesh", () => {
     expect(revoked).toEqual([["iu-thread", "understanding-write"]]);
   });
 
-  it("a grant triggers the live-mount hook after the grant is active", () => {
+  it("a grant triggers the live-mount hook after the grant is active", async () => {
     const mounted: Array<[string, string, string[]]> = [];
     const registry = new InMemoryActorRepository();
     registry.upsert({
@@ -6324,9 +6359,15 @@ describe("ActorMesh", () => {
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
+    const grants = capabilityAdminFor("root");
     const mesh = new ActorMesh({
       actors: registry,
-      capabilityGrants: capabilityAdminFor("root"),
+      capabilityGrants: grants,
+      writer: memoryGrantWriter({
+        actors: registry,
+        grants,
+        experiments: new InMemoryExperimentEnrollmentStore(),
+      }),
       createActor: () => ({}) as unknown as Actor,
       grantableCapabilities: new Set(["understanding-write"]),
       onCapabilityGranted: (actorId, capability) => {
@@ -6334,14 +6375,14 @@ describe("ActorMesh", () => {
       },
     });
 
-    mesh.grantCapability("iu-thread", "understanding-write", "root");
+    await mesh.grantCapability("iu-thread", "understanding-write", "root");
     expect(mounted).toEqual([["iu-thread", "understanding-write", ["understanding-write"]]]);
   });
 
   // ── Grantor authorization : root grants anything grantable; a non-root
   // parent grants/revokes only PARENT_GRANTABLE secrets, only to direct children.
 
-  it("root grants any grantable capability to any actor (unchanged), audited with peerId = grantor", () => {
+  it("root grants any grantable capability to any actor (unchanged), audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
     const { mesh, registry } = setup({
       events: (e) => events.push(e),
@@ -6354,7 +6395,7 @@ describe("ActorMesh", () => {
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
-    mesh.grantCapability("iu-thread", "understanding-write", "root");
+    await mesh.grantCapability("iu-thread", "understanding-write", "root");
     expect(mesh.activeCapabilitiesFor("iu-thread")).toEqual(["understanding-write"]);
     expect(events.find((e) => e.kind === "capability_granted")).toMatchObject({
       actorId: "iu-thread",
@@ -6363,7 +6404,7 @@ describe("ActorMesh", () => {
     });
   });
 
-  it("requires calendar-read grants to name an explicit calendar ID", () => {
+  it("requires calendar-read grants to name an explicit calendar ID", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["calendar-read"]),
     });
@@ -6375,24 +6416,24 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() => mesh.grantCapability("iu-thread", "calendar-read", "root")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "calendar-read", "root")).rejects.toThrow(
       "bare calendar-read grant is not allowed"
     );
-    expect(() => mesh.grantCapability("iu-thread", "calendar-read:", "root")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "calendar-read:", "root")).rejects.toThrow(
       "bare calendar-read grant is not allowed"
     );
-    expect(() => mesh.grantCapability("iu-thread", "calendar-read:account:", "root")).toThrow(
-      "calendar-read grant must specify"
-    );
-    mesh.grantCapability("iu-thread", "calendar-read:person@example.com", "root");
-    mesh.grantCapability("iu-thread", "calendar-read:account:a@example.com", "root");
+    await expect(
+      mesh.grantCapability("iu-thread", "calendar-read:account:", "root")
+    ).rejects.toThrow("calendar-read grant must specify");
+    await mesh.grantCapability("iu-thread", "calendar-read:person@example.com", "root");
+    await mesh.grantCapability("iu-thread", "calendar-read:account:a@example.com", "root");
     expect(mesh.activeCapabilitiesFor("iu-thread")).toEqual([
       "calendar-read:person@example.com",
       "calendar-read:account:a@example.com",
     ]);
   });
 
-  it("requires calendar-write grants to name an explicit calendar ID", () => {
+  it("requires calendar-write grants to name an explicit calendar ID", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["calendar-write"]),
     });
@@ -6404,17 +6445,17 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() => mesh.grantCapability("iu-thread", "calendar-write", "root")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "calendar-write", "root")).rejects.toThrow(
       "bare calendar-write grant is not allowed"
     );
-    expect(() => mesh.grantCapability("iu-thread", "calendar-write:", "root")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "calendar-write:", "root")).rejects.toThrow(
       "bare calendar-write grant is not allowed"
     );
-    mesh.grantCapability("iu-thread", "calendar-write:person@example.com", "root");
+    await mesh.grantCapability("iu-thread", "calendar-write:person@example.com", "root");
     expect(mesh.activeCapabilitiesFor("iu-thread")).toEqual(["calendar-write:person@example.com"]);
   });
 
-  it("requires email-send grants to name an explicit recipient", () => {
+  it("requires email-send grants to name an explicit recipient", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["email-send"]),
     });
@@ -6426,17 +6467,17 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() => mesh.grantCapability("iu-thread", "email-send", "root")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "email-send", "root")).rejects.toThrow(
       "bare email-send grant is not allowed"
     );
-    expect(() => mesh.grantCapability("iu-thread", "email-send:", "root")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "email-send:", "root")).rejects.toThrow(
       "bare email-send grant is not allowed"
     );
-    mesh.grantCapability("iu-thread", "email-send:person@example.com", "root");
+    await mesh.grantCapability("iu-thread", "email-send:person@example.com", "root");
     expect(mesh.activeCapabilitiesFor("iu-thread")).toEqual(["email-send:person@example.com"]);
   });
 
-  it("allows bare drive-read grants as well as scoped folder grants", () => {
+  it("allows bare drive-read grants as well as scoped folder grants", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["drive-read"]),
     });
@@ -6448,15 +6489,15 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    mesh.grantCapability("iu-thread", "drive-read", "root");
-    mesh.grantCapability("iu-thread", "drive-read:some-folder", "root");
+    await mesh.grantCapability("iu-thread", "drive-read", "root");
+    await mesh.grantCapability("iu-thread", "drive-read:some-folder", "root");
     expect(mesh.activeCapabilitiesFor("iu-thread")).toEqual([
       "drive-read",
       "drive-read:some-folder",
     ]);
   });
 
-  it("requires a space name for chat-write grants", () => {
+  it("requires a space name for chat-write grants", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["chat-write"]),
     });
@@ -6468,18 +6509,18 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() => mesh.grantCapability("worker-thread", "chat-write", "root")).toThrow(
+    await expect(mesh.grantCapability("worker-thread", "chat-write", "root")).rejects.toThrow(
       "bare chat-write grant is not allowed"
     );
-    expect(() => mesh.grantCapability("worker-thread", "chat-write:", "root")).toThrow(
+    await expect(mesh.grantCapability("worker-thread", "chat-write:", "root")).rejects.toThrow(
       "bare chat-write grant is not allowed"
     );
 
-    mesh.grantCapability("worker-thread", "chat-write:spaces/AAQA29JwOwg", "root");
+    await mesh.grantCapability("worker-thread", "chat-write:spaces/AAQA29JwOwg", "root");
     expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual(["chat-write:spaces/AAQA29JwOwg"]);
   });
 
-  it("grants channel-scoped slack-write by its base capability (#1003)", () => {
+  it("grants channel-scoped slack-write by its base capability (#1003)", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["slack-write"]),
     });
@@ -6493,8 +6534,8 @@ describe("ActorMesh", () => {
 
     // The mount path already aggregates `slack-write:<channel>` rows by base;
     // the grant path has to accept them for that mount to be reachable.
-    mesh.grantCapability("worker-thread", "slack-write:*", "root");
-    mesh.grantCapability("worker-thread", "slack-write:C0123456789", "root");
+    await mesh.grantCapability("worker-thread", "slack-write:*", "root");
+    await mesh.grantCapability("worker-thread", "slack-write:C0123456789", "root");
     expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual([
       "slack-write:*",
       "slack-write:C0123456789",
@@ -6510,7 +6551,7 @@ describe("ActorMesh", () => {
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
 
-    mesh.grantCapability(child, "secret:gemini-api-key", parent);
+    await mesh.grantCapability(child, "secret:gemini-api-key", parent);
     expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:gemini-api-key"]);
     expect(events.find((e) => e.kind === "capability_granted")).toMatchObject({
       actorId: child,
@@ -6532,18 +6573,18 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent });
     const grandchild = mesh.spawn({ charter: "grandchild", parentId: child });
 
-    expect(() => mesh.grantCapability(sibling, "secret:gemini-api-key", parent)).toThrow(
+    await expect(mesh.grantCapability(sibling, "secret:gemini-api-key", parent)).rejects.toThrow(
       /direct children/
     );
-    expect(() => mesh.grantCapability(grandchild, "secret:gemini-api-key", parent)).toThrow(
+    await expect(mesh.grantCapability(grandchild, "secret:gemini-api-key", parent)).rejects.toThrow(
       /direct children/
     );
-    expect(() => mesh.grantCapability(parent, "secret:gemini-api-key", parent)).toThrow(
+    await expect(mesh.grantCapability(parent, "secret:gemini-api-key", parent)).rejects.toThrow(
       /direct children/
     );
-    expect(() => mesh.grantCapability("ghost-grantee", "secret:gemini-api-key", parent)).toThrow(
-      "unknown thread id: ghost-grantee"
-    );
+    await expect(
+      mesh.grantCapability("ghost-grantee", "secret:gemini-api-key", parent)
+    ).rejects.toThrow("unknown thread id: ghost-grantee");
     expect(mesh.activeCapabilitiesFor(sibling)).toEqual([]);
     expect(mesh.activeCapabilitiesFor(grandchild)).toEqual([]);
     expect(mesh.activeCapabilitiesFor(parent)).toEqual([]);
@@ -6558,20 +6599,20 @@ describe("ActorMesh", () => {
   });
 
   describe("generic secret capability containment and grant rules", () => {
-    it("rejects bare secret and bare secret: grants", () => {
+    it("rejects bare secret and bare secret: grants", async () => {
       const { mesh } = setup({
         grantableCapabilities: new Set(["secret"]),
       });
       const child = mesh.spawn({ charter: "child", parentId: "root" });
-      expect(() => mesh.grantCapability(child, "secret", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret", "root")).rejects.toThrow(
         /bare secret grant is not allowed/
       );
-      expect(() => mesh.grantCapability(child, "secret:", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret:", "root")).rejects.toThrow(
         /bare secret grant is not allowed/
       );
     });
 
-    it("rejects path traversal, absolute paths, missing files, symlink escapes, and directories", () => {
+    it("rejects path traversal, absolute paths, missing files, symlink escapes, and directories", async () => {
       const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
       const outsideDir = mkdtempSync(join(tmpdir(), "rusa-outside-"));
       writeFileSync(join(outsideDir, "outside-secret"), "outside");
@@ -6586,28 +6627,30 @@ describe("ActorMesh", () => {
       const child = mesh.spawn({ charter: "child", parentId: "root" });
 
       // Path traversal
-      expect(() => mesh.grantCapability(child, "secret:../outside", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret:../outside", "root")).rejects.toThrow(
         /path traversal/
       );
       // Absolute path
-      expect(() => mesh.grantCapability(child, "secret:/etc/passwd", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret:/etc/passwd", "root")).rejects.toThrow(
         /absolute path/
       );
       // Missing file
-      expect(() => mesh.grantCapability(child, "secret:missing-secret", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret:missing-secret", "root")).rejects.toThrow(
         /secret file does not exist/
       );
       // Symlink escape
-      expect(() => mesh.grantCapability(child, "secret:escape-link", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret:escape-link", "root")).rejects.toThrow(
         /escapes secrets directory/
       );
       // Non-regular file (directory)
-      expect(() => mesh.grantCapability(child, "secret:nested-dir", "root")).toThrow(
+      await expect(mesh.grantCapability(child, "secret:nested-dir", "root")).rejects.toThrow(
         /regular file/
       );
 
       // Valid regular file succeeds
-      expect(() => mesh.grantCapability(child, "secret:valid-secret", "root")).not.toThrow();
+      await expect(
+        mesh.grantCapability(child, "secret:valid-secret", "root")
+      ).resolves.not.toThrow();
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:valid-secret"]);
 
       rmSync(customSecretsDir, { recursive: true, force: true });
@@ -6639,7 +6682,7 @@ describe("ActorMesh", () => {
         "secret",
         "secret:",
       ]) {
-        expect(() => mesh.grantCapability(child, guessed, parent)).toThrow(
+        await expect(mesh.grantCapability(child, guessed, parent)).rejects.toThrow(
           /only a capability-admin holder may grant|bare secret grant/
         );
       }
@@ -6647,22 +6690,22 @@ describe("ActorMesh", () => {
       expect(events.filter((e) => e.kind === "capability_granted")).toEqual([]);
       // The refusal is the same whether or not the guessed file exists: a
       // non-root grantor gets no existence oracle over the secrets directory.
-      expect(() => mesh.grantCapability(child, "secret:webhook-secret", parent)).toThrow(
+      await expect(mesh.grantCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
         /only a capability-admin holder may grant secret:webhook-secret/
       );
-      expect(() => mesh.grantCapability(child, "secret:no-such-file", parent)).toThrow(
+      await expect(mesh.grantCapability(child, "secret:no-such-file", parent)).rejects.toThrow(
         /only a capability-admin holder may grant secret:no-such-file/
       );
       // Nor may the parent strip such a grant that root made.
-      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      await mesh.grantCapability(child, "secret:webhook-secret", "root");
       await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
         /only a capability-admin holder may revoke/
       );
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
 
       // The allow-listed LLM keys still delegate exactly as before #542.
-      mesh.grantCapability(child, "secret:gemini-api-key", parent);
-      mesh.grantCapability(child, "secret:mistral-api-key", parent);
+      await mesh.grantCapability(child, "secret:gemini-api-key", parent);
+      await mesh.grantCapability(child, "secret:mistral-api-key", parent);
       expect(mesh.activeCapabilitiesFor(child).sort()).toEqual([
         "secret:gemini-api-key",
         "secret:mistral-api-key",
@@ -6675,7 +6718,7 @@ describe("ActorMesh", () => {
       rmSync(customSecretsDir, { recursive: true, force: true });
     });
 
-    it("root may grant any contained secret, and a delegated LLM-key grant still fails containment when the file is missing", () => {
+    it("root may grant any contained secret, and a delegated LLM-key grant still fails containment when the file is missing", async () => {
       const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
       writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
 
@@ -6686,10 +6729,10 @@ describe("ActorMesh", () => {
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
 
-      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      await mesh.grantCapability(child, "secret:webhook-secret", "root");
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
       // Authorized name, but no such file on this host: containment still gates it.
-      expect(() => mesh.grantCapability(child, "secret:gemini-api-key", parent)).toThrow(
+      await expect(mesh.grantCapability(child, "secret:gemini-api-key", parent)).rejects.toThrow(
         /secret file does not exist/
       );
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
@@ -6707,7 +6750,7 @@ describe("ActorMesh", () => {
       });
       const child = mesh.spawn({ charter: "child", parentId: "root" });
 
-      mesh.grantCapability(child, "secret:ephemeral-secret", "root");
+      await mesh.grantCapability(child, "secret:ephemeral-secret", "root");
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:ephemeral-secret"]);
 
       // Delete file on host
@@ -6727,9 +6770,9 @@ describe("ActorMesh", () => {
     const { mesh } = setup({
       grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
-    expect(() => mesh.grantCapability("ghost-grantee", "understanding-write", "root")).toThrow(
-      "unknown thread id: ghost-grantee"
-    );
+    await expect(
+      mesh.grantCapability("ghost-grantee", "understanding-write", "root")
+    ).rejects.toThrow("unknown thread id: ghost-grantee");
     await expect(
       mesh.revokeCapability("ghost-grantee", "understanding-write", "root")
     ).rejects.toThrow("unknown thread id: ghost-grantee");
@@ -6741,7 +6784,7 @@ describe("ActorMesh", () => {
     });
     const child = mesh.spawn({ charter: "child", parentId: "root" });
 
-    expect(() => mesh.grantCapability(child, OBLIGATIONS_ADMIN_CAPABILITY, "root")).toThrow(
+    await expect(mesh.grantCapability(child, OBLIGATIONS_ADMIN_CAPABILITY, "root")).rejects.toThrow(
       /authenticated operator/
     );
     capabilityGrants.grant({
@@ -6763,7 +6806,7 @@ describe("ActorMesh", () => {
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
 
-    expect(() => mesh.grantCapability(child, "understanding-write", parent)).toThrow(
+    await expect(mesh.grantCapability(child, "understanding-write", parent)).rejects.toThrow(
       /only a capability-admin holder may grant/
     );
     expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
@@ -6772,7 +6815,7 @@ describe("ActorMesh", () => {
     );
   });
 
-  it("an unknown grantor is never root (fail-closed)", () => {
+  it("an unknown grantor is never root (fail-closed)", async () => {
     const { mesh, registry } = setup({
       grantableCapabilities: new Set(["understanding-write"]),
     });
@@ -6783,7 +6826,7 @@ describe("ActorMesh", () => {
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
-    expect(() => mesh.grantCapability("iu-thread", "understanding-write", "ghost")).toThrow(
+    await expect(mesh.grantCapability("iu-thread", "understanding-write", "ghost")).rejects.toThrow(
       /only a capability-admin holder may grant/
     );
   });
@@ -6816,27 +6859,29 @@ describe("ActorMesh", () => {
     });
 
     // Root has grant and revoke authority
-    expect(() => mesh.grantCapability("iu-thread", "understanding-write", "root")).not.toThrow();
+    await expect(
+      mesh.grantCapability("iu-thread", "understanding-write", "root")
+    ).resolves.not.toThrow();
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "root")
     ).resolves.not.toThrow();
 
     // A sandboxed parentless record (ab-rig-holder shape) is refused grant & revoke authority
-    expect(() => mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")).toThrow(
-      /only a capability-admin holder may grant/
-    );
+    await expect(
+      mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")
+    ).rejects.toThrow(/only a capability-admin holder may grant/);
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "ab-rig-holder")
     ).rejects.toThrow(/only a capability-admin holder may revoke/);
 
     // So is a parentless record that runs unsandboxed, as root does: neither
     // topology nor running unsandboxed confers authority
-    expect(() =>
+    await expect(
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
-    ).toThrow(/only a capability-admin holder may grant/);
+    ).rejects.toThrow(/only a capability-admin holder may grant/);
   });
 
-  it("scopes a capability-admin holder's authority to its own subtree; a second parentless root holds none until granted (#549)", () => {
+  it("scopes a capability-admin holder's authority to its own subtree; a second parentless root holds none until granted (#549)", async () => {
     const { mesh, registry, capabilityGrants } = setup({
       grantableCapabilities: new Set(["understanding-write"]),
     });
@@ -6856,23 +6901,23 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() => mesh.grantCapability("account-b-child", "understanding-write", "root")).toThrow(
-      /own subtree/
-    );
+    await expect(
+      mesh.grantCapability("account-b-child", "understanding-write", "root")
+    ).rejects.toThrow(/own subtree/);
     // Being parentless confers nothing: the other tree's root is refused
     // until it holds capability-admin itself (a row, not a topology inference).
-    expect(() =>
+    await expect(
       mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
-    ).toThrow(/only a capability-admin holder may grant/);
+    ).rejects.toThrow(/only a capability-admin holder may grant/);
     capabilityGrants.grant({
       actorId: "account-b-root",
       capability: CAPABILITY_ADMIN_CAPABILITY,
       grantedBy: "test",
       grantedAt: "2026-01-01T00:00:00Z",
     });
-    expect(() =>
+    await expect(
       mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
-    ).not.toThrow();
+    ).resolves.not.toThrow();
   });
 
   it('routes the grandfathered "root" id to a generated-id root', async () => {
@@ -6885,7 +6930,7 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries.some((entry) => entry.actorId === generatedRootId)).toBe(true);
   });
 
-  it('resolves the grandfathered "root" address across control entry points', () => {
+  it('resolves the grandfathered "root" address across control entry points', async () => {
     const generatedRootId = "11111111-1111-4111-8111-111111111111";
     const inboxStore = createMemoryInboxStore();
     const { mesh, registry, root } = setup({
@@ -6903,7 +6948,7 @@ describe("ActorMesh", () => {
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
     expect(registry.get(parent)?.parentId).toBe(generatedRootId);
-    mesh.grantCapability(parent, "understanding-write", "root");
+    await mesh.grantCapability(parent, "understanding-write", "root");
     expect(mesh.activeCapabilitiesFor(parent)).toEqual(["understanding-write"]);
     mesh.reparentThread(child, "root");
     expect(registry.get(child)?.parentId).toBe(generatedRootId);
@@ -16214,16 +16259,22 @@ describe("accountRun token accounting (#443)", () => {
       const inboxStore = new SqliteInboxRepository(db);
       const actors = new InMemoryActorRepository();
       const counts = opts.completedFocusEntryCounts ?? (() => new Map<string, number>());
+      const capabilityGrants = new InMemoryCapabilityGrantStore();
+      const experimentEnrollments = new InMemoryExperimentEnrollmentStore();
       const writer = createInProcessMeshWriter(db, {
         obligations: new ObligationRepository(db),
         inbox: inboxStore,
         actors,
         actorRuns: { completedFocusEntryCounts: (actorId) => counts(actorId) },
+        grants: capabilityGrants,
+        experiments: experimentEnrollments,
       });
       const fixture = setup({
         inboxStore,
         actors,
         writer,
+        capabilityGrants,
+        experimentEnrollments,
         completedFocusEntryCounts: counts,
         sharedProvider: opts.sharedProvider,
         events: opts.events,

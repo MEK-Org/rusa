@@ -97,6 +97,45 @@ export interface CapabilityGrantStore {
   activeFor(actorId: string): string[];
 }
 
+/**
+ * Authority that no grant row records: the boot-selected default actor's
+ * role-derived capabilities, and the grantor whose legacy rows confer
+ * nothing (#1087). It is process configuration, fixed once chosen, so a
+ * write operation receives it as input; the grant rows it is combined with
+ * are still the transaction's.
+ */
+export interface CapabilityPolicy {
+  /** The actor holding `capabilities` without a grant row, once one is selected. */
+  readonly recipientId: string | undefined;
+  readonly capabilities: readonly string[];
+  /** Rows granted by this grantor are kept for audit but confer nothing. */
+  readonly ignoredGrantor: string;
+}
+
+/**
+ * The capabilities `actorId` holds: its active grant rows, minus those the
+ * policy ignores, plus the policy's role capabilities when it is the
+ * recipient. Without a policy, every active row counts.
+ */
+export function effectiveCapabilities(
+  grants: readonly CapabilityGrant[],
+  actorId: string,
+  policy: CapabilityPolicy | null
+): string[] {
+  const rows = grants
+    .filter(
+      (grant) =>
+        grant.actorId === actorId &&
+        !grant.revokedAt &&
+        (policy === null || grant.grantedBy !== policy.ignoredGrantor)
+    )
+    .map((grant) => grant.capability);
+  if (policy === null) return rows;
+  return [
+    ...new Set([...rows, ...(actorId === policy.recipientId ? policy.capabilities : [])]),
+  ].sort();
+}
+
 const key = (actorId: string, capability: string): string => `${actorId} ${capability}`;
 
 /** In-memory grant store — for tests and the e2e runner. */

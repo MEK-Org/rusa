@@ -3122,7 +3122,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           opts: { mcpServers: Array<{ name: string; url: string }> };
         }
       ).opts;
-      handles.mesh.grantCapability(handles.root.id, "glass_goals:synthetic-user:read", rootId);
+      await handles.mesh.grantCapability(
+        handles.root.id,
+        "glass_goals:synthetic-user:read",
+        rootId
+      );
       const spec = options.mcpServers.find((server) => server.name === "glass_goals");
       if (!spec) throw new Error("custom service was not mounted");
       expect(JSON.stringify(spec)).not.toContain("synthetic-host-token");
@@ -3176,7 +3180,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       false
     );
 
-    mesh.grantCapability("live-worker", "understanding-write", rootId);
+    await mesh.grantCapability("live-worker", "understanding-write", rootId);
 
     expect(actorOptions.mcpServers.some((server) => server.name === "understanding-write")).toBe(
       true
@@ -3207,8 +3211,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const first = spawnWorker("local computer holder");
     const second = spawnWorker("local computer waiter");
     const unrelated = spawnWorker("local unrelated worker");
-    liveMesh.grantCapability(first, "computer-use", rootId);
-    liveMesh.grantCapability(second, "computer-use", rootId);
+    await liveMesh.grantCapability(first, "computer-use", rootId);
+    await liveMesh.grantCapability(second, "computer-use", rootId);
 
     type GateOptions = Pick<ActorOptions, "gate" | "modelConfig">;
     const started: string[] = [];
@@ -4345,11 +4349,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).opts;
     expect(actorOptions.mcpServers.some((server) => server.name === "calendar-read")).toBe(false);
 
-    mesh.grantCapability(rootId, "calendar-read:account:person@example.com", rootId);
+    await mesh.grantCapability(rootId, "calendar-read:account:person@example.com", rootId);
 
     expect(actorOptions.mcpServers.some((server) => server.name === "calendar-read")).toBe(true);
 
-    mesh.revokeCapability(rootId, "calendar-read:account:person@example.com", rootId);
+    await mesh.revokeCapability(rootId, "calendar-read:account:person@example.com", rootId);
     await vi.waitFor(() => {
       expect(actorOptions.mcpServers.some((server) => server.name === "calendar-read")).toBe(false);
     });
@@ -4434,12 +4438,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).opts;
     expect(actorOptions.mcpServers.some((server) => server.name === "email-send")).toBe(true);
 
-    mesh.revokeCapability(rootId, "email-send:startup@example.com", rootId);
+    await mesh.revokeCapability(rootId, "email-send:startup@example.com", rootId);
     await vi.waitFor(() => {
       expect(actorOptions.mcpServers.some((server) => server.name === "email-send")).toBe(false);
     });
 
-    mesh.grantCapability(rootId, "email-send:next@example.com", rootId);
+    await mesh.grantCapability(rootId, "email-send:next@example.com", rootId);
     expect(actorOptions.mcpServers.some((server) => server.name === "email-send")).toBe(true);
   });
 
@@ -4465,11 +4469,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).opts;
     expect(actorOptions.mcpServers.some((server) => server.name === "drive-read")).toBe(false);
 
-    mesh.grantCapability(rootId, "drive-read", rootId);
+    await mesh.grantCapability(rootId, "drive-read", rootId);
 
     expect(actorOptions.mcpServers.some((server) => server.name === "drive-read")).toBe(true);
 
-    mesh.revokeCapability(rootId, "drive-read", rootId);
+    await mesh.revokeCapability(rootId, "drive-read", rootId);
     await vi.waitFor(() => {
       expect(actorOptions.mcpServers.some((server) => server.name === "drive-read")).toBe(false);
     });
@@ -10751,7 +10755,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const initialChatReadUrl = chatReadSpecs[0].url;
 
     // Grant a write capability and verify chat-read is retained without duplication
-    mesh.grantCapability(workerId, "chat-write:spaces/AAAA", rootId);
+    await mesh.grantCapability(workerId, "chat-write:spaces/AAAA", rootId);
     const updatedChatReadSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
     expect(updatedChatReadSpecs).toHaveLength(1);
     expect(updatedChatReadSpecs[0].url).toBe(initialChatReadUrl);
@@ -10761,12 +10765,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Scoped chat-read is no longer a grantable capability (all actors have implicit unscoped read)
     const liveMesh = mesh;
-    expect(() => liveMesh.grantCapability(workerId, "chat-read:spaces/BBBB", rootId)).toThrow(
-      "not a grantable capability: chat-read:spaces/BBBB"
-    );
+    await expect(
+      liveMesh.grantCapability(workerId, "chat-read:spaces/BBBB", rootId)
+    ).rejects.toThrow("not a grantable capability: chat-read:spaces/BBBB");
 
     // Revoking write capability preserves the default chat-read server intact
-    mesh.revokeCapability(workerId, "chat-write:spaces/AAAA", rootId);
+    await mesh.revokeCapability(workerId, "chat-write:spaces/AAAA", rootId);
     const afterRevokeSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
     expect(afterRevokeSpecs).toHaveLength(1);
     expect(afterRevokeSpecs[0].url).toBe(initialChatReadUrl);
@@ -10846,7 +10850,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       parentId: rootId,
       modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
-    mesh.grantCapability(workerId, "chat-write:spaces/A", rootId);
+    await mesh.grantCapability(workerId, "chat-write:spaces/A", rootId);
     const worker = mesh.get(workerId);
     if (!worker) throw new Error("worker not ready");
     const workerOptions = (worker as unknown as { opts: ChatActorOptions }).opts;
@@ -10911,7 +10915,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       executionTarget: "signature-follower",
       modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
     });
-    mesh.grantCapability(workerId, "chat-write:spaces/A", rootId);
+    await mesh.grantCapability(workerId, "chat-write:spaces/A", rootId);
     if (!remote || !remoteOptions) throw new Error("remote signature worker did not start");
     const chatUrl = remoteOptions.mcpServers.find((server) => server.name === "chat-write")?.url;
     if (!chatUrl) throw new Error("remote chat-write server missing");
@@ -11236,7 +11240,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       executionTarget: "signature-follower",
       modelConfig: { provider: "codex", model: "gpt-5.5" },
     });
-    mesh.grantCapability(workerId, "chat-write:spaces/A", rootId);
+    await mesh.grantCapability(workerId, "chat-write:spaces/A", rootId);
     // This suite records Actor wakes instead of running them. Only the
     // follower's Actor, which runs the fixture provider, needs a real run.
     const recordWake = vi.mocked(Actor.prototype.requestRun).getMockImplementation();
@@ -12001,7 +12005,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         parentId: firstId,
         modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       });
-      handles.mesh.grantCapability(childId, "chat-write:spaces/A", firstId);
+      await handles.mesh.grantCapability(childId, "chat-write:spaces/A", firstId);
       expect(handles.mesh.activeCapabilitiesFor(childId)).toEqual(["chat-write:spaces/A"]);
       await handles.mesh.revokeCapability(childId, "chat-write:spaces/A", firstId);
       expect(handles.mesh.activeCapabilitiesFor(childId)).toEqual([]);

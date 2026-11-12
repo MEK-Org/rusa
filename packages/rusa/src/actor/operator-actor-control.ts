@@ -1,6 +1,6 @@
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import type { ActorRecord } from "./actor-record.js";
 import { OBLIGATIONS_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
-import type { CapabilityGrantStore } from "./capability-grants.js";
 import type { RootControlPrincipal } from "./root-control.js";
 
 /** What a human operator's reparent was asked to do and how it ended. */
@@ -71,7 +71,7 @@ export interface OperatorActorControlMesh {
 export class OperatorActorControl {
   constructor(
     private readonly mesh: OperatorActorControlMesh,
-    private readonly grants: CapabilityGrantStore,
+    private readonly writer: Pick<MeshObligationWriter, "write">,
     private readonly rootId: string | undefined,
     private readonly now: () => string = () => new Date().toISOString()
   ) {}
@@ -161,11 +161,11 @@ export class OperatorActorControl {
    * response is a store readback, so an operator can observe the durable
    * binding before relying on it.
    */
-  setObligationsAdmin(
+  async setObligationsAdmin(
     actorId: string,
     enabled: boolean,
     principal: RootControlPrincipal
-  ): ObligationsAdminBinding {
+  ): Promise<ObligationsAdminBinding> {
     const canonicalActorId = this.mesh.resolveActorId(actorId);
     const audit = (outcome: OperatorObligationsAdminAudit["outcome"], reason?: string) =>
       this.recordObligationsAdmin({
@@ -180,23 +180,21 @@ export class OperatorActorControl {
       audit("denied", reason);
       throw new Error(reason);
     }
-    if (!this.mesh.list().some((record) => record.id === canonicalActorId)) {
+    // The actor's existence, the write and its readback are one transaction
+    // (#1289 D1), so no other grant write lands between the write and the
+    // state this answers.
+    const { known, active } = await this.writer.write("grants.setOperatorProvisioned", {
+      actorId: canonicalActorId,
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      active: enabled,
+      grantedBy: `operator:${principal}`,
+      at: this.now(),
+    });
+    if (!known) {
       const reason = `unknown actor: ${canonicalActorId}`;
       audit("denied", reason);
       throw new Error(reason);
     }
-
-    if (enabled) {
-      this.grants.grant({
-        actorId: canonicalActorId,
-        capability: OBLIGATIONS_ADMIN_CAPABILITY,
-        grantedBy: `operator:${principal}`,
-        grantedAt: this.now(),
-      });
-    } else {
-      this.grants.revoke(canonicalActorId, OBLIGATIONS_ADMIN_CAPABILITY, this.now());
-    }
-    const active = this.grants.activeFor(canonicalActorId).includes(OBLIGATIONS_ADMIN_CAPABILITY);
     if (active !== enabled) {
       const reason = `durable ${OBLIGATIONS_ADMIN_CAPABILITY} readback did not match requested state`;
       audit("denied", reason);

@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { memoryGrantWriter } from "../db/fixtures/memory-grant-writer.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import { OBLIGATIONS_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "./experiments.js";
 import type { MeshEventInput } from "./mesh-events.js";
 import {
   OperatorActorControl,
@@ -66,7 +68,12 @@ function setup() {
     obligationAudits,
     retirementAudits,
     mesh,
-    control: new OperatorActorControl(mesh, grants, "imported", () => "2026-10-16T05:30:00.000Z"),
+    control: new OperatorActorControl(
+      mesh,
+      memoryGrantWriter({ actors, grants, experiments: new InMemoryExperimentEnrollmentStore() }),
+      "imported",
+      () => "2026-10-16T05:30:00.000Z"
+    ),
   };
 }
 
@@ -222,10 +229,10 @@ describe("OperatorActorControl (#1003)", () => {
     ]);
   });
 
-  it("provisions, reads back, revokes, and audits obligations administration separately", () => {
+  it("provisions, reads back, revokes, and audits obligations administration separately", async () => {
     const { control, grants, obligationAudits } = setup();
 
-    expect(control.setObligationsAdmin("worker", true, OPERATOR)).toEqual({
+    expect(await control.setObligationsAdmin("worker", true, OPERATOR)).toEqual({
       actorId: "worker",
       capability: OBLIGATIONS_ADMIN_CAPABILITY,
       active: true,
@@ -240,7 +247,7 @@ describe("OperatorActorControl (#1003)", () => {
       },
     ]);
 
-    expect(control.setObligationsAdmin("worker", false, OPERATOR)).toEqual({
+    expect(await control.setObligationsAdmin("worker", false, OPERATOR)).toEqual({
       actorId: "worker",
       capability: OBLIGATIONS_ADMIN_CAPABILITY,
       active: false,
@@ -262,7 +269,7 @@ describe("OperatorActorControl (#1003)", () => {
     ]);
   });
 
-  it("uses durable actor IDs when the legacy root alias crosses an operator boundary", () => {
+  it("uses durable actor IDs when the legacy root alias crosses an operator boundary", async () => {
     const { actors, audits, control, grants, obligationAudits, retirementAudits } = setup();
 
     control.reparent("root", "other", OPERATOR);
@@ -277,7 +284,7 @@ describe("OperatorActorControl (#1003)", () => {
       },
     ]);
 
-    expect(control.setObligationsAdmin("root", true, OPERATOR)).toEqual({
+    expect(await control.setObligationsAdmin("root", true, OPERATOR)).toEqual({
       actorId: "imported",
       capability: OBLIGATIONS_ADMIN_CAPABILITY,
       active: true,
@@ -294,11 +301,15 @@ describe("OperatorActorControl (#1003)", () => {
     ]);
   });
 
-  it("denies and audits root-LLM and unknown-target obligations-admin requests", () => {
+  it("denies and audits root-LLM and unknown-target obligations-admin requests", async () => {
     const { control, grants, obligationAudits } = setup();
 
-    expect(() => control.setObligationsAdmin("worker", true, "root-llm")).toThrow(/human operator/);
-    expect(() => control.setObligationsAdmin("ghost", true, OPERATOR)).toThrow(/unknown actor/);
+    await expect(control.setObligationsAdmin("worker", true, "root-llm")).rejects.toThrow(
+      /human operator/
+    );
+    await expect(control.setObligationsAdmin("ghost", true, OPERATOR)).rejects.toThrow(
+      /unknown actor/
+    );
     expect(grants.list()).toEqual([]);
     expect(obligationAudits()).toEqual([
       expect.objectContaining({

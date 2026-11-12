@@ -175,6 +175,8 @@ function setup(
 ) {
   const registry = new InMemoryActorRepository();
   const capabilityGrants = new InMemoryCapabilityGrantStore();
+  const experimentEnrollments =
+    opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
   const events: {
     kind: string;
     actorId?: string;
@@ -233,9 +235,11 @@ function setup(
         completedFocusEntryCounts: (actorId) =>
           opts.completedFocusEntryCounts?.(actorId) ?? new Map<string, number>(),
       },
+      grants: capabilityGrants,
+      experiments: experimentEnrollments,
     }),
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    experimentEnrollments: opts.experimentEnrollments,
+    experimentEnrollments,
     // The production registry is empty between rollouts; the tools are
     // exercised against a fixture rollout instead.
     experimentRegistry: { [FIXTURE_EXPERIMENT]: { intent: "Exercise the rollout seam." } },
@@ -5395,7 +5399,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
-    expect(() => mesh.grantCapability(worker, "enroll_actor_experiment", "root")).toThrow(
+    await expect(mesh.grantCapability(worker, "enroll_actor_experiment", "root")).rejects.toThrow(
       /not a grantable capability/
     );
     const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));

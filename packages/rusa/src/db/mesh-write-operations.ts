@@ -1,5 +1,17 @@
 import type Database from "better-sqlite3";
 import {
+  type CapabilityGrant,
+  type CapabilityGrantStore,
+  type CapabilityPolicy,
+  effectiveCapabilities,
+} from "../actor/capability-grants.js";
+import type { ExperimentEnrollment, ExperimentEnrollmentStore } from "../actor/experiments.js";
+import {
+  assertExperimentAuthority,
+  assertGrantAuthority,
+  type GrantAuthorityReader,
+} from "../actor/grant-authority.js";
+import {
   evaluateHeadClosure,
   type HeadClosureQuery,
   type HeadClosureShortfall,
@@ -42,6 +54,8 @@ export interface MeshWriteRepos {
   readonly inbox: SqliteInboxRepository;
   readonly actors: Pick<ActorRepository, "get">;
   readonly actorRuns: Pick<ActorRunRepository, "completedFocusEntryCounts">;
+  readonly grants: CapabilityGrantStore;
+  readonly experiments: Pick<ExperimentEnrollmentStore, "enroll" | "unenroll">;
 }
 
 /** What a committed write owes the main thread. */
@@ -139,6 +153,21 @@ function parentAuthorityReader(repos: MeshWriteRepos): ParentInboxAuthorityReade
     readEntry: (actorId: string, entryId: string) => repos.inbox.read(actorId, entryId),
     completedFocusEntryCounts: (actorId: string) =>
       repos.actorRuns.completedFocusEntryCounts(actorId),
+  };
+}
+
+/**
+ * The grant and experiment authority checks' reads, over the writing
+ * connection: actor records and grant rows as this transaction sees them,
+ * combined with the caller's policy (#1289 D1).
+ */
+function grantAuthorityReader(
+  repos: Pick<MeshWriteRepos, "actors" | "grants">,
+  policy: CapabilityPolicy | null
+): GrantAuthorityReader {
+  return {
+    actor: (id) => repos.actors.get(id),
+    capabilities: (id) => effectiveCapabilities(repos.grants.list(), id, policy),
   };
 }
 
@@ -537,6 +566,120 @@ export const MESH_WRITE_OPERATIONS = {
     mutating(context, (obligations) =>
       obligations.recordCompletionMatcherClosedUnmerged(input.id, input.expected)
     ),
+
+  /**
+   * Grant a capability, if the grantor still may (#1289 D1). The grantor's
+   * authority is decided from this transaction's grant rows and actor tree,
+   * so a revocation or reparent committed before this runs refuses it with
+   * nothing written. The capability's own validity (allow-list, host-global
+   * and operator-provisioned refusals, secret containment) is static and was
+   * checked by the caller.
+   */
+  "grants.grant": (
+    context: Context,
+    input: { readonly grant: CapabilityGrant; readonly policy: CapabilityPolicy | null }
+  ): void => {
+    const { grant, policy } = input;
+    assertGrantAuthority(grantAuthorityReader(context.repos, policy), {
+      grantorId: grant.grantedBy,
+      granteeId: grant.actorId,
+      capability: grant.capability,
+      verb: "grant",
+    });
+    context.repos.grants.grant(grant);
+  },
+
+  /** Revoke a capability, if the revoker still may (#1289 D1); see grants.grant. */
+  "grants.revoke": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly capability: string;
+      readonly revokedBy: string;
+      readonly at: string;
+      readonly policy: CapabilityPolicy | null;
+    }
+  ): void => {
+    assertGrantAuthority(grantAuthorityReader(context.repos, input.policy), {
+      grantorId: input.revokedBy,
+      granteeId: input.actorId,
+      capability: input.capability,
+      verb: "revoke",
+    });
+    context.repos.grants.revoke(input.actorId, input.capability, input.at);
+  },
+
+  /**
+   * Set or clear an operator-provisioned grant for an actor that exists, and
+   * answer the row's state as this transaction leaves it (#1289 D1). The
+   * operator's identity was authenticated by the caller; no actor grant
+   * confers this, so no grant row is consulted to allow it.
+   */
+  "grants.setOperatorProvisioned": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly capability: string;
+      readonly active: boolean;
+      readonly grantedBy: string;
+      readonly at: string;
+    }
+  ): { readonly known: boolean; readonly active: boolean } => {
+    const { grants, actors } = context.repos;
+    if (!actors.get(input.actorId)) return { known: false, active: false };
+    if (input.active) {
+      grants.grant({
+        actorId: input.actorId,
+        capability: input.capability,
+        grantedBy: input.grantedBy,
+        grantedAt: input.at,
+      });
+    } else {
+      grants.revoke(input.actorId, input.capability, input.at);
+    }
+    return { known: true, active: grants.activeFor(input.actorId).includes(input.capability) };
+  },
+
+  /**
+   * Enroll an actor in an experiment, if the enroller still may and the actor
+   * is not retired (#1289 D1). Answers whether this call enrolled it.
+   */
+  "experiments.enroll": (
+    context: Context,
+    input: { readonly enrollment: ExperimentEnrollment; readonly policy: CapabilityPolicy | null }
+  ): boolean => {
+    const { enrollment, policy } = input;
+    const record = assertExperimentAuthority(grantAuthorityReader(context.repos, policy), {
+      callerId: enrollment.enrolledBy,
+      actorId: enrollment.actorId,
+      verb: "enroll",
+    });
+    if (record.status === "retired") {
+      throw new Error(`Cannot enroll a retired thread: ${enrollment.actorId}`);
+    }
+    return context.repos.experiments.enroll(enrollment);
+  },
+
+  /**
+   * Remove an enrollment, if the caller still may (#1289 D1). Answers whether
+   * a real enrollment was removed.
+   */
+  "experiments.unenroll": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly experiment: string;
+      readonly unenrolledBy: string;
+      readonly policy: CapabilityPolicy | null;
+    }
+  ): boolean => {
+    assertExperimentAuthority(grantAuthorityReader(context.repos, input.policy), {
+      callerId: input.unenrolledBy,
+      actorId: input.actorId,
+      verb: "unenroll",
+    });
+    return context.repos.experiments.unenroll(input.actorId, input.experiment);
+  },
 
   /** A host timer fired: activate or release whatever has come due. */
   "obligations.wakeScheduled": (

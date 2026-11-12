@@ -1371,7 +1371,7 @@ async function routeMeshApiRequest(
       }
       const actorId = decodeURIComponent(obligationsAdminMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1391,7 +1391,7 @@ async function routeMeshApiRequest(
           const principal = requireOperatorPrincipal(req, res, deps);
           if (!principal) return;
           try {
-            const binding = operatorActors.setObligationsAdmin(
+            const binding = await operatorActors.setObligationsAdmin(
               actorId,
               (parsed as Record<string, boolean>).enabled,
               principal
