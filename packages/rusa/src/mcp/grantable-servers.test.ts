@@ -2,6 +2,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it, vi } from "vitest";
+import { withDefaultActorCapabilities } from "../actor/administrative-capabilities.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
 import { FakeChatClient } from "../chat/fake.js";
 import { createSelectedInboxEntriesAccessor } from "../commands/start.js";
@@ -12,6 +14,7 @@ import type { DistillerState } from "../understanding/distiller-cursor.js";
 import {
   buildGrantableServers,
   type GrantableServerDeps,
+  type GrantableServerFactory,
   handleCapabilityRevoked,
   mountGrantedServers,
 } from "./grantable-servers.js";
@@ -180,7 +183,7 @@ describe("grantable capabilities allow-list ", () => {
       },
     };
 
-    expect(mountGrantedServers("reader", [], servers, mcpHttp)).toEqual([]);
+    expect(mountGrantedServers("reader", () => [], servers, mcpHttp)).toEqual([]);
     // A row that no longer matches the configured user or scope shape never
     // reaches the provider's MCP map.
     for (const stale of [
@@ -188,11 +191,11 @@ describe("grantable capabilities allow-list ", () => {
       "glass_goals:another-user:write",
       "glass_goals:configured-user:bogus",
     ]) {
-      expect(mountGrantedServers("reader", [stale], servers, mcpHttp)).toEqual([]);
+      expect(mountGrantedServers("reader", () => [stale], servers, mcpHttp)).toEqual([]);
     }
     expect(mountedFactories.size).toBe(0);
     expect(
-      mountGrantedServers("reader", ["glass_goals:configured-user:read"], servers, mcpHttp)
+      mountGrantedServers("reader", () => ["glass_goals:configured-user:read"], servers, mcpHttp)
     ).toEqual([{ name: "glass_goals", url: "http://mcp/reader:glass_goals" }]);
     expect(mountedFactories.has("reader:glass_goals")).toBe(true);
 
@@ -245,14 +248,17 @@ describe("grantable capabilities allow-list ", () => {
     // Denied: an actor holding other grants, but not `distiller`, has no
     // endpoint that could carry the tool at all.
     expect(
-      mountGrantedServers("actor-1", ["understanding-write", "host-jobs"], servers, mcpHttp).map(
-        (spec) => spec.name
-      )
+      mountGrantedServers(
+        "actor-1",
+        () => ["understanding-write", "host-jobs"],
+        servers,
+        mcpHttp
+      ).map((spec) => spec.name)
     ).toEqual(["understanding-write", "host-jobs"]);
     expect(mountedFactories.has("actor-1:distiller")).toBe(false);
 
     // Authorized: the grant mounts the distiller server, and the read is on it.
-    expect(mountGrantedServers("actor-1", ["distiller"], servers, mcpHttp)).toEqual([
+    expect(mountGrantedServers("actor-1", () => ["distiller"], servers, mcpHttp)).toEqual([
       { name: "distiller", url: "http://mcp/actor-1:distiller" },
     ]);
     const server = mountedFactories.get("actor-1:distiller")?.();
@@ -291,7 +297,7 @@ describe("grantable capabilities allow-list ", () => {
     expect(
       mountGrantedServers(
         "actor-1",
-        ["chat-write:spaces/A", "chat-write:spaces/B:thread"],
+        () => ["chat-write:spaces/A", "chat-write:spaces/B:thread"],
         factories,
         mcpHttp
       )
@@ -301,7 +307,7 @@ describe("grantable capabilities allow-list ", () => {
 
     mountGrantedServers(
       "actor-1",
-      ["chat-write:spaces/A", "chat-write:spaces/B:thread", "chat-write:spaces/C"],
+      () => ["chat-write:spaces/A", "chat-write:spaces/B:thread", "chat-write:spaces/C"],
       factories,
       mcpHttp
     );
@@ -381,7 +387,7 @@ describe("grantable capabilities allow-list ", () => {
     const mountedFactories = new Map<string, () => McpServer>();
     mountGrantedServers(
       "actor-1",
-      ["calendar-read:legacy@example.com", "calendar-read:account:a@example.com"],
+      () => ["calendar-read:legacy@example.com", "calendar-read:account:a@example.com"],
       servers,
       {
         addServer: (name, factory) => {
@@ -679,5 +685,69 @@ describe("grantable capabilities allow-list ", () => {
       arguments: { spaceName: "spaces/A", text: "reply in thread" },
     });
     expect(fakeChatClient.sent[1]?.threadName).toBe("spaces/A/threads/T1");
+  });
+});
+
+describe("per-request admission of a granted endpoint (#1289 D1)", () => {
+  const factory: GrantableServerFactory = () => ({}) as McpServer;
+  const servers = new Map<string, GrantableServerFactory>([
+    ["understanding-write", factory],
+    ["host-jobs", factory],
+  ]);
+
+  function capture() {
+    const authorizers = new Map<string, (() => boolean) | undefined>();
+    return {
+      authorizers,
+      addServer: (
+        name: string,
+        _factory: () => McpServer,
+        opts?: { authorize?: () => boolean }
+      ) => {
+        authorizers.set(name, opts?.authorize);
+        return `http://mcp/${name}`;
+      },
+    };
+  }
+
+  it("admits on effective capabilities: role authority without a row, never an ignored row", () => {
+    const store = new InMemoryCapabilityGrantStore();
+    const capabilities = withDefaultActorCapabilities(store, () => ({
+      recipientId: "default",
+      capabilities: ["understanding-write"],
+      ignoredGrantor: "bootstrap",
+    }));
+    // A legacy row that confers nothing under the policy.
+    store.grant({
+      actorId: "default",
+      capability: "host-jobs",
+      grantedBy: "bootstrap",
+      grantedAt: "2026-11-12T00:00:00.000Z",
+    });
+    const mcpHttp = capture();
+
+    const mounted = mountGrantedServers(
+      "default",
+      () => capabilities.activeFor("default"),
+      servers,
+      mcpHttp
+    );
+
+    expect(mounted.map((spec) => spec.name)).toEqual(["understanding-write"]);
+    expect(store.activeFor("default")).not.toContain("understanding-write");
+    expect(mcpHttp.authorizers.get("default:understanding-write")?.()).toBe(true);
+    expect(mcpHttp.authorizers.has("default:host-jobs")).toBe(false);
+  });
+
+  it("refuses every request once any capability the endpoint was built from is gone", () => {
+    let held = ["understanding-write"];
+    const mcpHttp = capture();
+    mountGrantedServers("actor-1", () => held, servers, mcpHttp);
+    const authorize = mcpHttp.authorizers.get("actor-1:understanding-write");
+    expect(authorize?.()).toBe(true);
+    held = [];
+    expect(authorize?.()).toBe(false);
+    held = ["understanding-write"];
+    expect(authorize?.()).toBe(true);
   });
 });

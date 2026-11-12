@@ -3,7 +3,11 @@ import { OBLIGATION_RESPONSIVE_CAPABILITY } from "../mcp/obligations-mcp.js";
 import { PNPM_HARDLINKS_MCP_NAME } from "../mcp/pnpm-hardlinks-mcp.js";
 import { UPDATE_MCP_NAME } from "../mcp/update-mcp.js";
 import type { ActorRecord } from "./actor-record.js";
-import type { CapabilityGrantStore } from "./capability-grants.js";
+import {
+  type CapabilityGrantStore,
+  type CapabilityPolicy,
+  effectiveCapabilities,
+} from "./capability-grants.js";
 
 /**
  * Administrative authority over other actors is a set of narrowly named,
@@ -150,29 +154,31 @@ export const CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR = "system:bootstrap";
  */
 export function withDefaultActorCapabilities(
   store: CapabilityGrantStore,
-  recipient: () => string | undefined,
-  capabilities: readonly string[]
+  policy: () => CapabilityPolicy
 ): CapabilityGrantStore {
   return {
+    mutations: store.mutations,
     grant: (grant) => store.grant(grant),
     revoke: (actorId, capability, at) => store.revoke(actorId, capability, at),
     list: () => store.list(),
-    activeFor: (actorId) =>
-      [
-        ...new Set([
-          ...store
-            .list()
-            .filter(
-              (grant) =>
-                grant.actorId === actorId &&
-                !grant.revokedAt &&
-                grant.grantedBy !== CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR
-            )
-            .map((grant) => grant.capability),
-          ...(actorId === recipient() ? capabilities : []),
-        ]),
-      ].sort(),
+    activeFor: (actorId) => effectiveCapabilities(store.list(), actorId, policy()),
   };
+}
+
+/**
+ * The default actor's role-derived authority as one policy: `recipient` holds
+ * `capabilities` without a grant row, and legacy bootstrap rows confer
+ * nothing. The mesh's grant view and its grant writes both apply it (#1289).
+ */
+export function defaultActorCapabilityPolicy(
+  recipient: () => string | undefined,
+  capabilities: readonly string[]
+): () => CapabilityPolicy {
+  return () => ({
+    recipientId: recipient(),
+    capabilities,
+    ignoredGrantor: CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
+  });
 }
 
 /**

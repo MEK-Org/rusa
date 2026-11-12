@@ -3,6 +3,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
 import type { HeadClosureQuery } from "../actor/head-closure.js";
 import type { ObligationActivationScheduler } from "../actor/os-scheduler.js";
 import { createObligationsMcpServer, type ObligationsMcpOptions } from "../mcp/obligations-mcp.js";
@@ -137,6 +139,8 @@ describe("ready-head sequences", () => {
       inbox: new SqliteInboxRepository(db),
       actors: { get: () => undefined },
       actorRuns: { completedFocusEntryCounts: () => new Map() },
+      grants: new InMemoryCapabilityGrantStore(),
+      experiments: new InMemoryExperimentEnrollmentStore(),
     };
     const testWriter = new InProcessMeshWriter<MeshWriteRepos, MeshEffect, typeof ops>(
       db,
@@ -692,6 +696,8 @@ describe("inbox marks and the checks they depend on (#1289)", () => {
       actorRuns: {
         completedFocusEntryCounts: (actorId) => focusCounts.get(actorId) ?? new Map(),
       },
+      grants: new InMemoryCapabilityGrantStore(),
+      experiments: new InMemoryExperimentEnrollmentStore(),
     });
   });
 

@@ -30,6 +30,7 @@ import type { ActorRecord, ExecutionConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   defaultActorBootstrapCapabilities,
+  defaultActorCapabilityPolicy,
   defaultGrantRecipient,
   HOST_GLOBAL_CAPABILITIES,
   OBLIGATIONS_ADMIN_CAPABILITY,
@@ -2447,6 +2448,10 @@ async function composeStart(
   });
   let impliedOwnerId = defaultGrantRecipient(actors.list())?.id;
   let defaultActorId = impliedOwnerId;
+  const capabilityPolicy = defaultActorCapabilityPolicy(
+    () => defaultActorId,
+    defaultActorBootstrapCapabilities(config)
+  );
   const rootSourceSync = reconcileEventSources(
     persistentEventSourceOwners,
     configuredRoots,
@@ -2793,7 +2798,7 @@ async function composeStart(
     if (!workerMcp) return;
     const mounted = mountGrantedServers(
       actorId,
-      mesh.activeCapabilitiesFor(actorId),
+      () => mesh.activeCapabilitiesFor(actorId),
       grantableServers,
       mcpHttp
     );
@@ -3185,11 +3190,10 @@ async function composeStart(
     // writer, with its authority check inside the write (#1289). Resolved
     // lazily like the repositories above.
     writer: { write: (op, input) => getMeshWriter().write(op, input) },
-    capabilityGrants: withDefaultActorCapabilities(
-      capabilityGrants,
-      () => defaultActorId,
-      defaultActorBootstrapCapabilities(config)
-    ),
+    // One policy for the mesh's grant view and its grant writes' authority
+    // checks (#1289 D1), so the two cannot describe different authority.
+    capabilityGrants: withDefaultActorCapabilities(capabilityGrants, capabilityPolicy),
+    capabilityPolicy,
     // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
     // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
     // a restart; the registry of legal experiment names stays in code.
@@ -3647,7 +3651,12 @@ async function composeStart(
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
         // are aggregated by their base name and passed to the factory.
         workerMcp.push(
-          ...mountGrantedServers(id, mesh.activeCapabilitiesFor(rec.id), grantableServers, mcpHttp)
+          ...mountGrantedServers(
+            id,
+            () => mesh.activeCapabilitiesFor(rec.id),
+            grantableServers,
+            mcpHttp
+          )
         );
 
         // Each worker gets its own private working directory and nothing else: its
@@ -4596,7 +4605,11 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
-          operatorActors: new OperatorActorControl(mesh, capabilityGrants, rootId),
+          operatorActors: new OperatorActorControl(
+            mesh,
+            { write: (op, input) => getMeshWriter().write(op, input) },
+            rootId
+          ),
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the

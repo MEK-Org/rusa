@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { InboxMcpStore } from "../../mcp/inbox-mcp.js";
 import type { ObligationStore } from "../../mcp/obligations-mcp.js";
 import {
@@ -50,6 +52,8 @@ export function meshWriterFor(
     inbox: repos.inbox ?? new SqliteInboxRepository(db),
     actors: repos.actors ?? { get: () => undefined },
     actorRuns: repos.actorRuns ?? new ActorRunRepository(db),
+    grants: repos.grants ?? new InMemoryCapabilityGrantStore(),
+    experiments: repos.experiments ?? new InMemoryExperimentEnrollmentStore(),
   };
   const writer = createInProcessMeshWriter(db, { obligations: repository, ...built });
   writers.set(repository, { db, repos: built, writer });

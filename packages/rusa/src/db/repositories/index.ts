@@ -190,6 +190,8 @@ export class Repositories {
       inbox: this.sqliteInbox,
       actors: this.actors,
       actorRuns: this.actorRuns,
+      grants: this.capabilityGrants,
+      experiments: this.experimentEnrollments,
     };
   }
 }
