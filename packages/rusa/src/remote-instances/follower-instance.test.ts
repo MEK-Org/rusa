@@ -2724,9 +2724,10 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       expect(h.failures).toEqual([]);
     }, 15000);
 
-    it("no-interrupt control allows follow-up run to complete (#1303)", async () => {
-      const h = setup({ delayMs: 100 });
-      const id = h.spawn("Run long");
+    it("allows genuine subsequent queued admission to be cancelled by interrupt (#1303)", async () => {
+      const pacer = new ProviderPacer(0);
+      const h = setup({ pacer });
+      const id = h.spawn("Run 1");
       await waitUntil(() => started(h, id).length === 1);
       const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
       h.inboxStore.markHandled(
@@ -2734,17 +2735,43 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
         first.map((e) => e.id)
       );
 
-      h.dispatchNormal(id, "test:during-run");
+      // Defer pacer so Run 2 queues in admission pacing rather than starting immediately.
+      pacer.deferUntil(Date.now() + 1000);
+      h.dispatchNormal(id, "test:run2");
 
-      await waitUntil(() => started(h, id).length === 2, 5000);
-      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+      // Wait until Run 2 is waiting in the pacer queue.
+      await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1, 5000);
+
+      // Interrupt while queued. Must succeed with wasQueued cancellation.
+      const res = h.mesh.interrupt(id, h.user.id);
+      expect(res).toEqual({ interrupted: true });
+      expect(h.runtime(id).isQueued).toBe(false);
+      expect(pacer.waiting).toBe(0);
+      expect(h.runtime(id).getInterruptedWatermark()).not.toBeNull();
       expect(
         h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
-      ).toHaveLength(0);
+      ).toHaveLength(1);
+
+      await waitUntil(
+        () =>
+          h.meshEvents.some(
+            (e) => e.kind === "run_abandoned" && e.actorId === id && e.detail === "start-cancelled"
+          ),
+        5000
+      );
+
+      // Releasing pacer does not run the cancelled opportunity.
+      pacer.deferUntil(0);
+      await delay(100);
+      expect(started(h, id)).toHaveLength(1);
+
+      // Fresh work delivered after the interrupt starts Run 2 cleanly.
+      h.dispatchNormal(id, "test:after-interrupt");
+      await waitUntil(() => started(h, id).length === 2, 5000);
       expect(h.failures).toEqual([]);
     }, 15000);
 
-    it("allows genuine subsequent admission to be cancelled by interrupt (#1303)", async () => {
+    it("allows genuine subsequent active execution to be cancelled by interrupt (#1303)", async () => {
       let holdRun2: Promise<void> | undefined;
       let releaseRun2 = () => {};
       let run2Started = false;
@@ -2781,7 +2808,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
 
       // Now Run 2 is executing. An interrupt must succeed and advance the watermark.
       const res = h.mesh.interrupt(id, h.user.id);
-      expect(res.interrupted).toBe(true);
+      expect(res).toEqual({ interrupted: true });
       expect(h.runtime(id).getInterruptedWatermark()).not.toBeNull();
       expect(
         h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
@@ -2791,6 +2818,22 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       releaseRun2();
       expect(h.failures).toEqual([]);
     }, 15000);
+
+    it("clears finalizing state when an actor moves to idle (#1303)", async () => {
+      const h = setup({ delayMs: 25 });
+      const id = h.spawn("Run normal");
+      await waitUntil(() => started(h, id).length === 1);
+      const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
+      h.inboxStore.markHandled(
+        id,
+        first.map((e) => e.id)
+      );
+
+      await waitUntil(() => !h.runtime(id).isRunning, 5000);
+      expect(h.runtime(id).isRunning).toBe(false);
+      expect((h.runtime(id) as unknown as { finalizing: boolean }).finalizing).toBe(false);
+      expect(h.failures).toEqual([]);
+    });
 
     it("ignores responsive preemption during held onEnd (#1303)", async () => {
       let release = () => {};

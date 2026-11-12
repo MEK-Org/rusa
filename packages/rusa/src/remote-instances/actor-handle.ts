@@ -342,7 +342,7 @@ export class ActorHandle implements MeshActor {
    * it would only set a false watermark that strands work delivered during the run.
    */
   private get finalizing(): boolean {
-    return this.finalizingRunId !== undefined;
+    return this.isRunning && this.finalizingRunId !== undefined;
   }
 
   requestRun(nudge?: RunNudge): void {
@@ -888,9 +888,6 @@ export class ActorHandle implements MeshActor {
     const runId = started ? this.startedRunId : this.queuedRunId;
     if (!runId) return;
     this.runOpen = false;
-    if (started && !this.closed) {
-      this.finalizingRunId = runId;
-    }
     this.admittedAt = undefined;
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
