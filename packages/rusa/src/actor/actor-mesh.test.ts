@@ -265,13 +265,13 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
           (entry) => entry.actorId === actorId && entry.seenAt === null && entry.handledAt === null
         )
         .map((entry) => entry.id),
-    markSeen: (actorId, seenAt = new Date("2026-01-01T00:00:00Z"), entryIds) => {
+    markSeen: (actorId, entryIds, seenAt = new Date("2026-01-01T00:00:00Z")) => {
       const unseen = entries.filter(
         (entry) =>
           entry.actorId === actorId &&
           entry.seenAt === null &&
           entry.handledAt === null &&
-          (entryIds === undefined || entryIds.includes(entry.id))
+          entryIds.includes(entry.id)
       );
       for (const entry of unseen) entry.seenAt = seenAt;
       return unseen;
@@ -414,7 +414,7 @@ function memoryMeshWriter(
     switch (op) {
       case "inbox.markSeen": {
         const mark = input as { actorId: string; entryIds: readonly string[] };
-        return inbox.markSeen(mark.actorId, undefined, mark.entryIds);
+        return inbox.markSeen(mark.actorId, mark.entryIds);
       }
       case "obligations.closureShortfalls":
         if (!closure) throw new Error("this test mesh has no obligations to decide closure on");

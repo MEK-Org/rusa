@@ -222,7 +222,7 @@ export const MESH_WRITE_OPERATIONS = {
   "inbox.markSeen": (
     context: Context,
     input: { readonly actorId: string; readonly entryIds: readonly string[] }
-  ): InboxEntry[] => context.repos.inbox.markSeen(input.actorId, undefined, input.entryIds),
+  ): InboxEntry[] => context.repos.inbox.markSeen(input.actorId, input.entryIds),
 
   /** A parent marks its child's exhausted entries handled, if it still may. */
   "inbox.markChildHandled": (

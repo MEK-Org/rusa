@@ -114,7 +114,7 @@ describe("#1018 inbox metric samples", () => {
     addActor("a");
     const first = deliver("a", t0 - 3 * MINUTE);
     const second = deliver("a", t0 - 1 * MINUTE);
-    inbox.markSeen("a", new Date(t0 - 30_000));
+    inbox.markSeen("a", inbox.unseenEntryIds("a"), new Date(t0 - 30_000));
 
     expect(metrics.sampleIfDue(t0)).toMatchObject({ inboxSizeMax: 2, oldestAgeSecondsMax: 180 });
     // A second tick in the same minute keeps the first reading.
@@ -166,7 +166,7 @@ describe("#1018 inbox metric samples", () => {
 
     // Changing: seeing them moves nothing.
     for (const id of ["mixed", "only-human", "legacy"])
-      inbox.markSeen(id, new Date(at(1) + 10_000));
+      inbox.markSeen(id, inbox.unseenEntryIds(id), new Date(at(1) + 10_000));
     expect(metrics.sampleIfDue(at(2))).toMatchObject(sharedOnly(2));
 
     // Removing: neither does handling them.

@@ -214,10 +214,10 @@ describe("SqliteInboxRepository", () => {
     ]);
 
     const firstAt = new Date("2026-07-13T13:00:00Z");
-    expect(store.markSeen("a", firstAt)).toMatchObject([
+    expect(store.markSeen("a", store.unseenEntryIds("a"), firstAt)).toMatchObject([
       { id: "a1", actorId: "a", seenAt: firstAt, handledAt: null },
     ]);
-    expect(store.markSeen("a", new Date("2026-07-13T14:00:00Z"))).toEqual([]);
+    expect(store.markSeen("a", ["a1"], new Date("2026-07-13T14:00:00Z"))).toEqual([]);
     expect(store.read("a", "a1")?.seenAt).toEqual(firstAt);
     expect(store.read("a", "a2")?.seenAt).toBeNull();
     expect(store.read("b", "b1")?.seenAt).toBeNull();
@@ -240,12 +240,10 @@ describe("SqliteInboxRepository", () => {
     store.markHandled("a", ["done"]);
     expect(store.unseenEntryIds("a")).toEqual(["early", "late"]);
 
-    expect(store.markSeen("a", undefined, ["late", "done", "theirs"]).map((e) => e.id)).toEqual([
-      "late",
-    ]);
+    expect(store.markSeen("a", ["late", "done", "theirs"]).map((e) => e.id)).toEqual(["late"]);
     expect(store.unseenEntryIds("a")).toEqual(["early"]);
     expect(store.unseenEntryIds("b")).toEqual(["theirs"]);
-    expect(store.markSeen("a", undefined, [])).toEqual([]);
+    expect(store.markSeen("a", [])).toEqual([]);
     expect(store.unseenEntryIds("a")).toEqual(["early"]);
   });
 

@@ -390,6 +390,31 @@ export class RunManager {
   }
 
   /**
+   * Whether a voice memo delivered at `at` is still unhandled, seen or not:
+   * the same unhandled responsive read as {@link pendingResponsive}, without
+   * its unseen filter, because the mark that joined a queued opportunity has
+   * made the memo seen.
+   */
+  private voiceMemoPending(actorId: string, at: number): boolean {
+    let cursor: string | undefined;
+    do {
+      const page = this.inbox.list(actorId, {
+        status: "unhandled",
+        responsiveOnly: true,
+        limit: RESPONSIVE_PAGE_LIMIT,
+        cursor,
+      });
+      for (const entry of page.entries) {
+        if (entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE && entry.deliveredAt.getTime() === at) {
+          return true;
+        }
+      }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    return false;
+  }
+
+  /**
    * Decode one row's durable interruption policy, making a malformed stored
    * shape visible once. The row is still scheduled, conservatively joining.
    */
@@ -624,9 +649,14 @@ export class RunManager {
     if (current.isRunning) return true;
     let nudge = dispatchNudge(work);
     // A voice memo this dispatch brought is seen now, so the re-read no longer
-    // dates it; the request still carries its delivery time, as one made
-    // without waiting would have.
-    if (isResponsiveNudge(nudge) && arrivedVoiceAt !== undefined) {
+    // dates it; while it is still unhandled the request carries its delivery
+    // time, as one made without waiting would have. Once handled, it dates
+    // nothing this run will do.
+    if (
+      isResponsiveNudge(nudge) &&
+      arrivedVoiceAt !== undefined &&
+      this.voiceMemoPending(actorId, arrivedVoiceAt)
+    ) {
       nudge = {
         ...nudge,
         voiceTimestamp: Math.min(nudge.voiceTimestamp ?? arrivedVoiceAt, arrivedVoiceAt),

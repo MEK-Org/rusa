@@ -275,18 +275,18 @@ export class SqliteInboxRepository implements InboxRepository {
     return rows.map((row) => row.id);
   }
 
-  markSeen(actorId: string, at = this.now(), entryIds?: readonly string[]): InboxEntry[] {
+  markSeen(actorId: string, entryIds: readonly string[], at = this.now()): InboxEntry[] {
     if (!Number.isFinite(at.getTime())) throw new Error("invalid seenAt");
-    if (entryIds?.length === 0) return [];
+    if (entryIds.length === 0) return [];
     // The id list is bound as one JSON text rather than one parameter per id,
     // so its length meets no bound-parameter limit.
-    const only = entryIds === undefined ? "" : " AND id IN (SELECT value FROM json_each(?))";
-    const params = entryIds === undefined ? [actorId] : [actorId, JSON.stringify(entryIds)];
+    const params = [actorId, JSON.stringify(entryIds)];
     return this.db.transaction(() => {
       const rows = this.db
         .prepare(
           `SELECT * FROM actor_inbox_entries
-           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL${only}
+           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL
+             AND id IN (SELECT value FROM json_each(?))
            ORDER BY delivered_at ASC, id ASC`
         )
         .all(...params) as InboxRow[];
@@ -295,7 +295,8 @@ export class SqliteInboxRepository implements InboxRepository {
       this.db
         .prepare(
           `UPDATE actor_inbox_entries SET seen_at = ?
-           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL${only}`
+           WHERE actor_id = ? AND seen_at IS NULL AND handled_at IS NULL
+             AND id IN (SELECT value FROM json_each(?))`
         )
         .run(stamp, ...params);
       return rows.map((row) => toEntry({ ...row, seen_at: stamp }));
