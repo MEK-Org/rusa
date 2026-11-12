@@ -13,6 +13,7 @@ import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-
 import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
+import { CAPABILITY_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
 import { parentOf } from "./event-subscriptions.js";
 
 // Thread-scoped Google Chat write grants and thread delegation (#1311), on the
@@ -125,6 +126,15 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
     rmSync(dir, { recursive: true, force: true });
   });
 
+  function grantAdmin(actorId: string): void {
+    host.repos.capabilityGrants.grant({
+      actorId,
+      capability: CAPABILITY_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: AT,
+    });
+  }
+
   function reboot(): Host {
     host.db.close();
     host = boot(path);
@@ -154,7 +164,7 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
     });
 
-    it("lets a chat-write:* holder grant and revoke a thread like a space holder", async () => {
+    it("lets a chat-write:* holder grant a thread like a space holder", async () => {
       await host.mesh.grantCapability("worker", T1_WRITE, "wildcard");
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
       expect(host.mesh.hasActiveCapability("worker", SPACE_WRITE)).toBe(false);
@@ -166,8 +176,11 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
         /capability-admin/
       );
 
-      await host.mesh.revokeCapability("worker", T1_WRITE, "wildcard");
-      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
+      // Nor does wildcard possession authorize revoking it.
+      await expect(host.mesh.revokeCapability("worker", T1_WRITE, "wildcard")).rejects.toThrow(
+        /capability-admin/
+      );
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
     });
 
     it("refuses a thread grant from anyone not holding that space", async () => {
@@ -220,19 +233,30 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
       expect(host.repos.capabilityGrants.activeFor("worker")).not.toContain(T1_WRITE);
     });
 
-    it("revokes under the same rule it grants under", async () => {
+    it("keeps the ordinary revoke authority: space possession does not revoke", async () => {
       await host.mesh.grantCapability("worker", T1_WRITE, "steward");
 
-      await expect(host.mesh.revokeCapability("worker", T1_WRITE, "stranger")).rejects.toThrow(
-        /capability-admin/
-      );
-      await expect(host.mesh.revokeCapability("worker", T1_WRITE, "worker")).rejects.toThrow(
-        /capability-admin/
-      );
+      // Not even the grantor's own grant: #1311 commissions granting only.
+      for (const revoker of ["steward", "stranger", "worker"]) {
+        await expect(
+          host.mesh.revokeCapability("worker", T1_WRITE, revoker),
+          `${revoker} must not revoke ${T1_WRITE}`
+        ).rejects.toThrow(/capability-admin/);
+      }
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
 
-      await host.mesh.revokeCapability("worker", T1_WRITE, "steward");
+      // A capability-admin over the grantee revokes it as any other grant.
+      grantAdmin("root");
+      await host.mesh.revokeCapability("worker", T1_WRITE, "root");
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
+    });
+
+    it("keeps a thread grant after its grantor loses the space", async () => {
+      await host.mesh.grantCapability("worker", T1_WRITE, "steward");
+      host.repos.capabilityGrants.revoke("steward", SPACE_WRITE, AT);
+
+      // As any grant outlives its grantor's authority; revoking it is explicit.
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
     });
 
     it("keeps a thread grant across a restart", async () => {
@@ -240,8 +264,9 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
 
       const after = reboot();
       expect(after.mesh.activeCapabilitiesFor("worker")).toContain(T1_WRITE);
-      // And it is still revocable by the space writer after the restart.
-      await after.mesh.revokeCapability("worker", T1_WRITE, "steward");
+      // And it is still revocable through the ordinary path after the restart.
+      grantAdmin("root");
+      await after.mesh.revokeCapability("worker", T1_WRITE, "root");
       expect(after.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
     });
   });

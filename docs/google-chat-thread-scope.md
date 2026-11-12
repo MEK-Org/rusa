@@ -21,9 +21,9 @@ Grants with any other parameter are refused.
 
 **Who may grant a thread.** An actor holding whole-space
 `chat-write:spaces/S`, or `chat-write:*` (which already writes every space),
-may grant `chat-write:spaces/S/threads/T` to any existing actor. It needs no `capability-admin` and no ancestry, because the
-grant is narrower than what the grantor already holds. The same rule governs
-revoking such a grant. The following can only grant a thread under the
+may grant `chat-write:spaces/S/threads/T` to any existing actor. It needs no
+`capability-admin` and no ancestry, because the grant is narrower than what
+the grantor already holds. The following can only grant a thread under the
 ordinary rules, which require `capability-admin` over the grantee:
 
 - a holder of a different space
@@ -31,12 +31,26 @@ ordinary rules, which require `capability-admin` over the grantee:
 
 A space holder cannot use this path to grant the whole space.
 
+**Who may revoke a thread grant.** Revoking uses the ordinary rules: a
+`capability-admin` holder over the grantee. Holding the space does not
+authorize revoking a thread grant, not even one the same actor issued. #1311
+asks for the grant only.
+
+A thread grant outlives its grantor's space write, as any grant outlives its
+grantor's authority. If the grantor later loses `chat-write:spaces/S`, the
+grantee keeps the thread until the grant is revoked.
+
 **What a thread writer can do.** Each write tool checks the thread the
 message would actually land in, after selected-inbox reply routing (#611),
 not the arguments as written:
 
 - `send_message` succeeds only when the effective thread is one of the
-  writer's threads. A send with no thread, which would post top-level, is
+  writer's threads, and only in a named, threaded space: Google supports
+  reply placement only in named spaces. Before sending, or uploading any
+  inline attachment, the tool reads the space and refuses unless it reports
+  `spaceType: SPACE` and `spaceThreadingState: THREADED_MESSAGES`. A direct
+  message, a group chat, an unthreaded space, or a space that cannot be read
+  is refused. A send with no thread, which would post top-level, is
   refused. A selected top-level message routes replies top-level, so use
   `createThread: true` to reply under it when it heads the granted thread.
   The send asks Google to reply or fail (`REPLY_MESSAGE_OR_FAIL`), so it

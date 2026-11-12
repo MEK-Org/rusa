@@ -53,10 +53,11 @@ function parentGrantBase(capability: string): string {
 }
 
 /**
- * Grantor authority for a grant or revocation. A thread-scoped
+ * Grantor authority for a grant or revocation. Granting a thread-scoped
  * `chat-write:spaces/S/threads/T` is authorized by the grantor's own active
  * `chat-write` on space S, for any existing grantee (#1311): the grant is
- * narrower than what the grantor already holds. Otherwise a `capability-admin`
+ * narrower than what the grantor already holds. #1311 commissions that grant
+ * only, so revoking it keeps the rules below. Otherwise a `capability-admin`
  * holder may grant or revoke within its own subtree, itself included, and any
  * other grantor may only touch a capability in
  * {@link PARENT_GRANTABLE_CAPABILITIES}, and only on its direct child.
@@ -79,6 +80,7 @@ export function assertGrantAuthority(
   const chatParam = chatWriteParam(capability);
   const chatScope = chatParam === undefined ? undefined : parseChatWriteScope(chatParam);
   if (
+    verb === "grant" &&
     chatScope?.kind === "thread" &&
     holdsChatWriteSpace(reader.capabilities(grantorId), chatScope.space)
   ) {

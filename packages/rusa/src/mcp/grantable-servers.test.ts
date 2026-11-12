@@ -6,6 +6,7 @@ import { withDefaultActorCapabilities } from "../actor/administrative-capabiliti
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
 import { FakeChatClient } from "../chat/fake.js";
+import type { ChatSpace } from "../chat/types.js";
 import { createSelectedInboxEntriesAccessor } from "../commands/start.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
@@ -769,9 +770,20 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     };
   }
 
+  const THREADED: ChatSpace = {
+    name: "spaces/A",
+    spaceType: "SPACE",
+    spaceThreadingState: "THREADED_MESSAGES",
+  };
+
   /** Mount chat-write from grant params exactly as a capability grant does. */
-  async function mount(params: string[], selected: InboxEntry[] = []) {
+  async function mount(
+    params: string[],
+    selected: InboxEntry[] = [],
+    space: ChatSpace | null = THREADED
+  ) {
     const chat = new FakeChatClient();
+    if (space) chat.spaces.push(space);
     chat.messages.push(
       { name: "spaces/A/messages/R1", thread: { name: T1 } },
       { name: "spaces/A/messages/R2", thread: { name: T2 } }
@@ -797,6 +809,9 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
   }
 
   const send = (args: Record<string, unknown>) => ({ spaceName: "spaces/A", text: "hi", ...args });
+  const inlineAttachment = {
+    attachments: [{ filename: "note.txt", contentBase64: Buffer.from("hi").toString("base64") }],
+  };
 
   it("lets a thread writer reply in its thread, and only as a reply", async () => {
     const { chat, call } = await mount([T1]);
@@ -836,11 +851,14 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     expect((await inT1.call("send_message", send({}))).isError).toBe(false);
     expect(inT1.chat.sent[0]).toMatchObject({ threadName: T1, requireExistingThread: true });
 
-    // A selected reply in a sibling thread places it there, which is refused.
+    // A selected reply in a sibling thread places it there, which is refused
+    // before any inline attachment uploads.
     const inT2 = await mount([T1], [chatEntry("spaces/A/messages/R2", T2)]);
-    const sibling = await inT2.call("send_message", send({}));
+    const sibling = await inT2.call("send_message", send(inlineAttachment));
     expect(sibling.isError).toBe(true);
     expect(sibling.text).toMatch(/T2 is not in allowed threads/);
+    expect(inT2.chat.sent).toEqual([]);
+    expect(inT2.chat.uploadedAttachments).toEqual([]);
 
     // A selected head of T1 routes top-level unless createThread asks for its thread.
     const head = await mount([T1], [chatEntry("spaces/A/messages/T1", T1)]);
@@ -851,6 +869,27 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     expect(head.chat.sent).toEqual([
       expect.objectContaining({ threadName: T1, requireExistingThread: true }),
     ]);
+  });
+
+  it("fails closed outside a threaded named space, before any upload", async () => {
+    for (const space of [
+      { ...THREADED, spaceType: "DIRECT_MESSAGE" },
+      { ...THREADED, spaceType: "GROUP_CHAT" },
+      { ...THREADED, spaceThreadingState: "UNTHREADED_MESSAGES" },
+      { ...THREADED, spaceThreadingState: "GROUPED_MESSAGES" },
+      { name: "spaces/A" },
+      null, // the space cannot be read
+    ]) {
+      const { chat, call } = await mount([T1], [], space);
+      const result = await call("send_message", send({ threadName: T1, ...inlineAttachment }));
+      expect(result.isError, JSON.stringify(space)).toBe(true);
+      expect(result.text).toMatch(/access denied: (thread-scoped writes need|cannot confirm)/);
+      expect(chat.sent).toEqual([]);
+      expect(chat.uploadedAttachments).toEqual([]);
+    }
+    // A whole-space writer's placement never depended on the space's shape.
+    const whole = await mount(["spaces/A"], [], null);
+    expect((await whole.call("send_message", send({ threadName: T1 }))).isError).toBe(false);
   });
 
   it("scopes reactions to messages in the writer's thread", async () => {
