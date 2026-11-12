@@ -45,10 +45,11 @@ export class ObligationChangedError extends ObligationValidationError {
 }
 
 /**
- * The owner the caller authorized the write against (#1289). Every
- * owner-dependent authorization (`canManage`, owner-only snooze) is decided
- * from the owner alone, so a write still made against that owner is still
- * authorized; one made after a reassignment is refused, not re-decided.
+ * The owner the caller authorized the write against (#1289). A write made
+ * after a reassignment is refused, not re-decided. This covers the owner only:
+ * `canManage` also reads the caller's capability grants and the actor tree, and
+ * a grant revoked or a thread reparented between the caller's check and this
+ * write is not caught here.
  */
 interface OwnerPrecondition {
   readonly expectedOwnerId?: string;

@@ -14923,7 +14923,7 @@ describe("strict obligation handling (#382, #917)", () => {
       selectHead(mesh, subject, "head");
       expect(rejection(mesh, subject)).toMatch(/selected head obligation head/);
 
-      repo.setSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
+      repo.writeSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
       expect(rejection(mesh, subject)).toBe("");
     });
 
@@ -14931,7 +14931,7 @@ describe("strict obligation handling (#382, #917)", () => {
       const { mesh } = snoozeMesh();
       const subject = worker(mesh, "snoozed before");
       repo.create({ id: "deferred", title: "Deferred", ownerId: subject });
-      repo.setSnooze("deferred", new Date(T0 + HOUR).toISOString(), subject);
+      repo.writeSnooze("deferred", new Date(T0 + HOUR).toISOString(), subject);
       selectDirectFocus(mesh, subject, "deferred");
       expect(rejection(mesh, subject)).toBe("");
     });
@@ -14953,7 +14953,7 @@ describe("strict obligation handling (#382, #917)", () => {
       expect(repo.get("head")?.status).toBe("waiting");
       expect(rejection(mesh, subject)).toMatch(/gained neither/);
 
-      repo.setSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
+      repo.writeSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
       expect(rejection(mesh, subject)).toBe("");
       // The snooze defers attention only; the child still blocks the head.
       expect(repo.get("head")?.status).toBe("waiting");
@@ -14964,7 +14964,7 @@ describe("strict obligation handling (#382, #917)", () => {
       const subject = worker(mesh, "expires mid-run");
       repo.create({ id: "head", title: "Head", ownerId: subject });
       selectHead(mesh, subject, "head");
-      repo.setSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
+      repo.writeSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
 
       clock = T0 + HOUR;
       expect(rejection(mesh, subject)).toMatch(/selected head obligation head/);
@@ -15080,7 +15080,7 @@ describe("strict obligation handling (#382, #917)", () => {
             listObligationActivations: () => [],
             canScheduleAt: () => true,
           });
-          repo.setSnooze("head", "2999-01-01T00:00:00.000Z", subject);
+          repo.writeSnooze("head", "2999-01-01T00:00:00.000Z", subject);
         },
       ],
       [

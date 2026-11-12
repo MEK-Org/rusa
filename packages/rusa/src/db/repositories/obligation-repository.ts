@@ -883,12 +883,13 @@ export class ObligationRepository {
       for (const id of ids) {
         try {
           this.reconcileObligationSchedule(id);
+          this.scheduleErrors.delete(id);
         } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.scheduleErrors.set(id, message);
           failed.push(id);
           console.warn(
-            `[obligations] retry failed to reconcile scheduled activation for ${id}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
+            `[obligations] retry failed to reconcile scheduled activation for ${id}: ${message}`
           );
         }
       }
@@ -907,7 +908,8 @@ export class ObligationRepository {
 
   /**
    * Why each obligation's host timer failed to arm at its latest post-commit
-   * reconcile; an id is removed when a reconcile succeeds. A mutation always
+   * reconcile, including the bounded in-process retries; an id is removed when
+   * a reconcile or retry succeeds. A mutation always
    * reconciles the ids it marked, so a caller reading this right after its own
    * write is delivered learns whether *that* write's timer armed (or the state a
    * later write of the same obligation left) — never a failure left behind by
@@ -3867,38 +3869,11 @@ export class ObligationRepository {
   }
 
   /**
-   * Set, replace, or clear (`until = null`) an obligation's snooze (#722).
-   *
-   * Authorization belongs to the calling surface: snoozing is owner-only, and
-   * this method cannot tell an owner from anyone else. The deadline is
-   * normalized to UTC and must be in the future; rewriting the current value is
-   * a no-op. A snooze keeps the underlying status and every dependency and
-   * parent block. Setting one where nothing could end it — no scheduler is
-   * attached to this process (the standalone dashboard), or the host is known
-   * to lack `at` — is refused with {@link SnoozeTimerUnavailableError} before
-   * anything is written. Clearing needs no timer and is always allowed.
-   *
-   * Returns the committed obligation, plus `scheduleError` when this call's
-   * write committed but its host timer did not arm. The mutation retries the
-   * timer in-process and boot reconciliation re-derives it, but the caller
-   * learns now rather than from a snooze that silently never ends. An identical
-   * rewrite changes no row but still re-derives the timer, so it doubles as a
-   * retry whose `scheduleError` reports the timer's current state.
-   */
-  setSnooze(
-    id: string,
-    until: string | null,
-    principal: EntityId
-  ): { obligation: Obligation; scheduleError: string | null } {
-    this.assertSnoozeSchedulable(until);
-    const obligation = this.writeSnooze(id, until, principal);
-    return { obligation, scheduleError: this.scheduleErrorFor(id) };
-  }
-
-  /**
-   * The part of {@link setSnooze} that needs this process's scheduler, split
-   * out (#1289) so a caller whose write runs as a writer operation checks it on
-   * the main thread, which owns the scheduler, before submitting the write.
+   * Refuse a snooze nothing could end (#722), before anything is written:
+   * no scheduler is attached to this process (the standalone dashboard), or
+   * the host is known to lack `at`. Clearing (`until = null`) needs no timer and
+   * is always allowed. Callers run this on the main thread, which owns the
+   * scheduler, and then submit {@link writeSnooze} as a writer operation (#1289).
    */
   assertSnoozeSchedulable(until: string | null): void {
     const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
@@ -3916,11 +3891,18 @@ export class ObligationRepository {
   }
 
   /**
-   * The write {@link setSnooze} makes, without its scheduler check (#1289): a
-   * writer operation runs this, and the caller has already run
-   * {@link assertSnoozeSchedulable} where the scheduler lives. The host timer is
-   * reconciled when the mutation's effect is delivered; read its outcome with
-   * {@link scheduleErrorFor}.
+   * Set, replace, or clear (`until = null`) an obligation's snooze (#722).
+   *
+   * Authorization belongs to the calling surface: snoozing is owner-only, and
+   * this method cannot tell an owner from anyone else. The caller has already
+   * run {@link assertSnoozeSchedulable}. The deadline is normalized to UTC and
+   * must be in the future; rewriting the current value changes no row. A snooze
+   * keeps the underlying status and every dependency and parent block.
+   *
+   * The host timer is reconciled when the mutation's effect is delivered; read
+   * its outcome with {@link scheduleErrorFor}, so the caller learns now rather
+   * than from a snooze that silently never ends. An identical rewrite still
+   * re-derives the timer, so it doubles as a retry.
    */
   writeSnooze(id: string, until: string | null, principal: EntityId): Obligation {
     const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
