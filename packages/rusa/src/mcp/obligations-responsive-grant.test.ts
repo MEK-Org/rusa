@@ -13,6 +13,7 @@ import {
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { canManageObligation } from "../obligations/owner.js";
@@ -81,7 +82,7 @@ function setup() {
   const repository = new ObligationRepository(db);
 
   const workerServer = (id: string) =>
-    createObligationsMcpServer(repository, id, {
+    createObligationsMcpServer(obligationStore(db, repository), id, {
       canManage: (callerId, obligation) =>
         canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
       canSetResponsive: () => mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),

@@ -23,6 +23,7 @@ import {
   type AvatarGenerationEvent,
   readAvatar,
 } from "../avatar/avatars.js";
+import { meshWriterFor } from "../db/fixtures/obligation-store.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import { InboxMetricRepository } from "../db/repositories/inbox-metric-repository.js";
@@ -243,6 +244,7 @@ describe("handleMeshApiRequest", () => {
       meshChat,
       inbox,
       obligations,
+      obligationWriter: meshWriterFor(db, obligations),
       sseHub: new SseHub(new MeshEventEmitter()),
       mesh: mockMesh as unknown as ActorMesh,
       rootControl: {
@@ -5501,7 +5503,7 @@ describe("handleMeshApiRequest", () => {
           intent: "build feature",
         });
         const { res } = await call(deps, "POST", "/api/mesh/obligations", body);
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(201);
         const data = JSON.parse(res.body);
         expect(data.obligation.ownerId).toBe(UUID_A);
@@ -5523,7 +5525,7 @@ describe("handleMeshApiRequest", () => {
             creatorId: "actor-impostor",
           })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(201);
         const created = JSON.parse(res.body).obligation;
         expect(created.creatorId).toBe(LOCAL_USER);
@@ -5538,7 +5540,7 @@ describe("handleMeshApiRequest", () => {
           JSON.stringify({ ownerId: UUID_A, title: "   ", intent: "blank heading" }),
         ]) {
           const { res } = await call(deps, "POST", "/api/mesh/obligations", body);
-          await new Promise((resolve) => process.nextTick(resolve));
+          await settled(res);
           // A node with no heading cannot appear in a call-list, which is the
           // one thing the human-decision contract needs it for.
           expect(res.statusCode).toBe(400);
@@ -5554,7 +5556,7 @@ describe("handleMeshApiRequest", () => {
             "/api/mesh/obligations",
             JSON.stringify({ ownerId, title: "Typo", intent: "typo" })
           );
-          await new Promise((resolve) => process.nextTick(resolve));
+          await settled(res);
           // A typed handle that resolves to nothing must not become live work
           // owned by an id that appears in no queue and wakes nobody.
           expect(res.statusCode).toBe(400);
@@ -5569,7 +5571,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations",
           JSON.stringify({ ownerId: "   " })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(400);
       });
     });
@@ -5588,7 +5590,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/task-1/status",
           JSON.stringify({ status: "done" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(200);
         const data = JSON.parse(res.body);
         expect(data.ok).toBe(true);
@@ -5602,7 +5604,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/missing-task/status",
           JSON.stringify({ status: "done" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(404);
       });
 
@@ -5619,7 +5621,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/decide-stack/status",
           JSON.stringify({ status: "done", note: "Flutter. Tooling is already wired here." })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(200);
         expect(JSON.parse(res.body).obligation.terminalNote).toBe(
           "Flutter. Tooling is already wired here."
@@ -5639,7 +5641,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/coerce-me/status",
           JSON.stringify({ status: "cancelled", note: { why: "nope" } })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         // "[object Object]" stored as a stated reason is worse than no reason.
         expect(res.statusCode).toBe(200);
         expect(JSON.parse(res.body).obligation.terminalNote).toBeNull();
@@ -5762,7 +5764,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/linkable/external-ref",
           JSON.stringify({ externalRef: "github:MEK-Org/rusa/issues/33" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(link.res);
         expect(link.res.statusCode).toBe(200);
         expect(JSON.parse(link.res.body).obligation.externalRef.key).toBe(
           "github:MEK-Org/rusa/issues/33"
@@ -5776,7 +5778,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/linkable/external-ref",
           JSON.stringify({ externalRef: "  " })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(clear.res);
         expect(JSON.parse(clear.res.body).obligation.externalRef).toBeNull();
       });
 
@@ -5790,7 +5792,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/repo-level/external-ref",
           JSON.stringify({ externalRef: "github:MEK-Org/rusa" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(ok.res);
         expect(ok.res.statusCode).toBe(200);
 
         const bad = await call(
@@ -5799,7 +5801,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/repo-level/external-ref",
           JSON.stringify({ externalRef: "github:MEK-Org/rusa/issues/33/comments/9" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(bad.res);
         // The server owns the grammar; its complaint is what the dialog shows.
         expect(bad.res.statusCode).toBe(400);
         expect(JSON.parse(bad.res.body).error).toContain("external ref must name");
@@ -5823,7 +5825,7 @@ describe("handleMeshApiRequest", () => {
             external_ref: "github:MEK-Org/rusa/issues/34",
           })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(unlink.res);
 
         expect(unlink.res.statusCode).toBe(200);
         expect(JSON.parse(unlink.res.body).obligation.externalRef).toBeNull();
@@ -5844,7 +5846,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/keep-link/external-ref",
           JSON.stringify({})
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(missing.res);
 
         expect(missing.res.statusCode).toBe(400);
         expect(JSON.parse(missing.res.body).error).toBe("externalRef is required");
@@ -5858,7 +5860,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/missing/external-ref",
           JSON.stringify({ externalRef: "github:MEK-Org/rusa" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(404);
       });
     });
@@ -5882,7 +5884,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/second/reorder",
           JSON.stringify({ nextId: "first" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(200);
         const data = JSON.parse(res.body);
         expect(data.ok).toBe(true);
@@ -5917,7 +5919,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/c1/reparent",
           JSON.stringify({ parentId: "p2" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(200);
         const data = JSON.parse(res.body);
         expect(data.ok).toBe(true);
@@ -5946,7 +5948,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/ready-root/reparent",
           JSON.stringify({ parentId: "waiting-parent" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(accepted);
         expect(accepted.statusCode).toBe(200);
         expect(JSON.parse(accepted.body).obligation.parentId).toBe("waiting-parent");
 
@@ -5956,7 +5958,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/ready-root/reparent",
           JSON.stringify({ parentId: "done-parent" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(refused);
         expect(refused.statusCode).toBe(400);
         expect(JSON.parse(refused.body).error).toBe("cannot add a child to a terminal obligation");
         expect(obligations.require("ready-root").parentId).toBe("waiting-parent");
@@ -5975,7 +5977,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/task-self/reparent",
           JSON.stringify({ parentId: "task-self" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(400);
       });
     });
@@ -5993,7 +5995,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/task-owner/reassign",
           JSON.stringify({ ownerId: LOCAL_USER })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(200);
         expect(JSON.parse(res.body).obligation.ownerId).toBe(LOCAL_USER);
       });
@@ -6007,7 +6009,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/review/reassign",
           JSON.stringify({ ownerId: UUID_A, message: "Please answer seat 2 first." })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(200);
 
         const detail = await call(deps, "GET", "/api/mesh/obligations/review?history_limit=1");
@@ -6027,7 +6029,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/review/reassign",
           JSON.stringify({ ownerId: UUID_A, message: 42 })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(res);
         expect(res.statusCode).toBe(400);
         expect(JSON.parse(res.body).error).toMatch(/message/);
         expect(obligations.get("review")?.ownerId).toBe(LOCAL_USER);
@@ -6047,7 +6049,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/task-owner/reassign",
           JSON.stringify({ ownerId: "   " })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(invalid.res);
         expect(invalid.res.statusCode).toBe(400);
 
         const missing = await call(
@@ -6056,7 +6058,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/missing/reassign",
           JSON.stringify({ ownerId: LOCAL_USER })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(missing.res);
         expect(missing.res.statusCode).toBe(404);
 
         const unknownOwner = await call(
@@ -6065,7 +6067,7 @@ describe("handleMeshApiRequest", () => {
           "/api/mesh/obligations/task-owner/reassign",
           JSON.stringify({ ownerId: "actor-typo" })
         );
-        await new Promise((resolve) => process.nextTick(resolve));
+        await settled(unknownOwner.res);
         expect(unknownOwner.res.statusCode).toBe(400);
         expect(obligations.get("task-owner")?.ownerId).toBe("actor-1");
       });

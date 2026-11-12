@@ -182,7 +182,7 @@ import {
   ConfiguredActorImportError,
   resolveConfiguredActor,
 } from "../db/configured-actor-import.js";
-import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
+import { closeDb, getDb, getMeshWriter, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
@@ -1867,6 +1867,7 @@ async function composeStart(
     | undefined;
   const completionMatcherEvaluator = new CompletionMatcherEvaluator({
     obligations: getRepositories().obligations,
+    writer: getMeshWriter(),
     issueClient,
     deployedSha: () => deployedSha,
     isAncestor: (ancestor, descendant) =>
@@ -3513,18 +3514,23 @@ async function composeStart(
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
-          createObligationsMcpServer(getRepositories().obligations, id, {
-            resolveOwner: (raw) =>
-              resolveObligationOwner(actors, raw, getRepositories().principals),
-            canManage: (callerId, obligation) =>
-              mesh.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
-              canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
-            canSetResponsive: () => mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
-            recordEvent: (event) => mesh.recordEvent(event),
-            validateCompletionMatcher,
-            evaluateCompletionMatcher: (obligationId) =>
-              completionMatcherEvaluator.evaluate(obligationId),
-          })
+          createObligationsMcpServer(
+            { obligations: getRepositories().obligations, writer: getMeshWriter() },
+            id,
+            {
+              resolveOwner: (raw) =>
+                resolveObligationOwner(actors, raw, getRepositories().principals),
+              canManage: (callerId, obligation) =>
+                mesh.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
+                canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
+              canSetResponsive: () =>
+                mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
+              recordEvent: (event) => mesh.recordEvent(event),
+              validateCompletionMatcher,
+              evaluateCompletionMatcher: (obligationId) =>
+                completionMatcherEvaluator.evaluate(obligationId),
+            }
+          )
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
           createMeshChatMcpServer(getRepositories().meshChat, id)
@@ -4138,8 +4144,8 @@ async function composeStart(
     // One callback for occurrences and snooze deadlines alike. It re-reads the
     // row and acts only on what is due, so an early, stale or duplicate job is
     // harmless (#722).
-    deliver: (id: string) => {
-      getRepositories().obligations.wakeScheduled(id, "system:mesh");
+    deliver: async (id: string) => {
+      await getMeshWriter().write("obligations.wakeScheduled", { id, principal: "system:mesh" });
     },
   });
 
@@ -4506,6 +4512,7 @@ async function composeStart(
           meshChat: getRepositories().meshChat,
           pushDeviceTokens: getRepositories().pushDeviceTokens,
           obligations: getRepositories().obligations,
+          obligationWriter: getMeshWriter(),
           inbox: getRepositories().inbox,
           reads: dbReads,
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),

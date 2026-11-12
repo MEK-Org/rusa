@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { meshWriterFor } from "../db/fixtures/obligation-store.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import { obligations } from "../db/migrations/0016_obligations.js";
 import { obligationPriority } from "../db/migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamps.js";
@@ -24,6 +26,7 @@ import type { CompletionMatcher, Obligation } from "./obligation.js";
 
 describe("CompletionMatcherEvaluator", () => {
   let repository: ObligationRepository;
+  let writer: MeshObligationWriter;
   const pr = "github:MEK-Org/rusa/pulls/190";
   const canonicalPr = "github:mek-org/rusa/pulls/190";
 
@@ -45,6 +48,7 @@ describe("CompletionMatcherEvaluator", () => {
     dropObligationReadyHeads.up(db);
     obligationCompletionMatchers.up(db);
     repository = new ObligationRepository(db);
+    writer = meshWriterFor(db, repository);
   });
 
   const evaluator = (
@@ -54,6 +58,7 @@ describe("CompletionMatcherEvaluator", () => {
   ) =>
     new CompletionMatcherEvaluator({
       obligations: repository,
+      writer,
       issueClient: {
         getPullRequestDetails: vi.fn(async () => ({
           number: 190,
@@ -116,6 +121,7 @@ describe("CompletionMatcherEvaluator", () => {
     const isAncestor = vi.fn(async () => true);
     const service = new CompletionMatcherEvaluator({
       obligations: repository,
+      writer,
       issueClient: { getPullRequestDetails: vi.fn() },
       deployedSha: () => deployed,
       isAncestor,
@@ -180,6 +186,7 @@ describe("CompletionMatcherEvaluator", () => {
     const log = vi.fn();
     const service = new CompletionMatcherEvaluator({
       obligations: repository,
+      writer,
       issueClient: {
         getPullRequestDetails: vi.fn(async (_repo: string, number: number) => ({
           number,
@@ -231,6 +238,7 @@ describe("CompletionMatcherEvaluator", () => {
     const log = vi.fn();
     const service = new CompletionMatcherEvaluator({
       obligations: repository,
+      writer,
       issueClient: { getPullRequestDetails: vi.fn() },
       deployedSha: () => "unknown",
       isAncestor: vi.fn(async () => true),

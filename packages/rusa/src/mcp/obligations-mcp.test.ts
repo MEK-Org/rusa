@@ -5,6 +5,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { MeshEventInput } from "../actor/mesh-events.js";
+import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { obligations } from "../db/migrations/0016_obligations.js";
 import { obligationPriority } from "../db/migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamps.js";
@@ -22,7 +23,7 @@ import { obligationCompletionMatchers } from "../db/migrations/0059_obligation_c
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
-import { createObligationsMcpServer } from "./obligations-mcp.js";
+import { createObligationsMcpServer, type ObligationStore } from "./obligations-mcp.js";
 
 const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -43,6 +44,7 @@ function dataOf(result: CallToolResult): unknown {
 describe("obligations MCP", () => {
   let db: Database.Database;
   let repository: ObligationRepository;
+  let store: ObligationStore;
 
   beforeEach(() => {
     db = new Database(":memory:");
@@ -62,10 +64,11 @@ describe("obligations MCP", () => {
     dropObligationReadyHeads.up(db);
     obligationCompletionMatchers.up(db);
     repository = new ObligationRepository(db);
+    store = obligationStore(db, repository);
   });
 
   it("exposes all 16 obligation tools", async () => {
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "add_obligation_prerequisite",
@@ -89,7 +92,7 @@ describe("obligations MCP", () => {
 
   it("creates responsive obligations and reports inherited responsiveness", async () => {
     const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canSetResponsive: () => true })
+      createObligationsMcpServer(store, "actor-a", { canSetResponsive: () => true })
     );
     const parent = (await client.callTool({
       name: "create_obligation",
@@ -145,7 +148,7 @@ describe("obligations MCP", () => {
   ])("denies responsive writes without the root capability even for %s", async (actorId) => {
     const existing = repository.create({ ownerId: actorId, title: "ordinary" });
     const client = await connect(
-      createObligationsMcpServer(repository, actorId, {
+      createObligationsMcpServer(store, actorId, {
         canManage: () => true,
       })
     );
@@ -178,7 +181,7 @@ describe("obligations MCP", () => {
       parentId: urgent.id,
     });
     const ordinary = repository.create({ ownerId: "actor-a", title: "ordinary" });
-    const worker = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const worker = await connect(createObligationsMcpServer(store, "actor-a"));
     for (const parent of [urgent, inherited]) {
       for (const responsive of [undefined, true]) {
         const result = await worker.callTool({
@@ -219,7 +222,7 @@ describe("obligations MCP", () => {
     const ordinary = repository.create({ ownerId: "actor-a", title: "ordinary" });
     const child = repository.create({ ownerId: "actor-a", title: "child", parentId: ordinary.id });
     const worker = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      createObligationsMcpServer(store, "actor-a", { canManage: () => true })
     );
     const before = db.serialize();
     const denied = await worker.callTool({
@@ -231,7 +234,7 @@ describe("obligations MCP", () => {
     expect(repository.require(child.id).effectiveResponsive).toBe(false);
     const root = await connect(
       // Composed as start.ts composes root: promotion also requires canManage.
-      createObligationsMcpServer(repository, "opaque-root-id", {
+      createObligationsMcpServer(store, "opaque-root-id", {
         canSetResponsive: () => true,
         canManage: () => true,
       })
@@ -269,7 +272,7 @@ describe("obligations MCP", () => {
     repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "hotfix" });
     const client = await connect(
       // Composed as start.ts composes root: marking also requires canManage.
-      createObligationsMcpServer(repository, "root-uuid", {
+      createObligationsMcpServer(store, "root-uuid", {
         canSetResponsive: () => true,
         canManage: () => true,
       })
@@ -289,7 +292,7 @@ describe("obligations MCP", () => {
   });
 
   it("stamps the creating actor as creator, distinct from the owner", async () => {
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const res = (await client.callTool({
       name: "create_obligation",
       arguments: {
@@ -318,7 +321,7 @@ describe("obligations MCP", () => {
   });
 
   it("refuses model-supplied creator attribution at the schema boundary", async () => {
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const res = (await client.callTool({
       name: "create_obligation",
       arguments: {
@@ -337,7 +340,7 @@ describe("obligations MCP", () => {
   });
 
   it("creates a root obligation and child obligation via create_obligation", async () => {
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const rootRes = (await client.callTool({
       name: "create_obligation",
       arguments: {
@@ -382,7 +385,7 @@ describe("obligations MCP", () => {
     });
     expect(repository.require("root-task").status).toBe("waiting");
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const doneRes = (await client.callTool({
       name: "set_obligation_status",
       arguments: { id: "child-task", status: "done" },
@@ -403,7 +406,7 @@ describe("obligations MCP", () => {
       ["actor-retired", { status: "retired" }],
     ]);
     const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", {
+      createObligationsMcpServer(store, "actor-a", {
         resolveOwner: (raw) =>
           resolveObligationOwner({ get: (id: string) => registry.get(id) as never }, raw, {
             get: (id) =>
@@ -450,7 +453,7 @@ describe("obligations MCP", () => {
     repository.setActorExists((id) => registry.get(id)?.status === "active");
     repository.setPrincipalKind((id) => principals.get(id)?.kind);
     const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", {
+      createObligationsMcpServer(store, "actor-a", {
         resolveOwner: (raw) =>
           resolveObligationOwner(
             { get: (id: string) => registry.get(id) as never },
@@ -487,7 +490,7 @@ describe("obligations MCP", () => {
       ownerId: "actor-a",
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const res = (await client.callTool({
       name: "set_obligation_status",
       arguments: {
@@ -514,7 +517,7 @@ describe("obligations MCP", () => {
       ownerId: "actor-a",
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const res = (await client.callTool({
       name: "set_obligation_status",
       arguments: { id: "silent-task", status: "done" },
@@ -528,7 +531,7 @@ describe("obligations MCP", () => {
 
   it("links and unlinks an identity claim after creation", async () => {
     repository.create({ title: "Ship it", id: "linkable", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
     const linked = (await client.callTool({
       name: "set_external_ref",
@@ -552,7 +555,7 @@ describe("obligations MCP", () => {
       ownerId: "actor-b",
       externalRef: "github:MEK-Org/rusa/issues/33",
     });
-    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const denied = await connect(createObligationsMcpServer(store, "actor-a"));
     const deniedResult = (await denied.callTool({
       name: "set_external_ref",
       arguments: { id: "foreign-ref", external_ref: null },
@@ -563,7 +566,7 @@ describe("obligations MCP", () => {
     );
 
     const ancestor = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      createObligationsMcpServer(store, "actor-a", { canManage: () => true })
     );
     const ancestorResult = (await ancestor.callTool({
       name: "set_external_ref",
@@ -575,7 +578,7 @@ describe("obligations MCP", () => {
 
   it("refuses a sub-resource as an identity claim", async () => {
     repository.create({ title: "Work", id: "sub", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
     const res = (await client.callTool({
       name: "set_external_ref",
@@ -588,7 +591,7 @@ describe("obligations MCP", () => {
 
   it("sets recurrence for the owner via set_obligation_recurrence", async () => {
     repository.create({ title: "recurring", id: "rec-owned", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
     const res = (await client.callTool({
       name: "set_obligation_recurrence",
@@ -600,7 +603,7 @@ describe("obligations MCP", () => {
 
   it("sets and clears an owner-managed completion matcher", async () => {
     repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
     const set = (await client.callTool({
       name: "set_completion_matcher",
@@ -626,7 +629,7 @@ describe("obligations MCP", () => {
   it("reports a committed matcher as unchecked when its evaluation throws", async () => {
     repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
     const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", {
+      createObligationsMcpServer(store, "actor-a", {
         evaluateCompletionMatcher: async () => {
           throw new Error("SQLITE_BUSY");
         },
@@ -652,7 +655,7 @@ describe("obligations MCP", () => {
   it("rejects set_obligation_recurrence for a non-owner, and honors the owner-ancestor policy", async () => {
     repository.create({ title: "foreign recurring", id: "rec-foreign", ownerId: "actor-b" });
 
-    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const denied = await connect(createObligationsMcpServer(store, "actor-a"));
     const deniedResult = (await denied.callTool({
       name: "set_obligation_recurrence",
       arguments: { id: "rec-foreign", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
@@ -661,7 +664,7 @@ describe("obligations MCP", () => {
     expect(repository.require("rec-foreign").recurrencePolicy).toBeNull();
 
     const ancestor = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      createObligationsMcpServer(store, "actor-a", { canManage: () => true })
     );
     const ancestorResult = (await ancestor.callTool({
       name: "set_obligation_recurrence",
@@ -683,7 +686,7 @@ describe("obligations MCP", () => {
       ownerId: "actor-a",
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const reorderRes = (await client.callTool({
       name: "reorder_obligation",
       arguments: {
@@ -717,7 +720,7 @@ describe("obligations MCP", () => {
       ownerId: "actor-a",
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const reparentRes = (await client.callTool({
       name: "reparent_obligation",
       arguments: { id: "c1", parent_id: "p2" },
@@ -741,7 +744,7 @@ describe("obligations MCP", () => {
       id: "task",
       ownerId: "actor-a",
     });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const result = (await client.callTool({
       name: "reassign_obligation",
       arguments: { id: "task", owner_id: "00000000-0000-4000-8000-000000000001" },
@@ -757,7 +760,7 @@ describe("obligations MCP", () => {
   it("returns the latest reassignment message from get_obligation, and no field without one (#947)", async () => {
     repository.create({ title: "task", id: "task", ownerId: "actor-a" });
     repository.create({ title: "other", id: "other", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     await client.callTool({
       name: "reassign_obligation",
       arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
@@ -779,7 +782,7 @@ describe("obligations MCP", () => {
 
   it("records an optional reassignment message in history (#941)", async () => {
     repository.create({ title: "task", id: "task", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const result = (await client.callTool({
       name: "reassign_obligation",
       arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
@@ -799,7 +802,7 @@ describe("obligations MCP", () => {
       id: "foreign",
       ownerId: "actor-b",
     });
-    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const denied = await connect(createObligationsMcpServer(store, "actor-a"));
     const deniedResult = (await denied.callTool({
       name: "reassign_obligation",
       arguments: { id: "foreign", owner_id: "actor-c" },
@@ -808,7 +811,7 @@ describe("obligations MCP", () => {
     expect(repository.require("foreign").ownerId).toBe("actor-b");
 
     const authorized = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      createObligationsMcpServer(store, "actor-a", { canManage: () => true })
     );
     const authorizedResult = (await authorized.callTool({
       name: "reassign_obligation",
@@ -836,7 +839,7 @@ describe("obligations MCP", () => {
     });
     repository.movePriorityInternal("second", null, "first", "actor-a", "subtree");
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const result = (await client.callTool({
       name: "list_owned",
       arguments: { status: "ready" },
@@ -867,7 +870,7 @@ describe("obligations MCP", () => {
       intent: "review the artifact",
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const result = (await client.callTool({
       name: "get_obligation",
       arguments: { id: "parent" },
@@ -907,7 +910,7 @@ describe("obligations MCP", () => {
         ownerId: "actor-a",
       });
     }
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const first = (await client.callTool({
       name: "list_owned",
       arguments: { status: "ready", limit: 2 },
@@ -963,7 +966,7 @@ describe("obligations MCP", () => {
       ownerId: "actor-b",
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const first = (await client.callTool({
       name: "get_obligation",
       arguments: { id: "parent", limit: 1 },
@@ -1018,7 +1021,7 @@ describe("obligations MCP", () => {
       repository.activateScheduled("recurring", "system:mesh");
     }
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const first = (await client.callTool({
       name: "get_obligation",
       arguments: { id: "recurring", limit: 1 },
@@ -1066,7 +1069,7 @@ describe("obligations MCP", () => {
   });
 
   it("returns an error for a missing obligation", async () => {
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const result = (await client.callTool({
       name: "get_obligation",
       arguments: { id: "missing" },
@@ -1076,7 +1079,7 @@ describe("obligations MCP", () => {
 
   it("accepts blocked_by on create_obligation and creates the dependent waiting", async () => {
     repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
     const res = (await client.callTool({
       name: "create_obligation",
@@ -1095,7 +1098,7 @@ describe("obligations MCP", () => {
   it("rejects blocked_by on create_obligation for a non-owner target, and honors the owner-ancestor policy (#212)", async () => {
     repository.create({ title: "prereq", id: "prereq", ownerId: "actor-b" });
 
-    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const denied = await connect(createObligationsMcpServer(store, "actor-a"));
     const deniedResult = (await denied.callTool({
       name: "create_obligation",
       arguments: {
@@ -1108,7 +1111,7 @@ describe("obligations MCP", () => {
     expect(repository.get("dependent")).toBeNull();
 
     const ancestor = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      createObligationsMcpServer(store, "actor-a", { canManage: () => true })
     );
     const ancestorResult = (await ancestor.callTool({
       name: "create_obligation",
@@ -1126,7 +1129,7 @@ describe("obligations MCP", () => {
   it("adds and removes a prerequisite for the owner, and honors the owner-ancestor policy", async () => {
     repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
     repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
-    const owner = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const owner = await connect(createObligationsMcpServer(store, "actor-a"));
 
     const added = (await owner.callTool({
       name: "add_obligation_prerequisite",
@@ -1147,7 +1150,7 @@ describe("obligations MCP", () => {
     repository.create({ title: "prereq", id: "prereq", ownerId: "actor-b" });
     repository.create({ title: "dependent", id: "dependent", ownerId: "actor-b" });
 
-    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const denied = await connect(createObligationsMcpServer(store, "actor-a"));
     const deniedResult = (await denied.callTool({
       name: "add_obligation_prerequisite",
       arguments: { id: "dependent", prerequisite_id: "prereq" },
@@ -1158,7 +1161,7 @@ describe("obligations MCP", () => {
     ).toHaveLength(0);
 
     const ancestor = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      createObligationsMcpServer(store, "actor-a", { canManage: () => true })
     );
     const ancestorResult = (await ancestor.callTool({
       name: "add_obligation_prerequisite",
@@ -1189,7 +1192,7 @@ describe("obligations MCP", () => {
       blockedBy: ["p1", "p2"],
     });
 
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(createObligationsMcpServer(store, "actor-a"));
     const dependentRes = (await client.callTool({
       name: "get_obligation",
       arguments: { id: "dependent", limit: 1 },
@@ -1238,7 +1241,7 @@ describe("obligations MCP", () => {
 
     it("records the standing, stamps this server's actor as its author, and reads it back", async () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
       const res = (await client.callTool({
         name: "set_checkpoint",
@@ -1266,7 +1269,7 @@ describe("obligations MCP", () => {
 
     it("replaces the previous standing instead of accumulating one", async () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
       await client.callTool({
         name: "set_checkpoint",
@@ -1284,7 +1287,7 @@ describe("obligations MCP", () => {
 
     it("clears the standing and its stamp when passed null", async () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
       await client.callTool({
         name: "set_checkpoint",
         arguments: { id: "arc", checkpoint: STANDING },
@@ -1306,7 +1309,7 @@ describe("obligations MCP", () => {
     it("rejects a non-owner, and honors the owner-ancestor policy", async () => {
       repository.create({ title: "Someone else's arc", id: "foreign", ownerId: "actor-b" });
 
-      const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const denied = await connect(createObligationsMcpServer(store, "actor-a"));
       const deniedResult = (await denied.callTool({
         name: "set_checkpoint",
         arguments: { id: "foreign", checkpoint: STANDING },
@@ -1318,7 +1321,7 @@ describe("obligations MCP", () => {
       // the MCP seam accepts a production-policy grant rather than an
       // unconditional allow callback.
       const ancestor = await connect(
-        createObligationsMcpServer(repository, "actor-a", {
+        createObligationsMcpServer(store, "actor-a", {
           canManage: (callerId, obligation) =>
             canManageObligation(
               callerId,
@@ -1339,7 +1342,7 @@ describe("obligations MCP", () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
       const events: MeshEventInput[] = [];
       const client = await connect(
-        createObligationsMcpServer(repository, "actor-a", {
+        createObligationsMcpServer(store, "actor-a", {
           recordEvent: (event) => events.push(event),
         })
       );
@@ -1366,7 +1369,7 @@ describe("obligations MCP", () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
       const events: MeshEventInput[] = [];
       const client = await connect(
-        createObligationsMcpServer(repository, "actor-a", {
+        createObligationsMcpServer(store, "actor-a", {
           recordEvent: (event) => events.push(event),
         })
       );
@@ -1389,7 +1392,7 @@ describe("obligations MCP", () => {
     it("keeps the committed checkpoint successful when an optional event sink fails", async () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
       const client = await connect(
-        createObligationsMcpServer(repository, "actor-a", {
+        createObligationsMcpServer(store, "actor-a", {
           recordEvent: () => {
             throw new Error("event store unavailable");
           },
@@ -1409,7 +1412,7 @@ describe("obligations MCP", () => {
       repository.create({ title: "Someone else's arc", id: "foreign", ownerId: "actor-b" });
       const events: MeshEventInput[] = [];
       const client = await connect(
-        createObligationsMcpServer(repository, "actor-a", {
+        createObligationsMcpServer(store, "actor-a", {
           recordEvent: (event) => events.push(event),
         })
       );
@@ -1427,7 +1430,7 @@ describe("obligations MCP", () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
       const events: MeshEventInput[] = [];
       const client = await connect(
-        createObligationsMcpServer(repository, "actor-a", {
+        createObligationsMcpServer(store, "actor-a", {
           recordEvent: (event) => events.push(event),
         })
       );
@@ -1447,7 +1450,7 @@ describe("obligations MCP", () => {
 
     it("applies the repository's trimmed cap instead of a different raw schema cap", async () => {
       repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
       const atCap = "x".repeat(OBLIGATION_CHECKPOINT_MAX);
 
       const res = (await client.callTool({
@@ -1460,7 +1463,7 @@ describe("obligations MCP", () => {
     });
 
     it("reports a missing obligation as an error rather than creating one", async () => {
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
       const res = (await client.callTool({
         name: "set_checkpoint",
         arguments: { id: "nope", checkpoint: STANDING },
@@ -1472,7 +1475,7 @@ describe("obligations MCP", () => {
   describe("obligation mutation history and server-bound attribution", () => {
     it("binds acting principal to actorId and never accepts it from client payload", async () => {
       repository.create({ title: "Task", id: "task-1", ownerId: "bound-actor-xyz" });
-      const client = await connect(createObligationsMcpServer(repository, "bound-actor-xyz"));
+      const client = await connect(createObligationsMcpServer(store, "bound-actor-xyz"));
 
       const { tools } = await client.listTools();
       for (const tool of tools) {
@@ -1503,7 +1506,7 @@ describe("obligations MCP", () => {
       repository.reassign("p1", "actor-b", "actor-a");
       repository.setExternalRef("p1", "github:MEK-Org/rusa/issues/185", "actor-b");
 
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
 
       // Schema check: get_obligation does not expose history_cursor parameter
       const { tools } = await client.listTools();
@@ -1545,7 +1548,7 @@ describe("obligations MCP", () => {
     it("lets the owner snooze and clear, and orders snoozed work after actionable work", async () => {
       repository.create({ title: "first", id: "first", ownerId: "actor-a" });
       repository.create({ title: "second", id: "second", ownerId: "actor-a" });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
       const until = inHours(2);
 
       const set = await call(client, "first", until);
@@ -1574,7 +1577,7 @@ describe("obligations MCP", () => {
         ["actor-parent", () => true],
       ] as const) {
         const client = await connect(
-          createObligationsMcpServer(repository, actor, canManage ? { canManage } : {})
+          createObligationsMcpServer(store, actor, canManage ? { canManage } : {})
         );
         const res = await call(client, "theirs", inHours(1));
         expect(res.isError).toBe(true);
@@ -1587,7 +1590,7 @@ describe("obligations MCP", () => {
     it("keeps the snooze across reassignment and hands control to the new owner", async () => {
       repository.create({ title: "task", id: "task", ownerId: "actor-a" });
       const until = inHours(3);
-      const ownerA = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const ownerA = await connect(createObligationsMcpServer(store, "actor-a"));
       expect((await call(ownerA, "task", until)).isError).toBeFalsy();
 
       const moved = (await ownerA.callTool({
@@ -1603,7 +1606,7 @@ describe("obligations MCP", () => {
       expect(repository.require("task").snoozedUntil).toBe(until);
 
       // Snoozing grants nothing: an unrelated actor still cannot reassign it.
-      const outsider = await connect(createObligationsMcpServer(repository, "actor-c"));
+      const outsider = await connect(createObligationsMcpServer(store, "actor-c"));
       const grab = (await outsider.callTool({
         name: "reassign_obligation",
         arguments: { id: "task", owner_id: "actor-c" },
@@ -1611,7 +1614,7 @@ describe("obligations MCP", () => {
       expect(grab.isError).toBe(true);
       expect(repository.require("task").ownerId).toBe("actor-b");
 
-      const ownerB = await connect(createObligationsMcpServer(repository, "actor-b"));
+      const ownerB = await connect(createObligationsMcpServer(store, "actor-b"));
       const cleared = await call(ownerB, "task", null);
       expect(cleared.isError).toBeFalsy();
       expect(repository.require("task").snoozedUntil).toBeNull();
@@ -1619,7 +1622,7 @@ describe("obligations MCP", () => {
 
     it("reports a repository validation refusal as a tool error", async () => {
       repository.create({ title: "task", id: "task", ownerId: "actor-a" });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
       const res = await call(client, "task", "2020-01-01T00:00:00Z");
       expect(res.isError).toBe(true);
       expect(JSON.stringify(res.content)).toContain("must be in the future");
@@ -1636,7 +1639,7 @@ describe("obligations MCP", () => {
         listObligationActivations: () => [],
         canScheduleAt: () => true,
       });
-      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const client = await connect(createObligationsMcpServer(store, "actor-a"));
       const until = inHours(1);
       const res = await call(client, "task", until);
       expect(res.isError).toBeFalsy();

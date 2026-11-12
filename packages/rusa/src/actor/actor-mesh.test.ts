@@ -6,6 +6,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { assembleConfiguredPortableInjection } from "../commands/start.js";
+import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
@@ -14270,7 +14271,7 @@ describe("strict obligation handling (#382, #917)", () => {
     registry: InMemoryActorRepository,
     actorId: string
   ): Promise<Client> {
-    const server = createObligationsMcpServer(repo, actorId, {
+    const server = createObligationsMcpServer(obligationStore(db, repo), actorId, {
       resolveOwner: (raw) =>
         resolveObligationOwner(registry, raw, {
           get: (id) =>

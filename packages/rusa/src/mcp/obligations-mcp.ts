@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { MeshEventSink } from "../actor/mesh-events.js";
+import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { CompletionMatcherEvaluation } from "../obligations/completion-matcher-evaluator.js";
 import {
@@ -20,27 +21,25 @@ type ObligationServerRepository = Pick<
   | "get"
   | "listChildrenPage"
   | "listOwnedPage"
-  | "create"
-  | "setTerminalStatus"
-  | "setExternalRef"
-  | "setCompletionMatcher"
-  | "setCheckpoint"
-  | "setSnooze"
-  | "attachArtifact"
   | "listArtifacts"
   | "latestReassignment"
-  | "movePriorityInternal"
-  | "markResponsive"
-  | "reassign"
-  | "reparent"
-  | "setRecurrence"
   | "listCompletionsPage"
   | "require"
-  | "addPrerequisite"
-  | "removePrerequisite"
   | "listBlockedByPage"
   | "listUnblocksPage"
+  | "assertSnoozeSchedulable"
+  | "scheduleErrorFor"
 >;
+
+/**
+ * Where the server reads obligations, and the writer every obligation write
+ * goes through (#1289). A write's promise settles after it has committed and
+ * its notifications have been delivered, so a handler answers only then.
+ */
+export interface ObligationStore {
+  readonly obligations: ObligationServerRepository;
+  readonly writer: MeshObligationWriter;
+}
 
 export interface ObligationsMcpOptions {
   /**
@@ -197,15 +196,29 @@ function ownedOffset(
 
 /** Actor-bound view of durable obligations. The model never supplies actor_id on list_owned. */
 export function createObligationsMcpServer(
-  repository: ObligationServerRepository,
+  store: ObligationStore,
   actorId: string,
   options?: ObligationsMcpOptions
 ): McpServer {
+  const { obligations: repository, writer } = store;
   const server = createMcpServer({ name: OBLIGATIONS_MCP_NAME, version: "0.1.0" });
   const ownerId = actorId;
   const canManage = (obligation: ManageableObligation): boolean =>
     options?.canManage ? options.canManage(actorId, obligation) : obligation.ownerId === actorId;
   const canSetResponsive = (): boolean => options?.canSetResponsive?.() ?? false;
+  // Why this principal may not start or extend a responsive branch onto work
+  // owned by `ownerId`, or null if it may. Decided here, where the authority
+  // lives; whether a write actually starts one is decided inside the write
+  // against committed state, which then applies this answer (#1289).
+  const responsiveRefusal = (
+    ownerId: string,
+    unauthorized: string,
+    unmanaged: string
+  ): string | null => {
+    if (!canSetResponsive()) return unauthorized;
+    if (!canManage({ ownerId })) return unmanaged;
+    return null;
+  };
 
   server.registerTool(
     "get_obligation",
@@ -423,39 +436,40 @@ export function createObligationsMcpServer(
         if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
           throw new Error("not authorized to manage this obligation's prerequisites");
         }
-        // Starting a responsive branch is a promotion: it needs the authority
-        // and, like marking, an owner the caller could otherwise manage.
-        if (
-          responsive === true &&
-          !(parent_id && repository.require(parent_id).effectiveResponsive)
-        ) {
-          if (!canSetResponsive()) {
-            throw new Error(`only ${RESPONSIVE_AUTHORITY} may create newly responsive obligations`);
-          }
-          if (!canManage({ ownerId: owner.ownerId })) {
-            throw new Error("not authorized to start a responsive branch for this owner");
-          }
-        }
         if (completion_matcher !== undefined && completion_matcher !== null) {
           await options?.validateCompletionMatcher?.(completion_matcher);
         }
-        const created = repository.create({
-          ownerId: owner.ownerId,
-          title,
-          parentId: parent_id ?? null,
-          intent: intent ?? null,
-          externalRef: external_ref ?? null,
-          priority: priority ?? null,
-          responsive: responsive ?? null,
-          recurrence: recurrence ?? null,
-          completionMatcher: completion_matcher ?? null,
-          blockedBy: blocked_by,
-          // Bound by the server from this server's actor identity, exactly like
-          // `owner` on list_owned. There is deliberately no `created_by` field
-          // in inputSchema: #1671's trust boundary requires that attribution is
-          // never accepted as model-supplied payload, so an actor cannot claim
-          // to be anyone else — including when it creates work owned by another.
-          creatorId: actorId,
+        // Starting a responsive branch is a promotion: it needs the authority
+        // and, like marking, an owner the caller could otherwise manage. Whether
+        // this create starts one depends on the parent's responsiveness when
+        // it commits, so the write decides that and applies this answer.
+        const created = await writer.write("obligations.create", {
+          responsiveRefusal:
+            responsive === true
+              ? responsiveRefusal(
+                  owner.ownerId,
+                  `only ${RESPONSIVE_AUTHORITY} may create newly responsive obligations`,
+                  "not authorized to start a responsive branch for this owner"
+                )
+              : null,
+          obligation: {
+            ownerId: owner.ownerId,
+            title,
+            parentId: parent_id ?? null,
+            intent: intent ?? null,
+            externalRef: external_ref ?? null,
+            priority: priority ?? null,
+            responsive: responsive ?? null,
+            recurrence: recurrence ?? null,
+            completionMatcher: completion_matcher ?? null,
+            blockedBy: blocked_by,
+            // Bound by the server from this server's actor identity, exactly like
+            // `owner` on list_owned. There is deliberately no `created_by` field
+            // in inputSchema: #1671's trust boundary requires that attribution is
+            // never accepted as model-supplied payload, so an actor cannot claim
+            // to be anyone else — including when it creates work owned by another.
+            creatorId: actorId,
+          },
         });
         const evaluation =
           created.completionMatcher === null ? null : await evaluateCommitted(created.id);
@@ -492,7 +506,12 @@ export function createObligationsMcpServer(
         const existing = repository.require(id);
         if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
         if (matcher !== null) await options?.validateCompletionMatcher?.(matcher);
-        const written = repository.setCompletionMatcher(id, matcher, actorId);
+        const written = await writer.write("obligations.setCompletionMatcher", {
+          id,
+          matcher,
+          principal: actorId,
+          expectedOwnerId: existing.ownerId,
+        });
         const evaluation = matcher === null ? null : await evaluateCommitted(written.id);
         return toolOk({ obligation: repository.get(written.id) ?? written, evaluation });
       } catch (error) {
@@ -524,7 +543,12 @@ export function createObligationsMcpServer(
       try {
         const existing = repository.require(id);
         if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
-        const obligation = repository.setRecurrence(id, recurrence, actorId);
+        const obligation = await writer.write("obligations.setRecurrence", {
+          id,
+          recurrence,
+          principal: actorId,
+          expectedOwnerId: existing.ownerId,
+        });
         return toolOk({ obligation });
       } catch (error) {
         return toolError(error);
@@ -547,13 +571,13 @@ export function createObligationsMcpServer(
     },
     async ({ id, status, note, resolution_ref }) => {
       try {
-        const obligation = repository.setTerminalStatus(
+        const obligation = await writer.write("obligations.setTerminalStatus", {
           id,
           status,
-          note ?? null,
-          resolution_ref ?? null,
-          actorId
-        );
+          note: note ?? null,
+          resolutionRef: resolution_ref ?? null,
+          principal: actorId,
+        });
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
@@ -577,7 +601,13 @@ export function createObligationsMcpServer(
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
         if (!canManage(current)) throw new Error("not authorized to change this obligation's ref");
-        return toolOk({ obligation: repository.setExternalRef(id, external_ref ?? null, actorId) });
+        const obligation = await writer.write("obligations.setExternalRef", {
+          id,
+          ref: external_ref ?? null,
+          principal: actorId,
+          expectedOwnerId: current.ownerId,
+        });
+        return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
       }
@@ -605,7 +635,12 @@ export function createObligationsMcpServer(
         if (!canManage(current)) {
           throw new Error("not authorized to set this obligation's checkpoint");
         }
-        const obligation = repository.setCheckpoint(id, checkpoint, actorId);
+        const obligation = await writer.write("obligations.setCheckpoint", {
+          id,
+          checkpoint,
+          principal: actorId,
+          expectedOwnerId: current.ownerId,
+        });
         // This event is a best-effort invalidation/observability signal, not
         // an audit receipt. The write committed above is the only durable
         // contract this tool reports; a missing or failing optional sink must
@@ -647,7 +682,16 @@ export function createObligationsMcpServer(
         if (current.ownerId !== actorId) {
           throw new Error("only the obligation's current owner may snooze or unsnooze it");
         }
-        const { obligation, scheduleError } = repository.setSnooze(id, until, actorId);
+        repository.assertSnoozeSchedulable(until);
+        // The write is refused if the obligation changed hands since the check.
+        const obligation = await writer.write("obligations.setSnooze", {
+          id,
+          until,
+          principal: actorId,
+          expectedOwnerId: actorId,
+        });
+        // Read after the write's effects were delivered, which armed the timer.
+        const scheduleError = repository.scheduleErrorFor(id);
         if (scheduleError !== null) {
           // The snooze committed; only its timer did not arm. Report both
           // rather than a bare error, which would read as "nothing happened".
@@ -676,7 +720,9 @@ export function createObligationsMcpServer(
     },
     async ({ obligation_id, ref, label }) => {
       try {
-        const artifact = repository.attachArtifact(obligation_id, ref, {
+        const artifact = await writer.write("obligations.attachArtifact", {
+          id: obligation_id,
+          ref,
           label: label ?? null,
           // Bound server-side from this server's identity, exactly like
           // `creatorId` on create: who cited a thing is attribution, and
@@ -707,7 +753,12 @@ export function createObligationsMcpServer(
         if (!canSetResponsive())
           throw new Error(`only ${RESPONSIVE_AUTHORITY} may mark obligations responsive`);
         if (!canManage(current)) throw new Error("not authorized to manage this obligation");
-        return toolOk({ obligation: repository.markResponsive(id, actorId) });
+        const obligation = await writer.write("obligations.markResponsive", {
+          id,
+          principal: actorId,
+          expectedOwnerId: current.ownerId,
+        });
+        return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
       }
@@ -729,13 +780,13 @@ export function createObligationsMcpServer(
     },
     async ({ id, previous_id, next_id, scope }) => {
       try {
-        const obligation = repository.movePriorityInternal(
+        const obligation = await writer.write("obligations.movePriority", {
           id,
-          previous_id ?? null,
-          next_id ?? null,
-          actorId,
-          scope
-        );
+          previousId: previous_id ?? null,
+          nextId: next_id ?? null,
+          principal: actorId,
+          scope,
+        });
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
@@ -767,7 +818,13 @@ export function createObligationsMcpServer(
         if (!canManage(current)) throw new Error("not authorized to reassign this obligation");
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) throw new Error(owner.error);
-        const obligation = repository.reassign(id, owner.ownerId, actorId, message);
+        const obligation = await writer.write("obligations.reassign", {
+          id,
+          ownerId: owner.ownerId,
+          principal: actorId,
+          message,
+          expectedOwnerId: current.ownerId,
+        });
         return toolOk({ obligation, previousOwnerId: current.ownerId });
       } catch (err) {
         return toolError(err);
@@ -791,18 +848,26 @@ export function createObligationsMcpServer(
     async ({ id, parent_id }) => {
       try {
         // Moving ordinary work under a responsive branch is a promotion too.
-        if (parent_id && repository.require(parent_id).effectiveResponsive) {
-          const moved = repository.require(id);
-          if (!moved.effectiveResponsive) {
-            if (!canSetResponsive()) {
-              throw new Error(
-                `only ${RESPONSIVE_AUTHORITY} may make obligations responsive by reparenting`
-              );
-            }
-            if (!canManage(moved)) throw new Error("not authorized to manage this obligation");
-          }
-        }
-        const obligation = repository.reparent(id, parent_id ?? null, actorId);
+        // Whether this move is one is decided inside the write, against the
+        // committed parent and the moved row's committed owner.
+        const moved = parent_id ? repository.get(id) : undefined;
+        const obligation = await writer.write("obligations.reparent", {
+          id,
+          parentId: parent_id ?? null,
+          principal: actorId,
+          ...(moved
+            ? {
+                promotion: {
+                  expectedOwnerId: moved.ownerId,
+                  refusal: responsiveRefusal(
+                    moved.ownerId,
+                    `only ${RESPONSIVE_AUTHORITY} may make obligations responsive by reparenting`,
+                    "not authorized to manage this obligation"
+                  ),
+                },
+              }
+            : {}),
+        });
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
@@ -827,7 +892,12 @@ export function createObligationsMcpServer(
         if (!canManage(dependent)) {
           throw new Error("not authorized to manage this obligation's prerequisites");
         }
-        const obligation = repository.addPrerequisite(id, prerequisite_id, actorId);
+        const obligation = await writer.write("obligations.addPrerequisite", {
+          id,
+          prerequisiteId: prerequisite_id,
+          principal: actorId,
+          expectedOwnerId: dependent.ownerId,
+        });
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
@@ -852,7 +922,12 @@ export function createObligationsMcpServer(
         if (!canManage(dependent)) {
           throw new Error("not authorized to manage this obligation's prerequisites");
         }
-        const obligation = repository.removePrerequisite(id, prerequisite_id, actorId);
+        const obligation = await writer.write("obligations.removePrerequisite", {
+          id,
+          prerequisiteId: prerequisite_id,
+          principal: actorId,
+          expectedOwnerId: dependent.ownerId,
+        });
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
