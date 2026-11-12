@@ -2923,6 +2923,81 @@ describe("ActorMesh", () => {
     db.close();
   });
 
+  it("leaves a ready-head attention SQLite refused to the boot sweep, with the parent committed and later writes unaffected (#1306)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const inboxStore = new SqliteInboxRepository(db);
+    const actors = new InMemoryActorRepository();
+    const repo = new ObligationRepository(db);
+    repo.setPrincipalKind((id) => (["root", "actor-b"].includes(id) ? "actor" : undefined));
+    const writer = createInProcessMeshWriter(db, {
+      obligations: repo,
+      inbox: inboxStore,
+      actors,
+      actorRuns: { completedFocusEntryCounts: () => new Map<string, number>() },
+    });
+    const { mesh } = setup({ inboxStore, actors, writer });
+    repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null
+          ? null
+          : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
+        previousHeadId,
+        sequence,
+        epoch
+      );
+    });
+    const headRows = () =>
+      (
+        db
+          .prepare("SELECT payload_json FROM actor_inbox_entries WHERE actor_id = 'root'")
+          .all() as { payload_json: string }[]
+      )
+        .map((row) => JSON.parse(row.payload_json) as { type?: string; obligationId?: string })
+        .filter((payload) => payload.type === "obligation.ready_head")
+        .map((payload) => payload.obligationId);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // SQLite refuses the valid attention row the production sink appends.
+      db.exec(`CREATE TEMP TRIGGER refuse_ready_head BEFORE INSERT ON actor_inbox_entries
+        WHEN json_extract(NEW.payload_json, '$.type') = 'obligation.ready_head'
+        BEGIN SELECT RAISE(ABORT, 'refused ready-head row'); END`);
+      const err = await writer
+        .write("obligations.create", {
+          obligation: { id: "ob-1", title: "Head", ownerId: "root", priority: 1 },
+        })
+        .then(
+          () => null,
+          (e: unknown) => e
+        );
+      expect(err).toBeInstanceOf(MeshWriteCommittedError);
+      const committed = err as MeshWriteCommittedError;
+      expect((committed.result as { id: string }).id).toBe("ob-1");
+      expect(committed.failures.map((f) => (f as Error).message)).toEqual([
+        "the owner's ready-head attention was not delivered",
+      ]);
+      expect(repo.get("ob-1")).not.toBeNull();
+      expect(headRows()).toEqual([]);
+      db.exec("DROP TRIGGER refuse_ready_head");
+
+      // A later unrelated write resolves; nothing re-announces the lost head.
+      await expect(
+        writer.write("obligations.create", {
+          obligation: { id: "ob-2", title: "Other", ownerId: "actor-b", priority: 1 },
+        })
+      ).resolves.toMatchObject({ id: "ob-2" });
+      expect(headRows()).toEqual([]);
+
+      // The boot sweep repairs it.
+      await mesh.reconcileReadyHeads(repo);
+      expect(headRows()).toEqual(["ob-1"]);
+    } finally {
+      warn.mockRestore();
+      db.close();
+    }
+  });
+
   it("recovers a missed H->X->H recurrence after a handled boot repair, through production readyHeadRecords() reconciliation (#513)", async () => {
     const db = new Database(":memory:");
     runMigrations(db);

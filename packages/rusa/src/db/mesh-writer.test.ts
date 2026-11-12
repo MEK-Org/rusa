@@ -511,6 +511,47 @@ describe("DbWriter", () => {
     expect(exists("w-after-close")).toBe(false);
   });
 
+  it("finishes an accepted write whose delivery is suspended on close, including the write it makes", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const log: string[] = [];
+    let writer: DbWriter<TestEffect, TestWriteOperations> | undefined;
+    writer = await openDbWriter(async (effect) => {
+      log.push(`${effect.kind}:${effect.id}`);
+      if (effect.kind === "created" && effect.id === "w-close-parent") {
+        await gate;
+        const nested = await writer?.write("create", input("close-nested"));
+        log.push(`nested:${nested?.id}`);
+      }
+    });
+    const parent = writer.write("create", input("close-parent"));
+    // Wait until the parent's delivery is suspended: the worker has answered
+    // and the pool holds no request.
+    await vi.waitFor(() => expect(log).toContain("created:w-close-parent"));
+    let closed = false;
+    const closing = writer.close().then(() => {
+      closed = true;
+    });
+    const refused = await rejection(writer.write("create", input("close-after")));
+    expect(refused).toBeInstanceOf(DbWriterClosedError);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(closed).toBe(false);
+    release();
+    await expect(parent).resolves.toEqual({ id: "w-close-parent" });
+    await closing;
+    expect(log).toEqual([
+      "created:w-close-parent",
+      "created:w-close-nested",
+      "announced:w-close-nested",
+      "nested:w-close-nested",
+      "announced:w-close-parent",
+    ]);
+    expect(exists("w-close-nested")).toBe(true);
+    expect(exists("w-close-after")).toBe(false);
+  });
+
   it("refuses a worker that loaded another build", async () => {
     const err = await rejection(
       DbWriter.open<TestEffect, TestWriteOperations>({

@@ -232,6 +232,11 @@ export class EffectDeliverySequencer {
   private readonly queue: (() => unknown)[] = [];
   private busy = false;
 
+  /** Whether the current async context runs inside an open delivery. */
+  delivering(): boolean {
+    return this.scope.getStore()?.open === true;
+  }
+
   /** Deliver one committed write's effects, in its turn or nested in its parent's. */
   deliver<T>(work: () => T | Promise<T>): Promise<T> {
     // A delivery that has finished no longer holds the ordering, so work its
@@ -396,18 +401,30 @@ export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
   ) {}
 
   private readonly sequencer = new EffectDeliverySequencer();
+  /** Accepted writes whose callers have not been answered yet. */
+  private readonly accepted = new Set<Promise<unknown>>();
+  private closing: Promise<void> | null = null;
 
   write<K extends keyof Ops & string>(
     op: K,
     input: WriteInput<Ops, K>
   ): Promise<WriteOutput<Ops, K>> {
-    return this.pool
+    // Once closing, a write made inside an open delivery is still part of an
+    // accepted write that has not been answered, so it is accepted too.
+    if (this.closing && !this.sequencer.delivering()) {
+      return Promise.reject(new DbWriterClosedError("write pool is closed"));
+    }
+    const answered = this.pool
       .request(op, input)
       .then((outcome) =>
         this.sequencer.deliver(
           () => settle(op, outcome as ReturnedOutcome<E>, this.deliver) as WriteOutput<Ops, K>
         )
       );
+    this.accepted.add(answered);
+    const forget = () => this.accepted.delete(answered);
+    answered.then(forget, forget);
+    return answered;
   }
 
   /** See {@link DbWorkerPool.restore}. */
@@ -415,8 +432,17 @@ export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
     this.pool.restore();
   }
 
-  /** Refuse new writes, finish every accepted one, then stop the worker. Idempotent. */
+  /**
+   * Refuse new writes, finish every accepted one, then stop the worker.
+   * Idempotent. An accepted write is finished when its caller is answered,
+   * after its effects' delivery, including writes that delivery makes. A
+   * delivery that never settles therefore holds close too.
+   */
   close(): Promise<void> {
-    return this.pool.close();
+    this.closing ??= (async () => {
+      while (this.accepted.size > 0) await Promise.allSettled([...this.accepted]);
+      await this.pool.close();
+    })();
+    return this.closing;
   }
 }
