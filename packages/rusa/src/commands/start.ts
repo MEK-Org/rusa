@@ -182,12 +182,13 @@ import {
   ConfiguredActorImportError,
   resolveConfiguredActor,
 } from "../db/configured-actor-import.js";
-import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
+import { bundledReadWorker, DbReadPool } from "../db/read-pool.js";
 import type {
   AvailabilityHold,
   AvailabilityHoldOrigin,
@@ -376,7 +377,7 @@ import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { MaintenanceShutdownCoordinator } from "../update/maintenance-shutdown.js";
-import { isUpdateInProgress } from "../update/orchestrator.js";
+import { type BuildSeam, isUpdateInProgress } from "../update/orchestrator.js";
 import {
   BuildRunner,
   GitRunner,
@@ -1102,6 +1103,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     await resources.close();
     throw err;
   }
+}
+
+/**
+ * The update's build seam, telling the dashboard's read pool once a failed
+ * update has put the previous dist back. A read worker started during the swap
+ * window loaded the new build and was refused, so without this reads would stay
+ * unavailable until a restart the failed update never makes (#1289). The pool
+ * admits only workers of its own build, so a rollback that restored something
+ * else leaves reads refused.
+ */
+function restoringReadsOnRollback(runner: BuildRunner, restoreReads: () => void): BuildSeam {
+  return {
+    build: (sha) => runner.build(sha),
+    rollback: async () => {
+      await runner.rollback();
+      restoreReads();
+    },
+  };
 }
 
 /**
@@ -2475,6 +2494,8 @@ async function composeStart(
   );
   let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
+  // Set once the dashboard's read pool is open (#1289).
+  let restoreDbReads: () => void = () => {};
 
   const maintenanceDrainer = new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), "");
   const maintenanceShutdown = new MaintenanceShutdownCoordinator({
@@ -2528,10 +2549,13 @@ async function composeStart(
       maintenanceShutdown,
       deps: {
         git: new GitRunner(repoRoot),
-        build: new BuildRunner(
-          packageDir,
-          { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
-          (m) => console.log(m)
+        build: restoringReadsOnRollback(
+          new BuildRunner(
+            packageDir,
+            { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
+            (m) => console.log(m)
+          ),
+          () => restoreDbReads()
         ),
         coordinator: new SystemdCoordinatorRestarter({
           cliPath: join(packageDir, "dist", "cli.js"),
@@ -4440,6 +4464,28 @@ async function composeStart(
     // cold cache as an authoritative empty snapshot (#527).
     await initialQuotaHistoryWarmup;
   }
+  // Read workers open their connections only now, after migrations and before
+  // the dashboard serves a request; acquired before the dashboard server, so
+  // shutdown stops serving first and then drains the reads already accepted.
+  // A source run has no built worker and keeps the dashboard's reads in-process;
+  // a built run whose worker is missing fails here instead.
+  const readWorker = bindDashboard ? bundledReadWorker() : null;
+  if (bindDashboard && !readWorker) {
+    log.warn("db_read_pool_unavailable", {
+      reason: "running from source; reads stay in-process",
+    });
+  }
+  const dbReads = readWorker
+    ? await DbReadPool.open({
+        dbPath: meshDbPath(mcHome),
+        worker: readWorker,
+        logger: log.child({ component: "db-read-pool" }),
+      })
+    : undefined;
+  if (dbReads) {
+    resources.acquire("db read pool", () => dbReads.close());
+    restoreDbReads = () => dbReads.restore();
+  }
   const dashboardServer = bindDashboard
     ? await startDashboardServer({
         auth: config.auth,
@@ -4461,6 +4507,7 @@ async function composeStart(
           pushDeviceTokens: getRepositories().pushDeviceTokens,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
+          reads: dbReads,
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,

@@ -55,8 +55,9 @@ import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
-import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import * as readPool from "../db/read-pool.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
@@ -79,6 +80,7 @@ import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SlackClient } from "../slack/slack-client.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
+import { BuildRunner } from "../update/runner.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -778,6 +780,60 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(passedOpts.quotaClientHealth?.()).toEqual({ quota_client_service_connected: 0 });
     } finally {
       startDashboardServerSpy.mockRestore();
+    }
+  });
+
+  it("hands the dashboard the read pool it opens on the mesh database (#1289)", async () => {
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    // A source run has no built worker; stand in for a built run's pool.
+    const workerSpy = vi
+      .spyOn(readPool, "bundledReadWorker")
+      .mockReturnValue("/dist/db-read-worker.js");
+    const pool = { read: vi.fn(), close: vi.fn(async () => {}), restore: vi.fn() };
+    const openSpy = vi
+      .spyOn(readPool.DbReadPool, "open")
+      .mockResolvedValue(pool as unknown as readPool.DbReadPool);
+    const rollbackSpy = vi.spyOn(BuildRunner.prototype, "rollback");
+    try {
+      const handles = await new Promise<RunStartE2EHandles>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (ready) => {
+              shutdownFn = ready.shutdown;
+              resolve(ready);
+            },
+          },
+        });
+      });
+
+      expect(openSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          dbPath: meshDbPath(homeDir),
+          worker: "/dist/db-read-worker.js",
+        })
+      );
+      expect(startDashboardServerSpy.mock.calls[0][0].mesh?.reads).toBe(pool);
+
+      // A failed update's rollback restores the pool only once dist is back.
+      const build = handles.updateToolDepsFor?.("self").deps.build;
+      rollbackSpy.mockRejectedValueOnce(new Error("cannot restore previous dist"));
+      await expect(build?.rollback?.()).rejects.toThrow("cannot restore previous dist");
+      expect(pool.restore).not.toHaveBeenCalled();
+      rollbackSpy.mockResolvedValueOnce(undefined);
+      await build?.rollback?.();
+      expect(pool.restore).toHaveBeenCalledOnce();
+
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      expect(pool.close).toHaveBeenCalled();
+    } finally {
+      startDashboardServerSpy.mockRestore();
+      workerSpy.mockRestore();
+      openSpy.mockRestore();
+      rollbackSpy.mockRestore();
     }
   });
 

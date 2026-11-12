@@ -18,6 +18,8 @@ import {
   readAvatar,
   uploadAvatar,
 } from "../avatar/avatars.js";
+import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
+import { DbReadUnavailableError } from "../db/read-pool.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type {
   AvailabilityHold,
@@ -98,6 +100,11 @@ export interface DashboardDataDeps {
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
+  /**
+   * Standalone reads served off the main thread (#1289). Absent → the same
+   * operations run in-process against {@link obligations} and {@link inbox}.
+   */
+  reads?: DbReads;
   /**
    * Durable actor inbox. Read-only to the dashboard apart from a single write:
    * the operator clearing an entry the actor should not have to answer (#66).
@@ -690,27 +697,21 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 }
 
 /**
- * The ancestors of a page's rows, each once and none that is itself a row.
- * Every ancestor is read at most once, so the reads stay within the page's
- * distinct ancestry however many rows share it, and a cycle ends the walk.
+ * Where a route's standalone reads run: the read workers when wired, otherwise
+ * in-process. Each route checks the repository it needs before reading.
  */
-function pageAncestors(
-  obligations: Pick<ObligationRepository, "get">,
-  rows: readonly Obligation[]
-): Obligation[] {
-  const seen = new Set(rows.map((row) => row.id));
-  const ancestors: Obligation[] = [];
-  for (const row of rows) {
-    let parentId = row.parentId;
-    while (parentId && !seen.has(parentId)) {
-      seen.add(parentId);
-      const parent = obligations.get(parentId);
-      if (!parent) break;
-      ancestors.push(parent);
-      parentId = parent.parentId;
-    }
-  }
-  return ancestors;
+function readsOf(deps: DashboardDataDeps): DbReads {
+  if (deps.reads) return deps.reads;
+  return inProcessReads({
+    get obligations() {
+      if (!deps.obligations) throw new Error("obligations data unavailable");
+      return deps.obligations;
+    },
+    get inbox() {
+      if (!deps.inbox) throw new Error("inbox data unavailable");
+      return deps.inbox;
+    },
+  });
 }
 
 /**
@@ -1011,6 +1012,23 @@ async function resolveReferenceBatch(
  * server) every mesh route 503s — the static UI is unaffected.
  */
 export async function handleMeshApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: DashboardDataDeps | null
+): Promise<boolean> {
+  try {
+    return await routeMeshApiRequest(req, res, url, deps);
+  } catch (err) {
+    // A full queue, a worker that stopped mid-read or a closed or failed pool
+    // is the service being unavailable, not the request being bad (#1289).
+    if (!(err instanceof DbReadUnavailableError) || res.headersSent) throw err;
+    sendJson(res, 503, { error: err.message });
+    return true;
+  }
+}
+
+async function routeMeshApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
@@ -2682,9 +2700,12 @@ export async function handleMeshApiRequest(
       res,
       200,
       await resolveInboxPage(
-        deps.inbox.list(actorId, {
-          status: status as "unhandled" | "handled" | "all" | undefined,
-          limit: clampLimit(url),
+        await readsOf(deps).read("inboxPage", {
+          actorId,
+          options: {
+            status: status as "unhandled" | "handled" | "all" | undefined,
+            limit: clampLimit(url),
+          },
         }),
         deps,
         viewerScope()
@@ -2731,22 +2752,19 @@ export async function handleMeshApiRequest(
       return true;
     }
 
-    const page = deps.obligations.listPage({
+    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
+    // page once each, so the client can draw each row's path from the page it
+    // already asked for instead of one detail read per row.
+    const rawAncestors = url.searchParams.get("ancestors");
+    const page = await readsOf(deps).read("obligationPage", {
       ownerId,
       status: status as ObligationStatus | undefined,
       queue: queue as ObligationQueue | undefined,
       rootsOnly,
       limit,
       offset,
+      ancestors: rawAncestors === "true" || rawAncestors === "1",
     });
-    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
-    // page once each, so the client can draw each row's path from the page it
-    // already asked for instead of one detail read per row.
-    const rawAncestors = url.searchParams.get("ancestors");
-    if (rawAncestors === "true" || rawAncestors === "1") {
-      sendJson(res, 200, { ...page, ancestors: pageAncestors(deps.obligations, page.obligations) });
-      return true;
-    }
     sendJson(res, 200, page);
     return true;
   }
@@ -2786,17 +2804,15 @@ export async function handleMeshApiRequest(
       url.searchParams.get("include_terminal_roots");
     const includeTerminalRoots =
       rawIncludeTerminalRoots === "true" || rawIncludeTerminalRoots === "1";
-    const page = deps.obligations.listPage({
-      rootsOnly: true,
-      excludeQuietTerminalRoots: !includeTerminalRoots,
-      limit,
-      offset,
-    });
-    const trees = deps.obligations.getForest(
-      page.obligations.map((obligation) => obligation.id),
-      { excludeQuietTerminalDescendants: !includeTerminalRoots }
+    sendJson(
+      res,
+      200,
+      await readsOf(deps).read("obligationForest", {
+        limit,
+        offset,
+        includeTerminalRoots,
+      })
     );
-    sendJson(res, 200, { trees, total: page.total, hasMore: page.hasMore });
     return true;
   }
 
@@ -2808,17 +2824,21 @@ export async function handleMeshApiRequest(
       return true;
     }
     const id = decodeURIComponent(obligationTreeMatch[1]);
-    const obligation = deps.obligations.get(id);
-    if (!obligation) {
+    let tree: ReadOutput<"obligationTree">;
+    try {
+      tree = await readsOf(deps).read("obligationTree", { id });
+    } catch (err) {
+      // Only the tree's own validation (a cycle) is the request's fault. Matched
+      // by name: a read worker carries back an error's name, not its class.
+      if (!(err instanceof Error) || err.name !== "ObligationValidationError") throw err;
+      sendJson(res, 400, { error: err.message });
+      return true;
+    }
+    if (!tree) {
       sendJson(res, 404, { error: "obligation not found" });
       return true;
     }
-    try {
-      const tree = deps.obligations.getTree(id);
-      sendJson(res, 200, tree);
-    } catch (err) {
-      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-    }
+    sendJson(res, 200, tree);
     return true;
   }
 
@@ -2830,51 +2850,35 @@ export async function handleMeshApiRequest(
       return true;
     }
     const id = decodeURIComponent(obligationMatch[1]);
-    const obligation = deps.obligations.get(id);
-    if (!obligation) {
+    const detail = await readsOf(deps).read("obligationDetail", {
+      id,
+      limit: clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT),
+      offset: parsePositiveInt(url, "offset") ?? 0,
+      completionsOffset: parsePositiveInt(url, "completions_offset") ?? 0,
+      blockedByOffset: parsePositiveInt(url, "blocked_by_offset") ?? 0,
+      blocksOffset: parsePositiveInt(url, "blocks_offset") ?? 0,
+      historyBefore: url.searchParams.get("history_before") ?? undefined,
+      historyLimit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
+    });
+    if (!detail) {
       sendJson(res, 404, { error: "obligation not found" });
       return true;
     }
-    const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
-    const offset = parsePositiveInt(url, "offset") ?? 0;
-    const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
-    const blockedByOffset = parsePositiveInt(url, "blocked_by_offset") ?? 0;
-    const blocksOffset = parsePositiveInt(url, "blocks_offset") ?? 0;
-    const children = deps.obligations.listChildrenPage(id, { limit, offset });
-    const blockingChildren = deps.obligations.listChildrenPage(id, {
-      limit,
-      offset: 0,
-      blockingOnly: true,
-    });
-    const completions = deps.obligations.listCompletionsPage(id, {
-      limit,
-      offset: completionsOffset,
-    });
-    const blockedBy = deps.obligations.listBlockedByPage(id, {
-      limit,
-      offset: blockedByOffset,
-    });
-    const blocks = deps.obligations.listUnblocksPage(id, {
-      limit,
-      offset: blocksOffset,
-    });
-    const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
-    const ancestors = [];
-    const seen = new Set([id]);
-    let ancestor = parent;
-    while (ancestor && !seen.has(ancestor.id)) {
-      seen.add(ancestor.id);
-      ancestors.unshift(ancestor);
-      ancestor = ancestor.parentId ? deps.obligations.get(ancestor.parentId) : null;
-    }
-    const history = deps.obligations.listHistoryPage(id, {
-      before: url.searchParams.get("history_before") ?? undefined,
-      limit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
-    });
+    const {
+      obligation,
+      parent,
+      ancestors,
+      history,
+      children,
+      blockingChildren,
+      completions,
+      blockedBy,
+      blocks,
+    } = detail;
     // Citations and the external reference go out as their keys alone: the
     // client resolves them through /api/mesh/references after the pane has
     // painted, so a cold GitHub or Chat read never holds the response (#940).
-    const artifacts = deps.obligations.listArtifacts(id).map((artifact) => ({ artifact }));
+    const artifacts = detail.artifacts.map((artifact) => ({ artifact }));
     sendJson(res, 200, {
       obligation,
       parent,

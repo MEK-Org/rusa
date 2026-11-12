@@ -154,6 +154,8 @@ export interface DashboardMeshRefs {
   obligations?: ObligationRepository;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
   inbox?: InboxRepository;
+  /** Standalone reads served off the main thread; see `DashboardDataDeps`. */
+  reads?: DashboardDataDeps["reads"];
   resolveActorId?: DashboardDataDeps["resolveActorId"];
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
@@ -690,6 +692,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
+          reads: options.mesh.reads,
           resolveActorId: options.mesh.resolveActorId,
           actorRuns: options.mesh.actorRuns,
           runPrompts: options.mesh.runPrompts,
