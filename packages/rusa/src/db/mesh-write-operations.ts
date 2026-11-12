@@ -1,13 +1,27 @@
 import type Database from "better-sqlite3";
+import {
+  evaluateHeadClosure,
+  type HeadClosureQuery,
+  type HeadClosureShortfall,
+} from "../actor/head-closure.js";
+import { assertParentExhaustedInboxAuthority } from "../actor/parent-inbox-authority.js";
 import type { CompletionMatcher, CompletionMatcherInput } from "../obligations/obligation.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
+import type { InboxEntry, MarkHandledResult } from "../repositories/inbox-repository.js";
 import { InProcessMeshWriter, type MeshWriter } from "./mesh-writer.js";
+import type { ActorRunRepository } from "./repositories/actor-run-repository.js";
 import type {
   CreateObligationInput,
   ObligationMutationEffect,
   ObligationRepository,
   PriorityScope,
 } from "./repositories/obligation-repository.js";
+import {
+  INBOX_MUTATION_EFFECT,
+  type InboxMutationEffect,
+  type SqliteInboxRepository,
+} from "./repositories/sqlite-inbox-repository.js";
 import type { WriteContext, WriteOperationTable } from "./write-worker-runtime.js";
 
 // The mesh's write operations (#1289). Each runs whole inside the writer's
@@ -18,10 +32,13 @@ import type { WriteContext, WriteOperationTable } from "./write-worker-runtime.j
 /** The repositories a write operation reaches, over the writing connection. */
 export interface MeshWriteRepos {
   readonly obligations: ObligationRepository;
+  readonly inbox: SqliteInboxRepository;
+  readonly actors: Pick<ActorRepository, "get">;
+  readonly actorRuns: Pick<ActorRunRepository, "completedFocusEntryCounts">;
 }
 
 /** What a committed write owes the main thread. */
-export type MeshEffect = ObligationMutationEffect;
+export type MeshEffect = ObligationMutationEffect | InboxMutationEffect;
 
 type Context = WriteContext<MeshWriteRepos, MeshEffect>;
 
@@ -74,7 +91,139 @@ function mutating<T>(context: Context, work: (obligations: ObligationRepository)
   return obligations.inWriteOperation(context, () => work(obligations));
 }
 
+/**
+ * Run `work` with every obligation and inbox write it makes emitting its
+ * effect to `context`, in the order the writes are made.
+ */
+function writing<T>(context: Context, work: (repos: MeshWriteRepos) => T): T {
+  const { obligations, inbox } = context.repos;
+  return obligations.inWriteOperation(context, () =>
+    inbox.inWriteOperation(context, () => work(context.repos))
+  );
+}
+
+/**
+ * The heads in `closure` that are not closed, as the inbox mark decides it:
+ * their due snoozes are cleared first, through the normal mutation path and
+ * attributed to the mesh (#722), then closure is evaluated (#382). Inside a
+ * write operation every read and the clearing are the transaction's.
+ */
+export function inboxClosureShortfalls(
+  repos: Pick<MeshWriteRepos, "obligations" | "actors">,
+  closure: HeadClosureQuery
+): HeadClosureShortfall[] {
+  const { obligations, actors } = repos;
+  obligations.expireDueSnoozes(closure.heads, "system:mesh");
+  return evaluateHeadClosure(
+    {
+      get: (id) => obligations.get(id),
+      listDirectChildEdges: (id) => obligations.listDirectChildEdges(id),
+      listPrerequisiteEdges: (id) => obligations.listPrerequisiteEdges(id),
+      actorStatus: (id) => actors.get(id)?.status,
+    },
+    closure
+  );
+}
+
+/** The parent-clearance check's durable reads, over the writing connection. */
+function parentAuthorityReader(repos: MeshWriteRepos) {
+  return {
+    actor: (id: string) => repos.actors.get(id),
+    readEntry: (actorId: string, entryId: string) => repos.inbox.read(actorId, entryId),
+    completedFocusEntryCounts: (actorId: string) =>
+      repos.actorRuns.completedFocusEntryCounts(actorId),
+  };
+}
+
+/** A parent clearing a child's exhausted inbox work. */
+interface ParentClearance {
+  /** The caller as it named itself; the audit note keeps this form. */
+  readonly callerId: string;
+  readonly childId: string;
+  readonly entryIds: readonly string[];
+  /** Already trimmed and non-empty. */
+  readonly note: string;
+  readonly rootId: string | null;
+}
+
 export const MESH_WRITE_OPERATIONS = {
+  /**
+   * Mark an actor's inbox entries handled. With `closure`, the heads those
+   * entries are attention for must be closed first (#382): their due snoozes
+   * are cleared and closure is decided against this transaction's state, so
+   * no other write can land between the verdict and the mark. A refusal still
+   * commits the cleared snoozes, as clearing them did before the check moved
+   * in here, and is returned rather than thrown so it does not roll them back.
+   */
+  "inbox.markHandled": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly entryIds: string[];
+      readonly note?: string;
+      readonly closure?: HeadClosureQuery | null;
+    }
+  ):
+    | { readonly refused: HeadClosureShortfall[] }
+    | { readonly refused: null; readonly entries: MarkHandledResult[] } =>
+    writing(context, (repos) => {
+      const { closure } = input;
+      if (closure && closure.heads.length > 0) {
+        const shortfalls = inboxClosureShortfalls(repos, closure);
+        if (shortfalls.length > 0) return { refused: shortfalls };
+      }
+      return {
+        refused: null,
+        entries: repos.inbox.markHandled(input.actorId, input.entryIds, undefined, input.note),
+      };
+    }),
+
+  /** A parent marks its child's exhausted entries handled, if it still may. */
+  "inbox.markChildHandled": (
+    context: Context,
+    input: ParentClearance
+  ): { childId: string; handled: MarkHandledResult[] } =>
+    writing(context, (repos) => {
+      const { childId, entries } = assertParentExhaustedInboxAuthority(
+        parentAuthorityReader(repos),
+        input
+      );
+      const handled = repos.inbox.markHandled(
+        childId,
+        entries.map((entry) => entry.id),
+        undefined,
+        `Marked handled by parent (${input.callerId}): ${input.note}`
+      );
+      return { childId, handled };
+    }),
+
+  /**
+   * A parent releases its child's exhausted entries for re-handling, if it
+   * still may: each is marked handled and replaced by a fresh unhandled copy.
+   */
+  "inbox.releaseChildSelectionLock": (
+    context: Context,
+    input: ParentClearance
+  ): { childId: string; released: string[]; replacements: InboxEntry[] } =>
+    writing(context, (repos) => {
+      const { childId, entries } = assertParentExhaustedInboxAuthority(
+        parentAuthorityReader(repos),
+        input
+      );
+      const ids = entries.map((entry) => entry.id);
+      const { replacements } = repos.inbox.replaceEntries(
+        childId,
+        ids,
+        `Released by parent (${input.callerId}) for re-handling: ${input.note}`,
+        entries.map((entry) => ({
+          actorId: childId,
+          source: entry.source,
+          payload: entry.payload,
+        }))
+      );
+      return { childId, released: ids, replacements };
+    }),
+
   /**
    * Create an obligation. `responsiveRefusal` is the caller's answer to "may
    * this principal start a new responsive branch for this owner?": null when
@@ -346,7 +495,8 @@ export type MeshObligationWriter = MeshWriter<MeshWriteOperations>;
  * repository: its listeners, retry state and host scheduler live there.
  */
 export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): void {
-  repos.obligations.deliverMutationEffect(effect);
+  if (effect.kind === INBOX_MUTATION_EFFECT) repos.inbox.deliverMutationEffect(effect);
+  else repos.obligations.deliverMutationEffect(effect);
 }
 
 /**

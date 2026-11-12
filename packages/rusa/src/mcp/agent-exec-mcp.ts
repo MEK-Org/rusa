@@ -804,7 +804,12 @@ export function createAgentExecMcpServer(
     },
     async ({ thread_id, entry_ids, note }) => {
       try {
-        const result = mesh.releaseChildInboxSelectionLock(selfId, thread_id, entry_ids, note);
+        const result = await mesh.releaseChildInboxSelectionLock(
+          selfId,
+          thread_id,
+          entry_ids,
+          note
+        );
         options?.onWrite?.();
         return toolOk(result);
       } catch (err) {
@@ -846,7 +851,7 @@ export function createAgentExecMcpServer(
     },
     async ({ thread_id, entry_ids, note }) => {
       try {
-        const result = mesh.markChildInboxHandled(selfId, thread_id, entry_ids, note);
+        const result = await mesh.markChildInboxHandled(selfId, thread_id, entry_ids, note);
         options?.onWrite?.();
         return toolOk(result);
       } catch (err) {

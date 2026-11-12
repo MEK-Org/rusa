@@ -4,12 +4,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
-import { actorInbox } from "../db/migrations/0003_actor_inbox.js";
-import { actorInboxSeen } from "../db/migrations/0012_actor_inbox_seen.js";
-import { actorInboxHandledNote } from "../db/migrations/0015_actor_inbox_handled_note.js";
+import { inboxMcpStore } from "../db/fixtures/obligation-store.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { Obligation } from "../obligations/obligation.js";
-import { createInboxMcpServer } from "./inbox-mcp.js";
+import { createInboxMcpServer, type InboxMcpRunScope } from "./inbox-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -27,12 +27,13 @@ function dataOf(result: CallToolResult): unknown {
 
 describe("inbox MCP server", () => {
   let store: SqliteInboxRepository;
+  let db: Database.Database;
+  const server = (actorId: string, scope?: InboxMcpRunScope) =>
+    createInboxMcpServer(inboxMcpStore(db, store), actorId, scope);
 
   beforeEach(() => {
-    const db = new Database(":memory:");
-    actorInbox.up(db);
-    actorInboxSeen.up(db);
-    actorInboxHandledNote.up(db);
+    db = new Database(":memory:");
+    runMigrations(db);
     store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00Z"));
     store.append([
       { id: "own", actorId: "actor-a", source: "chat", payload: { type: "message.created" } },
@@ -41,7 +42,7 @@ describe("inbox MCP server", () => {
   });
 
   it("exposes list, select, read, and mark_handled", async () => {
-    const client = await connect(createInboxMcpServer(store, "actor-a"));
+    const client = await connect(server("actor-a"));
     expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
       "list",
       "mark_handled",
@@ -51,7 +52,7 @@ describe("inbox MCP server", () => {
   });
 
   it("bakes actor identity into list/read and hides foreign ids as not found", async () => {
-    const client = await connect(createInboxMcpServer(store, "actor-a"));
+    const client = await connect(server("actor-a"));
     const listed = (await client.callTool({ name: "list", arguments: {} })) as CallToolResult;
     expect((dataOf(listed) as { entries: Array<{ id: string }> }).entries.map((e) => e.id)).toEqual(
       ["own"]
@@ -68,7 +69,7 @@ describe("inbox MCP server", () => {
     store.append([
       { id: "own-2", actorId: "actor-a", source: "chat", payload: { type: "message.created" } },
     ]);
-    const client = await connect(createInboxMcpServer(store, "actor-a"));
+    const client = await connect(server("actor-a"));
     const invalid = (await client.callTool({
       name: "mark_handled",
       arguments: { entry_id: "own", entry_ids: ["own-2"], note: "handled in test" },
@@ -94,7 +95,7 @@ describe("inbox MCP server", () => {
   });
 
   it("requires a non-empty note and rejects missing or blank ones", async () => {
-    const client = await connect(createInboxMcpServer(store, "actor-a"));
+    const client = await connect(server("actor-a"));
     await client.callTool({ name: "select", arguments: { entry_ids: ["own"] } });
 
     const missing = (await client.callTool({
@@ -146,7 +147,7 @@ describe("inbox MCP server", () => {
         },
       },
     ]);
-    const client = await connect(createInboxMcpServer(store, "actor-a"));
+    const client = await connect(server("actor-a"));
     const result = (await client.callTool({
       name: "select",
       arguments: { entry_ids: ["human-msg", "gchat-reply-msg", "gchat-head-msg", "own"] },
@@ -188,7 +189,7 @@ describe("inbox MCP server", () => {
       },
     ]);
     const client = await connect(
-      createInboxMcpServer(store, "actor-a", {
+      server("actor-a", {
         select: (ids) => {
           if (
             voiceActive &&
@@ -241,7 +242,7 @@ describe("inbox MCP server", () => {
   it("passes an explicit obligation to the run scope and returns resolved focus", async () => {
     let selectedObligation: string | undefined;
     const client = await connect(
-      createInboxMcpServer(store, "actor-a", {
+      server("actor-a", {
         select: (entryIds, obligationId) => {
           selectedObligation = obligationId;
           return {
@@ -296,7 +297,7 @@ describe("inbox MCP server", () => {
         return entry;
       });
     const client = await connect(
-      createInboxMcpServer(store, "actor-a", {
+      server("actor-a", {
         select: readEntries,
         selected: () => ["peer-msg", "own"],
         chatContext: {
@@ -363,7 +364,7 @@ describe("inbox MCP server", () => {
         return entry;
       });
     const client = await connect(
-      createInboxMcpServer(store, "actor-a", {
+      server("actor-a", {
         select: readEntries,
         selected: () => ["human-msg", "own"],
         openQuestions: {
@@ -400,5 +401,81 @@ describe("inbox MCP server", () => {
       },
     });
     expect(entries[1]).not.toHaveProperty("openQuestions");
+  });
+
+  describe("mark_handled through the writer (#1289)", () => {
+    const readEntry = (id: string) => {
+      const entry = store.read("actor-a", id);
+      if (!entry) throw new Error("missing test entry");
+      return entry;
+    };
+
+    it("commits before anything queued while its closure question is asked runs", async () => {
+      // The question is asked as the write is submitted, and the in-process
+      // writer commits inside the call, so a microtask queued while asking is
+      // the first thing that could run after it. An await between the
+      // question and the write would let the microtask see the entry unhandled.
+      let seenAfterQuestion: unknown = "not run";
+      const client = await connect(
+        server("actor-a", {
+          select: (ids) => ids.map(readEntry),
+          selected: () => ["own"],
+          closureFor: () => {
+            queueMicrotask(() => {
+              seenAfterQuestion = store.read("actor-a", "own")?.handledAt ?? null;
+            });
+            return null;
+          },
+        })
+      );
+
+      const result = (await client.callTool({
+        name: "mark_handled",
+        arguments: { entry_id: "own", note: "done" },
+      })) as CallToolResult;
+
+      expect(result.isError).not.toBe(true);
+      expect(seenAfterQuestion).toBeTruthy();
+    });
+
+    it("returns closure's refusal and leaves the entry unhandled", async () => {
+      new ObligationRepository(db).create({ id: "head", ownerId: "actor-a", title: "Head" });
+      let handled = 0;
+      const client = await connect(
+        server("actor-a", {
+          select: (ids) => ids.map(readEntry),
+          selected: () => ["own"],
+          onHandled: () => handled++,
+          closureFor: () => ({
+            actorId: "actor-a",
+            heads: ["head"],
+            baseline: {
+              selectedHeads: new Map([
+                [
+                  "head",
+                  { ownerId: "actor-a", checkpoint: null, checkpointAt: null, checkpointBy: null },
+                ],
+              ]),
+              preExistingChildIds: new Map(),
+              preExistingPrerequisiteIds: new Map(),
+            },
+            rootId: null,
+            retiring: new Set(),
+          }),
+        })
+      );
+
+      const result = (await client.callTool({
+        name: "mark_handled",
+        arguments: { entry_id: "own", note: "not yet" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain(
+        'Cannot mark handled: selected head obligation head (\\"Head\\") was not finished or decomposed. Reason: obligation is still ready.'
+      );
+      expect(store.read("actor-a", "own")?.handledAt).toBeNull();
+      expect(handled).toBe(0);
+    });
   });
 });

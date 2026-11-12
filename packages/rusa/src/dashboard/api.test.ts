@@ -244,7 +244,7 @@ describe("handleMeshApiRequest", () => {
       meshChat,
       inbox,
       obligations,
-      obligationWriter: meshWriterFor(db, obligations),
+      obligationWriter: meshWriterFor(db, obligations, { inbox }),
       sseHub: new SseHub(new MeshEventEmitter()),
       mesh: mockMesh as unknown as ActorMesh,
       rootControl: {

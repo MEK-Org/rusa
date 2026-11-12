@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ActorFactoryContext, ActorMeshOptions } from "../actor/actor-mesh.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
 import { ProviderPacer } from "../actor/provider-pacer.js";
+import { inboxClosureShortfalls } from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { ClaudeProvider } from "../providers/claude.js";
@@ -2635,14 +2636,20 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
     if (!entry) throw new Error("expected ready-head inbox entry");
     h.mesh.selectInboxEntries(id, [entry.id]);
+    // The inbox tool's write decides the mesh's closure question this way
+    // (#1289); this leader keeps obligations and inbox in separate databases,
+    // so the verdict and the mark are taken here in turn.
+    if (closes) repo.setTerminalStatus("remote-head", "done", null, null, "system:mesh");
+    const closure = h.mesh.inboxHandlingClosure(id, [entry.id]);
+    if (!closure) throw new Error("expected a closure question for the selected head");
+    const refusal = inboxClosureShortfalls({ obligations: repo, actors: h.actors }, closure)
+      .map((shortfall) => shortfall.message)
+      .join(" ");
     if (closes) {
-      repo.setTerminalStatus("remote-head", "done", null, null, "system:mesh");
-      h.mesh.assertInboxEntriesHandleable(id, [entry.id]);
+      expect(refusal).toBe("");
       h.inboxStore.markHandled(id, [entry.id]);
     } else {
-      expect(() => h.mesh.assertInboxEntriesHandleable(id, [entry.id])).toThrow(
-        /Cannot mark handled: selected head obligation remote-head/
-      );
+      expect(refusal).toMatch(/selected head obligation remote-head/);
     }
 
     await waitUntil(
