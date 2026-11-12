@@ -2857,6 +2857,23 @@ describe("ActorMesh", () => {
           epoch
         );
       });
+    // Each repository's writes go through a production in-process writer over
+    // it, so each mutation answers only after its head attention is appended
+    // (#1289 C2), and the counts below are read after delivery.
+    const writerFor = (repo: ObligationRepository) => {
+      const writer = createInProcessMeshWriter(db, {
+        obligations: repo,
+        inbox: new SqliteInboxRepository(db),
+        actors,
+        actorRuns: { completedFocusEntryCounts: () => new Map<string, number>() },
+      });
+      return {
+        create: (obligation: { id: string; title: string; ownerId: string; priority: number }) =>
+          writer.write("obligations.create", { obligation }),
+        reassign: (id: string, ownerId: string) =>
+          writer.write("obligations.reassign", { id, ownerId, principal: "system:mesh" }),
+      };
+    };
 
     // Process 1: A arrives, B displaces it, then B leaves and returns, leaving
     // B as the head. Transition #3 is B -> A at sequence 3; the actor handles
@@ -2867,10 +2884,11 @@ describe("ActorMesh", () => {
     );
     const mesh1 = setup({ inboxStore, actors });
     wire(mesh1.mesh, repo1);
-    repo1.create({ id: "ob-a", title: "Task A", ownerId: "root", priority: 1 });
-    repo1.create({ id: "ob-b", title: "Task B", ownerId: "root", priority: 0 });
-    repo1.reassign("ob-b", "actor-someone-else", "system:mesh");
-    repo1.reassign("ob-b", "root", "system:mesh");
+    const writes1 = writerFor(repo1);
+    await writes1.create({ id: "ob-a", title: "Task A", ownerId: "root", priority: 1 });
+    await writes1.create({ id: "ob-b", title: "Task B", ownerId: "root", priority: 0 });
+    await writes1.reassign("ob-b", "actor-someone-else");
+    await writes1.reassign("ob-b", "root");
     expect(headEntries()).toHaveLength(4);
     expect(headEntries()[2].payload).toMatchObject({ obligationId: "ob-a" });
     for (const entry of headEntries()) inboxStore.markHandled("root", [entry.id]);
@@ -2884,10 +2902,11 @@ describe("ActorMesh", () => {
       ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
     );
     wire(mesh1.mesh, repo2);
-    repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
+    const writes2 = writerFor(repo2);
+    await writes2.reassign("ob-b", "actor-someone-else");
     expect(headEntries()).toHaveLength(5);
     inboxStore.markHandled("root", [headEntries()[4].id]);
-    repo2.reassign("ob-b", "root", "system:mesh");
+    await writes2.reassign("ob-b", "root");
     expect(headEntries()).toHaveLength(6);
     inboxStore.markHandled("root", [headEntries()[5].id]);
 
@@ -2896,7 +2915,7 @@ describe("ActorMesh", () => {
     // the actor was never woken about live work; the epoch in the dedupe key
     // keeps the recurrence a distinct entry. Replays within this process are
     // still suppressed.
-    repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
+    await writes2.reassign("ob-b", "actor-someone-else");
     expect(headEntries()).toHaveLength(7);
     expect(headEntries()[6].payload).toMatchObject({ obligationId: "ob-a" });
 

@@ -2780,8 +2780,8 @@ export class ActorMesh {
   }
 
   /**
-   * The actor's state is read before the append is awaited; the wake after it
-   * is advisory and re-reads its target itself.
+   * The actor's state is read before the append is awaited. The row's wake is
+   * the advisory one the append seam owes it, which re-reads its target.
    */
   private async appendReadyHeadEntry(
     actorId: string,
@@ -2819,17 +2819,16 @@ export class ActorMesh {
           ...(latestReassignment ? { latestReassignment } : {}),
           // A responsive head's attention is immediately responsive work:
           // it preempts where the inbox model admits preemption. The priority
-          // written here is the only thing that makes the dispatch below
-          // responsive.
+          // written here is the only thing that makes the dispatch the append
+          // seam owes this row responsive.
           ...(responsive ? { priority: "responsive" as const } : {}),
         } as unknown as InboxPayload,
       },
     ]);
-    if (entries.length === 0) {
-      return false;
-    }
-    this.wake(actorId, "ready-head attention");
-    return true;
+    // The after-commit append seam owes the row its one ordinary, preemptive
+    // wake (#632). A second wake here would be a second dispatch of the same
+    // work, now that the append is awaited and the seam's drain runs first.
+    return entries.length > 0;
   }
 
   /**
@@ -2995,9 +2994,8 @@ export class ActorMesh {
         } as unknown as InboxPayload,
       },
     ]);
-    if (entries.length === 0) return false;
-    this.wake(actorId, "prerequisite-cancelled attention");
-    return true;
+    // The after-commit append seam owes the row its wake (#632).
+    return entries.length > 0;
   }
 
   /**
@@ -3066,9 +3064,8 @@ export class ActorMesh {
         } as unknown as InboxPayload,
       },
     ]);
-    if (entries.length === 0) return false;
-    this.wake(actorId, "completion-matcher attention");
-    return true;
+    // The after-commit append seam owes the row its wake (#632).
+    return entries.length > 0;
   }
 
   /** Boot recovery for {@link deliverCompletionMatcherClosedUnmergedAttention}. */
