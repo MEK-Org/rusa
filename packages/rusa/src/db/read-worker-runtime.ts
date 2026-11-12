@@ -3,26 +3,7 @@ import Database from "better-sqlite3";
 import type { ReadRepositories } from "./read-operations.js";
 import { ObligationRepository } from "./repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "./repositories/sqlite-inbox-repository.js";
-
-/** A read the pool hands a worker. */
-export interface ReadRequest {
-  readonly id: number;
-  readonly op: string;
-  readonly input: unknown;
-}
-
-/**
- * A worker's answer: `ready` once its connection is open, carrying the build of
- * the code it runs (`BUILD_ID`), then one per request.
- */
-export type ReadWorkerMessage =
-  | { readonly type: "ready"; readonly build: string | null }
-  | { readonly type: "result"; readonly id: number; readonly value: unknown }
-  | {
-      readonly type: "error";
-      readonly id: number;
-      readonly error: { readonly name: string; readonly message: string };
-    };
+import type { WorkerMessage, WorkerRequest } from "./worker-pool.js";
 
 export type ReadOperationTable = Readonly<
   Record<string, (repos: ReadRepositories, input: never) => unknown>
@@ -54,9 +35,9 @@ export function serveReads(
     obligations: new ObligationRepository(db),
     inbox: new SqliteInboxRepository(db),
   };
-  port.on("message", (request: ReadRequest) => {
+  port.on("message", (request: WorkerRequest) => {
     const operation = Object.hasOwn(operations, request.op) ? operations[request.op] : undefined;
-    let message: ReadWorkerMessage;
+    let message: WorkerMessage;
     try {
       if (!operation) throw new Error(`unknown read operation: ${request.op}`);
       const value = db.transaction(() => operation(repos, request.input as never))();
@@ -71,5 +52,5 @@ export function serveReads(
     }
     port.postMessage(message);
   });
-  port.postMessage({ type: "ready", build } satisfies ReadWorkerMessage);
+  port.postMessage({ type: "ready", build } satisfies WorkerMessage);
 }

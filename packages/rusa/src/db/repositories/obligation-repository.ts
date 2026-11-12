@@ -822,7 +822,10 @@ export class ObligationRepository {
         );
       END;
     `);
-    this.historyCaptureInstalled = true;
+    // Created inside a caller's transaction, the table and trigger are undone
+    // if it rolls back, as every rejected write-worker operation does (#1289).
+    // Re-creating them is idempotent, so trust them only once they stand alone.
+    this.historyCaptureInstalled = !this.db.inTransaction;
   }
 
   /**

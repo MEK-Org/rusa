@@ -1,10 +1,8 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Worker } from "node:worker_threads";
-import { type Logger, nullLogger } from "../observability/logger.js";
-import { BUILD_ID } from "./build-id.js";
+import type { Logger } from "../observability/logger.js";
 import type { DbReads, ReadInput, ReadOperationName, ReadOutput } from "./read-operations.js";
-import type { ReadRequest, ReadWorkerMessage } from "./read-worker-runtime.js";
+import { DbWorkerPool, type WorkerPoolErrors } from "./worker-pool.js";
 
 /**
  * The pool could not serve a read, though nothing was wrong with the read
@@ -52,24 +50,19 @@ export interface DbReadPoolOptions {
   readonly logger?: Logger;
 }
 
-interface PendingRead {
-  readonly request: ReadRequest;
-  readonly resolve: (value: unknown) => void;
-  readonly reject: (error: Error) => void;
-}
-
-interface Slot {
-  worker: Worker;
-  ready: boolean;
-  current: PendingRead | null;
-  /** Set when the pool itself stops this worker, so its exit is expected. */
-  stopping: boolean;
-}
-
 const DEFAULT_SIZE = 2;
 const DEFAULT_MAX_QUEUED = 256;
-/** Consecutive workers that may fail before opening their connection. */
-const MAX_START_FAILURES = 3;
+
+const READ_POOL_ERRORS: WorkerPoolErrors = {
+  label: "read",
+  queueFull: (message) => new DbReadQueueFullError(message),
+  closed: (message) => new DbReadPoolClosedError(message),
+  buildMismatch: (message) => new DbReadBuildMismatchError(message),
+  unavailable: (message) => new DbReadUnavailableError(message),
+  exited: (message) => new DbReadWorkerExitedError(message),
+  abandoned: (message) => new DbReadWorkerExitedError(message),
+  isBuildMismatch: (error) => error instanceof DbReadBuildMismatchError,
+};
 
 /**
  * The read worker tsup builds beside the shared chunk that carries this pool,
@@ -95,56 +88,27 @@ export function bundledReadWorker(moduleUrl: string = import.meta.url): string |
  * every write its caller already awaited.
  */
 export class DbReadPool implements DbReads {
-  private readonly slots: Slot[] = [];
-  private readonly queue: PendingRead[] = [];
-  private readonly size: number;
-  private readonly maxQueued: number;
-  private readonly logger: Logger;
-  private nextId = 1;
-  private startFailures = 0;
-  private failure: Error | null = null;
-  private closed: Promise<void> | null = null;
-  private drained: (() => void) | null = null;
-
   /**
    * Start every worker and resolve once each has opened its connection, so a
    * database the readers cannot open fails startup rather than the first read.
    */
   static async open(options: DbReadPoolOptions): Promise<DbReadPool> {
-    const pool = new DbReadPool(options);
-    try {
-      await Promise.all(pool.slots.map((slot) => pool.whenReady(slot)));
-    } catch (err) {
-      await pool.close();
-      throw err;
-    }
-    return pool;
+    return new DbReadPool(
+      await DbWorkerPool.open({
+        dbPath: options.dbPath,
+        size: options.size ?? DEFAULT_SIZE,
+        maxQueued: options.maxQueued ?? DEFAULT_MAX_QUEUED,
+        worker: options.worker,
+        errors: READ_POOL_ERRORS,
+        logger: options.logger,
+      })
+    );
   }
 
-  private constructor(private readonly options: DbReadPoolOptions) {
-    const size = options.size ?? DEFAULT_SIZE;
-    if (!Number.isInteger(size) || size < 1) throw new Error("read pool size must be >= 1");
-    this.size = size;
-    this.maxQueued = options.maxQueued ?? DEFAULT_MAX_QUEUED;
-    this.logger = options.logger ?? nullLogger;
-    for (let index = 0; index < size; index++) this.slots.push(this.spawn());
-  }
+  private constructor(private readonly pool: DbWorkerPool) {}
 
   read<K extends ReadOperationName>(op: K, input: ReadInput<K>): Promise<ReadOutput<K>> {
-    if (this.closed) return Promise.reject(new DbReadPoolClosedError("read pool is closed"));
-    if (this.failure) return Promise.reject(this.failure);
-    return new Promise((resolve, reject) => {
-      const pending: PendingRead = {
-        request: { id: this.nextId++, op, input },
-        resolve: resolve as (value: unknown) => void,
-        reject,
-      };
-      const idle = this.slots.find((slot) => slot.ready && slot.current === null);
-      if (idle) this.dispatch(idle, pending);
-      else if (this.queue.length >= this.maxQueued) {
-        reject(new DbReadQueueFullError(`read queue is full (${this.maxQueued} waiting)`));
-      } else this.queue.push(pending);
-    });
+    return this.pool.request(op, input) as Promise<ReadOutput<K>>;
   }
 
   /**
@@ -156,14 +120,7 @@ export class DbReadPool implements DbReads {
    * filled. Any other failure, and a closed pool, stay as they are.
    */
   restore(): void {
-    if (this.closed) return;
-    if (this.failure && !(this.failure instanceof DbReadBuildMismatchError)) return;
-    for (const slot of this.slots.filter((candidate) => !candidate.ready)) this.discard(slot);
-    if (this.slots.length === this.size) return;
-    this.logger.info("db_read_pool_restoring", { missing: this.size - this.slots.length });
-    this.failure = null;
-    this.startFailures = 0;
-    while (this.slots.length < this.size) this.slots.push(this.spawn());
+    this.pool.restore();
   }
 
   /**
@@ -171,173 +128,6 @@ export class DbReadPool implements DbReads {
    * Idempotent.
    */
   close(): Promise<void> {
-    this.closed ??= (async () => {
-      if (!this.isIdle()) await new Promise<void>((resolve) => (this.drained = resolve));
-      await Promise.all(
-        this.slots.map((slot) => {
-          slot.stopping = true;
-          return slot.worker.terminate();
-        })
-      );
-    })();
-    return this.closed;
-  }
-
-  private spawn(): Slot {
-    const worker = new Worker(this.options.worker, { workerData: { dbPath: this.options.dbPath } });
-    const slot: Slot = { worker, ready: false, current: null, stopping: false };
-    let lastError: Error | null = null;
-    worker.on("message", (message: ReadWorkerMessage) => this.onMessage(slot, message));
-    worker.on("error", (err: unknown) => {
-      lastError = err instanceof Error ? err : new Error(String(err));
-    });
-    worker.on("exit", (code) => this.onExit(slot, code, lastError));
-    return slot;
-  }
-
-  private whenReady(slot: Slot): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (slot.ready) return resolve();
-      let lastError: Error | null = null;
-      const onError = (err: Error) => {
-        lastError = err;
-      };
-      const onMessage = (message: ReadWorkerMessage) => {
-        if (message.type !== "ready") return;
-        cleanup();
-        // The pool's own handler ran first and has refused a mismatched build.
-        if (this.failure) reject(this.failure);
-        else resolve();
-      };
-      const onExit = (code: number) => {
-        cleanup();
-        reject(lastError ?? new Error(`read worker exited during startup (code ${code})`));
-      };
-      const cleanup = () => {
-        slot.worker.off("error", onError);
-        slot.worker.off("message", onMessage);
-        slot.worker.off("exit", onExit);
-      };
-      slot.worker.on("error", onError);
-      slot.worker.on("message", onMessage);
-      slot.worker.on("exit", onExit);
-    });
-  }
-
-  private dispatch(slot: Slot, pending: PendingRead): void {
-    slot.current = pending;
-    slot.worker.postMessage(pending.request);
-  }
-
-  /** Stop a worker that holds no read and forget it; its exit and messages are ignored. */
-  private discard(slot: Slot): void {
-    slot.stopping = true;
-    void slot.worker.terminate();
-    this.slots.splice(this.slots.indexOf(slot), 1);
-  }
-
-  private onMessage(slot: Slot, message: ReadWorkerMessage): void {
-    // A worker the pool has stopped can still deliver what it sent before.
-    if (slot.stopping) return;
-    if (message.type === "ready") {
-      if (message.build !== BUILD_ID) {
-        // An update swapped `dist` (or a rollback restored it) after this
-        // process started, and the replacement loaded that build, wholly or in
-        // part. Its reads and result shapes need not match this process or its
-        // migrations, so reads stay unavailable until the process restarts or
-        // restore() finds this build in `dist` again.
-        this.discard(slot);
-        this.fail(
-          new DbReadBuildMismatchError(
-            `read worker runs build ${message.build ?? "(none)"}, ` +
-              `but this process runs ${BUILD_ID ?? "(none)"}; reads resume after restart ` +
-              "or once an update rollback restores this build"
-          )
-        );
-        return;
-      }
-      slot.ready = true;
-      this.startFailures = 0;
-      this.pump(slot);
-      return;
-    }
-    const pending = slot.current;
-    if (!pending || pending.request.id !== message.id) return;
-    slot.current = null;
-    if (message.type === "result") pending.resolve(message.value);
-    else {
-      const error = new Error(message.error.message);
-      error.name = message.error.name;
-      pending.reject(error);
-    }
-    this.pump(slot);
-  }
-
-  private onExit(slot: Slot, code: number, error: Error | null): void {
-    if (slot.stopping) return;
-    const reason = error?.message ?? `exit code ${code}`;
-    const pending = slot.current;
-    slot.current = null;
-    pending?.reject(new DbReadWorkerExitedError(`read worker stopped before answering: ${reason}`));
-    if (!slot.ready) this.startFailures++;
-    this.logger.warn("db_read_worker_exited", {
-      code,
-      reason,
-      ready: slot.ready,
-      startFailures: this.startFailures,
-    });
-    const index = this.slots.indexOf(slot);
-    if (this.closed || this.failure) {
-      // Shutting down, or failed for good: finish with the workers that remain
-      // rather than start one that close() might never stop or that the
-      // failure has already ruled out.
-      this.slots.splice(index, 1);
-      if (this.slots.length === 0) {
-        for (const waiting of this.queue.splice(0)) {
-          waiting.reject(
-            new DbReadWorkerExitedError("read pool lost its last worker while closing")
-          );
-        }
-      }
-      this.settleIfDrained();
-      return;
-    }
-    if (this.startFailures >= MAX_START_FAILURES) {
-      this.slots.splice(index, 1);
-      this.fail(
-        new DbReadUnavailableError(
-          `read workers failed to start ${this.startFailures} times: ${reason}`
-        )
-      );
-      return;
-    }
-    // The replacement takes queued reads once it reports ready; until then
-    // they wait for whichever worker is ready first.
-    this.slots[index] = this.spawn();
-  }
-
-  /** Stop replacing workers; refuse waiting and future reads with `error`. */
-  private fail(error: Error): void {
-    this.failure = error;
-    this.logger.error("db_read_pool_failed", { reason: error.message });
-    for (const pending of this.queue.splice(0)) pending.reject(error);
-    this.settleIfDrained();
-  }
-
-  private pump(slot: Slot): void {
-    const next = this.queue.shift();
-    if (next) this.dispatch(slot, next);
-    else this.settleIfDrained();
-  }
-
-  private isIdle(): boolean {
-    return this.queue.length === 0 && this.slots.every((slot) => slot.current === null);
-  }
-
-  private settleIfDrained(): void {
-    if (this.drained && this.isIdle()) {
-      this.drained();
-      this.drained = null;
-    }
+    return this.pool.close();
   }
 }

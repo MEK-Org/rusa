@@ -132,6 +132,22 @@ describe("Obligation mutation history", () => {
     expect(history.every((h) => h.timestamp === new Date(now).toISOString())).toBe(true);
   });
 
+  it("keeps capturing history after its first mutation rolls back inside a caller's transaction", () => {
+    // A write-worker operation is one caller transaction (#1289); the capture
+    // table and trigger created inside it roll back with it.
+    expect(() =>
+      db.transaction(() => {
+        repository.create({ id: "rolled-back", title: "Rolled back", ownerId: "actor-a" });
+        throw new Error("operation failed");
+      })()
+    ).toThrow("operation failed");
+    expect(repository.get("rolled-back")).toBeNull();
+
+    const ob = db.transaction(() => repository.create({ title: "After", ownerId: "actor-a" }))();
+    repository.setCheckpoint(ob.id, "standing", "actor-b");
+    expect(repository.listHistory(ob.id).map((h) => h.after)).toEqual([{ checkpoint: "standing" }]);
+  });
+
   it("records an identical-text standing rewrite with its new actor and exact checkpoint time", () => {
     const ob = repository.create({ title: "History", ownerId: "actor-a" });
     repository.setCheckpoint(ob.id, "same text", "actor-a");
