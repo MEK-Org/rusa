@@ -192,15 +192,56 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
     }
   });
 
-  it("says a write committed when its result cannot be returned, and delivers nothing", async () => {
-    const delivered: TestEffect[] = [];
-    const { writer, close } = await open((effect) => delivered.push(effect));
+  it("delivers every effect when only the committed result cannot be returned", async () => {
+    const delivered: string[] = [];
+    const { writer, close } = await open((effect) => delivered.push(`${effect.kind}:${effect.id}`));
     try {
       const err = await rejection(writer.write("uncloneable", input("uncloneable")));
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
-      expect(err.message).toMatch(/committed, but its outcome could not be returned/);
-      expect(delivered).toEqual([]);
+      expect(err.message).toMatch(/committed, but its result could not be returned/);
+      const committed = err as MeshWriteCommittedError;
+      expect(committed.result).toBeUndefined();
+      expect(committed.failures).toEqual([]);
+      expect(delivered).toEqual([`created:${id("uncloneable")}`, `announced:${id("uncloneable")}`]);
       expect(exists(id("uncloneable"))).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("delivers the other effects and the result when one effect cannot be returned", async () => {
+    const delivered: string[] = [];
+    const { writer, close } = await open((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    try {
+      const err = await rejection(writer.write("uncloneableEffect", input("bad-effect")));
+      expect(err).toBeInstanceOf(MeshWriteCommittedError);
+      const committed = err as MeshWriteCommittedError;
+      expect(committed.result).toEqual({ id: id("bad-effect") });
+      expect(committed.failures.map(String)).toEqual([
+        expect.stringMatching(/^Error: effect 2 of 2 could not be returned: /),
+      ]);
+      expect(delivered).toEqual([`created:${id("bad-effect")}`]);
+      expect(exists(id("bad-effect"))).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("refuses an input that cannot be cloned without attempting it, then keeps serving", async () => {
+    const delivered: TestEffect[] = [];
+    const { writer, close } = await open((effect) => delivered.push(effect));
+    try {
+      const bad = { ...input("bad-input"), callback: () => undefined };
+      const err = await rejection(writer.write("create", bad));
+      expect(err.name).toBe("DataCloneError");
+      expect(err).not.toBeInstanceOf(MeshWriteCommittedError);
+      expect(exists(id("bad-input"))).toBe(false);
+      await writer.write("create", input("after-bad-input"));
+      expect(exists(id("after-bad-input"))).toBe(true);
+      expect(delivered.map((effect) => effect.id)).toEqual([
+        id("after-bad-input"),
+        id("after-bad-input"),
+      ]);
     } finally {
       await close();
     }
@@ -337,6 +378,34 @@ describe("DbWriter", () => {
       );
       await Promise.all([held, queued]);
       expect(exists("w-refused")).toBe(false);
+    } finally {
+      await writer.close();
+    }
+  });
+
+  it("refuses a queued input that cannot be cloned and still serves and drains the rest", async () => {
+    const writer = await openDbWriter(() => undefined);
+    const badInput = { ...input("admit-bad"), callback: () => undefined };
+    const held = writer.write("hold", { ...input("admit-held"), ms: 200 });
+    const bad = writer.write("create", badInput);
+    const after = writer.write("create", input("admit-after"));
+    const err = await rejection(bad);
+    expect(err.name).toBe("DataCloneError");
+    await expect(held).resolves.toEqual({ id: "w-admit-held" });
+    await expect(after).resolves.toEqual({ id: "w-admit-after" });
+    await writer.close();
+    expect(exists("w-admit-bad")).toBe(false);
+  });
+
+  it("runs a queued write with its input as it was when called", async () => {
+    const writer = await openDbWriter(() => undefined);
+    try {
+      const held = writer.write("hold", { ...input("snapshot-held"), ms: 200 });
+      const queuedInput = { ...input("snapshot"), title: "w-snapshot-as-called" };
+      const queued = writer.write("create", queuedInput);
+      queuedInput.title = "w-snapshot-changed-later";
+      await Promise.all([held, queued]);
+      expect(getRepositories().obligations.get("w-snapshot")?.title).toBe("w-snapshot-as-called");
     } finally {
       await writer.close();
     }

@@ -123,9 +123,18 @@ export class DbWorkerPool {
     const { label } = this.errors;
     if (this.closed) return Promise.reject(this.errors.closed(`${label} pool is closed`));
     if (this.failure) return Promise.reject(this.failure);
+    let snapshot: unknown;
+    try {
+      // Clone at admission, as postMessage would at dispatch: an input that
+      // cannot reach a worker is refused before it takes a worker or a queue
+      // place, and a queued request runs with its input as it was when called.
+      snapshot = structuredClone(input);
+    } catch (err) {
+      return Promise.reject(err);
+    }
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = {
-        request: { id: this.nextId++, op, input },
+        request: { id: this.nextId++, op, input: snapshot },
         resolve,
         reject,
       };

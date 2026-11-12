@@ -2,10 +2,10 @@ import type Database from "better-sqlite3";
 import type { Logger } from "../observability/logger.js";
 import { DbWorkerPool, type WorkerPoolErrors } from "./worker-pool.js";
 import {
-  COMMITTED_ERROR_NAME,
+  type ReturnedOutcome,
+  returnOutcome,
   runWriteOperation,
   type WriteOperationTable,
-  type WriteOutcome,
 } from "./write-worker-runtime.js";
 
 /**
@@ -38,16 +38,17 @@ export class MeshWriteOutcomeUnknownError extends Error {
 }
 
 /**
- * The write committed, but its result could not be returned or one of its
- * effects failed when delivered. Every other effect was still delivered, in
- * order. An error an operation throws itself means the write rolled back.
+ * The write committed, but its result could not be returned, or one of its
+ * effects could not be returned or failed when delivered. Every other effect
+ * was still delivered, in order. An error an operation throws itself means the
+ * write rolled back.
  */
 export class MeshWriteCommittedError extends Error {
-  override readonly name = COMMITTED_ERROR_NAME;
+  override readonly name = "MeshWriteCommittedError";
   readonly committed = true;
   /** The committed result, when it reached the main thread. */
   readonly result: unknown;
-  /** What each failed effect delivery threw, in delivery order. */
+  /** Why each effect that could not be returned or delivered failed, in order. */
   readonly failures: readonly unknown[];
 
   constructor(
@@ -81,25 +82,42 @@ export interface MeshWriter<Ops extends Operations> {
 export type DeliverEffect<E> = (effect: E) => void;
 
 /**
- * Deliver every effect, in order, then answer the result. A failing delivery
- * does not stop the ones after it, because each describes something that has
- * already committed.
+ * Deliver every effect, in order, then answer the result. An effect that could
+ * not be returned or whose delivery fails does not stop the ones after it, and
+ * a result that could not be returned stops none of them, because each effect
+ * describes something that has already committed.
  */
-function settle<E>(op: string, outcome: WriteOutcome<E>, deliver: DeliverEffect<E>): unknown {
+function settle<E>(op: string, outcome: ReturnedOutcome<E>, deliver: DeliverEffect<E>): unknown {
+  const { effects } = outcome;
   const failures: unknown[] = [];
-  for (const effect of outcome.effects) {
+  effects.forEach((item, index) => {
+    if ("unreturnable" in item) {
+      failures.push(
+        new Error(
+          `effect ${index + 1} of ${effects.length} could not be returned: ${item.unreturnable}`
+        )
+      );
+      return;
+    }
     try {
-      deliver(effect);
+      deliver(item.effect);
     } catch (err) {
       failures.push(err);
     }
-  }
-  if (failures.length > 0) {
-    throw new MeshWriteCommittedError(
-      `write ${op} committed, but ${failures.length} of its ${outcome.effects.length} ` +
-        "effects failed to deliver",
-      { result: outcome.result, failures }
-    );
+  });
+  const problems = [
+    ...(outcome.unreturnableResult === undefined
+      ? []
+      : [`its result could not be returned: ${outcome.unreturnableResult}`]),
+    ...(failures.length > 0
+      ? [`${failures.length} of its ${effects.length} effects failed to deliver`]
+      : []),
+  ];
+  if (problems.length > 0) {
+    throw new MeshWriteCommittedError(`write ${op} committed, but ${problems.join("; and ")}`, {
+      result: outcome.result,
+      failures,
+    });
   }
   return outcome.result;
 }
@@ -108,8 +126,9 @@ function settle<E>(op: string, outcome: WriteOutcome<E>, deliver: DeliverEffect<
  * Runs each write on the main connection when it is called, so a converted
  * caller's write lands in the same order as any synchronous write beside it.
  * This keeps the main connection the one writer until the worker takes over
- * (#1289). The outcome is structured-cloned as the worker's would be, so a
- * result the worker could not return fails here first, after its commit.
+ * (#1289). Its input and outcome are structured-cloned as the worker's would
+ * be, so an input the worker could not take is refused here too, and a result
+ * or effect the worker could not return fails here first, after its commit.
  */
 export class InProcessMeshWriter<R, E, Ops extends WriteOperationTable<R, E>>
   implements MeshWriter<Ops>
@@ -129,7 +148,7 @@ export class InProcessMeshWriter<R, E, Ops extends WriteOperationTable<R, E>>
     op: K,
     input: WriteInput<Ops, K>
   ): Promise<WriteOutput<Ops, K>> {
-    let outcome: WriteOutcome<E>;
+    let outcome: ReturnedOutcome<E>;
     try {
       // Inside a caller's transaction this would only be a savepoint, and its
       // effects would be delivered before anything committed. The worker could
@@ -137,19 +156,12 @@ export class InProcessMeshWriter<R, E, Ops extends WriteOperationTable<R, E>>
       if (this.db.inTransaction) {
         throw new Error(`write ${op} was called inside an open transaction`);
       }
-      outcome = runWriteOperation(this.db, this.repos, this.operations, op, input);
+      const snapshot = structuredClone(input);
+      outcome = returnOutcome(
+        runWriteOperation(this.db, this.repos, this.operations, op, snapshot)
+      );
     } catch (err) {
       return Promise.reject(err);
-    }
-    try {
-      outcome = structuredClone(outcome);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      return Promise.reject(
-        new MeshWriteCommittedError(
-          `write ${op} committed, but its outcome could not be returned: ${reason}`
-        )
-      );
     }
     return new Promise((resolve, reject) => {
       this.backlog.push(() => {
@@ -230,12 +242,11 @@ export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
     op: K,
     input: WriteInput<Ops, K>
   ): Promise<WriteOutput<Ops, K>> {
-    return this.pool.request(op, input).then(
-      (outcome) => settle(op, outcome as WriteOutcome<E>, this.deliver) as WriteOutput<Ops, K>,
-      (err: Error) => {
-        throw err.name === COMMITTED_ERROR_NAME ? new MeshWriteCommittedError(err.message) : err;
-      }
-    );
+    return this.pool
+      .request(op, input)
+      .then(
+        (outcome) => settle(op, outcome as ReturnedOutcome<E>, this.deliver) as WriteOutput<Ops, K>
+      );
   }
 
   /** See {@link DbWorkerPool.restore}. */

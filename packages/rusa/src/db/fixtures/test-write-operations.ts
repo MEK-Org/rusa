@@ -45,6 +45,13 @@ export const TEST_WRITE_OPERATIONS = {
     ...create(context, input),
     callback: () => undefined,
   }),
+  /** Commits; its second effect carries a function, which cannot cross a thread. */
+  uncloneableEffect: ({ repos, emit }: Context, input: Create): { id: string } => {
+    const { id } = repos.obligations.create(input);
+    emit({ kind: "created", id });
+    emit({ kind: "announced", id, callback: () => undefined } as TestEffect);
+    return { id };
+  },
   /** Holds the writer for `ms` inside its transaction, then creates. Worker only. */
   hold: (context: Context, input: Create & { readonly ms: number }) => {
     Atomics.wait(pause, 0, 0, input.ms);

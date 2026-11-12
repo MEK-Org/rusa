@@ -28,12 +28,45 @@ export interface WriteOutcome<E> {
   readonly effects: readonly E[];
 }
 
+/** One emitted effect as it reaches the main thread, or why it could not. */
+export type ReturnedEffect<E> = { readonly effect: E } | { readonly unreturnable: string };
+
+/** A committed outcome as it reaches the main thread. */
+export interface ReturnedOutcome<E> {
+  /** The committed result; undefined when it could not be returned. */
+  readonly result: unknown;
+  /** Why the committed result could not be returned, when it could not. */
+  readonly unreturnableResult?: string;
+  /** Every emitted effect, in order. */
+  readonly effects: readonly ReturnedEffect<E>[];
+}
+
 /**
- * The error name a writer reports when its operation committed but its outcome
- * could not be sent back. It is kept distinct from any operation error, every
- * one of which means the operation rolled back.
+ * Clone a committed outcome part by part, as it must be cloned to leave the
+ * worker. A result or effect that cannot be cloned is replaced by the reason,
+ * so it costs only itself: every other committed effect still reaches the main
+ * thread. Every part is then a clone or a string, so posting it cannot fail.
  */
-export const COMMITTED_ERROR_NAME = "MeshWriteCommittedError";
+export function returnOutcome<E>(outcome: WriteOutcome<E>): ReturnedOutcome<E> {
+  const result = clonePart(outcome.result);
+  return {
+    ...("value" in result
+      ? { result: result.value }
+      : { result: undefined, unreturnableResult: result.reason }),
+    effects: outcome.effects.map((effect) => {
+      const cloned = clonePart(effect);
+      return "value" in cloned ? { effect: cloned.value } : { unreturnable: cloned.reason };
+    }),
+  };
+}
+
+function clonePart<T>(value: T): { readonly value: T } | { readonly reason: string } {
+  try {
+    return { value: structuredClone(value) };
+  } catch (err) {
+    return { reason: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 /**
  * The writing connection to the database the main thread has already opened
@@ -94,22 +127,11 @@ export function serveWrites<R, E>(
       port.postMessage(errorMessage(request.id, err));
       return;
     }
-    try {
-      port.postMessage({ type: "result", id: request.id, value: outcome } satisfies WorkerMessage);
-    } catch (err) {
-      // Committed, but the outcome cannot be cloned. Say so, rather than let
-      // the caller read this as the rollback every other error means.
-      port.postMessage({
-        type: "error",
-        id: request.id,
-        error: {
-          name: COMMITTED_ERROR_NAME,
-          message:
-            `write ${request.op} committed, but its outcome could not be returned: ` +
-            (err instanceof Error ? err.message : String(err)),
-        },
-      } satisfies WorkerMessage);
-    }
+    port.postMessage({
+      type: "result",
+      id: request.id,
+      value: returnOutcome(outcome),
+    } satisfies WorkerMessage);
   });
   port.postMessage({ type: "ready", build } satisfies WorkerMessage);
 }
