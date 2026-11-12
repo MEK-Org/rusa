@@ -956,8 +956,16 @@ export class ObligationRepository {
    * overdue completion-interval occurrence activates. A cron occurrence keeps
    * waiting for its next tick, as it always has; one whose snooze just expired
    * activates here because the snooze is what held it back.
+   *
+   * `wakeDue` makes that wake (#1289 C2): the runtime passes the writer's
+   * `obligations.wakeScheduled`, so the wake's attention is delivered and
+   * awaited like any other write's. The row is re-read after it either way,
+   * so a wake that failed or committed without its answer is planned from
+   * whatever committed.
    */
-  reconcileScheduledObligations(): void {
+  async reconcileScheduledObligations(
+    wakeDue: (id: string, principal: EntityId) => Promise<unknown>
+  ): Promise<void> {
     if (!this.scheduler) return;
     const validIds = new Set<string>();
     const stmt = this.db.prepare(
@@ -980,7 +988,15 @@ export class ObligationRepository {
               isDeadlineDue(row.next_ready_at, now);
         if (overdue) {
           // Background scheduler activation is an automated system process; bind "system:mesh"
-          this.wakeScheduled(row.id, "system:mesh");
+          try {
+            await wakeDue(row.id, "system:mesh");
+          } catch (err) {
+            console.warn(
+              `[obligations] overdue wake for ${row.id} failed at boot: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+          }
           row = this.db
             .prepare(
               `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at, snoozed_until

@@ -73,6 +73,16 @@ const MIN = 60_000;
 const HOUR = 60 * MIN;
 const iso = (ms: number) => new Date(ms).toISOString();
 
+
+/**
+ * The overdue wake boot reconciliation makes, made on the repository under
+ * test; the runtime passes the writer's `obligations.wakeScheduled` (#1289 C2).
+ */
+const directWake =
+  (repo: ObligationRepository) =>
+  async (id: string, principal: string): Promise<unknown> =>
+    repo.wakeScheduled(id, principal);
+
 describe("ObligationRepository", () => {
   let db: Database.Database;
   let repository: ObligationRepository;
@@ -4122,14 +4132,14 @@ describe("ObligationRepository", () => {
     });
 
     describe("reconcileScheduledObligations (boot reconciliation)", () => {
-      it("re-arms a cron entry regardless of the obligation's current status", () => {
+      it("re-arms a cron entry regardless of the obligation's current status", async () => {
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
         scheduler.activations.clear(); // simulate a restart: nothing armed yet
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(scheduler.activations.get("rec-1")).toEqual({ kind: "cron", cronExpr: "0 * * * *" });
       });
 
-      it("activates an overdue scheduled obligation immediately instead of arming a past OS job", () => {
+      it("activates an overdue scheduled obligation immediately instead of arming a past OS job", async () => {
         repository.setRecurrence(
           "rec-1",
           { policy: "completion_interval", intervalSeconds: 1 },
@@ -4142,12 +4152,12 @@ describe("ObligationRepository", () => {
         );
         scheduler.activations.clear();
 
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(repository.require("rec-1").status).toBe("ready");
         expect(scheduler.activations.has("rec-1")).toBe(false);
       });
 
-      it("arms a future `at` job for a scheduled obligation that has not yet come due", () => {
+      it("arms a future `at` job for a scheduled obligation that has not yet come due", async () => {
         repository.setRecurrence(
           "rec-1",
           { policy: "completion_interval", intervalSeconds: 1 },
@@ -4160,7 +4170,7 @@ describe("ObligationRepository", () => {
         );
         scheduler.activations.clear();
 
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(repository.require("rec-1").status).toBe("scheduled");
         expect(scheduler.activations.get("rec-1")).toEqual({
           kind: "at",
@@ -4168,30 +4178,30 @@ describe("ObligationRepository", () => {
         });
       });
 
-      it("cancels an orphaned OS activation for an obligation that no longer needs one", () => {
+      it("cancels an orphaned OS activation for an obligation that no longer needs one", async () => {
         scheduler.activations.set("ghost-id", { kind: "cron", cronExpr: "0 * * * *" });
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(scheduler.cancelled).toContain("ghost-id");
         expect(scheduler.activations.has("ghost-id")).toBe(false);
       });
 
-      it("does not cancel an orphaned OS activation belonging to a foreign instance", () => {
+      it("does not cancel an orphaned OS activation belonging to a foreign instance", async () => {
         // Scheduler reports an orphaned entry belonging to another instance
         scheduler.listObligationActivations = () => [
           { id: "foreign-id", instanceId: "other-instance" },
         ];
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(scheduler.cancelled).not.toContain("foreign-id");
       });
 
-      it("does not cancel a legacy unscoped OS activation without an instance component", () => {
+      it("does not cancel a legacy unscoped OS activation without an instance component", async () => {
         // Scheduler reports a legacy unscoped entry
         scheduler.listObligationActivations = () => [{ id: "legacy-id", instanceId: undefined }];
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(scheduler.cancelled).not.toContain("legacy-id");
       });
 
-      it("keeps reconciling other rows when one row's OS scheduler call fails (e.g. `at` confirmed unavailable)", () => {
+      it("keeps reconciling other rows when one row's OS scheduler call fails (e.g. `at` confirmed unavailable)", async () => {
         repository.create({ title: "iv", id: "rec-2", ownerId: "actor-a", intent: "recur" });
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
         repository.setRecurrence(
@@ -4211,7 +4221,7 @@ describe("ObligationRepository", () => {
           original(id, time);
         };
 
-        expect(() => repository.reconcileScheduledObligations()).not.toThrow();
+        await expect(repository.reconcileScheduledObligations(directWake(repository))).resolves.toBeUndefined();
         // rec-2's `at`-kind reconciliation failed and was logged, but rec-1's
         // cron reconciliation still ran — one row's OS failure must not abort
         // the sweep for every other row queued behind it.
@@ -4219,13 +4229,13 @@ describe("ObligationRepository", () => {
         expect(scheduler.activations.has("rec-2")).toBe(false);
       });
 
-      it("is a no-op when no OS scheduler is attached", () => {
+      it("is a no-op when no OS scheduler is attached", async () => {
         const bare = new ObligationRepository(
           db,
           (id: string) => ["actor-a"].includes(id),
           () => now++
         );
-        expect(() => bare.reconcileScheduledObligations()).not.toThrow();
+        await expect(bare.reconcileScheduledObligations(directWake(bare))).resolves.toBeUndefined();
       });
     });
   });
@@ -4709,7 +4719,7 @@ describe("ObligationRepository", () => {
     });
 
     describe("boot reconciliation", () => {
-      it("settles an overdue snooze exactly once and re-arms a live one", () => {
+      it("settles an overdue snooze exactly once and re-arms a live one", async () => {
         repository.create({ title: "late", id: "late", ownerId: "actor-a" });
         repository.create({ title: "live", id: "live", ownerId: "actor-a" });
         snooze("late", iso(T0 + HOUR));
@@ -4718,8 +4728,8 @@ describe("ObligationRepository", () => {
         scheduler.activations.clear();
 
         t = T0 + 2 * HOUR;
-        repository.reconcileScheduledObligations();
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
+        await repository.reconcileScheduledObligations(directWake(repository));
 
         expect(repository.require("late").snoozedUntil).toBeNull();
         expect(repository.require("late").readyCount).toBe(before + 1);
@@ -4730,12 +4740,12 @@ describe("ObligationRepository", () => {
         });
       });
 
-      it("activates a scheduled occurrence an overdue snooze was holding back", () => {
+      it("activates a scheduled occurrence an overdue snooze was holding back", async () => {
         intervalScheduled();
         snooze("rec", iso(T0 + 3 * HOUR));
         scheduler.activations.clear();
         t = T0 + 4 * HOUR;
-        repository.reconcileScheduledObligations();
+        await repository.reconcileScheduledObligations(directWake(repository));
         expect(repository.require("rec").status).toBe("ready");
         expect(repository.require("rec").snoozedUntil).toBeNull();
       });
@@ -5934,7 +5944,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
   it.each([
     ["prod then staging", "prod", "staging"],
     ["staging then prod", "staging", "prod"],
-  ] as const)("preserves foreign blocks and removes own stale work: %s", (_order, firstName, secondName) => {
+  ] as const)("preserves foreign blocks and removes own stale work: %s", async (_order, firstName, secondName) => {
     const f = createFixture();
     const instance = (name: "prod" | "staging") =>
       name === "prod"
@@ -5962,7 +5972,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
       expect(f.getAtJobs().find((job) => job.id === id)?.script).toBe(initialAtScripts.get(id));
     };
 
-    first.repo.reconcileScheduledObligations();
+    await first.repo.reconcileScheduledObligations(directWake(first.repo));
 
     expect(f.getCrontab()).not.toContain(first.staleTag);
     expect(f.getCrontab()).toContain(first.activeBlock);
@@ -5971,7 +5981,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     assertAtUnchanged(second.staleAtId);
     assertAtUnchanged("legacy-at-1");
 
-    second.repo.reconcileScheduledObligations();
+    await second.repo.reconcileScheduledObligations(directWake(second.repo));
 
     expect(f.getCrontab()).not.toContain(second.staleTag);
     expect(f.getCrontab()).toContain(second.activeBlock);
@@ -5980,7 +5990,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     assertAtUnchanged("legacy-at-1");
   });
 
-  it("a restarted process re-arms an at activation without leaving its predecessor's job queued (#1274)", () => {
+  it("a restarted process re-arms an at activation without leaving its predecessor's job queued (#1274)", async () => {
     const db = setupDb();
     const now = Date.now();
     let crontab = "";
@@ -6029,7 +6039,8 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     // Each start-up's boot reconciliation re-arms the row before it reads the
     // queue; the replacement must take the old job's place, not join it.
     for (let restart = 0; restart < 3; restart++) {
-      boot().reconcileScheduledObligations();
+      const booted = boot();
+      await booted.reconcileScheduledObligations(directWake(booted));
       expect(jobs).toHaveLength(1);
     }
   });

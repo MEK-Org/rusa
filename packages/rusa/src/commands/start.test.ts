@@ -12196,9 +12196,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         if (!gitBridge) throw new Error("git bridge not started");
         const meshShutdown = vi.spyOn(mesh, "shutdownAll");
         const deliveries = [
-          vi.spyOn(mesh, "deliverReadyHeadAttention").mockReturnValue(true),
-          vi.spyOn(mesh, "deliverPrerequisiteCancelledAttention").mockReturnValue(true),
-          vi.spyOn(mesh, "deliverResponsiveReadyAttention").mockReturnValue(true),
+          vi.spyOn(mesh, "deliverReadyHeadAttention").mockResolvedValue(true),
+          vi.spyOn(mesh, "deliverPrerequisiteCancelledAttention").mockResolvedValue(true),
+          vi.spyOn(mesh, "deliverResponsiveReadyAttention").mockResolvedValue(true),
         ];
         const recordEvent = vi.spyOn(mesh, "recordEvent");
         const statusEvents = () =>

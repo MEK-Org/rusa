@@ -137,6 +137,12 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 export const SCHEDULER_SENDER_ID = "scheduler";
 
 type ResponsiveReadyAttention = { id: string; intent: string | null; readyCount?: number };
+/** The net head change a run made to its own queue, taken at the run's end. */
+type RunHeadAttention = {
+  from: string | null;
+  to: { id: string; intent: string | null; responsive?: boolean };
+  epoch: string;
+};
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -1357,9 +1363,10 @@ export class ActorMesh {
             this.actorStarted(event.actorId);
           },
           onEnd: (event) => {
-            // Only a result waits on a write (its closure check), so only it
-            // returns a promise; an abandoned run ends synchronously, and the
-            // listeners after this one see it at once.
+            // A result waits on its closure check. An abandoned run waits
+            // only on appending attention its run buffered (#1289 C2); with
+            // none it ends synchronously, and the listeners after this one
+            // see it at once.
             const { terminal } = event;
             if (terminal.kind === "result") {
               return this.finishInboxRun(event.actorId, {
@@ -1373,13 +1380,16 @@ export class ActorMesh {
                 this.clearSelection(event.actorId);
               });
             }
-            this.abandonInboxRun(event.actorId);
+            const flushed = this.abandonInboxRun(event.actorId);
             // A launched run that ended without a result still ended: a pool
             // staged while it ran is due now, not at some later dispatch (#652).
             if (terminal.started) {
               this.applyPendingTarget(event.actorId);
             }
             this.clearSelection(event.actorId);
+            // Its buffered attention is appended through the writer; the end
+            // settles once those rows have (#1289 C2).
+            return flushed;
           },
         },
         ...this.lifecycleListeners,
@@ -1531,11 +1541,11 @@ export class ActorMesh {
    * attention after restart, without colliding with an earlier handled repair
    * entry from a previous process generation.
    */
-  reconcileReadyHeads(obligations: {
+  async reconcileReadyHeads(obligations: {
     readyHeadEpoch: string;
     readyHeadRecords(): Iterable<{ ownerId: string; headId: string; responsive: boolean }>;
     get(id: string): { id: string; intent: string | null } | null;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const { ownerId, headId, responsive } of obligations.readyHeadRecords()) {
@@ -1545,7 +1555,7 @@ export class ActorMesh {
         if (!record || record.status !== "active") continue;
         const head = obligations.get(headId);
         if (!head) continue;
-        this.appendReadyHeadEntry(
+        await this.appendReadyHeadEntry(
           actorId,
           { id: head.id, intent: head.intent, responsive },
           null,
@@ -2316,8 +2326,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    this.flushRunHeadAttention(actorId);
-    this.flushRunResponsiveReadyAttention(actorId);
+    await this.flushRunAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
@@ -2569,13 +2578,55 @@ export class ActorMesh {
    * It does not consume a staged model change itself: the lifecycle `onEnd`
    * applies one only when the abandoned run had actually launched.
    */
-  abandonInboxRun(actorId: string): void {
+  abandonInboxRun(actorId: string): Promise<void> | undefined {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    this.flushRunHeadAttention(actorId);
-    this.flushRunResponsiveReadyAttention(actorId);
+    return this.flushRunAttention(actorId);
+  }
+
+  /**
+   * Close the run's head window and deliver what it buffered (#1289 C2). The
+   * window closes and both buffers are taken before anything is awaited, so
+   * attention arriving while the appends are in flight is delivered as an
+   * idle actor's rather than buffered into a run that has ended. The appends
+   * go through the writer and are awaited, so the run's end, and the next run
+   * that waits on it, sees their rows. One failing does not stop the other;
+   * neither rejects, because the run has ended either way. A run that
+   * buffered nothing returns nothing to await and ends at once.
+   */
+  private flushRunAttention(actorId: string): Promise<void> | undefined {
+    const head = this.takeRunHeadAttention(actorId);
+    const responsive = this.runResponsiveReadyAttention.get(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
+    if (!head && !(responsive && responsive.size > 0)) return undefined;
+    return this.appendRunAttention(actorId, head, responsive);
+  }
+
+  private async appendRunAttention(
+    actorId: string,
+    head: RunHeadAttention | null,
+    responsive: ReadonlyMap<string, ResponsiveReadyAttention> | undefined
+  ): Promise<void> {
+    if (head) {
+      try {
+        await this.appendReadyHeadEntry(actorId, head.to, head.from, null, head.epoch);
+      } catch (err) {
+        this.log(
+          `run-end ready-head attention for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    if (responsive && responsive.size > 0) {
+      try {
+        await this.flushRunResponsiveReadyAttention(actorId, responsive);
+      } catch (err) {
+        this.log(
+          `run-end responsive-ready attention for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
   }
 
   /**
@@ -2587,20 +2638,20 @@ export class ActorMesh {
    * waiting parent, typically because the actor filed a question for a human
    * under it), there is nothing to point at, so nothing is delivered.
    */
-  private flushRunHeadAttention(actorId: string): void {
+  private takeRunHeadAttention(actorId: string): RunHeadAttention | null {
     this.actorsInRun.delete(actorId);
     const net = this.runHeadNet.get(actorId);
     this.runHeadNet.delete(actorId);
-    if (!net) return;
+    if (!net) return null;
     // It settled back where it started, or it ended with no head at all — in
     // the last case there is no obligation to point the actor at.
     if (net.to === null || net.to.id === net.from) {
       this.log(
         `ready-head attention for ${actorId} suppressed at run end: net ${net.from ?? "none"} -> ${net.to?.id ?? "none"}`
       );
-      return;
+      return null;
     }
-    this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
+    return { from: net.from, to: net.to, epoch: net.epoch };
   }
 
   /**
@@ -2612,10 +2663,11 @@ export class ActorMesh {
    * listener is the sole scheduling seam: valid rows are committed together so
    * one actor receives at most one advisory dispatch attempt.
    */
-  private flushRunResponsiveReadyAttention(actorId: string): void {
-    const pending = this.runResponsiveReadyAttention.get(actorId);
-    this.runResponsiveReadyAttention.delete(actorId);
-    if (!pending || pending.size === 0 || !this.inboxStore) return;
+  private async flushRunResponsiveReadyAttention(
+    actorId: string,
+    pending: ReadonlyMap<string, ResponsiveReadyAttention>
+  ): Promise<void> {
+    if (!this.inboxStore) return;
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return;
 
@@ -2650,7 +2702,7 @@ export class ActorMesh {
       }
       entries.push(this.responsiveReadyAttentionEntry(actorId, obligation));
     }
-    if (entries.length > 0) this.inboxStore.append(entries);
+    if (entries.length > 0) await this.appendInbox(entries);
   }
 
   /**
@@ -2694,7 +2746,7 @@ export class ActorMesh {
     previousHeadId: string | null = null,
     sequence: number | null = null,
     epoch: string = this.directReadyHeadEpoch
-  ): boolean {
+  ): Promise<boolean> {
     actorId = this.resolveThreadId(actorId);
     // Mid-run: accumulate rather than deliver. `from` is fixed by the first
     // change of the run so the collapsed entry describes where the run started,
@@ -2702,20 +2754,43 @@ export class ActorMesh {
     if (this.actorsInRun.has(actorId)) {
       const net = this.runHeadNet.get(actorId);
       this.runHeadNet.set(actorId, { from: net ? net.from : previousHeadId, to: head, epoch });
-      return false;
+      return Promise.resolve(false);
     }
-    if (head === null) return false;
+    if (head === null) return Promise.resolve(false);
     return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence, epoch);
   }
 
-  private appendReadyHeadEntry(
+  /**
+   * Append inbox entries through the writer (#1289 C2), answering the rows
+   * this call inserted. The append's own effect (its listeners' bookkeeping)
+   * is delivered before this settles. A write that committed counts as made
+   * even if its effects or its answer were lost: its inserted rows are
+   * answered when the writer returned them, and none otherwise. One that did
+   * not commit, or may not have, rejects and is not retried here.
+   */
+  private async appendInbox(entries: InboxAppendInput[]): Promise<InboxEntry[]> {
+    if (!this.writer) throw new Error("this mesh has no writer configured");
+    try {
+      return await this.writer.write("inbox.append", { entries });
+    } catch (err) {
+      if (!(err instanceof MeshWriteCommittedError)) throw err;
+      this.log(`inbox append: ${err.message}`);
+      return Array.isArray(err.result) ? (err.result as InboxEntry[]) : [];
+    }
+  }
+
+  /**
+   * The actor's state is read before the append is awaited; the wake after it
+   * is advisory and re-reads its target itself.
+   */
+  private async appendReadyHeadEntry(
     actorId: string,
     head: { id: string; intent: string | null; responsive?: boolean },
     previousHeadId: string | null,
     sequence: number | null,
     /** Epoch from the repository whose sequence produced this transition. */
     epoch: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!this.inboxStore) return false;
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
@@ -2730,7 +2805,7 @@ export class ActorMesh {
     );
     const responsive = head.responsive === true;
     const latestReassignment = this.readLatestReassignment(head.id);
-    const entries = this.inboxStore.append([
+    const entries = await this.appendInbox([
       {
         id: entryId,
         actorId,
@@ -2826,11 +2901,11 @@ export class ActorMesh {
      * delivery semantics and remain outside this slice.
      */
     selfCausedMidRun = false
-  ): boolean {
-    if (!this.inboxStore) return false;
+  ): Promise<boolean> {
+    if (!this.inboxStore) return Promise.resolve(false);
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
-    if (!record || record.status !== "active") return false;
+    if (!record || record.status !== "active") return Promise.resolve(false);
 
     // Mid-run self-caused ready attention: defer delivery until the end of
     // the run. Generalizes the ready-head deferral principle (#632):
@@ -2844,15 +2919,14 @@ export class ActorMesh {
         this.runResponsiveReadyAttention.set(actorId, pending);
       }
       pending.set(obligation.id, obligation);
-      return true;
+      return Promise.resolve(true);
     }
 
     // The after-commit append seam owes this row its ordinary, preemptive
     // wake (#632); an unannotated row is never a joining wake.
-    const entries = this.inboxStore.append([
-      this.responsiveReadyAttentionEntry(actorId, obligation),
-    ]);
-    return entries.length > 0;
+    return this.appendInbox([this.responsiveReadyAttentionEntry(actorId, obligation)]).then(
+      (entries) => entries.length > 0
+    );
   }
 
   /**
@@ -2863,14 +2937,14 @@ export class ActorMesh {
    * `append` is `ON CONFLICT(id) DO NOTHING`, so a transition already delivered
    * is a silent no-op.
    */
-  reconcileResponsiveReadyAttention(obligations: {
+  async reconcileResponsiveReadyAttention(obligations: {
     listResponsiveReadyAttention(): Iterable<{
       id: string;
       ownerId: string;
       intent: string | null;
       readyCount?: number;
     }>;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const obligation of obligations.listResponsiveReadyAttention()) {
@@ -2880,7 +2954,7 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(obligation.ownerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
-        this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
+        await this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
       }
     } catch (err) {
       this.log(
@@ -2896,11 +2970,11 @@ export class ActorMesh {
    * runs — no sequence number is needed, only exact-once delivery of the one
    * (dependent, prerequisite) pair.
    */
-  deliverPrerequisiteCancelledAttention(
+  async deliverPrerequisiteCancelledAttention(
     actorId: string,
     dependentObligationId: string,
     prerequisiteId: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!this.inboxStore) return false;
     actorId = this.resolveThreadId(actorId);
     const record = this.actors.get(actorId);
@@ -2909,7 +2983,7 @@ export class ActorMesh {
       `obligation-prereq-cancelled:${prerequisiteEdgeKey(dependentObligationId, prerequisiteId)}`,
       actorId
     );
-    const entries = this.inboxStore.append([
+    const entries = await this.appendInbox([
       {
         id: entryId,
         actorId,
@@ -2932,13 +3006,13 @@ export class ActorMesh {
    * prerequisite is cancelled), so this simply replays that query through the
    * same idempotent delivery path used at the moment of cancellation.
    */
-  reconcileCancelledPrerequisiteAttention(obligations: {
+  async reconcileCancelledPrerequisiteAttention(obligations: {
     listPrerequisiteCancellationAttention(): Iterable<{
       dependentId: string;
       dependentOwnerId: string;
       prerequisiteId: string;
     }>;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const {
@@ -2952,7 +3026,7 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(dependentOwnerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
-        this.deliverPrerequisiteCancelledAttention(actorId, dependentId, prerequisiteId);
+        await this.deliverPrerequisiteCancelledAttention(actorId, dependentId, prerequisiteId);
       }
     } catch (err) {
       this.log(
@@ -2968,17 +3042,17 @@ export class ActorMesh {
    * while a replaced matcher that closes unmerged again is announced again.
    * Human owners see the recorded state on the dashboard instead.
    */
-  deliverCompletionMatcherClosedUnmergedAttention(
+  async deliverCompletionMatcherClosedUnmergedAttention(
     ownerId: string,
     obligationId: string,
     matcherSetAt: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!this.inboxStore) return false;
     if (ownerId.startsWith("system:")) return false;
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    const entries = this.inboxStore.append([
+    const entries = await this.appendInbox([
       {
         id: deduplicatedInboxEntryId(
           `obligation-matcher-closed-unmerged:${obligationId}:${matcherSetAt}`,
@@ -2998,17 +3072,17 @@ export class ActorMesh {
   }
 
   /** Boot recovery for {@link deliverCompletionMatcherClosedUnmergedAttention}. */
-  reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
+  async reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
     listCompletionMatcherClosedUnmergedAttention(): Iterable<{
       obligationId: string;
       ownerId: string;
       matcherSetAt: string;
     }>;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const attention of obligations.listCompletionMatcherClosedUnmergedAttention()) {
-        this.deliverCompletionMatcherClosedUnmergedAttention(
+        await this.deliverCompletionMatcherClosedUnmergedAttention(
           attention.ownerId,
           attention.obligationId,
           attention.matcherSetAt

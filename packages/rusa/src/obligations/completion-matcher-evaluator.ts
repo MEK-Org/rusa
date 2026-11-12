@@ -24,7 +24,8 @@ export interface CompletionMatcherEvaluatorDeps {
    * of that durable fact, so the sink must deduplicate by matcher installation;
    * boot reconciliation re-derives the same attention from stored state.
    */
-  onClosedUnmerged?: (obligation: Obligation, matcher: CompletionMatcher) => void;
+  /** Owner notice; awaited, so its append is made before the observation settles (#1289 C2). */
+  onClosedUnmerged?: (obligation: Obligation, matcher: CompletionMatcher) => void | Promise<void>;
   log?: (message: string) => void;
 }
 
@@ -209,7 +210,7 @@ export class CompletionMatcherEvaluator {
     // installation, so every observation may retry it; a failure here is
     // repaired by the next observation or the boot attention reconciliation.
     try {
-      this.deps.onClosedUnmerged?.(current, current.completionMatcher);
+      await this.deps.onClosedUnmerged?.(current, current.completionMatcher);
     } catch (error) {
       this.deps.log?.(
         `[completion-matcher] unmerged-close notice deferred for ${obligation.id}: ${errorMessage(error)}`
