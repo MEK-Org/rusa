@@ -586,4 +586,28 @@ describe("GchatClient reads", () => {
       ],
     });
   });
+  it("replies or fails, never opening a new thread, when the thread is required (#1311)", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockImplementation(
+        async () => new Response(JSON.stringify({ name: "spaces/A/messages/M1" }), { status: 200 })
+      );
+    const client = new GchatClient(credentialsDir());
+
+    await client.send("spaces/A", "scoped", {
+      threadName: "spaces/A/threads/T1",
+      requireExistingThread: true,
+    });
+    await client.send("spaces/A", "whole space", { threadName: "spaces/A/threads/T1" });
+
+    const replyOption = (call: number) =>
+      new URL(String(fetchMock.mock.calls[call]?.[0])).searchParams.get("messageReplyOption");
+    expect(replyOption(1)).toBe("REPLY_MESSAGE_OR_FAIL");
+    expect(replyOption(2)).toBe("REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
+  });
 });

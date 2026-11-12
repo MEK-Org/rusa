@@ -179,7 +179,7 @@ export function createAgentExecMcpServer(
       .string()
       .optional()
       .describe(
-        "Canonical URL-style reference string, e.g. github:owner/repo, github:owner/repo/issues/123, gchat:spaces/ABC, system:events."
+        "Canonical URL-style reference string, e.g. github:owner/repo, github:owner/repo/issues/123, gchat:spaces/ABC, gchat:spaces/ABC/threads/DEF (one Chat thread), system:events."
       ),
     kind: z
       .enum([
@@ -865,7 +865,7 @@ export function createAgentExecMcpServer(
     {
       title: "Delegate event source to an actor",
       description:
-        "Delegate an event source you currently own to any actor you hold a handle to. Effective ownership is resolved with live obligation claims taking precedence over stored subscriptions, which fall back to most-specific-live-subscriber-wins with parent bubbling.",
+        "Delegate an event source you currently own to any actor you hold a handle to. Effective ownership is resolved with live obligation claims taking precedence over stored subscriptions, which fall back to most-specific-live-subscriber-wins with parent bubbling. A Google Chat space owner may delegate one thread (source 'gchat:spaces/S/threads/T'): that thread's messages then route to the holder, while the space's other threads and new top-level messages stay with the space owner, and the space's direct subscribers still receive all of them. Delegating routes events only; it grants no Chat write (see grant_capability).",
       inputSchema: {
         child_thread_id: z.string().describe("The actor thread id to receive events."),
         ...eventResourceInputSchema,
@@ -1057,7 +1057,7 @@ export function createAgentExecMcpServer(
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches only on obligations it may already manage); without 'capability-admin' you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' needs a 'capability-admin' holder) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths (e.g. $RUSA_HOME/secrets/mistral-api-key); secret grants do not export environment variables (for tools expecting an env var, pass it per-command: MISTRAL_API_KEY=\"$(cat \"$RUSA_HOME/secrets/mistral-api-key\")\" ...). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' is instead checked on every obligation tool call, so it takes effect immediately, even in an open session. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches only on obligations it may already manage); without 'capability-admin' you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' needs a 'capability-admin' holder) and only to your DIRECT children. Exception: a holder of whole-space 'chat-write:spaces/S' (not 'chat-write:*') may grant one thread of that space, 'chat-write:spaces/S/threads/T', to any actor, with no 'capability-admin' or ancestry; its grantee may reply only within that thread (no top-level posts, sibling threads, or reactions outside it) and cannot re-grant it. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths (e.g. $RUSA_HOME/secrets/mistral-api-key); secret grants do not export environment variables (for tools expecting an env var, pass it per-command: MISTRAL_API_KEY=\"$(cat \"$RUSA_HOME/secrets/mistral-api-key\")\" ...). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' is instead checked on every obligation tool call, so it takes effect immediately, even in an open session. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
@@ -1080,7 +1080,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin' you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' is instead checked on every obligation tool call, so its revocation takes effect immediately, even in an open session.",
+        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin' you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. A holder of whole-space 'chat-write:spaces/S' may revoke any 'chat-write:spaces/S/threads/T' grant. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' is instead checked on every obligation tool call, so its revocation takes effect immediately, even in an open session.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),

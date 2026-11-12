@@ -1,4 +1,9 @@
 import {
+  chatWriteParam,
+  holdsChatWriteSpace,
+  parseChatWriteScope,
+} from "../chat/chat-write-scope.js";
+import {
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
 } from "./administrative-capabilities.js";
@@ -48,11 +53,14 @@ function parentGrantBase(capability: string): string {
 }
 
 /**
- * Grantor authority for a grant or revocation. A `capability-admin` holder
- * may grant or revoke within its own subtree, itself included. Any other
- * grantor may only touch a capability in {@link PARENT_GRANTABLE_CAPABILITIES},
- * and only on its direct child. Fail-closed: an unknown grantor holds nothing.
- * Ids are already resolved.
+ * Grantor authority for a grant or revocation. A thread-scoped
+ * `chat-write:spaces/S/threads/T` is authorized by the grantor's own active
+ * `chat-write` on space S, for any existing grantee (#1311): the grant is
+ * narrower than what the grantor already holds. Otherwise a `capability-admin`
+ * holder may grant or revoke within its own subtree, itself included, and any
+ * other grantor may only touch a capability in
+ * {@link PARENT_GRANTABLE_CAPABILITIES}, and only on its direct child.
+ * Fail-closed: an unknown grantor holds nothing. Ids are already resolved.
  */
 export function assertGrantAuthority(
   reader: GrantAuthorityReader,
@@ -67,6 +75,14 @@ export function assertGrantAuthority(
   const grantee = reader.actor(granteeId);
   if (!grantee) {
     throw new Error(`unknown thread id: ${granteeId}`);
+  }
+  const chatParam = chatWriteParam(capability);
+  const chatScope = chatParam === undefined ? undefined : parseChatWriteScope(chatParam);
+  if (
+    chatScope?.kind === "thread" &&
+    holdsChatWriteSpace(reader.capabilities(grantorId), chatScope.space)
+  ) {
+    return;
   }
   if (reader.capabilities(grantorId).includes(CAPABILITY_ADMIN_CAPABILITY)) {
     if (!isAncestorIn(reader, grantorId, granteeId)) {
