@@ -211,6 +211,8 @@ export class McpHttpServer {
   private readonly tokenToName = new Map<string, string>();
   /** Per mounted server: the safe label recorded for it, never its raw name. */
   private readonly serverLabels = new Map<string, string>();
+  /** Per-request admission for a mount; a refused request 404s like an unknown path. */
+  private readonly authorizers = new Map<string, () => boolean>();
   /** Per server-name: session id -> monotonic creation time for close diagnostics. */
   private readonly sessionStartedAt = new Map<string, Map<string, number>>();
   private readonly log: Logger;
@@ -316,8 +318,14 @@ export class McpHttpServer {
    * per-actor endpoint (e.g. the agent-execution server for one actor, with its
    * id baked in). Returns the loopback URL to hand the actor's provider.
    */
-  addServer(name: string, factory: () => McpServer, opts?: { logLabel?: string }): string {
+  addServer(
+    name: string,
+    factory: () => McpServer,
+    opts?: { logLabel?: string; authorize?: () => boolean }
+  ): string {
     this.factories[name] = factory;
+    if (opts?.authorize) this.authorizers.set(name, opts.authorize);
+    else this.authorizers.delete(name);
     if (!this.sessions.has(name)) this.sessions.set(name, new Map());
     if (!this.sessionStartedAt.has(name)) this.sessionStartedAt.set(name, new Map());
     this.serverLabels.set(
@@ -342,6 +350,7 @@ export class McpHttpServer {
     }
     this.sessionStartedAt.delete(name);
     this.serverLabels.delete(name);
+    this.authorizers.delete(name);
     delete this.factories[name];
     const token = this.nameToToken.get(name);
     if (token) {
@@ -382,7 +391,7 @@ export class McpHttpServer {
       return;
     }
     const name = this.serverNameFor(req.url);
-    if (!name) {
+    if (!name || this.authorizers.get(name)?.() === false) {
       res.writeHead(404, { "content-type": "text/plain" });
       res.end("not found");
       return;

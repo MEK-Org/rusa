@@ -157,6 +157,7 @@ export function withDefaultActorCapabilities(
   policy: () => CapabilityPolicy
 ): CapabilityGrantStore {
   return {
+    mutations: store.mutations,
     grant: (grant) => store.grant(grant),
     revoke: (actorId, capability, at) => store.revoke(actorId, capability, at),
     list: () => store.list(),

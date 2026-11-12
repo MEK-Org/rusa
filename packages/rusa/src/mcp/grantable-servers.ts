@@ -315,23 +315,65 @@ export function buildGrantableServers(
   return map;
 }
 
+/** Where a granted MCP endpoint is mounted, and what decides each request. */
+export interface GrantedServerMounts {
+  addServer: (
+    name: string,
+    factory: () => McpServer,
+    opts?: { authorize?: () => boolean }
+  ) => string;
+}
+
+/** The capabilities an endpoint built from `params` stands for. */
+function builtCapabilities(baseCapability: string, params: readonly string[]): string[] {
+  return params.length === 0
+    ? [baseCapability]
+    : params.map((param) => `${baseCapability}:${param}`);
+}
+
 /**
- * Mount the MCP servers represented by an actor's active grants. Parameterized
- * grants share one endpoint per base capability, with every parameter passed to
- * that endpoint's factory. Re-adding an existing server replaces its factory
- * while preserving its URL, so a live actor's next provider run gets the newly
- * widened capability without disrupting an in-flight transport.
+ * Mount one granted endpoint whose every request is admitted only while each
+ * capability it was built from is still held (#1289 D1). `capabilities` is
+ * read per request, so a committed revocation or narrowing refuses the next
+ * request at once, on a new session or an open one, before the revocation hook
+ * unmounts or re-mounts the endpoint. A request already running is not
+ * cancelled. The reader must return effective capabilities (role-derived
+ * ones included), not raw grant rows.
+ */
+function mountGrantedServer(
+  actorId: string,
+  baseCapability: string,
+  params: readonly string[],
+  factory: GrantableServerFactory,
+  capabilities: () => readonly string[],
+  mcpHttp: GrantedServerMounts
+): string {
+  const built = builtCapabilities(baseCapability, params);
+  return mcpHttp.addServer(`${actorId}:${baseCapability}`, () => factory(actorId, [...params]), {
+    authorize: () => {
+      const active = new Set(capabilities());
+      return built.every((capability) => active.has(capability));
+    },
+  });
+}
+
+/**
+ * Mount the MCP servers represented by an actor's active grants, read from
+ * `capabilities` (the actor's effective capabilities). Parameterized grants
+ * share one endpoint per base capability, with every parameter passed to that
+ * endpoint's factory. Re-adding an existing server replaces its factory while
+ * preserving its URL, so a live actor's next provider run gets the newly
+ * widened capability without disrupting an in-flight transport. Each request
+ * is admitted against `capabilities` again; see {@link mountGrantedServer}.
  */
 export function mountGrantedServers(
   actorId: string,
-  activeCapabilities: readonly string[],
+  capabilities: () => readonly string[],
   grantableServers: Map<string, GrantableServerFactory>,
-  mcpHttp: {
-    addServer: (name: string, factory: () => McpServer) => string;
-  }
+  mcpHttp: GrantedServerMounts
 ): McpServerSpec[] {
   const baseToParams = new Map<string, string[]>();
-  for (const capability of activeCapabilities) {
+  for (const capability of capabilities()) {
     const parts = capability.split(":");
     const baseCapability = parts[0];
     const param = parts.length > 1 ? parts.slice(1).join(":") : undefined;
@@ -346,7 +388,7 @@ export function mountGrantedServers(
   for (const [baseCapability, params] of baseToParams.entries()) {
     const factory = grantableServers.get(baseCapability);
     if (!factory || factory.acceptsParams?.(params) === false) continue;
-    const url = mcpHttp.addServer(`${actorId}:${baseCapability}`, () => factory(actorId, params));
+    const url = mountGrantedServer(actorId, baseCapability, params, factory, capabilities, mcpHttp);
     mounted.push({ name: baseCapability, url });
   }
   return mounted;
@@ -363,10 +405,7 @@ export async function handleCapabilityRevoked(
   capability: string,
   getActiveCapabilities: () => string[],
   grantableServers: Map<string, GrantableServerFactory>,
-  mcpHttp: {
-    removeServer: (name: string) => Promise<void>;
-    addServer: (name: string, factory: () => McpServer) => string;
-  }
+  mcpHttp: GrantedServerMounts & { removeServer: (name: string) => Promise<void> }
 ): Promise<void> {
   const currentLock = revokeMutexes.get(actorId) ?? Promise.resolve();
   const nextLock = currentLock.then(async () => {
@@ -401,7 +440,16 @@ export async function handleCapabilityRevoked(
         const factory = grantableServers.get(baseCapability);
         await mcpHttp.removeServer(`${actorId}:${baseCapability}`);
         if (factory && factory.acceptsParams?.(params) !== false) {
-          mcpHttp.addServer(`${actorId}:${baseCapability}`, () => factory(actorId, params));
+          // Admitted per request like the original mount, so the narrowed
+          // endpoint refuses again if a later revocation commits.
+          mountGrantedServer(
+            actorId,
+            baseCapability,
+            params,
+            factory,
+            getActiveCapabilities,
+            mcpHttp
+          );
         }
       }
     } else {

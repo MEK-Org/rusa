@@ -4,6 +4,8 @@ import {
   type CapabilityGrantStore,
   type CapabilityPolicy,
   effectiveCapabilities,
+  GRANT_MUTATION_EFFECT,
+  type GrantMutationEffect,
 } from "../actor/capability-grants.js";
 import type { ExperimentEnrollment, ExperimentEnrollmentStore } from "../actor/experiments.js";
 import {
@@ -60,7 +62,7 @@ export interface MeshWriteRepos {
 }
 
 /** What a committed write owes the main thread. */
-export type MeshEffect = ObligationMutationEffect | InboxMutationEffect;
+export type MeshEffect = ObligationMutationEffect | InboxMutationEffect | GrantMutationEffect;
 
 type Context = WriteContext<MeshWriteRepos, MeshEffect>;
 
@@ -588,6 +590,13 @@ export const MESH_WRITE_OPERATIONS = {
       verb: "grant",
     });
     context.repos.grants.grant(grant);
+    context.emit({
+      kind: GRANT_MUTATION_EFFECT,
+      change: "granted",
+      actorId: grant.actorId,
+      capability: grant.capability,
+      by: grant.grantedBy,
+    });
   },
 
   /** Revoke a capability, if the revoker still may (#1289 D1); see grants.grant. */
@@ -608,6 +617,14 @@ export const MESH_WRITE_OPERATIONS = {
       verb: "revoke",
     });
     context.repos.grants.revoke(input.actorId, input.capability, input.at);
+    // Announced even when nothing was active, so a stale mount is still torn down.
+    context.emit({
+      kind: GRANT_MUTATION_EFFECT,
+      change: "revoked",
+      actorId: input.actorId,
+      capability: input.capability,
+      by: input.revokedBy,
+    });
   },
 
   /**
@@ -707,6 +724,7 @@ export type MeshObligationWriter = MeshWriter<MeshWriteOperations>;
  */
 export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): Promise<void> | void {
   if (effect.kind === INBOX_MUTATION_EFFECT) repos.inbox.deliverMutationEffect(effect);
+  else if (effect.kind === GRANT_MUTATION_EFFECT) return repos.grants.mutations.deliver(effect);
   else return repos.obligations.deliverMutationEffect(effect);
 }
 

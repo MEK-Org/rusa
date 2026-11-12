@@ -77,12 +77,68 @@ export interface CapabilityGrant {
   revokedAt?: string;
 }
 
+/** The kind of a committed grant or revocation's writer effect (#1289 D1). */
+export const GRANT_MUTATION_EFFECT = "grant.mutation";
+
+/**
+ * What one committed grant or revocation owes the mesh (#1289 D1), as plain
+ * data so it can cross the writer boundary. The writer delivers it in commit
+ * order with every other write's effects, so the mesh's event and mount hooks
+ * land in that order too.
+ */
+export interface GrantMutationEffect {
+  readonly kind: typeof GRANT_MUTATION_EFFECT;
+  readonly change: "granted" | "revoked";
+  readonly actorId: string;
+  readonly capability: string;
+  /** The grantor or revoker. */
+  readonly by: string;
+}
+
+export type GrantMutationListener = (effect: GrantMutationEffect) => Promise<void> | void;
+
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  typeof (value as { then?: unknown } | null)?.then === "function";
+
+/**
+ * The listeners a grant store's committed writes are delivered to. Delivery
+ * stays synchronous while every listener does, and otherwise awaits each
+ * listener in turn.
+ */
+export class GrantMutationListeners {
+  private readonly listeners = new Set<GrantMutationListener>();
+
+  /** Subscribe; returns the unsubscribe. */
+  on(listener: GrantMutationListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Deliver one committed write's effect to every listener. */
+  deliver(effect: GrantMutationEffect): Promise<void> | void {
+    const listeners = [...this.listeners];
+    for (let index = 0; index < listeners.length; index += 1) {
+      const out = listeners[index]?.(effect);
+      if (isThenable(out)) {
+        return (async () => {
+          await out;
+          for (const listener of listeners.slice(index + 1)) await listener(effect);
+        })();
+      }
+    }
+  }
+}
+
 /**
  * Persistence boundary for capability grants — mirrors {@link ActorRepository}:
  * a local JSON file in production ({@link FileCapabilityGrantStore}), in-memory
  * for tests. Keyed on (actorId, capability); one record per pair.
  */
 export interface CapabilityGrantStore {
+  /** Where the writer delivers this store's committed grant writes (#1289 D1). */
+  readonly mutations: GrantMutationListeners;
   /**
    * Grant `capability` to `actorId`. Idempotent on (actorId, capability):
    * re-granting sets/keeps it active (clearing any prior revocation) and updates
@@ -147,6 +203,7 @@ const key = (actorId: string, capability: string): string => `${actorId} ${capab
 
 /** In-memory grant store — for tests and the e2e runner. */
 export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
+  readonly mutations = new GrantMutationListeners();
   private readonly grants = new Map<string, CapabilityGrant>();
 
   grant(grant: CapabilityGrant): void {
@@ -178,6 +235,7 @@ export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
  * visible to the next actor construction without an orchestrator restart.
  */
 export class FileCapabilityGrantStore implements CapabilityGrantStore {
+  readonly mutations = new GrantMutationListeners();
   private mem = new InMemoryCapabilityGrantStore();
 
   constructor(private readonly file: string) {

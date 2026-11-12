@@ -1,5 +1,7 @@
+import { GRANT_MUTATION_EFFECT } from "../../actor/capability-grants.js";
 import {
   MESH_WRITE_OPERATIONS,
+  type MeshEffect,
   type MeshObligationWriter,
   type MeshWriteRepos,
 } from "../mesh-write-operations.js";
@@ -23,9 +25,10 @@ export function isGrantWrite(op: string): boolean {
 /**
  * Run one grant or experiment write operation over in-memory stores, for a
  * test mesh with no database (#1289 D1). The production operation decides it,
- * so the authority a test exercises is the writer's. These operations emit no
- * effects; the production writer's transaction and rollback are tested over
- * SQLite.
+ * so the authority a test exercises is the writer's, and its grant effects are
+ * delivered to the store's listeners as the writer would, after it returns.
+ * The production writer's transaction, rollback and delivery order are tested
+ * over SQLite.
  */
 export async function runGrantWrite(
   repos: GrantWriteRepos,
@@ -37,16 +40,24 @@ export async function runGrantWrite(
     context: unknown,
     input: unknown
   ) => unknown;
-  return operation(
+  const effects: MeshEffect[] = [];
+  const result = operation(
     {
       repos,
-      emit: () => {
-        throw new Error(`${op} emitted an effect a grant write does not make`);
+      emit: (effect: MeshEffect) => {
+        if (effect.kind !== GRANT_MUTATION_EFFECT) {
+          throw new Error(`${op} emitted an effect a grant write does not make`);
+        }
+        effects.push(effect);
       },
       afterCommit: (callback: () => void) => callback(),
     },
-    input
+    structuredClone(input)
   );
+  for (const effect of effects) {
+    if (effect.kind === GRANT_MUTATION_EFFECT) await repos.grants.mutations.deliver(effect);
+  }
+  return result;
 }
 
 /** A writer over in-memory stores that makes only grant and experiment writes. */

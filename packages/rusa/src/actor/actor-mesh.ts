@@ -80,6 +80,7 @@ import {
 import {
   type CapabilityGrantStore,
   type CapabilityPolicy,
+  type GrantMutationEffect,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
@@ -736,7 +737,9 @@ interface ActorMeshBaseOptions {
   /**
    * Called after a capability grant is durably recorded, for live resource
    * wiring the mesh does not own. The production wiring uses this to mount the
-   * endpoint and update the actor's provider config for its next run.
+   * endpoint and update the actor's provider config for its next run. Runs in
+   * the grant's writer effect delivery, in commit order (#1289 D1); it must
+   * not await a write it did not make.
    */
   onCapabilityGranted?: (actorId: string, capability: string) => void;
   /**
@@ -744,6 +747,9 @@ interface ActorMeshBaseOptions {
    * teardown the mesh doesn't own — namely unmounting the granted MCP endpoint so
    * revocation takes effect IMMEDIATELY (a 404), not only at the actor's next
    * reconstruction. Invoked in a try/catch so a hook throw can't break revoke.
+   * A writer revocation runs it in that write's effect delivery, in commit
+   * order (#1289 D1), and later deliveries wait until it settles; it must not
+   * await a write it did not make.
    */
   onCapabilityRevoked?: (actorId: string, capability: string) => Promise<void> | void;
   /**
@@ -1011,6 +1017,7 @@ export class ActorMesh {
   private readonly inboxStore?: InboxRepository;
   private unsubscribeInboxAppends?: () => void;
   private unsubscribeInboxHandled?: () => void;
+  private unsubscribeGrantMutations?: () => void;
   private dispatchJoiningActiveRunPort?: (actorId: string) => Promise<boolean>;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet, with
@@ -1207,6 +1214,11 @@ export class ActorMesh {
     this.onRevive = opts.onRevive;
     this.onCapabilityGranted = opts.onCapabilityGranted;
     this.onCapabilityRevoked = opts.onCapabilityRevoked;
+    // The writer delivers each committed grant or revocation here, in commit
+    // order with every other write's effects (#1289 D1).
+    this.unsubscribeGrantMutations = this.grants.mutations.on((effect) =>
+      this.deliverGrantMutation(effect)
+    );
     this.onModelSet = opts.onModelSet;
     this.retireCleanups = [
       ...(opts.retireCleanups ?? []),
@@ -3618,18 +3630,43 @@ export class ActorMesh {
       grant: { actorId, capability, grantedBy, grantedAt: this.now() },
       policy: this.capabilityPolicy(),
     });
-    this.recordEvent({
-      kind: "capability_granted",
-      actorId,
-      detail: capability,
-      payload: JSON.stringify({ grantedBy }),
-    });
-    if (this.onCapabilityGranted) {
+  }
+
+  /**
+   * What one committed grant or revocation owes the mesh, delivered by the
+   * writer in commit order (#1289 D1): the audit event, then the live-resource
+   * hook. A revocation's delivery settles when its unmount hook does, so later
+   * deliveries wait behind it. Hook failures are logged, never thrown, so a
+   * hook cannot fail a write that has already committed.
+   */
+  private deliverGrantMutation(effect: GrantMutationEffect): Promise<void> | void {
+    const { actorId, capability } = effect;
+    const describe = (err: unknown) => (err instanceof Error ? err.message : String(err));
+    if (effect.change === "granted") {
+      this.recordEvent({
+        kind: "capability_granted",
+        actorId,
+        detail: capability,
+        payload: JSON.stringify({ grantedBy: effect.by }),
+      });
       try {
-        this.onCapabilityGranted(actorId, capability);
+        this.onCapabilityGranted?.(actorId, capability);
       } catch (err) {
-        this.log(`onCapabilityGranted failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.log(`onCapabilityGranted failed: ${describe(err)}`);
       }
+      return;
+    }
+    this.recordEvent({ kind: "capability_revoked", actorId, detail: capability });
+    if (!this.onCapabilityRevoked) return;
+    let pending: Promise<void> | void;
+    try {
+      pending = this.onCapabilityRevoked(actorId, capability);
+    } catch (err) {
+      this.log(`onCapabilityRevoked failed: ${describe(err)}`);
+      return;
+    }
+    if (pending instanceof Promise) {
+      return pending.catch((err) => this.log(`onCapabilityRevoked failed: ${describe(err)}`));
     }
   }
 
@@ -3640,10 +3677,14 @@ export class ActorMesh {
    * capability is refused here regardless of grantor. Any other `revokedBy`
    * only revokes a parent-grantable capability from a direct child. No-op on
    * the store if not active, but the unmount hook still
-   * fires so a stale mounted endpoint is torn down idempotently. Revocation takes
-   * effect immediately via {@link ActorMeshOptions.onCapabilityRevoked} (the
-   * wiring unmounts the granted endpoint → a 404), not only at the actor's next
-   * reconstruction; a granted secret disappears at the actor's next spawn.
+   * fires so a stale mounted endpoint is torn down idempotently. A mounted
+   * endpoint admits each request against the actor's capabilities, so it
+   * refuses new requests once the revocation commits; the unmount hook
+   * ({@link ActorMeshOptions.onCapabilityRevoked}) then runs in this write's
+   * ordered effect delivery and closes its sessions, possibly after an earlier
+   * delivery settles (#1289 D1). A request already running is not cancelled.
+   * A granted secret disappears at the actor's next spawn. Resolves once the
+   * hook has settled.
    */
   async revokeCapability(actorId: string, capability: string, revokedBy: string): Promise<void> {
     actorId = this.resolveThreadId(actorId);
@@ -3660,14 +3701,6 @@ export class ActorMesh {
       at: this.now(),
       policy: this.capabilityPolicy(),
     });
-    this.recordEvent({ kind: "capability_revoked", actorId, detail: capability });
-    if (this.onCapabilityRevoked) {
-      try {
-        await this.onCapabilityRevoked(actorId, capability);
-      } catch (err) {
-        this.log(`onCapabilityRevoked failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
   }
 
   /**
@@ -5832,6 +5865,8 @@ export class ActorMesh {
     this.unsubscribeInboxAppends = undefined;
     this.unsubscribeInboxHandled?.();
     this.unsubscribeInboxHandled = undefined;
+    this.unsubscribeGrantMutations?.();
+    this.unsubscribeGrantMutations = undefined;
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
     this.activeSuppressions.clear();

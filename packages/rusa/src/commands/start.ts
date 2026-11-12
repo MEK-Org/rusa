@@ -2798,7 +2798,7 @@ async function composeStart(
     if (!workerMcp) return;
     const mounted = mountGrantedServers(
       actorId,
-      mesh.activeCapabilitiesFor(actorId),
+      () => mesh.activeCapabilitiesFor(actorId),
       grantableServers,
       mcpHttp
     );
@@ -3651,7 +3651,12 @@ async function composeStart(
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
         // are aggregated by their base name and passed to the factory.
         workerMcp.push(
-          ...mountGrantedServers(id, mesh.activeCapabilitiesFor(rec.id), grantableServers, mcpHttp)
+          ...mountGrantedServers(
+            id,
+            () => mesh.activeCapabilitiesFor(rec.id),
+            grantableServers,
+            mcpHttp
+          )
         );
 
         // Each worker gets its own private working directory and nothing else: its

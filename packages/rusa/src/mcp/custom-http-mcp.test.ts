@@ -882,7 +882,7 @@ describe("configured MCP service through the mesh grant boundary", () => {
       const [spec] = hub.toolUrls(
         "mac",
         "reader",
-        mountGrantedServers("reader", mesh.activeCapabilitiesFor("reader"), servers, mcpHttp)
+        mountGrantedServers("reader", () => mesh.activeCapabilitiesFor("reader"), servers, mcpHttp)
       );
       if (!spec) throw new Error("no proxied spec");
       expect(spec.name).toBe("glass_goals");
@@ -898,7 +898,7 @@ describe("configured MCP service through the mesh grant boundary", () => {
       grants.set("other", ["glass_goals:configured-user:read"]);
       expect((await call(await connect("other"), "read_goal")).contextId).toBe(before.contextId);
       expect(
-        mountGrantedServers("reader", mesh.activeCapabilitiesFor("reader"), servers, mcpHttp)
+        mountGrantedServers("reader", () => mesh.activeCapabilitiesFor("reader"), servers, mcpHttp)
       ).toEqual([]);
     } finally {
       await tool.close();
