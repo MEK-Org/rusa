@@ -463,6 +463,42 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(1);
   });
 
+  it("skips the run when preempted while its onQueued listener is still settling (admission epoch)", async () => {
+    // onQueued is awaited before the run reaches its gate; the mesh's queue
+    // gate awaits the inbox seen mark there (#1289 C1b). A responsive
+    // preemption landing in that wait cancels this opportunity, so the stale
+    // ordinary run must not go on to start ahead of its replacement.
+    const provider = new FakeProvider();
+    const queued: Array<() => void> = [];
+    const starts: boolean[] = [];
+    const actor = makeActor(
+      {
+        onQueued: () => new Promise<void>((resolve) => queued.push(resolve)),
+        onRunStart: (responsive) => {
+          starts.push(responsive);
+        },
+      },
+      provider
+    );
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(queued).toHaveLength(1);
+
+    const preemption = actor.preemptForResponsive();
+    expect(preemption).toEqual({ preempted: true, phase: "queued" });
+    actor.requestRun({ priority: "responsive" });
+
+    queued[0]?.();
+    await vi.advanceTimersByTimeAsync(50);
+    // The responsive replacement reaches its own queue gate.
+    expect(queued).toHaveLength(2);
+    queued[1]?.();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(provider.calls).toHaveLength(1);
+    expect(starts).toEqual([true]);
+  });
+
   it("skips the run when preempted in the gap after scheduler pops but before invoke", async () => {
     let resolveInvoke!: () => void;
     let invokeCalled = false;
@@ -833,6 +869,46 @@ describe("Actor", () => {
 
       expect(ended).toBe(1);
       expect(abandoned).toEqual([]);
+    });
+
+    it("queues no next run until the previous run's onEnd has settled", async () => {
+      // The mesh's run-end listener awaits its closure write before clearing
+      // that run's state (#1289 C1b); it relies on this actor not opening the
+      // next opportunity, and so not reaching its onQueued, meanwhile.
+      const ends: Array<() => void> = [];
+      const events: string[] = [];
+      const provider = new FakeProvider(() => {
+        return {};
+      });
+      const actor = makeActor(
+        {
+          onQueued: () => {
+            events.push("queued");
+          },
+          onRunEnd: () => {
+            events.push("end");
+            return new Promise<void>((resolve) => ends.push(resolve));
+          },
+        },
+        provider
+      );
+
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(events).toEqual(["queued", "end"]);
+
+      actor.requestRun();
+      actor.requestRun({ priority: "responsive" });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(events).toEqual(["queued", "end"]);
+      expect(provider.calls).toHaveLength(1);
+
+      ends[0]?.();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(events).toEqual(["queued", "end", "queued", "end"]);
+      expect(provider.calls).toHaveLength(2);
+      ends[1]?.();
+      await flush();
     });
 
     it("reports a cancelled queued start as abandoned, and its replay as ended", async () => {

@@ -26,7 +26,10 @@ import {
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { RusaConfig } from "../config/types.js";
+import { createInProcessMeshWriter } from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { Logger } from "../observability/logger.js";
@@ -202,6 +205,13 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
     inboxDb.close();
   });
   const inboxStore = new SqliteInboxRepository(inboxDb);
+  // The mesh's own writes (#1289) commit as in production, over the same database.
+  const writer = createInProcessMeshWriter(inboxDb, {
+    obligations: new ObligationRepository(inboxDb),
+    inbox: inboxStore,
+    actors,
+    actorRuns: new ActorRunRepository(inboxDb),
+  });
   const principals = new PrincipalRepository(inboxDb);
   principals.createUser({ email: "operator@example.test", createdAt: "t" });
   const starts: string[] = [];
@@ -223,6 +233,7 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
     principals,
     rootId: "root",
     inboxStore,
+    writer,
     eventSourceOwners: new InMemoryEventSourceOwnerStore(),
     eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
     capabilityGrants: new InMemoryCapabilityGrantStore(),

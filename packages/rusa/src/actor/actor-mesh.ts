@@ -3,6 +3,7 @@ import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js"
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { MESH_SYSTEM } from "../mcp/stamp.js";
@@ -110,7 +111,6 @@ import {
 } from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
 import {
-  evaluateHeadClosure,
   type HeadClosureQuery,
   type HeadClosureShortfall,
   headClosureShortfall,
@@ -293,11 +293,6 @@ export interface MeshObligationPort {
   listPrerequisiteEdges?(
     dependentId: string
   ): Array<{ prerequisiteId: string; status: ObligationStatus }>;
-  /**
-   * Clear the already-expired snoozes among `ids` in one transaction (#722),
-   * so strict closure judges an expired snooze by the ordinary rules.
-   */
-  expireDueSnoozes?(ids: readonly string[]): readonly string[];
   /** The latest reassignment's message (#947), carried on ready-head attention. */
   latestReassignment?(id: string): ObligationReassignment | null;
 }
@@ -313,19 +308,28 @@ export interface MeshObligationPort {
  * rather than arming a run whose heads it could not read.
  */
 export type MeshObligationClosurePort = MeshObligationPort &
-  Required<
-    Pick<
-      MeshObligationPort,
-      "get" | "listDirectChildEdges" | "listPrerequisiteEdges" | "expireDueSnoozes"
-    >
-  >;
+  Required<Pick<MeshObligationPort, "get" | "listDirectChildEdges" | "listPrerequisiteEdges">>;
 
 /** Whether a wired port can answer every read strict closure needs. */
 export function supportsObligationClosureReads(
   port: MeshObligationPort | undefined
 ): port is MeshObligationClosurePort {
-  return Boolean(
-    port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges && port.expireDueSnoozes
+  return Boolean(port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges);
+}
+
+/**
+ * Every head in `heads` refused as unverifiable. Selection refuses to arm a
+ * run without the closure reads, so this is the second half of the same
+ * fail-closed rule: an armed head never counts as closed on evidence the mesh
+ * cannot read.
+ */
+function unreadableClosure(heads: ReadonlySet<string>): HeadClosureShortfall[] {
+  return [...heads].map((obligationId) =>
+    headClosureShortfall(
+      obligationId,
+      null,
+      "the mesh obligation closure port is unavailable, so closure cannot be verified"
+    )
   );
 }
 
@@ -975,7 +979,7 @@ export class ActorMesh {
   private readonly inboxStore?: InboxRepository;
   private unsubscribeInboxAppends?: () => void;
   private unsubscribeInboxHandled?: () => void;
-  private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
+  private dispatchJoiningActiveRunPort?: (actorId: string) => Promise<boolean>;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet, with
    * the strongest wake their rows are owed. See {@link scheduleAppendedWork}.
@@ -1123,8 +1127,10 @@ export class ActorMesh {
       constructActor: (record) => this.createActor(this.factoryContext(record)),
       recordStatus: (actorId) => this.actors.get(actorId)?.status,
       isVoiceSessionActive: (actorId) => this.isVoiceSessionActive(actorId),
-      markInboxSeen: (actorId) => {
-        this.markInboxSeen(actorId);
+      // The dispatch that joins a queued run awaits this before requesting
+      // it (#1289 C1b), and owns its failure.
+      markInboxSeen: async (actorId) => {
+        await this.markInboxSeen(actorId);
       },
       onPreempted: (actorId, phase) => {
         this.recordEvent({
@@ -1332,28 +1338,33 @@ export class ActorMesh {
     const lifecycle = createActorLifecycle(
       [
         {
-          onQueued: (event) => {
-            this.actorQueued(event.actorId, event);
+          onQueued: async (event) => {
+            await this.actorQueued(event.actorId, event);
           },
           onStart: (event) => {
             this.actorStarted(event.actorId);
           },
           onEnd: (event) => {
-            if (event.terminal.kind === "result") {
-              this.finishInboxRun(event.actorId, {
-                successful: event.terminal.result.success,
+            // Only a result waits on a write (its closure check), so only it
+            // returns a promise; an abandoned run ends synchronously, and the
+            // listeners after this one see it at once.
+            const { terminal } = event;
+            if (terminal.kind === "result") {
+              return this.finishInboxRun(event.actorId, {
+                successful: terminal.result.success,
                 runId: event.runId,
+              }).then(() => {
+                this.accountRun(event.actorId, terminal.result, event.runId);
+                // A selection is run-scoped regardless of its terminal shape.
+                this.clearSelection(event.actorId);
               });
-              this.accountRun(event.actorId, event.terminal.result, event.runId);
-            } else {
-              this.abandonInboxRun(event.actorId);
-              // A launched run that ended without a result still ended: a pool
-              // staged while it ran is due now, not at some later dispatch (#652).
-              if (event.terminal.started) {
-                this.applyPendingTarget(event.actorId);
-              }
             }
-            // A selection is run-scoped regardless of its terminal shape.
+            this.abandonInboxRun(event.actorId);
+            // A launched run that ended without a result still ended: a pool
+            // staged while it ran is due now, not at some later dispatch (#652).
+            if (terminal.started) {
+              this.applyPendingTarget(event.actorId);
+            }
             this.clearSelection(event.actorId);
           },
         },
@@ -1448,7 +1459,12 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
-        this.reconcileActorInbox(work.actorId);
+        const actorId = work.actorId;
+        this.reconcileActorInbox(actorId).catch((err) =>
+          this.log(
+            `inbox reconciliation for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+          )
+        );
       }
     } catch (err) {
       // Recovery is a nudge over durable state, not the durability boundary.
@@ -1464,7 +1480,7 @@ export class ActorMesh {
    * calls this when it drops an admission its follower did not reclaim, since
    * no delivery is coming to wake the work that admission was for (#613).
    */
-  reconcileActorInbox(actorId: string): boolean {
+  async reconcileActorInbox(actorId: string): Promise<boolean> {
     const record = this.actors.get(actorId);
     if (record && record.status !== "active") return false;
     if (this.hasOnlyExhaustedWork(actorId)) return false;
@@ -1478,7 +1494,7 @@ export class ActorMesh {
       for (const work of this.inboxStore.actorsWithUnseen()) {
         const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
-        this.dispatch(work.actorId);
+        this.wake(work.actorId, "unseen inbox reconciliation");
       }
     } catch (err) {
       this.log(
@@ -1546,10 +1562,34 @@ export class ActorMesh {
    * {@link dispatchJoiningActiveRun}, so no caller of this method can turn
    * preemption off.
    */
-  dispatch(actorId: string): boolean {
+  async dispatch(actorId: string): Promise<boolean> {
     const resolved = this.resolveThreadId(actorId);
     this.appendWakesOwed.delete(resolved);
     return this.runs.dispatch(resolved);
+  }
+
+  /**
+   * A {@link dispatch} its caller does not wait for, because the caller's own
+   * answer is about the work it already made durable, not about the run
+   * (#1289 C1b). Its failure is reported here, so it is never silently
+   * dropped, and costs only latency: the work stays unhandled, so the next
+   * dispatch of this actor or reconciliation still finds it.
+   */
+  private wake(actorId: string, context: string): void {
+    this.dispatch(actorId).catch((err) => this.reportWakeFailure(actorId, context, err));
+  }
+
+  /** {@link wake} through {@link dispatchJoiningActiveRun}. */
+  private wakeJoining(actorId: string, context: string): void {
+    this.dispatchJoiningActiveRun(actorId).catch((err) =>
+      this.reportWakeFailure(actorId, context, err)
+    );
+  }
+
+  private reportWakeFailure(actorId: string, context: string, err: unknown): void {
+    this.log(
+      `${context} dispatch for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   isPreemptionSuppressed(actorId: string): boolean {
@@ -1808,7 +1848,7 @@ export class ActorMesh {
    * active run replaced. Self-caused mid-run ready attention is deferred to
    * run end (#632).
    */
-  private dispatchJoiningActiveRun(dest: string): boolean {
+  private async dispatchJoiningActiveRun(dest: string): Promise<boolean> {
     const resolved = this.resolveThreadId(dest);
     const dispatchJoiningActiveRun = this.dispatchJoiningActiveRunPort;
     if (!dispatchJoiningActiveRun) return false;
@@ -1865,28 +1905,31 @@ export class ActorMesh {
     queueMicrotask(() => {
       const unpaid = [...this.appendWakesOwed];
       this.appendWakesOwed.clear();
+      // An advisory wake is never allowed to become the appender's problem,
+      // and is not awaited here: this drain runs after the append's effect
+      // delivery has returned and holds nothing a dispatch needs (#1289 C1b).
+      // A failure is logged, and boot reconciliation still covers it.
       for (const [actorId, wake] of unpaid) {
-        try {
-          if (wake === "join") this.dispatchJoiningActiveRun(actorId);
-          else this.dispatch(actorId);
-        } catch (err) {
-          // An advisory wake is never allowed to become the appender's
-          // problem, and boot reconciliation still covers what it missed.
-          this.log(
-            `inbox notification dispatch for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        if (wake === "join") this.wakeJoining(actorId, "inbox notification");
+        else this.wake(actorId, "inbox notification");
       }
     });
   }
 
-  /** Lifecycle boundary after the halt gate and before scheduler admission. */
-  actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
+  /**
+   * Lifecycle boundary after the halt gate and before scheduler admission.
+   * The run-scoped state is reset before the seen mark is awaited; the run
+   * itself waits on this, so it starts with its entries seen.
+   */
+  async actorQueued(
+    actorId: string,
+    context: { responsive: boolean; mode: ActorRunMode }
+  ): Promise<InboxEntry[]> {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
+    const entries = context.mode === "ordinary" ? await this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
     } catch (err) {
@@ -1908,9 +1951,24 @@ export class ActorMesh {
     this.runResponsiveReadyAttention.delete(actorId);
   }
 
-  private markInboxSeen(actorId: string): InboxEntry[] {
+  /**
+   * Mark this actor's unseen entries seen through the writer. A mark that
+   * committed counts as made even if its answer was lost on the way back
+   * (#1289): its entries are then reported to no receipt listener, but they
+   * are seen. One that did not commit, or may not have, rejects and is not
+   * retried here.
+   */
+  private async markInboxSeen(actorId: string): Promise<InboxEntry[]> {
     if (!this.inboxStore) return [];
-    const entries = this.inboxStore.markSeen(actorId);
+    if (!this.writer) throw new Error("this mesh has no writer configured");
+    let entries: InboxEntry[];
+    try {
+      entries = await this.writer.write("inbox.markSeen", { actorId });
+    } catch (err) {
+      if (!(err instanceof MeshWriteCommittedError)) throw err;
+      this.log(`inbox seen mark for ${actorId}: ${err.message}`);
+      entries = Array.isArray(err.result) ? (err.result as InboxEntry[]) : [];
+    }
     if (entries.length > 0 && this.onInboxEntriesSeen) {
       try {
         this.onInboxEntriesSeen(actorId, entries);
@@ -1978,7 +2036,7 @@ export class ActorMesh {
     const closure = this.obligations;
     if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
-        `Cannot select head attention for ${actorId}: this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired, and every head selection is held to strict closure. Wire the closure port.`
+        `Cannot select head attention for ${actorId}: this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges) wired, and every head selection is held to strict closure. Wire the closure port.`
       );
     }
     // Status is a selection-time fact. Keeping only ready focuses in the run
@@ -2094,16 +2152,17 @@ export class ActorMesh {
   }
 
   /**
-   * Every armed head of this actor's current run that is not yet closed, or
-   * none when the run armed nothing (#382, #828). A head is closed when it is
-   * terminal, snoozed, handed off with this run's checkpoint, or waiting on a
-   * new live direct child or a new unmet prerequisite.
+   * The closure question for every armed head of this actor's current run, or
+   * null when the run armed nothing (#382, #828): what its return is judged
+   * by. A head is closed when it is terminal, snoozed, handed off with this
+   * run's checkpoint, or waiting on a new live direct child or a new unmet
+   * prerequisite.
    */
-  headClosureShortfalls(actorId: string): HeadClosureShortfall[] {
+  runClosureQuery(actorId: string): HeadClosureQuery | null {
     actorId = this.resolveThreadId(actorId);
     const runState = this.headClosureRuns.get(actorId);
-    if (!runState) return [];
-    return this.closureShortfalls(actorId, runState, runState.headObligationIds);
+    if (!runState || runState.headObligationIds.size === 0) return null;
+    return this.headClosureQuery(actorId, runState, runState.headObligationIds);
   }
 
   /**
@@ -2126,46 +2185,10 @@ export class ActorMesh {
     const heads = new Set(entryIds.flatMap((id) => [...(runState.headsByEntryId.get(id) ?? [])]));
     if (heads.size === 0) return null;
     if (!supportsObligationClosureReads(this.obligations)) {
-      const shortfalls = this.closureShortfalls(actorId, runState, heads);
+      const shortfalls = unreadableClosure(heads);
       throw new Error(`Cannot mark handled: ${shortfalls.map((s) => s.message).join(" ")}`);
     }
     return this.headClosureQuery(actorId, runState, heads);
-  }
-
-  private closureShortfalls(
-    actorId: string,
-    runState: HeadClosureRunState,
-    heads: ReadonlySet<string>
-  ): HeadClosureShortfall[] {
-    const closure = this.obligations;
-    // Selection already refused to arm a run without these reads, so this is
-    // the second half of the same fail-closed rule rather than a soft skip: an
-    // armed head never counts as closed on evidence the mesh cannot read.
-    if (!supportsObligationClosureReads(closure)) {
-      return [...heads].map((obligationId) =>
-        headClosureShortfall(
-          obligationId,
-          null,
-          "the mesh obligation closure port is unavailable, so closure cannot be verified"
-        )
-      );
-    }
-
-    // A snooze is the owner's explicit, time-bounded decision to defer this
-    // work, so it closes the head whether it was set during the run or before
-    // (#722). One whose deadline already passed is cleared first, through the
-    // normal mutation path, and the obligation then answers to the ordinary
-    // ready/waiting rules.
-    closure.expireDueSnoozes([...heads]);
-    return evaluateHeadClosure(
-      {
-        get: (id) => closure.get(id),
-        listDirectChildEdges: (id) => closure.listDirectChildEdges(id),
-        listPrerequisiteEdges: (id) => closure.listPrerequisiteEdges(id),
-        actorStatus: (id) => this.actors.get(id)?.status,
-      },
-      this.headClosureQuery(actorId, runState, heads)
-    );
   }
 
   /**
@@ -2200,14 +2223,20 @@ export class ActorMesh {
    * that throws is recorded as a rejection of every armed head rather than
    * allowed to abort the rest of run finishing.
    */
-  private recordReturnRejections(
-    actorId: string
-  ): Array<{ obligationId: string; title: string | null; reason: string }> {
-    const runState = this.headClosureRuns.get(actorId);
-    if (!runState) return [];
+  private async recordReturnRejections(
+    actorId: string,
+    runState: HeadClosureRunState | undefined
+  ): Promise<Array<{ obligationId: string; title: string | null; reason: string }>> {
+    if (!runState || runState.headObligationIds.size === 0) return [];
     let shortfalls: Array<Pick<HeadClosureShortfall, "obligationId" | "title" | "reason">>;
     try {
-      shortfalls = this.closureShortfalls(actorId, runState, runState.headObligationIds);
+      // The writer clears the heads' due snoozes and decides closure in one
+      // transaction (#1289), as the inbox mark does. Without it the return
+      // is refused fail closed, like a closure read that throws.
+      if (!this.writer) throw new Error("this mesh has no writer configured");
+      shortfalls = await this.writer.write("obligations.closureShortfalls", {
+        closure: this.headClosureQuery(actorId, runState, runState.headObligationIds),
+      });
     } catch (err) {
       const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
       shortfalls = [...runState.headObligationIds].map((obligationId) => ({
@@ -2235,12 +2264,24 @@ export class ActorMesh {
     return this.selectedInboxEntryIds.get(actorId) ?? [];
   }
 
-  finishInboxRun(actorId: string, outcome: { successful?: boolean; runId?: string } = {}): void {
+  async finishInboxRun(
+    actorId: string,
+    outcome: { successful?: boolean; runId?: string } = {}
+  ): Promise<void> {
     actorId = this.resolveThreadId(actorId);
+    // The run's state is read before the closure write is awaited, and the
+    // rest of finishing follows it with nothing else awaited. While it waits,
+    // this actor's next run cannot be queued: the run's own onEnd is still
+    // settling, and neither the local actor nor a remote handle admits the
+    // next run before it has (#1289 C1b). So the run state cleared below is
+    // still this run's, and attention arriving meanwhile is buffered with the
+    // rest of this run's and flushed with it.
     const selectedIds = [...this.selectedInboxEntries(actorId)];
+    const runState = this.headClosureRuns.get(actorId);
     // A failed run is not a return the actor chose, so it keeps the ordinary
     // failure route below rather than a closure rejection.
-    const rejections = outcome.successful !== false ? this.recordReturnRejections(actorId) : [];
+    const rejections =
+      outcome.successful !== false ? await this.recordReturnRejections(actorId, runState) : [];
     try {
       this.deliverReturnedRunResult(actorId, selectedIds, outcome);
     } catch (err) {
@@ -2284,7 +2325,8 @@ export class ActorMesh {
         // An older exhausted entry must not consume a later entry's one
         // recovery attempt when a multi-item selection contains both.
         if (hasRetryableUnhandled) {
-          this.dispatch(actorId);
+          // Not awaited: this run's end must not wait on the run after it.
+          this.wake(actorId, "selected work retry");
         } else {
           this.log(
             `actor ${actorId} exhausted selected work retries for entries: ${unhandledIds.join(", ")}`
@@ -2687,7 +2729,7 @@ export class ActorMesh {
     if (entries.length === 0) {
       return false;
     }
-    this.dispatch(actorId);
+    this.wake(actorId, "ready-head attention");
     return true;
   }
 
@@ -2856,7 +2898,7 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) return false;
-    this.dispatch(actorId);
+    this.wake(actorId, "prerequisite-cancelled attention");
     return true;
   }
 
@@ -2927,7 +2969,7 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) return false;
-    this.dispatch(actorId);
+    this.wake(actorId, "completion-matcher attention");
     return true;
   }
 
@@ -2958,22 +3000,24 @@ export class ActorMesh {
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
-      this.dispatch(actorId);
+      this.wake(actorId, "handled-entry follow-up");
     }
   }
 
   /**
    * Called once by the leased voice registry on explicit end or lease expiry.
    * The durable inbox remains the source of truth; this is only the one
-   * ordinary nudge that lets held background work resume.
+   * ordinary nudge that lets held background work resume. It returns whether
+   * that nudge was asked for; the nudge itself is a {@link wake}.
    */
   notifyVoiceSessionEnded(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
     if (!this.inboxStore) return false;
     const total = this.inboxStore.countUnhandled(actorId);
     const responsive = this.inboxStore.countUnhandled(actorId, { responsiveOnly: true });
-    if (total > responsive) return this.dispatch(actorId);
-    return false;
+    if (total <= responsive) return false;
+    this.wake(actorId, "voice session end");
+    return true;
   }
 
   /**
@@ -3054,13 +3098,7 @@ export class ActorMesh {
     // existing session-end path preserves normal-work deferral semantics.
     this.notifyVoiceSessionEnded(fromActorId);
     if (inserted.length > 0) {
-      try {
-        this.dispatch(target.id);
-      } catch (error) {
-        this.log(
-          `voice transfer recipient nudge failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
+      this.wake(target.id, "voice transfer recipient (after durable handoff)");
     }
     // The control is intentionally last: the recipient has durable work before
     // the browser changes selection/reconnects to it.
@@ -4315,7 +4353,7 @@ export class ActorMesh {
       ]);
       this.introduceMessageSender(toId, fromId);
     }
-    if (this.inboxStore) this.dispatch(toId);
+    if (this.inboxStore) this.wake(toId, "message delivery");
     else target.requestRun(responsive ? { priority: "responsive" } : {});
     return { delivered: true };
   }
@@ -4365,8 +4403,8 @@ export class ActorMesh {
       },
     ]);
     if (inserted.length === 0) return { delivered: true };
-    if (delivery.responsive) this.dispatchJoiningActiveRun(toId);
-    else this.dispatch(toId);
+    if (delivery.responsive) this.wakeJoining(toId, "message delivery");
+    else this.wake(toId, "message delivery");
     return { delivered: true };
   }
 
@@ -4435,7 +4473,7 @@ export class ActorMesh {
         },
       },
     ]);
-    this.dispatch(resolvedId);
+    this.wake(resolvedId, "wake delivery");
     return true;
   }
 
@@ -4583,7 +4621,7 @@ export class ActorMesh {
         const unhandled = this.inboxStore.list(targetId, { status: "unhandled" }).entries;
         const hasNewWork = unhandled.some((e) => e.deliveredAt > runStartTime);
         if (hasNewWork) {
-          this.dispatch(targetId);
+          this.wake(targetId, "post-interrupt");
         }
       }
       return { interrupted: true };
@@ -4619,7 +4657,7 @@ export class ActorMesh {
         },
       ]);
     }
-    this.dispatch(targetId);
+    this.wake(targetId, "run-now");
     return { queued: true };
   }
 
@@ -5268,7 +5306,7 @@ export class ActorMesh {
     if (this.inboxStore && this.runs.isLive(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
       if (unhandled.length > 0) {
-        this.dispatch(id);
+        this.wake(id, "model change");
       }
     }
     return staged ? "staged" : "applied";
@@ -6128,7 +6166,7 @@ export class ActorMesh {
         },
       ]);
       this.introduceMessageSender(toId, scheduled.fromId);
-      this.dispatch(toId);
+      this.wake(toId, "scheduled message");
       return;
     }
 

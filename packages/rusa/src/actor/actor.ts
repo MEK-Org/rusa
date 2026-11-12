@@ -637,6 +637,14 @@ export class Actor {
         responsive: isResponsiveNudge(nudge),
         mode: nudge.mode ?? "ordinary",
       });
+      if (this.admissionEpoch !== epoch) {
+        // Preempted or interrupted while an onQueued listener settled: the
+        // mesh's queue gate awaits its inbox seen mark there (#1289). The
+        // replacement owns the opportunity, so this run ends as a cancelled
+        // start rather than reaching the gate ahead of it.
+        this.lastRunSkipped = true;
+        return;
+      }
       await this.executeTurn(nudge);
     } finally {
       if (this.opts.sandbox) {
