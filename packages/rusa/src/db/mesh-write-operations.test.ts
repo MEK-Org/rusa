@@ -173,9 +173,10 @@ describe("check and act in one operation", () => {
     return first && first.type === "text" ? first.text : "";
   };
 
-  it("refuses a write authorized against an owner the obligation no longer has", async () => {
-    // The tool authorizes actor-a against the owner it read, then waits on
-    // matcher validation; another write reassigns the obligation meanwhile.
+  it("decides authority after matcher validation, against the obligation as it stands then", async () => {
+    // Another write reassigns the obligation while the tool awaits matcher
+    // validation. The authority check runs after that await, with nothing
+    // awaited between it and the commit, so it sees the new owner.
     repository.create({ id: "contested", ownerId: "actor-a", title: "contested" });
     const client = await connect(
       createObligationsMcpServer({ obligations: repository, writer }, "actor-a", {
@@ -198,7 +199,7 @@ describe("check and act in one operation", () => {
     })) as CallToolResult;
 
     expect(result.isError).toBe(true);
-    expect(text(result)).toContain("changed owner from actor-a to actor-b");
+    expect(text(result)).toContain("not authorized to manage this obligation");
     const contested = repository.require("contested");
     expect(contested.ownerId).toBe("actor-b");
     expect(contested.completionMatcher).toBeNull();

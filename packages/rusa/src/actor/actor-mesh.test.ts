@@ -16568,3 +16568,162 @@ describe("ready-head attention while the owner is only queued (#1071)", () => {
     h.db.close();
   });
 });
+
+describe("obligation manage policy at the write (#1289)", () => {
+  // The obligations MCP over the production policy (`canManageObligation`) and
+  // the production in-process writer. A grant revocation or a reparent that
+  // has happened before a write is decided refuses it before anything is
+  // written or delivered, including one that happens while the tool awaits
+  // matcher validation, its only await before the write.
+  let db: Database.Database;
+  let repo: ObligationRepository;
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    runMigrations(db);
+    repo = new ObligationRepository(db);
+  });
+
+  afterEach(() => db.close());
+
+  function world() {
+    const fixture = setup();
+    const { mesh, capabilityGrants, registry } = fixture;
+    const manager = mesh.spawn({ charter: "manager", parentId: "root" });
+    const worker = mesh.spawn({ charter: "worker", parentId: manager });
+    const elsewhere = mesh.spawn({ charter: "elsewhere", parentId: "root" });
+    const admin = mesh.spawn({ charter: "admin", parentId: "root" });
+    capabilityGrants.grant({
+      actorId: admin,
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      grantedBy: "operator:test",
+      grantedAt: "2026-11-12T00:00:00.000Z",
+    });
+    repo.setActorExists((id) => registry.get(id)?.status === "active");
+    repo.create({ id: "target", title: "target", ownerId: worker });
+    const effects: string[] = [];
+    repo.setReadyHeadListener((change) => effects.push(`ready-head:${change.ownerId}`));
+    const revokeAdmin = () =>
+      capabilityGrants.revoke(admin, OBLIGATIONS_ADMIN_CAPABILITY, "2026-11-12T00:01:00.000Z");
+    return { mesh, manager, worker, elsewhere, admin, effects, revokeAdmin };
+  }
+
+  async function call(
+    mesh: ActorMesh,
+    actorId: string,
+    name: string,
+    args: Record<string, unknown>,
+    validateCompletionMatcher?: () => Promise<void>
+  ): Promise<{ isError?: boolean; text: string }> {
+    const server = createObligationsMcpServer(obligationStore(db, repo), actorId, {
+      canManage: (callerId, obligation) => mesh.canManageObligation(callerId, obligation),
+      validateCompletionMatcher,
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "manage-policy", version: "0.0.0" });
+    await client.connect(clientTransport);
+    const result = (await client.callTool({ name, arguments: args })) as {
+      isError?: boolean;
+      content: { type: string; text?: string }[];
+    };
+    return { isError: result.isError, text: result.content[0]?.text ?? "" };
+  }
+
+  const matcher = { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/1" };
+
+  it("lets an obligations-admin and an owner's ancestor write", async () => {
+    const { mesh, manager, admin, elsewhere, effects } = world();
+
+    const byAdmin = await call(mesh, admin, "reassign_obligation", {
+      id: "target",
+      owner_id: elsewhere,
+    });
+    expect(byAdmin.isError).toBeFalsy();
+    expect(repo.require("target").ownerId).toBe(elsewhere);
+    expect(effects).toContain(`ready-head:${elsewhere}`);
+
+    const byAncestor = await call(mesh, "root", "set_completion_matcher", {
+      id: "target",
+      matcher,
+    });
+    expect(byAncestor.isError).toBeFalsy();
+    expect(repo.require("target").completionMatcher).not.toBeNull();
+
+    const notAncestor = await call(mesh, manager, "set_checkpoint", {
+      id: "target",
+      checkpoint: "standing",
+    });
+    expect(notAncestor.isError).toBe(true);
+  });
+
+  it("refuses an admin whose grant was revoked, without writing or delivering anything", async () => {
+    const { mesh, admin, elsewhere, worker, effects, revokeAdmin } = world();
+    revokeAdmin();
+
+    const refused = await call(mesh, admin, "reassign_obligation", {
+      id: "target",
+      owner_id: elsewhere,
+    });
+
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("not authorized to reassign this obligation");
+    expect(repo.require("target").ownerId).toBe(worker);
+    expect(effects).toEqual([]);
+  });
+
+  it("refuses a former ancestor after a reparent, without writing or delivering anything", async () => {
+    const { mesh, manager, worker, elsewhere, effects } = world();
+    mesh.reparentThread(worker, elsewhere);
+
+    const refused = await call(mesh, manager, "reassign_obligation", {
+      id: "target",
+      owner_id: manager,
+    });
+
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("not authorized to reassign this obligation");
+    expect(repo.require("target").ownerId).toBe(worker);
+    expect(effects).toEqual([]);
+
+    const byNewAncestor = await call(mesh, elsewhere, "reassign_obligation", {
+      id: "target",
+      owner_id: elsewhere,
+    });
+    expect(byNewAncestor.isError).toBeFalsy();
+    expect(repo.require("target").ownerId).toBe(elsewhere);
+  });
+
+  it("refuses a revocation or reparent made while matcher validation is awaited", async () => {
+    const { mesh, manager, worker, elsewhere, admin, effects, revokeAdmin } = world();
+
+    const revoked = await call(
+      mesh,
+      admin,
+      "set_completion_matcher",
+      { id: "target", matcher },
+      async () => revokeAdmin()
+    );
+    expect(revoked.isError).toBe(true);
+    expect(revoked.text).toContain("not authorized to manage this obligation");
+
+    const reparented = await call(
+      mesh,
+      manager,
+      "create_obligation",
+      {
+        title: "blocked",
+        owner_id: worker,
+        blocked_by: ["target"],
+        completion_matcher: matcher,
+      },
+      async () => mesh.reparentThread(worker, elsewhere)
+    );
+    expect(reparented.isError).toBe(true);
+    expect(reparented.text).toContain("not authorized to manage this obligation's prerequisites");
+
+    expect(repo.require("target").completionMatcher).toBeNull();
+    expect(repo.listOwned(worker).map((obligation) => obligation.id)).toEqual(["target"]);
+    expect(effects).toEqual([]);
+  });
+});

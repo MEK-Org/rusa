@@ -426,6 +426,13 @@ export function createObligationsMcpServer(
       blocked_by,
     }) => {
       try {
+        // Validation is the one await before the write, so it runs first:
+        // from the authority checks below to the commit inside `writer.write`
+        // nothing is awaited, and no other work can change grants, the actor
+        // tree or the obligation in between (#1289).
+        if (completion_matcher !== undefined && completion_matcher !== null) {
+          await options?.validateCompletionMatcher?.(completion_matcher);
+        }
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) return toolError(new Error(owner.error));
         // `blocked_by` imposes wait edges on the obligation being created —
@@ -435,9 +442,6 @@ export function createObligationsMcpServer(
         // created for (#212).
         if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
           throw new Error("not authorized to manage this obligation's prerequisites");
-        }
-        if (completion_matcher !== undefined && completion_matcher !== null) {
-          await options?.validateCompletionMatcher?.(completion_matcher);
         }
         // Starting a responsive branch is a promotion: it needs the authority
         // and, like marking, an owner the caller could otherwise manage. Whether
@@ -503,9 +507,11 @@ export function createObligationsMcpServer(
     },
     async ({ id, matcher }) => {
       try {
+        // As in create_obligation: validate first, so nothing is awaited
+        // between the authority check and the commit (#1289).
+        if (matcher !== null) await options?.validateCompletionMatcher?.(matcher);
         const existing = repository.require(id);
         if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
-        if (matcher !== null) await options?.validateCompletionMatcher?.(matcher);
         const written = await writer.write("obligations.setCompletionMatcher", {
           id,
           matcher,

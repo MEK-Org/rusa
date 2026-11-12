@@ -45,11 +45,14 @@ export class ObligationChangedError extends ObligationValidationError {
 }
 
 /**
- * The owner the caller authorized the write against (#1289). A write made
- * after a reassignment is refused, not re-decided. This covers the owner only:
- * `canManage` also reads the caller's capability grants and the actor tree, and
- * a grant revoked or a thread reparented between the caller's check and this
- * write is not caught here.
+ * The owner the caller meant to write to (#1289). A write made after a
+ * reassignment is refused, not re-decided, so it never lands on an owner the
+ * caller did not see. This protects the caller's intended target; it is not
+ * authorization. Authorization is the caller's `canManage`, which reads
+ * capability grants and the actor tree as well as the owner. With the
+ * in-process writer that check and this commit run with nothing awaited in
+ * between; the worker at F must decide it inside the transaction instead
+ * (https://github.com/MEK-Org/rusa/issues/1289#issuecomment-6813364620).
  */
 interface OwnerPrecondition {
   readonly expectedOwnerId?: string;

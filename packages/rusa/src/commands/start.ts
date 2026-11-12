@@ -250,7 +250,7 @@ import {
   isTerminalObligationStatus,
   type Obligation,
 } from "../obligations/obligation.js";
-import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
+import { resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import {
   DiskUsageAlert,
@@ -3520,9 +3520,7 @@ async function composeStart(
             {
               resolveOwner: (raw) =>
                 resolveObligationOwner(actors, raw, getRepositories().principals),
-              canManage: (callerId, obligation) =>
-                mesh.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
-                canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
+              canManage: (callerId, obligation) => mesh.canManageObligation(callerId, obligation),
               canSetResponsive: () =>
                 mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
               recordEvent: (event) => mesh.recordEvent(event),

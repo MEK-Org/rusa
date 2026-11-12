@@ -1663,6 +1663,10 @@ describe("obligations MCP", () => {
       readonly args: Record<string, unknown>;
     }[] = [
       { tool: "set_checkpoint", args: { checkpoint: "standing" } },
+      {
+        tool: "set_completion_matcher",
+        args: { matcher: { kind: "pr_merged", pr: "github:example/repo/pulls/1" } },
+      },
       { tool: "set_external_ref", args: { external_ref: "github:example/repo/issues/1" } },
       { tool: "reassign_obligation", args: { owner_id: "actor-b" } },
       { tool: "mark_obligation_responsive", args: {} },
@@ -1693,6 +1697,9 @@ describe("obligations MCP", () => {
       const client = await connect(
         createObligationsMcpServer(store, "actor-a", {
           canSetResponsive: () => true,
+          // An await before the check, as production validation is; one
+          // after it would let the microtask run before the commit.
+          validateCompletionMatcher: async () => {},
           canManage: () => {
             queueMicrotask(() => {
               seenAfterCheck = repository.require("target");
