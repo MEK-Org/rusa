@@ -8,6 +8,7 @@ import type { ObligationActivationScheduler } from "../actor/os-scheduler.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import type { InboxPayload } from "../repositories/inbox-repository.js";
 import { meshWriterFor } from "./fixtures/obligation-store.js";
 import {
   createInProcessMeshWriter,
@@ -438,22 +439,25 @@ describe("host timers", () => {
 });
 
 describe("a listener's own writes during delivery (r4545135121)", () => {
-  // Listeners record attention with synchronous appends on the main
-  // connection, never through the writer. Delivery runs on the main thread in
-  // both writers, so such an append commits before the next effect is
-  // delivered and before the write's caller continues, whichever writer
-  // committed the write.
+  // Attention sinks append through the writer (#1289 C2), and delivery awaits
+  // that nested write before the next effect is delivered and before the
+  // write's caller continues, whichever writer committed the write.
   it("is visible to later effects of the same write and to its caller's continuation", async () => {
     const inbox = new SqliteInboxRepository(db);
     const seenByStatusListener: number[] = [];
-    repository.setReadyHeadListener((change) => {
-      inbox.append([
-        {
-          actorId: change.ownerId,
-          source: "obligation-ready-head",
-          payload: { type: "obligation.ready_head", sequence: change.sequence },
-        },
-      ]);
+    repository.setReadyHeadListener(async (change) => {
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            actorId: change.ownerId,
+            source: "obligation-ready-head",
+            payload: {
+              type: "obligation.ready_head",
+              sequence: change.sequence,
+            } as unknown as InboxPayload,
+          },
+        ],
+      });
     });
     repository.setStatusChangeListener(() =>
       seenByStatusListener.push(inbox.countUnhandled("actor-a"))

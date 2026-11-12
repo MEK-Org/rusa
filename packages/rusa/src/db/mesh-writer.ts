@@ -166,7 +166,7 @@ function settle<E>(
 export class EffectDeliverySequencer {
   /** The delivery the current async context runs inside, while it is open. */
   private readonly scope = new AsyncLocalStorage<{ open: boolean }>();
-  private readonly queue: (() => void | PromiseLike<unknown>)[] = [];
+  private readonly queue: (() => unknown)[] = [];
   private busy = false;
 
   /** Deliver one committed write's effects, in its turn or nested in its parent's. */

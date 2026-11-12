@@ -73,7 +73,6 @@ const MIN = 60_000;
 const HOUR = 60 * MIN;
 const iso = (ms: number) => new Date(ms).toISOString();
 
-
 /**
  * The overdue wake boot reconciliation makes, made on the repository under
  * test; the runtime passes the writer's `obligations.wakeScheduled` (#1289 C2).
@@ -4221,7 +4220,9 @@ describe("ObligationRepository", () => {
           original(id, time);
         };
 
-        await expect(repository.reconcileScheduledObligations(directWake(repository))).resolves.toBeUndefined();
+        await expect(
+          repository.reconcileScheduledObligations(directWake(repository))
+        ).resolves.toBeUndefined();
         // rec-2's `at`-kind reconciliation failed and was logged, but rec-1's
         // cron reconciliation still ran — one row's OS failure must not abort
         // the sweep for every other row queued behind it.
