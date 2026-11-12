@@ -146,16 +146,20 @@ export const shorthandSink: EffectSink = { deliver };
 
   it("catches both on the writer's own ports", () => {
     const writer = JSON.stringify(join(packageRoot, "src", "db", "mesh-writer.ts"));
+    // Effect delivery may await (#1289 C2); the inbox append listener stays a
+    // synchronous port.
+    const inbox = JSON.stringify(join(packageRoot, "src", "repositories", "inbox-repository.ts"));
     expect(
       hazardsIn(
         {
-          "converted.ts": `import type { DeliverEffect, MeshWriter } from ${writer};
+          "converted.ts": `import type { MeshWriter } from ${writer};
+import type { InboxItemsAppendedListener } from ${inbox};
 type Ops = { create: (context: never, input: { title: string }) => { id: string } };
 export function convert(writer: MeshWriter<Ops>): void {
   writer.write("create", { title: "t" });
 }
-export const deliver: DeliverEffect<string> = async (effect) => {
-  await writer0.write("create", { title: effect });
+export const deliver: InboxItemsAppendedListener = async (items) => {
+  await writer0.write("create", { title: items[0]?.id ?? "" });
 };
 declare const writer0: MeshWriter<Ops>;
 `,
@@ -163,8 +167,8 @@ declare const writer0: MeshWriter<Ops>;
         { withPackage: true }
       )
     ).toEqual([
-      "async-into-void src/converted.ts:6 function literal",
-      "unawaited src/converted.ts:4 writer.write",
+      "async-into-void src/converted.ts:7 function literal",
+      "unawaited src/converted.ts:5 writer.write",
     ]);
   });
 

@@ -17,7 +17,7 @@ import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { ChatMessage } from "../chat/types.js";
 import type { SlackConfig } from "../config/types.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
-import { getRepositories } from "../db/index.js";
+import { getMeshWriter, getRepositories } from "../db/index.js";
 import { createE2EDashboardAuth } from "../e2e/auth-emulator.js";
 import { FakeIssueClient } from "../e2e/fake-issue-client.js";
 import { type E2EGitRemoteServer, startE2EGitRemoteServer } from "../e2e/git-remote-server.js";
@@ -538,7 +538,7 @@ export function startRootControlServer(opts: {
       return;
     }
     readJsonRequest(req)
-      .then((body) => {
+      .then(async (body) => {
         if (url.pathname === "/actors") {
           const target = typeof body.target === "string" ? body.target : undefined;
           // A supplied target must name a connected follower — a blank or
@@ -656,47 +656,51 @@ export function startRootControlServer(opts: {
           // The external driver IS the operator, so the creator is the shared
           // durable user id — the same server-side binding the actor MCP does
           // with its own actor id, never a value read off the request.
-          const obligation = getRepositories().obligations.create({
-            ownerId: String(body.ownerId ?? ""),
-            parentId: body.parentId == null ? null : String(body.parentId),
-            intent: body.intent == null ? null : String(body.intent),
-            title: String(body.title ?? ""),
-            externalRef: body.externalRef == null ? null : String(body.externalRef),
-            priority: typeof body.priority === "number" ? body.priority : null,
-            creatorId: operatorId(),
+          // Through the writer like every runtime mutation, so the answer
+          // follows the attention it caused (#1289 C2).
+          const obligation = await getMeshWriter().write("obligations.create", {
+            obligation: {
+              ownerId: String(body.ownerId ?? ""),
+              parentId: body.parentId == null ? null : String(body.parentId),
+              intent: body.intent == null ? null : String(body.intent),
+              title: String(body.title ?? ""),
+              externalRef: body.externalRef == null ? null : String(body.externalRef),
+              priority: typeof body.priority === "number" ? body.priority : null,
+              creatorId: operatorId(),
+            },
           });
           send(res, 200, { obligation });
           return;
         }
         const statusMatch = url.pathname.match(/^\/obligations\/([^/]+)\/status$/);
         if (statusMatch) {
-          const obligation = getRepositories().obligations.setTerminalStatus(
-            decodeURIComponent(statusMatch[1]),
-            body.status === "cancelled" ? "cancelled" : "done",
-            typeof body.note === "string" ? body.note : null,
-            typeof body.resolutionRef === "string" ? body.resolutionRef : null,
-            operatorId()
-          );
+          const obligation = await getMeshWriter().write("obligations.setTerminalStatus", {
+            id: decodeURIComponent(statusMatch[1]),
+            status: body.status === "cancelled" ? "cancelled" : "done",
+            note: typeof body.note === "string" ? body.note : null,
+            resolutionRef: typeof body.resolutionRef === "string" ? body.resolutionRef : null,
+            principal: operatorId(),
+          });
           send(res, 200, { obligation });
           return;
         }
         const reassignMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reassign$/);
         if (reassignMatch) {
-          const obligation = getRepositories().obligations.reassign(
-            decodeURIComponent(reassignMatch[1]),
-            String(body.ownerId ?? ""),
-            operatorId()
-          );
+          const obligation = await getMeshWriter().write("obligations.reassign", {
+            id: decodeURIComponent(reassignMatch[1]),
+            ownerId: String(body.ownerId ?? ""),
+            principal: operatorId(),
+          });
           send(res, 200, { obligation });
           return;
         }
         const reparentMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reparent$/);
         if (reparentMatch) {
-          const obligation = getRepositories().obligations.reparent(
-            decodeURIComponent(reparentMatch[1]),
-            body.parentId == null ? null : String(body.parentId),
-            operatorId()
-          );
+          const obligation = await getMeshWriter().write("obligations.reparent", {
+            id: decodeURIComponent(reparentMatch[1]),
+            parentId: body.parentId == null ? null : String(body.parentId),
+            principal: operatorId(),
+          });
           send(res, 200, { obligation });
           return;
         }

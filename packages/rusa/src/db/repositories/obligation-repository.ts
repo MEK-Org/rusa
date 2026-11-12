@@ -44,8 +44,51 @@ import {
 import { createLogger, type Logger } from "../../observability/logger.js";
 import type { PrincipalKind } from "../../principals/principal-ref.js";
 import { asGitHubIssue } from "../../references/reference.js";
+import { EffectDeliveryFailure } from "../mesh-writer.js";
 
 let _obligationLogger: Logger | undefined;
+/** A listener's answer that must be awaited before delivery moves on (#1289 C2). */
+function isPromiseLike(value: unknown): value is PromiseLike<void> {
+  return typeof (value as PromiseLike<void> | null)?.then === "function";
+}
+
+/**
+ * One listener call as a delivery step, whether it answers synchronously or
+ * with a promise: `settled` sees its outcome either way. A failure of work
+ * this mutation requires is rethrown, as an {@link EffectDeliveryFailure}
+ * naming `requiredReason`, so the caller can report which consequence is
+ * missing without seeing the listener error's own text, which `settled` logs.
+ * A retry carried for an earlier mutation (no `requiredReason`) is not this
+ * one's to fail (#1289), so its failure is left to `settled`, which logs it
+ * and keeps it for the next try.
+ */
+function listenerStep(
+  call: () => void | PromiseLike<void>,
+  settled: (failure: { err: unknown } | null) => void,
+  requiredReason: string | undefined
+): () => void | Promise<void> {
+  const failed = (err: unknown): void => {
+    settled({ err });
+    if (requiredReason !== undefined) throw new EffectDeliveryFailure(requiredReason, err);
+  };
+  return () => {
+    let pending: void | PromiseLike<void>;
+    try {
+      pending = call();
+    } catch (err) {
+      failed(err);
+      return;
+    }
+    if (!isPromiseLike(pending)) {
+      settled(null);
+      return;
+    }
+    return Promise.resolve(pending).then(() => settled(null), failed);
+  };
+}
+
+const failureMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 function obligationLogger(): Logger {
   _obligationLogger ??= createLogger({ context: { component: "obligations" } });
   return _obligationLogger;
@@ -951,8 +994,16 @@ export class ObligationRepository {
    * overdue completion-interval occurrence activates. A cron occurrence keeps
    * waiting for its next tick, as it always has; one whose snooze just expired
    * activates here because the snooze is what held it back.
+   *
+   * `wakeDue` makes that wake (#1289 C2): the runtime passes the writer's
+   * `obligations.wakeScheduled`, so the wake's attention is delivered and
+   * awaited like any other write's. The row is re-read after it either way,
+   * so a wake that failed or committed without its answer is planned from
+   * whatever committed.
    */
-  reconcileScheduledObligations(): void {
+  async reconcileScheduledObligations(
+    wakeDue: (id: string, principal: EntityId) => Promise<unknown>
+  ): Promise<void> {
     if (!this.scheduler) return;
     const validIds = new Set<string>();
     const stmt = this.db.prepare(
@@ -975,7 +1026,16 @@ export class ObligationRepository {
               isDeadlineDue(row.next_ready_at, now);
         if (overdue) {
           // Background scheduler activation is an automated system process; bind "system:mesh"
-          this.wakeScheduled(row.id, "system:mesh");
+          try {
+            await wakeDue(row.id, "system:mesh");
+          } catch (err) {
+            // A wake that failed, or committed but could not deliver, still
+            // leaves the row's next activation to be scheduled below.
+            obligationLogger().warn("obligation_overdue_wake_failed", {
+              obligationId: row.id,
+              err,
+            });
+          }
           row = this.db
             .prepare(
               `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at, snoozed_until
@@ -1028,7 +1088,7 @@ export class ObligationRepository {
    * Set after construction rather than injected: the mesh that consumes this
    * does not exist yet when the repository container is built.
    */
-  private readyHeadListener?: (change: ReadyHeadChange) => void;
+  private readyHeadListener?: (change: ReadyHeadChange) => void | Promise<void>;
 
   /**
    * Lifetime marker for in-memory ready-head sequences (#513). It belongs to
@@ -1086,7 +1146,9 @@ export class ObligationRepository {
     }
   }
 
-  setReadyHeadListener(listener: ((change: ReadyHeadChange) => void) | undefined): void {
+  setReadyHeadListener(
+    listener: ((change: ReadyHeadChange) => void | Promise<void>) | undefined
+  ): void {
     this.readyHeadListener = listener;
   }
 
@@ -1116,7 +1178,9 @@ export class ObligationRepository {
    * effect off `(dependentId, prerequisiteId)` and reconcile at boot from
    * {@link listPrerequisiteCancellationAttention}.
    */
-  private cancellationAttentionListener?: (attention: PrerequisiteAttention) => void;
+  private cancellationAttentionListener?: (
+    attention: PrerequisiteAttention
+  ) => void | Promise<void>;
 
   /**
    * Obligation ids whose prerequisite just landed on `cancelled` this
@@ -1161,7 +1225,7 @@ export class ObligationRepository {
   }
 
   setCancellationAttentionListener(
-    listener: ((attention: PrerequisiteAttention) => void) | undefined
+    listener: ((attention: PrerequisiteAttention) => void | Promise<void>) | undefined
   ): void {
     this.cancellationAttentionListener = listener;
   }
@@ -1179,7 +1243,10 @@ export class ObligationRepository {
    * mutation caused the transition, so a consumer can tell "this actor made
    * its own work ready" from "someone else did".
    */
-  private responsiveReadyListener?: (obligation: Obligation, actingPrincipal: EntityId) => void;
+  private responsiveReadyListener?: (
+    obligation: Obligation,
+    actingPrincipal: EntityId
+  ) => void | Promise<void>;
 
   /**
    * Obligation ids that transitioned to `ready` or newly resolved responsive
@@ -1201,7 +1268,9 @@ export class ObligationRepository {
   private failedResponsiveReadyDeliveries = new Map<string, EntityId>();
 
   setResponsiveReadyListener(
-    listener: ((obligation: Obligation, actingPrincipal: EntityId) => void) | undefined
+    listener:
+      | ((obligation: Obligation, actingPrincipal: EntityId) => void | Promise<void>)
+      | undefined
   ): void {
     this.responsiveReadyListener = listener;
   }
@@ -1517,7 +1586,16 @@ export class ObligationRepository {
     for (const [ownerId, sequence] of committedSequences) {
       this.previousHeadSequences.set(ownerId, sequence);
     }
-    this.deliverMutationEffect(effect);
+    try {
+      const pending = this.deliverMutationEffect(effect);
+      if (isPromiseLike(pending)) {
+        pending.catch((err) => {
+          obligationLogger().warn("obligation_direct_delivery_failed", { err });
+        });
+      }
+    } catch (err) {
+      obligationLogger().warn("obligation_direct_delivery_failed", { err });
+    }
     return result;
   }
 
@@ -1569,29 +1647,46 @@ export class ObligationRepository {
    * delivers them itself: ready-head changes, cancellation attention,
    * responsive-ready attention, status changes, then host timers. The
    * attention and timer steps re-read committed rows, so this must run after
-   * the commit, on any connection that can see it. A listener failure is
-   * logged and kept for retry from committed state on a later delivery; it
-   * never throws, because the write it describes has already committed.
+   * the commit, on any connection that can see it. An attention listener
+   * failure is logged and kept for retry from committed state on a later
+   * delivery; in the writer path it propagates so the writer reports
+   * MeshWriteCommittedError, while remaining effects still execute per
+   * c6814333204. A retry carried here for an earlier mutation is that
+   * mutation's work, not this one's: its failure is logged and kept for the
+   * next delivery without failing this write. A status-change listener
+   * failure is only logged.
+   *
+   * The attention listeners may return a promise (#1289 C2): an attention
+   * sink appends through the mesh writer, and that nested write and its own
+   * effects are awaited before the next listener, so later steps and the
+   * write's caller see the row. A promise is awaited only when a listener
+   * returns one, so while every listener returns synchronously the whole
+   * delivery runs inside this call and answers synchronously.
    */
-  deliverMutationEffect(effect: ObligationMutationEffect): void {
+  deliverMutationEffect(effect: ObligationMutationEffect): void | Promise<void> {
     if (effect.kind !== OBLIGATION_MUTATION_EFFECT) {
       throw new Error(`not an obligation mutation effect: ${String(effect.kind)}`);
     }
     const actingPrincipal = effect.actingPrincipal;
     const afterHeads = new Map(effect.afterHeads);
 
+    const steps: (() => void | Promise<void>)[] = [];
+
     const listener = this.readyHeadListener;
     if (listener) {
       for (const change of effect.readyHeadChanges) {
-        try {
-          listener(change);
-        } catch (err) {
-          console.warn(
-            `[obligations] ready-head listener failed for ${change.ownerId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-        }
+        steps.push(
+          listenerStep(
+            () => listener(change),
+            (failure) => {
+              if (!failure) return;
+              console.warn(
+                `[obligations] ready-head listener failed for ${change.ownerId}: ${failureMessage(failure.err)}`
+              );
+            },
+            "the owner's ready-head attention was not delivered"
+          )
+        );
       }
     }
 
@@ -1599,6 +1694,7 @@ export class ObligationRepository {
     if (cancellationAttentionListener) {
       const toDeliver = [...effect.cancellationAttention];
       const queuedKeys = new Set(toDeliver.map((a) => this.cancellationAttentionKey(a)));
+      const retryKeys = new Set<string>();
 
       // A prior mutation's delivery may have thrown (e.g. a transient inbox
       // append failure) — retry it here from current persisted truth rather
@@ -1611,6 +1707,7 @@ export class ObligationRepository {
           if (!this.failedCancellationAttentionKeys.has(key) || queuedKeys.has(key)) continue;
           toDeliver.push(attention);
           queuedKeys.add(key);
+          retryKeys.add(key);
           stillFailing.delete(key);
         }
         // Anything left here no longer matches a live dangling edge — the
@@ -1621,23 +1718,33 @@ export class ObligationRepository {
 
       for (const attention of toDeliver) {
         const key = this.cancellationAttentionKey(attention);
-        try {
-          cancellationAttentionListener(attention);
-          this.failedCancellationAttentionKeys.delete(key);
-        } catch (err) {
-          this.failedCancellationAttentionKeys.add(key);
-          console.warn(
-            `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-        }
+        steps.push(
+          listenerStep(
+            () => cancellationAttentionListener(attention),
+            (failure) => {
+              if (!failure) {
+                this.failedCancellationAttentionKeys.delete(key);
+                return;
+              }
+              this.failedCancellationAttentionKeys.add(key);
+              console.warn(
+                `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${failureMessage(failure.err)}`
+              );
+            },
+            retryKeys.has(key)
+              ? undefined
+              : "a dependent's cancellation attention was not delivered"
+          )
+        );
       }
     }
 
     const responsiveReadyListener = this.responsiveReadyListener;
     if (responsiveReadyListener) {
-      const toDeliver = new Map<string, { obligation: Obligation; actingPrincipal: EntityId }>();
+      const toDeliver = new Map<
+        string,
+        { obligation: Obligation; actingPrincipal: EntityId; retry: boolean }
+      >();
       for (const id of new Set(effect.responsiveReadyIds)) {
         const obligation = this.get(id);
         if (!obligation) continue;
@@ -1647,7 +1754,7 @@ export class ObligationRepository {
         // change, responsively when the head is responsive — only obligations
         // behind the head need this separate attention.
         if (afterHeads.get(obligation.ownerId) === obligation.id) continue;
-        toDeliver.set(obligation.id, { obligation, actingPrincipal });
+        toDeliver.set(obligation.id, { obligation, actingPrincipal, retry: false });
       }
 
       // A prior mutation's delivery may have thrown (defensive in-process
@@ -1664,55 +1771,99 @@ export class ObligationRepository {
           if (failedCause === undefined || toDeliver.has(obligation.id)) {
             continue;
           }
-          toDeliver.set(obligation.id, { obligation, actingPrincipal: failedCause });
+          toDeliver.set(obligation.id, { obligation, actingPrincipal: failedCause, retry: true });
           stillFailing.delete(obligation.id);
         }
         for (const key of stillFailing) this.failedResponsiveReadyDeliveries.delete(key);
       }
 
-      for (const { obligation, actingPrincipal: cause } of toDeliver.values()) {
-        try {
-          responsiveReadyListener(obligation, cause);
-          this.failedResponsiveReadyDeliveries.delete(obligation.id);
-        } catch (err) {
-          this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
-          console.warn(
-            `[obligations] responsive-ready listener failed for ${obligation.id}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-        }
+      for (const { obligation, actingPrincipal: cause, retry } of toDeliver.values()) {
+        steps.push(
+          listenerStep(
+            () => responsiveReadyListener(obligation, cause),
+            (failure) => {
+              if (!failure) {
+                this.failedResponsiveReadyDeliveries.delete(obligation.id);
+                return;
+              }
+              this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
+              console.warn(
+                `[obligations] responsive-ready listener failed for ${obligation.id}: ${failureMessage(failure.err)}`
+              );
+            },
+            retry ? undefined : "responsive-ready attention was not delivered"
+          )
+        );
       }
     }
 
     const statusChanges = effect.statusChanges;
     const statusChangeListener = this.statusChangeListener;
     if (statusChangeListener && statusChanges.length > 0) {
-      try {
-        statusChangeListener({ actingPrincipal, changes: statusChanges });
-      } catch (err) {
-        obligationLogger().warn("obligation_status_listener_failed", { err });
-      }
+      // Dashboard event fan-out, not required notification work: a failure is
+      // logged and does not report the committed write as failed.
+      steps.push(() => {
+        try {
+          statusChangeListener({ actingPrincipal, changes: statusChanges });
+        } catch (err) {
+          obligationLogger().warn("obligation_status_listener_failed", { err });
+        }
+      });
     }
 
     // OS scheduler side effects run only now, against the state the
     // transaction actually committed — never inside it, where a later
     // rollback couldn't take them back with it.
-    const failed: string[] = [];
-    for (const id of effect.scheduleIds) {
-      try {
-        this.reconcileObligationSchedule(id);
-        this.scheduleErrors.delete(id);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.scheduleErrors.set(id, message);
-        failed.push(id);
-        console.warn(
-          `[obligations] failed to reconcile scheduled activation for ${id}: ${message}`
-        );
-      }
+    if (effect.scheduleIds.length > 0) {
+      steps.push(() => {
+        const failed: string[] = [];
+        for (const id of effect.scheduleIds) {
+          try {
+            this.reconcileObligationSchedule(id);
+            this.scheduleErrors.delete(id);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.scheduleErrors.set(id, message);
+            failed.push(id);
+            console.warn(
+              `[obligations] failed to reconcile scheduled activation for ${id}: ${message}`
+            );
+          }
+        }
+        this.scheduleReconcileRetry(failed);
+      });
     }
-    this.scheduleReconcileRetry(failed);
+
+    // Every step runs even when an earlier one fails, each awaited before the
+    // next only when it answers with a promise; the failures are then
+    // reported together.
+    const errors: unknown[] = [];
+    const from = (start: number): void | Promise<void> => {
+      for (let index = start; index < steps.length; index++) {
+        let pending: void | Promise<void>;
+        try {
+          pending = (steps[index] as () => void | Promise<void>)();
+        } catch (err) {
+          errors.push(err);
+          continue;
+        }
+        if (isPromiseLike(pending)) {
+          return pending.then(
+            () => from(index + 1),
+            (err: unknown) => {
+              errors.push(err);
+              return from(index + 1);
+            }
+          );
+        }
+      }
+      if (errors.length > 0) {
+        throw errors.length === 1
+          ? errors[0]
+          : new AggregateError(errors, `${errors.length} mutation effect listeners failed`);
+      }
+    };
+    return from(0);
   }
 
   /**

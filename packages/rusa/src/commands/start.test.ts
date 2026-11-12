@@ -55,7 +55,7 @@ import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
-import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "../db/index.js";
+import { closeDb, getDb, getMeshWriter, getRepositories, initDb, meshDbPath } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import * as readPool from "../db/read-pool.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
@@ -12122,23 +12122,29 @@ describe("runStart webhook event routing (Phase 4)", () => {
     it("streams a committed close and its parent's re-ready to dashboards, without the note (#773)", async () => {
       const emitted = vi.spyOn(MeshEventEmitter.prototype, "emitMeshEvent");
       await boot();
-      const obligations = getRepositories().obligations;
-      obligations.create({ title: "parent", id: "status-parent", ownerId: rootId });
-      obligations.create({
-        title: "child",
-        id: "status-child",
-        ownerId: rootId,
-        parentId: "status-parent",
+      const writer = getMeshWriter();
+      await writer.write("obligations.create", {
+        obligation: { title: "parent", id: "status-parent", ownerId: rootId },
+      });
+      await writer.write("obligations.create", {
+        obligation: {
+          title: "child",
+          id: "status-child",
+          ownerId: rootId,
+          parentId: "status-parent",
+        },
       });
       emitted.mockClear();
 
-      obligations.setTerminalStatus(
-        "status-child",
-        "done",
-        "landed from a private branch",
-        "github:o/r/pulls/9",
-        rootId
-      );
+      // Through the writer, as production closes work: the close answers only
+      // once its committed effects, including the stream, are delivered (#1289).
+      await writer.write("obligations.setTerminalStatus", {
+        id: "status-child",
+        status: "done",
+        note: "landed from a private branch",
+        resolutionRef: "github:o/r/pulls/9",
+        principal: rootId,
+      });
 
       const streamed = emitted.mock.calls
         .map(([event]) => event)
@@ -12196,9 +12202,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         if (!gitBridge) throw new Error("git bridge not started");
         const meshShutdown = vi.spyOn(mesh, "shutdownAll");
         const deliveries = [
-          vi.spyOn(mesh, "deliverReadyHeadAttention").mockReturnValue(true),
-          vi.spyOn(mesh, "deliverPrerequisiteCancelledAttention").mockReturnValue(true),
-          vi.spyOn(mesh, "deliverResponsiveReadyAttention").mockReturnValue(true),
+          vi.spyOn(mesh, "deliverReadyHeadAttention").mockResolvedValue(true),
+          vi.spyOn(mesh, "deliverPrerequisiteCancelledAttention").mockResolvedValue(true),
+          vi.spyOn(mesh, "deliverResponsiveReadyAttention").mockResolvedValue(true),
         ];
         const recordEvent = vi.spyOn(mesh, "recordEvent");
         const statusEvents = () =>

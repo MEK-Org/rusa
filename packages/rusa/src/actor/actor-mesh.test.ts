@@ -13,6 +13,7 @@ import {
   inboxClosureShortfalls,
   type MeshObligationWriter,
 } from "../db/mesh-write-operations.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
@@ -49,6 +50,7 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type {
   InboxActorWork,
+  InboxAppendInput,
   InboxEntry,
   InboxItemsAppendedListener,
   InboxItemsHandledListener,
@@ -416,6 +418,8 @@ function memoryMeshWriter(
         const mark = input as { actorId: string; entryIds: readonly string[] };
         return inbox.markSeen(mark.actorId, mark.entryIds);
       }
+      case "inbox.append":
+        return inbox.append([...(input as { entries: readonly InboxAppendInput[] }).entries]);
       case "obligations.closureShortfalls":
         if (!closure) throw new Error("this test mesh has no obligations to decide closure on");
         return inboxClosureShortfalls(
@@ -2089,9 +2093,9 @@ describe("ActorMesh", () => {
     const { mesh, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
-      true
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)
+    ).toBe(true);
     await tick();
 
     const first = rootEntries();
@@ -2101,24 +2105,24 @@ describe("ActorMesh", () => {
 
     // Replay of the same transition — and, since the id is derived from the
     // transition rather than a run, this is also what a restart looks like.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
-      false
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)
+    ).toBe(false);
     expect(rootEntries()).toHaveLength(1);
 
     // A genuinely different head is genuinely new attention.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" }, "ob-1")).toBe(
-      true
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" }, "ob-1")
+    ).toBe(true);
     expect(rootEntries()).toHaveLength(2);
 
     // ob-1 becoming the head again after ob-2 displaced it is a NEW transition,
     // not a repeat of the first one. Keying on the head alone made this silent,
     // which left an actor that had already handled the ob-1 entry sitting on
     // live work with nothing to wake it.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-2")).toBe(
-      true
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-2")
+    ).toBe(true);
     expect(rootEntries()).toHaveLength(3);
   });
 
@@ -2144,10 +2148,10 @@ describe("ActorMesh", () => {
     const payloadFor = (id: string) =>
       inboxStore.entries.find((entry) => entry.source === `obligation:${id}`)?.payload;
 
-    mesh.deliverReadyHeadAttention("root", { id: "reassigned", intent: "review" }, null);
-    mesh.deliverReadyHeadAttention("root", { id: "plain", intent: "next" }, "reassigned");
+    await mesh.deliverReadyHeadAttention("root", { id: "reassigned", intent: "review" }, null);
+    await mesh.deliverReadyHeadAttention("root", { id: "plain", intent: "next" }, "reassigned");
     // A history row that cannot be read costs the message, not the attention.
-    mesh.deliverReadyHeadAttention("root", { id: "broken", intent: "last" }, "plain");
+    await mesh.deliverReadyHeadAttention("root", { id: "broken", intent: "last" }, "plain");
     await tick();
 
     expect(payloadFor("reassigned")).toEqual({
@@ -2173,25 +2177,25 @@ describe("ActorMesh", () => {
     const { mesh, fake, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
-      true
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)
+    ).toBe(true);
     await tick();
     expect(rootEntries()).toHaveLength(1);
 
     // Still unhandled: the wake is outstanding, so a repeat is pure noise.
     const beforeUnhandledRepeat = fake("root").calls.length;
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
-      false
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)
+    ).toBe(false);
     await tick();
     expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
 
     // Once handled, repeating the exact same transition sequence does NOT re-wake the actor.
     inboxStore.markHandled("root", [rootEntries()[0].id]);
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
-      false
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)
+    ).toBe(false);
     await tick();
     expect(rootEntries()).toHaveLength(1);
     expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
@@ -2214,10 +2218,10 @@ describe("ActorMesh", () => {
     // nest a child under it. Both move root's head, and the first head is
     // waiting again by the time the run ends.
     expect(
-      mesh.deliverReadyHeadAttention("root", { id: "parent", intent: "root goal" }, null)
+      await mesh.deliverReadyHeadAttention("root", { id: "parent", intent: "root goal" }, null)
     ).toBe(false);
     expect(
-      mesh.deliverReadyHeadAttention("root", { id: "child", intent: "first pass" }, "parent")
+      await mesh.deliverReadyHeadAttention("root", { id: "child", intent: "first pass" }, "parent")
     ).toBe(false);
     expect(headEntries()).toHaveLength(0);
 
@@ -2241,8 +2245,8 @@ describe("ActorMesh", () => {
 
     await mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
     mesh.actorStarted("root");
-    mesh.deliverReadyHeadAttention("root", { id: "b", intent: null }, "a");
-    mesh.deliverReadyHeadAttention("root", { id: "a", intent: null }, "b");
+    await mesh.deliverReadyHeadAttention("root", { id: "b", intent: null }, "a");
+    await mesh.deliverReadyHeadAttention("root", { id: "a", intent: null }, "b");
     await mesh.finishInboxRun("root");
     await tick();
 
@@ -2264,10 +2268,10 @@ describe("ActorMesh", () => {
 
     await mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
     mesh.actorStarted("root");
-    mesh.deliverReadyHeadAttention("root", { id: "parent", intent: null }, null);
+    await mesh.deliverReadyHeadAttention("root", { id: "parent", intent: null }, null);
     // Filing a question owned by the operator under it leaves root waiting with
     // nothing ready — there is no obligation to point it at.
-    mesh.deliverReadyHeadAttention("root", null, "parent");
+    await mesh.deliverReadyHeadAttention("root", null, "parent");
     await mesh.finishInboxRun("root");
     await tick();
 
@@ -2281,8 +2285,10 @@ describe("ActorMesh", () => {
 
     // Every non-run producer — a peer's mutation, the dashboard, a cron — must
     // still wake the actor at once.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: null }, null)).toBe(true);
-    expect(mesh.deliverReadyHeadAttention("root", null, "ob-1")).toBe(false);
+    expect(await mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: null }, null)).toBe(
+      true
+    );
+    expect(await mesh.deliverReadyHeadAttention("root", null, "ob-1")).toBe(false);
   });
 
   it("does not deliver ready-head attention to a retired actor", async () => {
@@ -2291,7 +2297,7 @@ describe("ActorMesh", () => {
     const id = mesh.spawn({ charter: "worker", parentId: "root" });
     registry.patch(id, { status: "retired" });
 
-    expect(mesh.deliverReadyHeadAttention(id, { id: "ob-1", intent: null })).toBe(false);
+    expect(await mesh.deliverReadyHeadAttention(id, { id: "ob-1", intent: null })).toBe(false);
     expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
   });
 
@@ -2310,7 +2316,7 @@ describe("ActorMesh", () => {
     expect(rootEntries()).toHaveLength(0);
 
     // Run boot reconciliation for ready heads
-    mesh.reconcileReadyHeads(obligations);
+    await mesh.reconcileReadyHeads(obligations);
     await tick();
 
     // Missed attention was delivered and actor nudged
@@ -2327,7 +2333,7 @@ describe("ActorMesh", () => {
     // Second boot reconciliation pass (restart idempotence test):
     // Attention for ob-1 is already in inbox, so no new entry or duplicate wake occurs.
     const callCountBefore = fake("root").calls.length;
-    mesh.reconcileReadyHeads(obligations);
+    await mesh.reconcileReadyHeads(obligations);
     await tick();
 
     expect(rootEntries()).toHaveLength(1);
@@ -2340,7 +2346,7 @@ describe("ActorMesh", () => {
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
     expect(
-      mesh.deliverReadyHeadAttention(
+      await mesh.deliverReadyHeadAttention(
         "root",
         { id: "ob-1", intent: "ship it", responsive: true },
         null
@@ -2356,9 +2362,9 @@ describe("ActorMesh", () => {
     });
 
     // A non-responsive head keeps ordinary payload and nudge (regression).
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "later" }, "ob-1")).toBe(
-      true
-    );
+    expect(
+      await mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "later" }, "ob-1")
+    ).toBe(true);
     await tick();
     const second = rootEntries().find((entry) => entry.source === "obligation:ob-2");
     expect(second?.payload).toMatchObject({ type: "obligation.ready_head", obligationId: "ob-2" });
@@ -2371,7 +2377,10 @@ describe("ActorMesh", () => {
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
     expect(
-      mesh.deliverResponsiveReadyAttention("root", { id: "ob-9", intent: "hotfix behind the head" })
+      await mesh.deliverResponsiveReadyAttention("root", {
+        id: "ob-9",
+        intent: "hotfix behind the head",
+      })
     ).toBe(true);
     await tick();
 
@@ -2388,14 +2397,17 @@ describe("ActorMesh", () => {
 
     // Same transition again — and this is also what a restart replay looks like.
     expect(
-      mesh.deliverResponsiveReadyAttention("root", { id: "ob-9", intent: "hotfix behind the head" })
+      await mesh.deliverResponsiveReadyAttention("root", {
+        id: "ob-9",
+        intent: "hotfix behind the head",
+      })
     ).toBe(false);
     expect(rootEntries()).toHaveLength(1);
 
     // Boot reconciliation derives the same fact set and replays through the
     // same idempotent path: already delivered, so no duplicate, no extra wake.
     const callsBefore = fake("root").calls.length;
-    mesh.reconcileResponsiveReadyAttention({
+    await mesh.reconcileResponsiveReadyAttention({
       listResponsiveReadyAttention: () => [
         { id: "ob-9", ownerId: "root", intent: "hotfix behind the head" },
       ],
@@ -2405,7 +2417,7 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBe(callsBefore);
 
     // A fact the live path missed (e.g. lost across a crash) is repaired.
-    mesh.reconcileResponsiveReadyAttention({
+    await mesh.reconcileResponsiveReadyAttention({
       listResponsiveReadyAttention: () => [
         { id: "ob-9", ownerId: "root", intent: "hotfix behind the head" },
         { id: "ob-10", ownerId: "root", intent: "missed hotfix" },
@@ -2422,9 +2434,9 @@ describe("ActorMesh", () => {
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
     const firstSet = "2026-10-01T00:00:00.000Z";
 
-    expect(mesh.deliverCompletionMatcherClosedUnmergedAttention("root", "ob-7", firstSet)).toBe(
-      true
-    );
+    expect(
+      await mesh.deliverCompletionMatcherClosedUnmergedAttention("root", "ob-7", firstSet)
+    ).toBe(true);
     await tick();
     expect(rootEntries()).toHaveLength(1);
     expect(rootEntries()[0].source).toBe("obligation:ob-7");
@@ -2436,11 +2448,11 @@ describe("ActorMesh", () => {
 
     // Every later observation of the same installation retries the notice;
     // the installation key makes those, and boot reconciliation, silent.
-    expect(mesh.deliverCompletionMatcherClosedUnmergedAttention("root", "ob-7", firstSet)).toBe(
-      false
-    );
+    expect(
+      await mesh.deliverCompletionMatcherClosedUnmergedAttention("root", "ob-7", firstSet)
+    ).toBe(false);
     const callsBefore = fake("root").calls.length;
-    mesh.reconcileCompletionMatcherClosedUnmergedAttention({
+    await mesh.reconcileCompletionMatcherClosedUnmergedAttention({
       listCompletionMatcherClosedUnmergedAttention: () => [
         { obligationId: "ob-7", ownerId: "root", matcherSetAt: firstSet },
       ],
@@ -2451,7 +2463,7 @@ describe("ActorMesh", () => {
 
     // A notice the live path lost is repaired at boot, and a replaced matcher
     // that closes unmerged again is a new installation with its own notice.
-    mesh.reconcileCompletionMatcherClosedUnmergedAttention({
+    await mesh.reconcileCompletionMatcherClosedUnmergedAttention({
       listCompletionMatcherClosedUnmergedAttention: () => [
         { obligationId: "ob-7", ownerId: "root", matcherSetAt: "2026-10-02T00:00:00.000Z" },
         { obligationId: "ob-8", ownerId: "root", matcherSetAt: firstSet },
@@ -2462,7 +2474,7 @@ describe("ActorMesh", () => {
 
     // Human owners read the recorded state on the dashboard instead.
     expect(
-      mesh.deliverCompletionMatcherClosedUnmergedAttention(
+      await mesh.deliverCompletionMatcherClosedUnmergedAttention(
         "00000000-0000-4000-8000-000000000001",
         "ob-9",
         firstSet
@@ -2477,7 +2489,7 @@ describe("ActorMesh", () => {
 
     // Episode 1 delivers once.
     expect(
-      mesh.deliverResponsiveReadyAttention("root", {
+      await mesh.deliverResponsiveReadyAttention("root", {
         id: "ob-9",
         intent: "hotfix behind the head",
         readyCount: 1,
@@ -2488,7 +2500,7 @@ describe("ActorMesh", () => {
 
     // A replay of the same committed episode — what a restart reconcile sees —
     // is silent.
-    mesh.reconcileResponsiveReadyAttention({
+    await mesh.reconcileResponsiveReadyAttention({
       listResponsiveReadyAttention: () => [
         { id: "ob-9", ownerId: "root", intent: "hotfix behind the head", readyCount: 1 },
       ],
@@ -2499,7 +2511,7 @@ describe("ActorMesh", () => {
     // Episode 2 — the obligation re-armed ready behind the same persistent
     // head — is a distinct entry, not swallowed by episode 1's handled key.
     expect(
-      mesh.deliverResponsiveReadyAttention("root", {
+      await mesh.deliverResponsiveReadyAttention("root", {
         id: "ob-9",
         intent: "hotfix behind the head",
         readyCount: 2,
@@ -2566,10 +2578,14 @@ describe("ActorMesh", () => {
     // ready. The delivery is deferred until run completion so it does not
     // self-interrupt mid-run (#632).
     expect(
-      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+      await mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-self", intent: "self-caused" },
+        true
+      )
     ).toBe(true);
     expect(
-      mesh.deliverResponsiveReadyAttention(
+      await mesh.deliverResponsiveReadyAttention(
         worker,
         { id: "ob-self-2", intent: "also self-caused" },
         true
@@ -2646,7 +2662,11 @@ describe("ActorMesh", () => {
 
     // Actor makes an obligation ready mid-run:
     expect(
-      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-closed", intent: "temp ready" }, true)
+      await mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-closed", intent: "temp ready" },
+        true
+      )
     ).toBe(true);
 
     // But before the run completes, the obligation is marked done or snoozed:
@@ -2693,7 +2713,7 @@ describe("ActorMesh", () => {
     first.mesh.dispatch(worker);
     await first.tick();
     expect(
-      first.mesh.deliverResponsiveReadyAttention(
+      await first.mesh.deliverResponsiveReadyAttention(
         worker,
         { id: "ob-recovered", intent: "survives restart" },
         true
@@ -2707,7 +2727,7 @@ describe("ActorMesh", () => {
     // the still-ready responsive fact from durable obligation state.
     const restarted = setup({ actors, inboxStore });
     restarted.mesh.rehydrateAll();
-    restarted.mesh.reconcileResponsiveReadyAttention({
+    await restarted.mesh.reconcileResponsiveReadyAttention({
       listResponsiveReadyAttention: () => [
         { id: "ob-recovered", ownerId: worker, intent: "survives restart" },
       ],
@@ -2747,7 +2767,7 @@ describe("ActorMesh", () => {
 
     // External caller (selfCausedMidRun = false) delivers responsive ready attention:
     expect(
-      mesh.deliverResponsiveReadyAttention(
+      await mesh.deliverResponsiveReadyAttention(
         worker,
         { id: "ob-ext", intent: "external responsive" },
         false
@@ -2774,7 +2794,12 @@ describe("ActorMesh", () => {
 
     // Restart-generation 1 observes B -> A at sequence 1 and the actor handles it.
     expect(
-      first.mesh.deliverReadyHeadAttention("root", { id: "ob-a", intent: "work A" }, "ob-b", 1)
+      await first.mesh.deliverReadyHeadAttention(
+        "root",
+        { id: "ob-a", intent: "work A" },
+        "ob-b",
+        1
+      )
     ).toBe(true);
     await first.tick();
     expect(rootEntries()).toHaveLength(1);
@@ -2788,14 +2813,24 @@ describe("ActorMesh", () => {
     // Pre-fix this append hit ON CONFLICT DO NOTHING and the actor lost the
     // wake; the epoch in the dedupe key makes the recurrence a distinct entry.
     expect(
-      restarted.mesh.deliverReadyHeadAttention("root", { id: "ob-a", intent: "work A" }, "ob-b", 1)
+      await restarted.mesh.deliverReadyHeadAttention(
+        "root",
+        { id: "ob-a", intent: "work A" },
+        "ob-b",
+        1
+      )
     ).toBe(true);
     await restarted.tick();
     expect(rootEntries()).toHaveLength(2);
 
     // Replays within the restarted process are still suppressed exactly once.
     expect(
-      restarted.mesh.deliverReadyHeadAttention("root", { id: "ob-a", intent: "work A" }, "ob-b", 1)
+      await restarted.mesh.deliverReadyHeadAttention(
+        "root",
+        { id: "ob-a", intent: "work A" },
+        "ob-b",
+        1
+      )
     ).toBe(false);
     expect(rootEntries()).toHaveLength(2);
   });
@@ -2812,8 +2847,8 @@ describe("ActorMesh", () => {
           (entry.payload as { type?: string }).type === "obligation.ready_head"
       );
     const wire = (mesh: ActorMesh, repo: ObligationRepository) =>
-      repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
-        mesh.deliverReadyHeadAttention(
+      repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+        await mesh.deliverReadyHeadAttention(
           ownerId,
           head === null
             ? null
@@ -2821,8 +2856,25 @@ describe("ActorMesh", () => {
           previousHeadId,
           sequence,
           epoch
-        )
-      );
+        );
+      });
+    // Each repository's writes go through a production in-process writer over
+    // it, so each mutation answers only after its head attention is appended
+    // (#1289 C2), and the counts below are read after delivery.
+    const writerFor = (repo: ObligationRepository) => {
+      const writer = createInProcessMeshWriter(db, {
+        obligations: repo,
+        inbox: new SqliteInboxRepository(db),
+        actors,
+        actorRuns: { completedFocusEntryCounts: () => new Map<string, number>() },
+      });
+      return {
+        create: (obligation: { id: string; title: string; ownerId: string; priority: number }) =>
+          writer.write("obligations.create", { obligation }),
+        reassign: (id: string, ownerId: string) =>
+          writer.write("obligations.reassign", { id, ownerId, principal: "system:mesh" }),
+      };
+    };
 
     // Process 1: A arrives, B displaces it, then B leaves and returns, leaving
     // B as the head. Transition #3 is B -> A at sequence 3; the actor handles
@@ -2833,10 +2885,11 @@ describe("ActorMesh", () => {
     );
     const mesh1 = setup({ inboxStore, actors });
     wire(mesh1.mesh, repo1);
-    repo1.create({ id: "ob-a", title: "Task A", ownerId: "root", priority: 1 });
-    repo1.create({ id: "ob-b", title: "Task B", ownerId: "root", priority: 0 });
-    repo1.reassign("ob-b", "actor-someone-else", "system:mesh");
-    repo1.reassign("ob-b", "root", "system:mesh");
+    const writes1 = writerFor(repo1);
+    await writes1.create({ id: "ob-a", title: "Task A", ownerId: "root", priority: 1 });
+    await writes1.create({ id: "ob-b", title: "Task B", ownerId: "root", priority: 0 });
+    await writes1.reassign("ob-b", "actor-someone-else");
+    await writes1.reassign("ob-b", "root");
     expect(headEntries()).toHaveLength(4);
     expect(headEntries()[2].payload).toMatchObject({ obligationId: "ob-a" });
     for (const entry of headEntries()) inboxStore.markHandled("root", [entry.id]);
@@ -2850,10 +2903,11 @@ describe("ActorMesh", () => {
       ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
     );
     wire(mesh1.mesh, repo2);
-    repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
+    const writes2 = writerFor(repo2);
+    await writes2.reassign("ob-b", "actor-someone-else");
     expect(headEntries()).toHaveLength(5);
     inboxStore.markHandled("root", [headEntries()[4].id]);
-    repo2.reassign("ob-b", "root", "system:mesh");
+    await writes2.reassign("ob-b", "root");
     expect(headEntries()).toHaveLength(6);
     inboxStore.markHandled("root", [headEntries()[5].id]);
 
@@ -2862,14 +2916,89 @@ describe("ActorMesh", () => {
     // the actor was never woken about live work; the epoch in the dedupe key
     // keeps the recurrence a distinct entry. Replays within this process are
     // still suppressed.
-    repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
+    await writes2.reassign("ob-b", "actor-someone-else");
     expect(headEntries()).toHaveLength(7);
     expect(headEntries()[6].payload).toMatchObject({ obligationId: "ob-a" });
 
     db.close();
   });
 
-  it("recovers a missed H->X->H recurrence after a handled boot repair, through production readyHeadRecords() reconciliation (#513)", () => {
+  it("leaves a ready-head attention SQLite refused to the boot sweep, with the parent committed and later writes unaffected (#1306)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const inboxStore = new SqliteInboxRepository(db);
+    const actors = new InMemoryActorRepository();
+    const repo = new ObligationRepository(db);
+    repo.setPrincipalKind((id) => (["root", "actor-b"].includes(id) ? "actor" : undefined));
+    const writer = createInProcessMeshWriter(db, {
+      obligations: repo,
+      inbox: inboxStore,
+      actors,
+      actorRuns: { completedFocusEntryCounts: () => new Map<string, number>() },
+    });
+    const { mesh } = setup({ inboxStore, actors, writer });
+    repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null
+          ? null
+          : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
+        previousHeadId,
+        sequence,
+        epoch
+      );
+    });
+    const headRows = () =>
+      (
+        db
+          .prepare("SELECT payload_json FROM actor_inbox_entries WHERE actor_id = 'root'")
+          .all() as { payload_json: string }[]
+      )
+        .map((row) => JSON.parse(row.payload_json) as { type?: string; obligationId?: string })
+        .filter((payload) => payload.type === "obligation.ready_head")
+        .map((payload) => payload.obligationId);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // SQLite refuses the valid attention row the production sink appends.
+      db.exec(`CREATE TEMP TRIGGER refuse_ready_head BEFORE INSERT ON actor_inbox_entries
+        WHEN json_extract(NEW.payload_json, '$.type') = 'obligation.ready_head'
+        BEGIN SELECT RAISE(ABORT, 'refused ready-head row'); END`);
+      const err = await writer
+        .write("obligations.create", {
+          obligation: { id: "ob-1", title: "Head", ownerId: "root", priority: 1 },
+        })
+        .then(
+          () => null,
+          (e: unknown) => e
+        );
+      expect(err).toBeInstanceOf(MeshWriteCommittedError);
+      const committed = err as MeshWriteCommittedError;
+      expect((committed.result as { id: string }).id).toBe("ob-1");
+      expect(committed.failures.map((f) => (f as Error).message)).toEqual([
+        "the owner's ready-head attention was not delivered",
+      ]);
+      expect(repo.get("ob-1")).not.toBeNull();
+      expect(headRows()).toEqual([]);
+      db.exec("DROP TRIGGER refuse_ready_head");
+
+      // A later unrelated write resolves; nothing re-announces the lost head.
+      await expect(
+        writer.write("obligations.create", {
+          obligation: { id: "ob-2", title: "Other", ownerId: "actor-b", priority: 1 },
+        })
+      ).resolves.toMatchObject({ id: "ob-2" });
+      expect(headRows()).toEqual([]);
+
+      // The boot sweep repairs it.
+      await mesh.reconcileReadyHeads(repo);
+      expect(headRows()).toEqual(["ob-1"]);
+    } finally {
+      warn.mockRestore();
+      db.close();
+    }
+  });
+
+  it("recovers a missed H->X->H recurrence after a handled boot repair, through production readyHeadRecords() reconciliation (#513)", async () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const inboxStore = createMemoryInboxStore();
@@ -2891,24 +3020,24 @@ describe("ActorMesh", () => {
     );
     const mesh1 = setup({ inboxStore, actors });
     repo1.create({ id: "ob-h", title: "Head task", ownerId: "root", priority: 1 });
-    mesh1.mesh.reconcileReadyHeads(repo1);
+    await mesh1.mesh.reconcileReadyHeads(repo1);
     expect(headEntries()).toHaveLength(1);
     expect(headEntries()[0].payload).toMatchObject({ obligationId: "ob-h" });
     inboxStore.markHandled("root", [headEntries()[0].id]);
-    mesh1.mesh.reconcileReadyHeads(repo1);
+    await mesh1.mesh.reconcileReadyHeads(repo1);
     expect(headEntries()).toHaveLength(1);
 
     // Same generation, live path: X displaces H and the epoch-scoped live
     // entry delivers; the actor handles it too.
-    repo1.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
-      mesh1.mesh.deliverReadyHeadAttention(
+    repo1.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh1.mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
     repo1.create({ id: "ob-x", title: "Displacer", ownerId: "root", priority: 0 });
     expect(headEntries()).toHaveLength(2);
     expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-x" });
@@ -2928,19 +3057,19 @@ describe("ActorMesh", () => {
       ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
     );
     const mesh2 = setup({ inboxStore, actors });
-    mesh2.mesh.reconcileReadyHeads(repo2);
+    await mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
     expect(headEntries()[2].id).not.toBe(headEntries()[0].id);
     expect(headEntries()[2].payload).toMatchObject({ obligationId: "ob-h" });
 
     // Repeated boots within Process 2 over the now-unchanged head stay silent.
-    mesh2.mesh.reconcileReadyHeads(repo2);
+    await mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
 
     db.close();
   });
 
-  it("recovers a lost reassignment that returns H after a handled boot repair, through production readyHeadRecords() reconciliation (#513)", () => {
+  it("recovers a lost reassignment that returns H after a handled boot repair, through production readyHeadRecords() reconciliation (#513)", async () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const inboxStore = createMemoryInboxStore();
@@ -2962,24 +3091,24 @@ describe("ActorMesh", () => {
     );
     const mesh1 = setup({ inboxStore, actors });
     repo1.create({ id: "ob-h", title: "Head task", ownerId: "root", priority: 1 });
-    mesh1.mesh.reconcileReadyHeads(repo1);
+    await mesh1.mesh.reconcileReadyHeads(repo1);
     expect(headEntries()).toHaveLength(1);
     expect(headEntries()[0].payload).toMatchObject({ obligationId: "ob-h" });
     inboxStore.markHandled("root", [headEntries()[0].id]);
-    mesh1.mesh.reconcileReadyHeads(repo1);
+    await mesh1.mesh.reconcileReadyHeads(repo1);
     expect(headEntries()).toHaveLength(1);
 
     // Same generation, live path: X displaces H and the epoch-scoped live
     // entry delivers; the actor handles it too.
-    repo1.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
-      mesh1.mesh.deliverReadyHeadAttention(
+    repo1.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh1.mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
     repo1.create({ id: "ob-x", title: "Displacer", ownerId: "root", priority: 0 });
     expect(headEntries()).toHaveLength(2);
     expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-x" });
@@ -3000,19 +3129,19 @@ describe("ActorMesh", () => {
       ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
     );
     const mesh2 = setup({ inboxStore, actors });
-    mesh2.mesh.reconcileReadyHeads(repo2);
+    await mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
     expect(headEntries()[2].id).not.toBe(headEntries()[0].id);
     expect(headEntries()[2].payload).toMatchObject({ obligationId: "ob-h" });
 
     // Repeated boots over the now-unchanged head stay silent again.
-    mesh2.mesh.reconcileReadyHeads(repo2);
+    await mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
 
     db.close();
   });
 
-  it("delivers at most one duplicate ready-head attention entry per restart when heads are unchanged, through production readyHeadRecords() reconciliation (#513)", () => {
+  it("delivers at most one duplicate ready-head attention entry per restart when heads are unchanged, through production readyHeadRecords() reconciliation (#513)", async () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const inboxStore = createMemoryInboxStore();
@@ -3038,13 +3167,13 @@ describe("ActorMesh", () => {
       priority: 1,
       responsive: true,
     });
-    mesh1.mesh.reconcileReadyHeads(repo1);
+    await mesh1.mesh.reconcileReadyHeads(repo1);
     expect(headEntries()).toHaveLength(1);
     expect(headEntries()[0].payload).toMatchObject({ priority: "responsive" });
     inboxStore.markHandled("root", [headEntries()[0].id]);
 
     // Repeated reconcile in Process 1 is silent.
-    mesh1.mesh.reconcileReadyHeads(repo1);
+    await mesh1.mesh.reconcileReadyHeads(repo1);
     expect(headEntries()).toHaveLength(1);
 
     // Process 2 (restart): H is unchanged across restart. In-memory state is
@@ -3055,7 +3184,7 @@ describe("ActorMesh", () => {
       ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
     );
     const mesh2 = setup({ inboxStore, actors });
-    mesh2.mesh.reconcileReadyHeads(repo2);
+    await mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(2);
     expect(headEntries()[1].payload).toMatchObject({
       obligationId: "ob-h",
@@ -3064,7 +3193,7 @@ describe("ActorMesh", () => {
 
     // Subsequent reconcile passes in Process 2 remain silent (deduplicated
     // within the process).
-    mesh2.mesh.reconcileReadyHeads(repo2);
+    await mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(2);
 
     db.close();
@@ -3086,7 +3215,7 @@ describe("ActorMesh", () => {
       get: (id: string) => ({ id, intent: null }),
     };
 
-    mesh.reconcileReadyHeads(obligations);
+    await mesh.reconcileReadyHeads(obligations);
     expect(inboxStore.entries).toHaveLength(0);
   });
 
@@ -3095,7 +3224,7 @@ describe("ActorMesh", () => {
     const { mesh, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    expect(mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-1")).toBe(true);
+    expect(await mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-1")).toBe(true);
     await tick();
 
     const first = rootEntries();
@@ -3108,11 +3237,11 @@ describe("ActorMesh", () => {
     });
 
     // Replay of the exact same fact is a no-op.
-    expect(mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-1")).toBe(false);
+    expect(await mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-1")).toBe(false);
     expect(rootEntries()).toHaveLength(1);
 
     // A different prerequisite on the same dependent is genuinely new attention.
-    expect(mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-2")).toBe(true);
+    expect(await mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-2")).toBe(true);
     expect(rootEntries()).toHaveLength(2);
   });
 
@@ -3126,8 +3255,8 @@ describe("ActorMesh", () => {
     // `("a:b", "c")` and `("a", "b:c")` onto one dedupe key, which for a
     // one-shot notice means one dependent's repair prompt silently
     // suppressing the other's.
-    expect(mesh.deliverPrerequisiteCancelledAttention("root", "a:b", "c")).toBe(true);
-    expect(mesh.deliverPrerequisiteCancelledAttention("root", "a", "b:c")).toBe(true);
+    expect(await mesh.deliverPrerequisiteCancelledAttention("root", "a:b", "c")).toBe(true);
+    expect(await mesh.deliverPrerequisiteCancelledAttention("root", "a", "b:c")).toBe(true);
     await tick();
 
     expect(rootEntries()).toHaveLength(2);
@@ -3145,7 +3274,7 @@ describe("ActorMesh", () => {
     const id = mesh.spawn({ charter: "worker", parentId: "root" });
     registry.patch(id, { status: "retired" });
 
-    expect(mesh.deliverPrerequisiteCancelledAttention(id, "dep-1", "gate-1")).toBe(false);
+    expect(await mesh.deliverPrerequisiteCancelledAttention(id, "dep-1", "gate-1")).toBe(false);
     expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
   });
 
@@ -3162,7 +3291,7 @@ describe("ActorMesh", () => {
 
     expect(rootEntries()).toHaveLength(0);
 
-    mesh.reconcileCancelledPrerequisiteAttention(obligations);
+    await mesh.reconcileCancelledPrerequisiteAttention(obligations);
     await tick();
 
     expect(rootEntries()).toHaveLength(1);
@@ -3175,7 +3304,7 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBeGreaterThan(0);
 
     const callCountBefore = fake("root").calls.length;
-    mesh.reconcileCancelledPrerequisiteAttention(obligations);
+    await mesh.reconcileCancelledPrerequisiteAttention(obligations);
     await tick();
 
     expect(rootEntries()).toHaveLength(1);
@@ -3196,7 +3325,7 @@ describe("ActorMesh", () => {
       ],
     };
 
-    mesh.reconcileCancelledPrerequisiteAttention(obligations);
+    await mesh.reconcileCancelledPrerequisiteAttention(obligations);
     expect(inboxStore.entries).toHaveLength(0);
   });
 
@@ -14417,7 +14546,7 @@ describe("strict obligation handling (#382, #917)", () => {
     actorId: string,
     obligationId: string
   ): Promise<string> {
-    mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
+    await mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
     await mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
     const entry = inboxStore.entries.find(
       (candidate) =>
@@ -14536,7 +14665,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     const staleHead = worker(mesh, "stale ready-head");
     repo.create({ id: "stale-head", title: "Stale head", ownerId: staleHead });
-    mesh.deliverReadyHeadAttention(staleHead, { id: "stale-head", intent: "stale" }, null);
+    await mesh.deliverReadyHeadAttention(staleHead, { id: "stale-head", intent: "stale" }, null);
     repo.create({
       id: "already-waiting-child",
       parentId: "stale-head",
@@ -14574,7 +14703,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     // An explicit foreign focus cannot replace the selected head's closure
     // requirement. It remains resolver context, not this actor's commitment.
-    mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
+    await mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
     await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const headEntry = inboxStore.entries.find(
       (entry) =>
@@ -14590,7 +14719,7 @@ describe("strict obligation handling (#382, #917)", () => {
     mesh.abandonInboxRun(subject);
 
     // When both are owned and ready, each selection-time focus remains armed.
-    mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
+    await mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
     await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const secondHeadEntry = inboxStore.entries
       .filter(
@@ -14614,7 +14743,7 @@ describe("strict obligation handling (#382, #917)", () => {
     const formerOwner = worker(mesh, "former owner");
     const newOwner = worker(mesh, "new owner");
     repo.create({ id: "moved-head", title: "Moved head", ownerId: formerOwner });
-    mesh.deliverReadyHeadAttention(formerOwner, { id: "moved-head", intent: "moved" }, null);
+    await mesh.deliverReadyHeadAttention(formerOwner, { id: "moved-head", intent: "moved" }, null);
     await mesh.actorQueued(formerOwner, { responsive: false, mode: "ordinary" });
     const movedEntry = inboxStore.entries.find(
       (entry) =>
@@ -14740,15 +14869,15 @@ describe("strict obligation handling (#382, #917)", () => {
   /** Route repository head transitions the way runStart's readyHeadSink does. */
   function wireLiveReadyHeads(mesh: ActorMesh): void {
     repo.setActorExists((id) => mesh.isLiveActor(id));
-    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
-      mesh.deliverReadyHeadAttention(
+    repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
   }
 
   function headEntries(actorId: string, obligationId: string) {
@@ -14872,7 +15001,7 @@ describe("strict obligation handling (#382, #917)", () => {
       },
     });
     resumed.mesh.rehydrateAll();
-    resumed.mesh.reconcileReadyHeads(repo);
+    await resumed.mesh.reconcileReadyHeads(repo);
     expect(headEntries(implementer, "review")).toHaveLength(1);
     expect(repo.get("review")).toMatchObject({ ownerId: implementer, status: "ready" });
   });
@@ -14957,7 +15086,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // this run: the null baseline stands, so the handoff still has nothing to
     // be attributed to.
     unreadable.delete("unreadable");
-    mesh.deliverReadyHeadAttention(source, { id: "unreadable", intent: "handle it" }, null);
+    await mesh.deliverReadyHeadAttention(source, { id: "unreadable", intent: "handle it" }, null);
     const reselected = inboxStore.entries
       .filter(
         (entry) =>
@@ -15178,6 +15307,49 @@ describe("strict obligation handling (#382, #917)", () => {
     await mesh.finishInboxRun(subject);
   });
 
+  it("records only the closure's committed shortfalls when its write committed but an effect failed (#1289)", async () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const closed = worker(mesh, "closed");
+    const open = worker(mesh, "open");
+    repo.create({ id: "closed-head", title: "Closed head", ownerId: closed });
+    repo.create({ id: "open-head", title: "Open head", ownerId: open });
+    await selectHead(mesh, closed, "closed-head");
+    await selectHead(mesh, open, "open-head");
+    repo.setTerminalStatus("closed-head", "done", null, null, closed);
+
+    // The closure write commits and answers, then one of its effects fails.
+    const meshWriter = (mesh as unknown as { writer: Pick<MeshObligationWriter, "write"> }).writer;
+    const committedWrites: string[] = [];
+    (mesh as unknown as { writer: Pick<MeshObligationWriter, "write"> }).writer = {
+      write: (async (op: string, input: unknown) => {
+        const result = await meshWriter.write(op as never, input as never);
+        if (op !== "obligations.closureShortfalls") return result;
+        committedWrites.push(op);
+        throw new MeshWriteCommittedError(
+          `write ${op} committed, but 1 of its 1 effects failed to deliver`,
+          {
+            result,
+            failures: [new Error("attention append failed")],
+          }
+        );
+      }) as Pick<MeshObligationWriter, "write">["write"],
+    };
+
+    await mesh.finishInboxRun(closed, { successful: true });
+    await mesh.finishInboxRun(open, { successful: true });
+
+    expect(committedWrites).toHaveLength(2);
+    const rejected = events.filter((event) => event.kind === "run_return_rejected");
+    expect(rejected).toEqual([
+      expect.objectContaining({
+        actorId: open,
+        detail: expect.stringContaining("Return rejected for head obligation open-head"),
+      }),
+    ]);
+    expect(JSON.stringify(rejected)).not.toContain("closure could not be read");
+  });
+
   it("preserves failed-run handling without a return rejection", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = strictMesh((event) => events.push(event));
@@ -15198,15 +15370,15 @@ describe("strict obligation handling (#382, #917)", () => {
     // mesh's attention delivery. Without this, no repository mutation could
     // ever append an entry and the "no early notification" assertion below
     // would hold even if head routing were broken.
-    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
-      mesh.deliverReadyHeadAttention(
+    repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh.deliverReadyHeadAttention(
         ownerId,
         head === null ? null : { id: head.id, intent: head.intent },
         previousHeadId,
         sequence,
         epoch
-      )
-    );
+      );
+    });
     const headEntries = () =>
       inboxStore.entries.filter(
         (entry) => entry.actorId === subject && entry.payload.type === "obligation.ready_head"
@@ -15265,8 +15437,12 @@ describe("strict obligation handling (#382, #917)", () => {
     const subject = worker(mesh, "two heads");
     repo.create({ id: "first-head", title: "First head", ownerId: subject });
     repo.create({ id: "second-head", title: "Second head", ownerId: subject });
-    mesh.deliverReadyHeadAttention(subject, { id: "first-head", intent: "first" }, null);
-    mesh.deliverReadyHeadAttention(subject, { id: "second-head", intent: "second" }, "first-head");
+    await mesh.deliverReadyHeadAttention(subject, { id: "first-head", intent: "first" }, null);
+    await mesh.deliverReadyHeadAttention(
+      subject,
+      { id: "second-head", intent: "second" },
+      "first-head"
+    );
     await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const entryIds = inboxStore.entries
       .filter(
@@ -16834,8 +17010,8 @@ describe("ready-head attention while the owner is only queued (#1071)", () => {
             : undefined
     );
     // The production sinks, as start.ts installs them.
-    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
-      mesh.deliverReadyHeadAttention(
+    repo.setReadyHeadListener(async ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+      await mesh.deliverReadyHeadAttention(
         ownerId,
         head === null
           ? null
@@ -16843,15 +17019,15 @@ describe("ready-head attention while the owner is only queued (#1071)", () => {
         previousHeadId,
         sequence,
         epoch
-      )
-    );
-    repo.setResponsiveReadyListener((obligation, actingPrincipal) =>
-      mesh.deliverResponsiveReadyAttention(
+      );
+    });
+    repo.setResponsiveReadyListener(async (obligation, actingPrincipal) => {
+      await mesh.deliverResponsiveReadyAttention(
         obligation.ownerId,
         { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
         actingPrincipal === obligation.ownerId
-      )
-    );
+      );
+    });
 
     const owner = mesh.spawn({
       charter: "owner",
@@ -17162,7 +17338,9 @@ describe("obligation manage policy at the write (#1289)", () => {
     repo.setActorExists((id) => registry.get(id)?.status === "active");
     repo.create({ id: "target", title: "target", ownerId: worker });
     const effects: string[] = [];
-    repo.setReadyHeadListener((change) => effects.push(`ready-head:${change.ownerId}`));
+    repo.setReadyHeadListener((change) => {
+      effects.push(`ready-head:${change.ownerId}`);
+    });
     const revokeAdmin = () =>
       capabilityGrants.revoke(admin, OBLIGATIONS_ADMIN_CAPABILITY, "2026-11-12T00:01:00.000Z");
     return { mesh, manager, worker, elsewhere, admin, effects, revokeAdmin };

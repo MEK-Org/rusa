@@ -3,8 +3,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { inboxMcpStore } from "../db/fixtures/obligation-store.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
@@ -476,6 +477,107 @@ describe("inbox MCP server", () => {
       );
       expect(store.read("actor-a", "own")?.handledAt).toBeNull();
       expect(handled).toBe(0);
+    });
+
+    const headClosure = (head: string) => ({
+      actorId: "actor-a",
+      heads: [head],
+      baseline: {
+        selectedHeads: new Map([
+          [head, { ownerId: "actor-a", checkpoint: null, checkpointAt: null, checkpointBy: null }],
+        ]),
+        preExistingChildIds: new Map(),
+        preExistingPrerequisiteIds: new Map(),
+      },
+      rootId: null,
+      retiring: new Set<string>(),
+    });
+
+    it("reports a refusal whose cleared snooze committed with a failed attention, and the commit (#1289)", async () => {
+      // The head's due snooze is cleared with the closure question, which makes
+      // it the owner's ready head: that announcement is required, and fails.
+      let clock = Date.parse("2026-07-13T12:00:00Z");
+      const obligations = new ObligationRepository(
+        db,
+        (id) => id === "actor-a",
+        () => clock
+      );
+      obligations.create({ id: "head", ownerId: "actor-a", title: "Head" });
+      obligations.writeSnooze("head", "2026-07-13T13:00:00Z", "actor-a");
+      clock = Date.parse("2026-07-13T14:00:00Z");
+      let announced = 0;
+      obligations.setReadyHeadListener(() => {
+        announced++;
+        throw new Error("attention append failed");
+      });
+      let handled = 0;
+      const client = await connect(
+        createInboxMcpServer(inboxMcpStore(db, store, obligations), "actor-a", {
+          select: (ids) => ids.map(readEntry),
+          selected: () => ["own"],
+          onHandled: () => handled++,
+          closureFor: () => headClosure("head"),
+        })
+      );
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const result = (await client.callTool({
+        name: "mark_handled",
+        arguments: { entry_id: "own", note: "not yet" },
+      })) as CallToolResult;
+      warn.mockRestore();
+
+      expect(result.isError).toBe(true);
+      const text = JSON.stringify(result.content);
+      expect(text).toContain("Cannot mark handled: selected head obligation head");
+      expect(text).toContain("write inbox.markHandled committed, but 1 of its");
+      expect(obligations.get("head")?.snoozedUntil).toBeNull();
+      expect(announced).toBe(1);
+      expect(store.read("actor-a", "own")?.handledAt).toBeNull();
+      expect(handled).toBe(0);
+    });
+
+    it("returns the entries a committed mark handled, as an error, and still wakes the follow-up (#1289)", async () => {
+      // An accepted mark has no required effect of its own in this fixture, so
+      // the committed failure is raised around the real committed write.
+      const { inbox, writer } = inboxMcpStore(db, store);
+      const write = writer.write.bind(writer);
+      let handled = 0;
+      const client = await connect(
+        createInboxMcpServer(
+          {
+            inbox,
+            writer: {
+              write: (async (op: string, input: unknown) => {
+                const result = await write(op as never, input as never);
+                throw new MeshWriteCommittedError(
+                  `write ${op} committed, but 1 of its 1 effects failed to deliver`,
+                  { result, failures: [new Error("attention append failed")] }
+                );
+              }) as typeof writer.write,
+            },
+          },
+          "actor-a",
+          {
+            select: (ids) => ids.map(readEntry),
+            selected: () => ["own"],
+            onHandled: () => handled++,
+          }
+        )
+      );
+
+      const result = (await client.callTool({
+        name: "mark_handled",
+        arguments: { entry_id: "own", note: "done" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(dataOf(result)).toMatchObject({
+        committed: true,
+        error: expect.stringContaining("do not retry the mutation"),
+        result: { refused: null, entries: [{ id: "own", alreadyHandled: false }] },
+      });
+      expect(store.read("actor-a", "own")?.handledAt).not.toBeNull();
+      expect(handled).toBe(1);
     });
   });
 });

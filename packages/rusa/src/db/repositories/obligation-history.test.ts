@@ -435,9 +435,9 @@ describe("Obligation mutation history", () => {
           id === TEST_USER_ID ? "user" : ["actor-a", "actor-b"].includes(id) ? "actor" : undefined
         );
         const ob = local.create({ id: "review", title: "Review", ownerId: TEST_USER_ID });
-        local.setReadyHeadListener((change) =>
-          changes.push({ ownerId: change.ownerId, headId: change.head?.id ?? null })
-        );
+        local.setReadyHeadListener((change) => {
+          changes.push({ ownerId: change.ownerId, headId: change.head?.id ?? null });
+        });
         local.reassign(ob.id, "actor-a", TEST_USER_ID, message);
         return changes;
       };
