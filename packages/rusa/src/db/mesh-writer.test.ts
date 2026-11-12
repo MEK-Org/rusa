@@ -154,7 +154,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("rejects a rolled-back write with the operation's own error and delivers nothing", async () => {
     const delivered: TestEffect[] = [];
-    const { writer, close } = await open((effect) => delivered.push(effect));
+    const { writer, close } = await open((effect) => {
+      delivered.push(effect);
+    });
     try {
       const err = await rejection(writer.write("fail", input("rolled-back")));
       expect(err.name).toBe("WriteConflictError");
@@ -192,7 +194,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("delivers every effect when only the committed result cannot be returned", async () => {
     const delivered: string[] = [];
-    const { writer, close } = await open((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    const { writer, close } = await open((effect) => {
+      delivered.push(`${effect.kind}:${effect.id}`);
+    });
     try {
       const err = await rejection(writer.write("uncloneable", input("uncloneable")));
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
@@ -209,7 +213,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("delivers the other effects and the result when one effect cannot be returned", async () => {
     const delivered: string[] = [];
-    const { writer, close } = await open((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    const { writer, close } = await open((effect) => {
+      delivered.push(`${effect.kind}:${effect.id}`);
+    });
     try {
       const err = await rejection(writer.write("uncloneableEffect", input("bad-effect")));
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
@@ -227,7 +233,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("refuses an input that cannot be cloned without attempting it, then keeps serving", async () => {
     const delivered: TestEffect[] = [];
-    const { writer, close } = await open((effect) => delivered.push(effect));
+    const { writer, close } = await open((effect) => {
+      delivered.push(effect);
+    });
     try {
       const bad = { ...input("bad-input"), callback: () => undefined };
       const err = await rejection(writer.write("create", bad));
@@ -245,28 +253,29 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
     }
   });
 
-  it("lets a delivery read committed state and write again, delivered in commit order", async () => {
+  it("delivers a write its delivery awaits inside that delivery, before the parent's later effects", async () => {
     const log: string[] = [];
-    let nested: Promise<unknown> | undefined;
-    const { writer, close } = await open((effect) => {
+    const { writer, close } = await open(async (effect) => {
       log.push(`${effect.kind}:${effect.id}`);
       if (effect.kind === "created" && effect.id === id("parent")) {
-        // A listener's own read and write, as the inbox listeners do today.
+        // A listener's own read and awaited write, as the attention sinks make (#1289 C2).
         log.push(`read:${getRepositories().obligations.get(id("parent"))?.title}`);
-        nested = writer.write("create", input("child"));
+        await writer.write("create", input("child"));
+        log.push(`child-settled:${exists(id("child"))}`);
       }
     });
     try {
       await writer.write("create", input("parent"));
-      await nested;
+      log.push("parent-continues");
       expect(log).toEqual([
         `created:${id("parent")}`,
         `read:${id("parent")}`,
-        `announced:${id("parent")}`,
         `created:${id("child")}`,
         `announced:${id("child")}`,
+        "child-settled:true",
+        `announced:${id("parent")}`,
+        "parent-continues",
       ]);
-      expect(exists(id("child"))).toBe(true);
     } finally {
       await close();
     }
@@ -283,7 +292,9 @@ describe("InProcessMeshWriter", () => {
       getDb(),
       repos(),
       TEST_WRITE_OPERATIONS,
-      (effect: TestEffect) => log.push(`${effect.kind}:${effect.id}`)
+      (effect: TestEffect) => {
+        log.push(`${effect.kind}:${effect.id}`);
+      }
     );
     const pending = writer.write("create", input("at-call"));
     log.push(`after-call:${exists("ip-at-call")}`);
@@ -297,7 +308,9 @@ describe("InProcessMeshWriter", () => {
       getDb(),
       repos(),
       TEST_WRITE_OPERATIONS,
-      (effect: TestEffect) => delivered.push(effect)
+      (effect: TestEffect) => {
+        delivered.push(effect);
+      }
     );
     let pending: Promise<unknown> | undefined;
     getDb().transaction(() => {
@@ -314,7 +327,9 @@ describe("DbWriter", () => {
 
   it("delivers one write's effects and runs its continuation before the next write's", async () => {
     const log: string[] = [];
-    const writer = await openDbWriter((effect) => log.push(`${effect.kind}:${effect.id}`));
+    const writer = await openDbWriter((effect) => {
+      log.push(`${effect.kind}:${effect.id}`);
+    });
     try {
       const labels = ["fifo-1", "fifo-2", "fifo-3"];
       await Promise.all(
@@ -409,7 +424,9 @@ describe("DbWriter", () => {
 
   it("finishes accepted writes on close and refuses new ones", async () => {
     const delivered: string[] = [];
-    const writer = await openDbWriter((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    const writer = await openDbWriter((effect) => {
+      delivered.push(`${effect.kind}:${effect.id}`);
+    });
     const held = writer.write("hold", { ...input("drain-held"), ms: 200 });
     const queued = writer.write("create", input("drain-queued"));
     const closing = writer.close();
