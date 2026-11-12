@@ -426,23 +426,32 @@ export function createObligationsMcpServer(
       blocked_by,
     }) => {
       try {
-        // Validation is the one await before the write, so it runs first:
-        // from the authority checks below to the commit inside `writer.write`
-        // nothing is awaited, and no other work can change grants, the actor
-        // tree or the obligation in between (#1289).
+        const authorize = (): string => {
+          const owner = options?.resolveOwner?.(owner_id) ?? {
+            ok: true as const,
+            ownerId: owner_id,
+          };
+          if (!owner.ok) throw new Error(owner.error);
+          // `blocked_by` imposes wait edges on the obligation being created —
+          // the same decision `add_obligation_prerequisite` gates behind
+          // `canManage` on an existing row. The row doesn't exist yet here, so
+          // the same seam is checked against the owner it is about to be
+          // created for (#212).
+          if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
+            throw new Error("not authorized to manage this obligation's prerequisites");
+          }
+          return owner.ownerId;
+        };
+        // Validation is the one await before the write. A caller refused now
+        // never reaches it (a deployed matcher can fetch from the remote), and
+        // the check that decides runs again after it: from there to the commit
+        // inside `writer.write` nothing is awaited, so no other work can change
+        // grants, the actor tree or the obligation in between (#1289).
         if (completion_matcher !== undefined && completion_matcher !== null) {
+          authorize();
           await options?.validateCompletionMatcher?.(completion_matcher);
         }
-        const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
-        if (!owner.ok) return toolError(new Error(owner.error));
-        // `blocked_by` imposes wait edges on the obligation being created —
-        // the same decision `add_obligation_prerequisite` gates behind
-        // `canManage` on an existing row. The row doesn't exist yet here, so
-        // the same seam is checked against the owner it is about to be
-        // created for (#212).
-        if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
-          throw new Error("not authorized to manage this obligation's prerequisites");
-        }
+        const ownerId = authorize();
         // Starting a responsive branch is a promotion: it needs the authority
         // and, like marking, an owner the caller could otherwise manage. Whether
         // this create starts one depends on the parent's responsiveness when
@@ -451,13 +460,13 @@ export function createObligationsMcpServer(
           responsiveRefusal:
             responsive === true
               ? responsiveRefusal(
-                  owner.ownerId,
+                  ownerId,
                   `only ${RESPONSIVE_AUTHORITY} may create newly responsive obligations`,
                   "not authorized to start a responsive branch for this owner"
                 )
               : null,
           obligation: {
-            ownerId: owner.ownerId,
+            ownerId,
             title,
             parentId: parent_id ?? null,
             intent: intent ?? null,
@@ -507,11 +516,18 @@ export function createObligationsMcpServer(
     },
     async ({ id, matcher }) => {
       try {
-        // As in create_obligation: validate first, so nothing is awaited
-        // between the authority check and the commit (#1289).
-        if (matcher !== null) await options?.validateCompletionMatcher?.(matcher);
-        const existing = repository.require(id);
-        if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
+        const authorize = () => {
+          const current = repository.require(id);
+          if (!canManage(current)) throw new Error("not authorized to manage this obligation");
+          return current;
+        };
+        // As in create_obligation: refuse before validating, then decide after
+        // it, so nothing is awaited between that check and the commit (#1289).
+        if (matcher !== null) {
+          authorize();
+          await options?.validateCompletionMatcher?.(matcher);
+        }
+        const existing = authorize();
         const written = await writer.write("obligations.setCompletionMatcher", {
           id,
           matcher,

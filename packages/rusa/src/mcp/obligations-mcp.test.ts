@@ -1657,6 +1657,10 @@ describe("obligations MCP", () => {
     // is the first thing that could run after it, so it must already see the
     // committed row. An await between the check and the write would let it
     // run first and see the row unchanged.
+    //
+    // set_snooze has no row: its check is an owner-equality test, not the
+    // canManage hook these rows instrument, and its op refuses inside the
+    // write when the owner is no longer the caller (expectedOwnerId).
     const cases: readonly {
       readonly tool: string;
       readonly prepare?: () => void;
@@ -1668,7 +1672,16 @@ describe("obligations MCP", () => {
         args: { matcher: { kind: "pr_merged", pr: "github:example/repo/pulls/1" } },
       },
       { tool: "set_external_ref", args: { external_ref: "github:example/repo/issues/1" } },
+      {
+        tool: "set_obligation_recurrence",
+        args: { recurrence: { policy: "completion_interval", intervalSeconds: 3600 } },
+      },
       { tool: "reassign_obligation", args: { owner_id: "actor-b" } },
+      {
+        tool: "reparent_obligation",
+        prepare: () => repository.create({ title: "home", id: "home", ownerId: "actor-a" }),
+        args: { parent_id: "home" },
+      },
       { tool: "mark_obligation_responsive", args: {} },
       {
         tool: "add_obligation_prerequisite",

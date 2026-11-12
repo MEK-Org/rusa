@@ -16694,6 +16694,52 @@ describe("obligation manage policy at the write (#1289)", () => {
     expect(repo.require("target").ownerId).toBe(elsewhere);
   });
 
+  it("refuses an unauthorized caller before awaiting matcher validation", async () => {
+    const { mesh, manager, elsewhere, worker, effects } = world();
+    let validations = 0;
+    const validate = async () => {
+      validations += 1;
+    };
+
+    const matcherRefused = await call(
+      mesh,
+      elsewhere,
+      "set_completion_matcher",
+      { id: "target", matcher },
+      validate
+    );
+    expect(matcherRefused.isError).toBe(true);
+    expect(matcherRefused.text).toContain("not authorized to manage this obligation");
+
+    const createRefused = await call(
+      mesh,
+      elsewhere,
+      "create_obligation",
+      { title: "blocked", owner_id: worker, blocked_by: ["target"], completion_matcher: matcher },
+      validate
+    );
+    expect(createRefused.isError).toBe(true);
+    expect(createRefused.text).toContain(
+      "not authorized to manage this obligation's prerequisites"
+    );
+
+    expect(validations).toBe(0);
+    expect(repo.require("target").completionMatcher).toBeNull();
+    expect(effects).toEqual([]);
+
+    // An authorized caller is still validated once, then written.
+    const allowed = await call(
+      mesh,
+      manager,
+      "set_completion_matcher",
+      { id: "target", matcher },
+      validate
+    );
+    expect(allowed.isError).toBeFalsy();
+    expect(validations).toBe(1);
+    expect(repo.require("target").completionMatcher).not.toBeNull();
+  });
+
   it("refuses a revocation or reparent made while matcher validation is awaited", async () => {
     const { mesh, manager, worker, elsewhere, admin, effects, revokeAdmin } = world();
 
