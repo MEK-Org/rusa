@@ -213,6 +213,13 @@ export class McpHttpServer {
   private readonly serverLabels = new Map<string, string>();
   /** Per-request admission for a mount; a refused request 404s like an unknown path. */
   private readonly authorizers = new Map<string, () => boolean>();
+  /**
+   * Per session: the admission that was current when its server was built.
+   * Re-adding a mount replaces its factory and admission but keeps open
+   * sessions, whose servers still hold what they were built with, so their
+   * requests are admitted against their own admission, not the mount's latest.
+   */
+  private readonly sessionAuthorizers = new WeakMap<StreamableHTTPServerTransport, () => boolean>();
   /** Per server-name: session id -> monotonic creation time for close diagnostics. */
   private readonly sessionStartedAt = new Map<string, Map<string, number>>();
   private readonly log: Logger;
@@ -391,7 +398,18 @@ export class McpHttpServer {
       return;
     }
     const name = this.serverNameFor(req.url);
-    if (!name || this.authorizers.get(name)?.() === false) {
+    // Routing must use the complete header. Its separately bounded form is for
+    // diagnostics only: trimming before Map#get changes which session receives
+    // a request.
+    let sessionId =
+      typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
+    const presented = name && sessionId ? this.sessions.get(name)?.get(sessionId) : undefined;
+    const authorize = presented
+      ? this.sessionAuthorizers.get(presented)
+      : name
+        ? this.authorizers.get(name)
+        : undefined;
+    if (!name || authorize?.() === false) {
       res.writeHead(404, { "content-type": "text/plain" });
       res.end("not found");
       return;
@@ -403,11 +421,6 @@ export class McpHttpServer {
     // Read the mount label once, at arrival: a session close can outlive the
     // mount, and every record for this request should name the mount that served it.
     const server = this.serverLabel(name);
-    // Routing must use the complete header. Its separately bounded form is for
-    // diagnostics only: trimming before Map#get changes which session receives
-    // a request.
-    let sessionId =
-      typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
     let loggedSessionId = boundedMetadata(sessionId);
     // Capture this before body parsing so an arrival record answers whether the
     // client presented a currently live session, even if parsing or dispatch stalls.
@@ -503,8 +516,14 @@ export class McpHttpServer {
               });
             }
           };
+          // Read the factory and its admission together: the mount may have
+          // been replaced while the body was read, and this session's later
+          // requests are admitted against what its server is built from.
+          const factory = this.factories[name];
+          const sessionAuthorize = this.authorizers.get(name);
+          if (sessionAuthorize) this.sessionAuthorizers.set(newTransport, sessionAuthorize);
           this.log.info("mcp_session_connecting", requestFields());
-          await this.factories[name]().connect(newTransport);
+          await factory().connect(newTransport);
           this.log.info("mcp_session_connected", requestFields());
           transport = newTransport;
         }

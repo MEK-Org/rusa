@@ -231,6 +231,15 @@ describe("a revoked grant's mounted endpoint while an earlier delivery is open (
     await expect(scopes(open)).rejects.toThrow();
     await expect(connect(url)).rejects.toThrow();
 
+    // A refresh mounts the same name again from the A-only view before the
+    // hook runs (a nested grant's refresh does this). It keeps the path and
+    // the open session, whose server was built from A and B, so that session
+    // stays refused; a session opened after the refresh is built from A alone.
+    expect(mount(SCOPED)).toBe(url);
+    await expect(scopes(open)).rejects.toThrow();
+    const refreshed = await connect(url);
+    expect(await scopes(refreshed)).toEqual({ scopes: ["A"] });
+
     releaseDelivery();
     await revoking;
     expect(hookEntered).toBe(true);
