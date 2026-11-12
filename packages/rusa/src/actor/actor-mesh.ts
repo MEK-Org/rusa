@@ -1966,18 +1966,22 @@ export class ActorMesh {
   }
 
   /**
-   * Mark this actor's unseen entries seen through the writer. A mark that
-   * committed counts as made even if its answer was lost on the way back
-   * (#1289): its entries are then reported to no receipt listener, but they
-   * are seen. One that did not commit, or may not have, rejects and is not
-   * retried here.
+   * Mark the entries this actor has unseen now seen through the writer. The
+   * mark names them when requested, so one that commits later never stamps an
+   * entry delivered meanwhile: that entry's own dispatch still finds it
+   * arriving (#1289 C1b). With none unseen there is nothing to write. A mark
+   * that committed counts as made even if its answer was lost on the way back:
+   * its entries are then reported to no receipt listener, but they are seen.
+   * One that did not commit, or may not have, rejects and is not retried here.
    */
   private async markInboxSeen(actorId: string): Promise<InboxEntry[]> {
     if (!this.inboxStore) return [];
     if (!this.writer) throw new Error("this mesh has no writer configured");
+    const entryIds = this.inboxStore.unseenEntryIds(actorId);
+    if (entryIds.length === 0) return [];
     let entries: InboxEntry[];
     try {
-      entries = await this.writer.write("inbox.markSeen", { actorId });
+      entries = await this.writer.write("inbox.markSeen", { actorId, entryIds });
     } catch (err) {
       if (!(err instanceof MeshWriteCommittedError)) throw err;
       this.log(`inbox seen mark for ${actorId}: ${err.message}`);

@@ -558,7 +558,7 @@ export class RunManager {
     if (target.isQueued) {
       // The new entry joins the already-accepted opportunity, which will list
       // the live worklist after admission, so it becomes seen first.
-      return this.joinQueuedOpportunity(actorId, target, opts, responsiveArrived);
+      return this.joinQueuedOpportunity(actorId, target, opts, responsiveArrived, work.voiceAt);
     }
     target.requestRun(nudge);
     return true;
@@ -599,7 +599,8 @@ export class RunManager {
     actorId: string,
     target: MeshActor,
     opts: { preempt: boolean },
-    responsiveArrived: boolean
+    responsiveArrived: boolean,
+    arrivedVoiceAt: number | undefined
   ): Promise<boolean> {
     await this.markInboxSeen(actorId);
     const current = this.live.get(actorId);
@@ -621,7 +622,16 @@ export class RunManager {
       return false;
     }
     if (target.isRunning) return true;
-    const nudge = dispatchNudge(work);
+    let nudge = dispatchNudge(work);
+    // A voice memo this dispatch brought is seen now, so the re-read no longer
+    // dates it; the request still carries its delivery time, as one made
+    // without waiting would have.
+    if (isResponsiveNudge(nudge) && arrivedVoiceAt !== undefined) {
+      nudge = {
+        ...nudge,
+        voiceTimestamp: Math.min(nudge.voiceTimestamp ?? arrivedVoiceAt, arrivedVoiceAt),
+      };
+    }
     // Responsive work this dispatch brought marked itself seen only to join
     // an opportunity that is now gone, so it still passes a voice hold: the
     // session-end wake leaves responsive work to the dispatch that brought it.

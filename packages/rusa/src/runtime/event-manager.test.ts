@@ -112,6 +112,10 @@ class FakeInboxStore implements InboxRepository {
       .slice(0, limit);
   }
 
+  unseenEntryIds(): string[] {
+    return [];
+  }
+
   markSeen(): InboxEntry[] {
     return [];
   }

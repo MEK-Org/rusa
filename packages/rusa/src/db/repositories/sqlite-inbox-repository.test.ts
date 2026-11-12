@@ -224,6 +224,31 @@ describe("SqliteInboxRepository", () => {
     expect(store.actorsWithUnseen()).toEqual([{ actorId: "b", priority: "normal" }]);
   });
 
+  it("lists an actor's unseen unhandled ids in delivery order, and stamps only named ones", () => {
+    store.append([
+      { id: "late", actorId: "a", source: "chat", payload: { type: "message.created" } },
+      {
+        id: "early",
+        actorId: "a",
+        source: "chat",
+        deliveredAt: new Date("2026-07-13T11:00:00Z"),
+        payload: { type: "message.created" },
+      },
+      { id: "done", actorId: "a", source: "chat", payload: { type: "message.created" } },
+      { id: "theirs", actorId: "b", source: "chat", payload: { type: "message.created" } },
+    ]);
+    store.markHandled("a", ["done"]);
+    expect(store.unseenEntryIds("a")).toEqual(["early", "late"]);
+
+    expect(store.markSeen("a", undefined, ["late", "done", "theirs"]).map((e) => e.id)).toEqual([
+      "late",
+    ]);
+    expect(store.unseenEntryIds("a")).toEqual(["early"]);
+    expect(store.unseenEntryIds("b")).toEqual(["theirs"]);
+    expect(store.markSeen("a", undefined, [])).toEqual([]);
+    expect(store.unseenEntryIds("a")).toEqual(["early"]);
+  });
+
   it("promotes recovery priority when any qualifying entry is responsive", () => {
     store.append([
       { id: "a-normal", actorId: "a", source: "chat", payload: { type: "normal" } },

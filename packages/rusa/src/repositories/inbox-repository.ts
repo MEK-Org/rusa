@@ -142,11 +142,15 @@ export interface InboxRepository {
   actorsWithUnhandled(): InboxActorWork[];
   /** Each actor with unseen work, promoted when any unseen entry is responsive. */
   actorsWithUnseen(): InboxActorWork[];
+  /** Ids of this actor's unhandled entries not yet seen, in delivery order. */
+  unseenEntryIds(actorId: string): string[];
   /**
    * Atomically stamp and return every unhandled entry not previously seen by
-   * this actor. The empty result makes repeated queue notifications a no-op.
+   * this actor — only those among `entryIds` when given, so a mark requested
+   * earlier never stamps an entry delivered after it was requested. The empty
+   * result makes repeated queue notifications a no-op.
    */
-  markSeen(actorId: string, seenAt?: Date): InboxEntry[];
+  markSeen(actorId: string, seenAt?: Date, entryIds?: readonly string[]): InboxEntry[];
   markHandled(
     actorId: string,
     entryIds: string[],
@@ -224,7 +228,10 @@ export class EmptyInboxRepository implements InboxRepository {
   actorsWithUnseen(): InboxActorWork[] {
     return [];
   }
-  markSeen(_actorId: string, _seenAt?: Date): InboxEntry[] {
+  unseenEntryIds(_actorId: string): string[] {
+    return [];
+  }
+  markSeen(_actorId: string, _seenAt?: Date, _entryIds?: readonly string[]): InboxEntry[] {
     return [];
   }
   markHandled(

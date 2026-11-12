@@ -214,11 +214,15 @@ export const MESH_WRITE_OPERATIONS = {
     mutating(context, () => inboxClosureShortfalls(context.repos, input.closure)),
 
   /**
-   * Mark every unseen, unhandled entry of an actor seen: the receipt that a
-   * queued run has taken them in. It has no listeners to notify.
+   * Mark an actor's entries seen: the receipt that a queued run has taken them
+   * in. Only the named entries that are still unseen and unhandled when it
+   * commits are stamped, so an entry delivered after the mark was requested
+   * keeps its arrival. It has no listeners to notify.
    */
-  "inbox.markSeen": (context: Context, input: { readonly actorId: string }): InboxEntry[] =>
-    context.repos.inbox.markSeen(input.actorId),
+  "inbox.markSeen": (
+    context: Context,
+    input: { readonly actorId: string; readonly entryIds: readonly string[] }
+  ): InboxEntry[] => context.repos.inbox.markSeen(input.actorId, undefined, input.entryIds),
 
   /** A parent marks its child's exhausted entries handled, if it still may. */
   "inbox.markChildHandled": (

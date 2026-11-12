@@ -991,6 +991,25 @@ describe("RunManager", () => {
       expect(responsive.nudges).toEqual([{ priority: "responsive" }]);
     });
 
+    it("keeps the delivery time of a voice memo it brought, though the mark has made it seen (r4547468362)", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = live(h, "a1");
+      actor.queued = true;
+      const at = new Date("2026-03-04T05:06:07.000Z");
+      append("a1", { type: "human.voice", priority: "responsive" }, at);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      // The mark stamps the memo, as the mesh's does, before it answers.
+      inbox.markSeen("a1");
+      held.marks[0].resolve();
+
+      expect(await dispatched).toBe(true);
+      // As the request made without waiting carried it.
+      expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: at.getTime() }]);
+    });
+
     it("never requests a run of an actor replaced during the wait; the replacement gets its own dispatch", async () => {
       const held = heldMarks();
       const h = setup({ markInboxSeen: held.markInboxSeen });
