@@ -21,6 +21,16 @@ export type UserPrincipalId = `${string}-${string}-${string}-${string}-${string}
  */
 export type RootControlPrincipal = "root-llm" | "e2e-controller" | UserPrincipalId;
 
+/**
+ * True if `principal` may use an operator-only boundary. The root LLM acts
+ * through root control as an actor, so it does not borrow the human
+ * operator's reach. The operator boundaries and the write operations they
+ * call share this one predicate.
+ */
+export function isHumanOperatorPrincipal(principal: RootControlPrincipal): boolean {
+  return principal !== "root-llm";
+}
+
 export interface RootChildRequest {
   executionTarget?: string;
   charter: string;

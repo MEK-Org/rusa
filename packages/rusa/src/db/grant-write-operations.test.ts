@@ -195,13 +195,29 @@ describe("grant and experiment writes decide authority in the transaction (#1289
         actorId,
         capability: "obligations-admin",
         active,
-        grantedBy: "operator:test",
+        principal: "e2e-controller",
         at: AT,
       });
     expect(await set("missing", true)).toEqual({ known: false, active: false });
     expect(repos.capabilityGrants.list().filter((g) => g.actorId === "missing")).toEqual([]);
     expect(await set("worker", true)).toEqual({ known: true, active: true });
+    expect(
+      repos.capabilityGrants.list().find((g) => g.actorId === "worker" && !g.revokedAt)?.grantedBy
+    ).toBe("operator:e2e-controller");
     expect(await set("worker", false)).toEqual({ known: true, active: false });
+  });
+
+  it("refuses an operator-provisioned grant for a principal that is not a human operator", async () => {
+    await expect(
+      writer.write("grants.setOperatorProvisioned", {
+        actorId: "worker",
+        capability: "obligations-admin",
+        active: true,
+        principal: "root-llm",
+        at: AT,
+      })
+    ).rejects.toThrow("only an authenticated human operator may provision obligations-admin");
+    expect(repos.capabilityGrants.activeFor("worker")).toEqual([]);
   });
 
   describe("through the mesh", () => {
@@ -276,6 +292,32 @@ describe("grant and experiment writes decide authority in the transaction (#1289
 
       await expect(pending).rejects.toThrow("only an experiment-admin holder may enroll");
       expect(repos.experimentEnrollments.isEnrolled("worker", EXPERIMENT)).toBe(false);
+    });
+
+    it("refuses a grant whose grantee is reparented out of the grantor's subtree after the mesh's check", async () => {
+      const { mesh, events, granted, holdWrites, releaseWrites } = heldMesh();
+      holdWrites();
+      // The mesh's advisory check passes on the old tree: worker is under steward.
+      const pending = mesh.grantCapability("worker", "understanding-write", "steward");
+      mesh.reparentThread("worker", "other");
+      releaseWrites();
+
+      await expect(pending).rejects.toThrow(
+        "steward may only grant capabilities in its own subtree (cannot grant worker)"
+      );
+      expect(repos.capabilityGrants.activeFor("worker")).toEqual([]);
+      expect(events.filter((e) => e.kind === "capability_granted")).toEqual([]);
+      expect(granted).toEqual([]);
+    });
+
+    it("commits an in-process grant before the caller first awaits", async () => {
+      // On the in-process writer nothing can commit between the mesh's check
+      // and the operation: the transaction runs in the caller's turn. The held
+      // cases above simulate the worker boundary that F introduces.
+      const { mesh } = heldMesh();
+      const pending = mesh.grantCapability("worker", "understanding-write", "steward");
+      expect(repos.capabilityGrants.activeFor("worker")).toEqual(["understanding-write"]);
+      await pending;
     });
 
     it("still grants and announces when nothing intervenes", async () => {

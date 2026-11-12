@@ -19,7 +19,7 @@ export interface GrantAuthorityReader {
 
 /** True if `ancestorId` is `id` itself or any ancestor up the actor tree. */
 export function isAncestorIn(
-  reader: GrantAuthorityReader,
+  reader: Pick<GrantAuthorityReader, "actor">,
   ancestorId: string,
   id: string
 ): boolean {

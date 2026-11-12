@@ -20,6 +20,7 @@ import {
   assertParentExhaustedInboxAuthority,
   type ParentInboxAuthorityReader,
 } from "../actor/parent-inbox-authority.js";
+import { isHumanOperatorPrincipal, type RootControlPrincipal } from "../actor/root-control.js";
 import type { CompletionMatcher, CompletionMatcherInput } from "../obligations/obligation.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
@@ -612,7 +613,9 @@ export const MESH_WRITE_OPERATIONS = {
   /**
    * Set or clear an operator-provisioned grant for an actor that exists, and
    * answer the row's state as this transaction leaves it (#1289 D1). The
-   * operator's identity was authenticated by the caller; no actor grant
+   * caller authenticates the operator and passes that principal; the
+   * operation refuses one that is not a human operator, with the same
+   * predicate the caller uses, and records it as the grantor. No actor grant
    * confers this, so no grant row is consulted to allow it.
    */
   "grants.setOperatorProvisioned": (
@@ -621,17 +624,20 @@ export const MESH_WRITE_OPERATIONS = {
       readonly actorId: string;
       readonly capability: string;
       readonly active: boolean;
-      readonly grantedBy: string;
+      readonly principal: RootControlPrincipal;
       readonly at: string;
     }
   ): { readonly known: boolean; readonly active: boolean } => {
+    if (!isHumanOperatorPrincipal(input.principal)) {
+      throw new Error(`only an authenticated human operator may provision ${input.capability}`);
+    }
     const { grants, actors } = context.repos;
     if (!actors.get(input.actorId)) return { known: false, active: false };
     if (input.active) {
       grants.grant({
         actorId: input.actorId,
         capability: input.capability,
-        grantedBy: input.grantedBy,
+        grantedBy: `operator:${input.principal}`,
         grantedAt: input.at,
       });
     } else {

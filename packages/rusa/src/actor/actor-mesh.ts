@@ -108,7 +108,11 @@ import {
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
 } from "./experiments.js";
-import { assertGrantAuthority, type GrantAuthorityReader } from "./grant-authority.js";
+import {
+  assertGrantAuthority,
+  type GrantAuthorityReader,
+  isAncestorIn,
+} from "./grant-authority.js";
 import { generateHandle } from "./handle-generator.js";
 import {
   type HeadClosureQuery,
@@ -5812,16 +5816,11 @@ export class ActorMesh {
 
   /** True if `ancestorId` is `id` itself or any ancestor up the ownership tree. */
   isAncestorOf(ancestorId: string, id: string): boolean {
-    ancestorId = this.resolveThreadId(ancestorId);
-    id = this.resolveThreadId(id);
-    let cursor: string | null = id;
-    const seen = new Set<string>();
-    while (cursor && !seen.has(cursor)) {
-      if (cursor === ancestorId) return true;
-      seen.add(cursor);
-      cursor = this.actors.parentOf(cursor) ?? null;
-    }
-    return false;
+    return isAncestorIn(
+      { actor: (actorId) => ({ parentId: this.actors.parentOf(actorId) }) },
+      this.resolveThreadId(ancestorId),
+      this.resolveThreadId(id)
+    );
   }
 
   /**

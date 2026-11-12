@@ -103,6 +103,13 @@ export interface CapabilityGrantStore {
  * nothing (#1087). It is process configuration, fixed once chosen, so a
  * write operation receives it as input; the grant rows it is combined with
  * are still the transaction's.
+ *
+ * Passing it as input is safe only because `recipientId` is write-once: it
+ * moves from `undefined` to an id at most once and never changes after that.
+ * So a snapshot taken before the transaction can only under-grant. A change
+ * that lets the default actor be re-selected breaks that guarantee. Such a
+ * change must resolve the recipient inside the write operation from durable
+ * rows instead.
  */
 export interface CapabilityPolicy {
   /** The actor holding `capabilities` without a grant row, once one is selected. */

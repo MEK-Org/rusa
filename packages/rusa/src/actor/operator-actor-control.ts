@@ -1,7 +1,7 @@
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import type { ActorRecord } from "./actor-record.js";
 import { OBLIGATIONS_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
-import type { RootControlPrincipal } from "./root-control.js";
+import { isHumanOperatorPrincipal, type RootControlPrincipal } from "./root-control.js";
 
 /** What a human operator's reparent was asked to do and how it ended. */
 export interface OperatorReparentAudit {
@@ -90,9 +90,7 @@ export class OperatorActorControl {
         outcome,
         ...(reason !== undefined ? { reason } : {}),
       });
-    // The root LLM principal is an actor acting through root control; it does
-    // not get to borrow the human operator's cross-forest reach.
-    if (principal === "root-llm") {
+    if (!isHumanOperatorPrincipal(principal)) {
       const reason = "only an authenticated human operator may use the operator reparent boundary";
       audit("denied", reason);
       throw new Error(reason);
@@ -123,7 +121,7 @@ export class OperatorActorControl {
         outcome,
         ...(reason !== undefined ? { reason } : {}),
       });
-    if (principal === "root-llm") {
+    if (!isHumanOperatorPrincipal(principal)) {
       const reason = "only an authenticated human operator may use the operator retire boundary";
       audit("denied", reason);
       throw new Error(reason);
@@ -175,7 +173,7 @@ export class OperatorActorControl {
         outcome,
         ...(reason !== undefined ? { reason } : {}),
       });
-    if (principal === "root-llm") {
+    if (!isHumanOperatorPrincipal(principal)) {
       const reason = "only an authenticated human operator may provision obligations-admin";
       audit("denied", reason);
       throw new Error(reason);
@@ -187,7 +185,7 @@ export class OperatorActorControl {
       actorId: canonicalActorId,
       capability: OBLIGATIONS_ADMIN_CAPABILITY,
       active: enabled,
-      grantedBy: `operator:${principal}`,
+      principal,
       at: this.now(),
     });
     if (!known) {
