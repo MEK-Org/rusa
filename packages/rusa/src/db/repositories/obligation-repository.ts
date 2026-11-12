@@ -51,6 +51,39 @@ function isPromiseLike(value: unknown): value is PromiseLike<void> {
   return typeof (value as PromiseLike<void> | null)?.then === "function";
 }
 
+/**
+ * One listener call as a delivery step, whether it answers synchronously or
+ * with a promise: `settled` sees its outcome either way, and a failure is
+ * rethrown so the caller can report it.
+ */
+function listenerStep(
+  call: () => void | PromiseLike<void>,
+  settled: (failure: { err: unknown } | null) => void
+): () => void | Promise<void> {
+  return () => {
+    let pending: void | PromiseLike<void>;
+    try {
+      pending = call();
+    } catch (err) {
+      settled({ err });
+      throw err;
+    }
+    if (!isPromiseLike(pending)) {
+      settled(null);
+      return;
+    }
+    return Promise.resolve(pending).then(
+      () => settled(null),
+      (err: unknown) => {
+        settled({ err });
+        throw err;
+      }
+    );
+  };
+}
+
+const failureMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 function obligationLogger(): Logger {
   _obligationLogger ??= createLogger({ context: { component: "obligations" } });
   return _obligationLogger;
@@ -1633,28 +1666,17 @@ export class ObligationRepository {
     const listener = this.readyHeadListener;
     if (listener) {
       for (const change of effect.readyHeadChanges) {
-        steps.push(() => {
-          try {
-            const pending = listener(change);
-            if (isPromiseLike(pending)) {
-              return pending.catch((err) => {
-                console.warn(
-                  `[obligations] ready-head listener failed for ${change.ownerId}: ${
-                    err instanceof Error ? err.message : String(err)
-                  }`
-                );
-                throw err;
-              });
+        steps.push(
+          listenerStep(
+            () => listener(change),
+            (failure) => {
+              if (!failure) return;
+              console.warn(
+                `[obligations] ready-head listener failed for ${change.ownerId}: ${failureMessage(failure.err)}`
+              );
             }
-          } catch (err) {
-            console.warn(
-              `[obligations] ready-head listener failed for ${change.ownerId}: ${
-                err instanceof Error ? err.message : String(err)
-              }`
-            );
-            throw err;
-          }
-        });
+          )
+        );
       }
     }
 
@@ -1684,36 +1706,21 @@ export class ObligationRepository {
 
       for (const attention of toDeliver) {
         const key = this.cancellationAttentionKey(attention);
-        steps.push(() => {
-          try {
-            const pending = cancellationAttentionListener(attention);
-            if (isPromiseLike(pending)) {
-              return pending.then(
-                () => {
-                  this.failedCancellationAttentionKeys.delete(key);
-                },
-                (err: unknown) => {
-                  this.failedCancellationAttentionKeys.add(key);
-                  console.warn(
-                    `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
-                      err instanceof Error ? err.message : String(err)
-                    }`
-                  );
-                  throw err;
-                }
+        steps.push(
+          listenerStep(
+            () => cancellationAttentionListener(attention),
+            (failure) => {
+              if (!failure) {
+                this.failedCancellationAttentionKeys.delete(key);
+                return;
+              }
+              this.failedCancellationAttentionKeys.add(key);
+              console.warn(
+                `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${failureMessage(failure.err)}`
               );
             }
-            this.failedCancellationAttentionKeys.delete(key);
-          } catch (err) {
-            this.failedCancellationAttentionKeys.add(key);
-            console.warn(
-              `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
-                err instanceof Error ? err.message : String(err)
-              }`
-            );
-            throw err;
-          }
-        });
+          )
+        );
       }
     }
 
@@ -1753,36 +1760,21 @@ export class ObligationRepository {
       }
 
       for (const { obligation, actingPrincipal: cause } of toDeliver.values()) {
-        steps.push(() => {
-          try {
-            const pending = responsiveReadyListener(obligation, cause);
-            if (isPromiseLike(pending)) {
-              return pending.then(
-                () => {
-                  this.failedResponsiveReadyDeliveries.delete(obligation.id);
-                },
-                (err: unknown) => {
-                  this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
-                  console.warn(
-                    `[obligations] responsive-ready listener failed for ${obligation.id}: ${
-                      err instanceof Error ? err.message : String(err)
-                    }`
-                  );
-                  throw err;
-                }
+        steps.push(
+          listenerStep(
+            () => responsiveReadyListener(obligation, cause),
+            (failure) => {
+              if (!failure) {
+                this.failedResponsiveReadyDeliveries.delete(obligation.id);
+                return;
+              }
+              this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
+              console.warn(
+                `[obligations] responsive-ready listener failed for ${obligation.id}: ${failureMessage(failure.err)}`
               );
             }
-            this.failedResponsiveReadyDeliveries.delete(obligation.id);
-          } catch (err) {
-            this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
-            console.warn(
-              `[obligations] responsive-ready listener failed for ${obligation.id}: ${
-                err instanceof Error ? err.message : String(err)
-              }`
-            );
-            throw err;
-          }
-        });
+          )
+        );
       }
     }
 
@@ -1822,44 +1814,36 @@ export class ObligationRepository {
       });
     }
 
+    // Every step runs even when an earlier one fails, each awaited before the
+    // next only when it answers with a promise; the failures are then
+    // reported together.
     const errors: unknown[] = [];
-    for (let i = 0; i < steps.length; i++) {
-      let pending: void | Promise<void>;
-      try {
-        pending = steps[i]();
-      } catch (err) {
-        errors.push(err);
-        continue;
-      }
-      if (isPromiseLike(pending)) {
-        return pending
-          .catch((err) => {
-            errors.push(err);
-          })
-          .then(async () => {
-            for (let j = i + 1; j < steps.length; j++) {
-              try {
-                const next = steps[j]();
-                if (isPromiseLike(next)) {
-                  await next;
-                }
-              } catch (err) {
-                errors.push(err);
-              }
+    const from = (start: number): void | Promise<void> => {
+      for (let index = start; index < steps.length; index++) {
+        let pending: void | Promise<void>;
+        try {
+          pending = (steps[index] as () => void | Promise<void>)();
+        } catch (err) {
+          errors.push(err);
+          continue;
+        }
+        if (isPromiseLike(pending)) {
+          return pending.then(
+            () => from(index + 1),
+            (err: unknown) => {
+              errors.push(err);
+              return from(index + 1);
             }
-            if (errors.length > 0) {
-              throw errors.length === 1
-                ? errors[0]
-                : new AggregateError(errors, `${errors.length} mutation effect listeners failed`);
-            }
-          });
+          );
+        }
       }
-    }
-    if (errors.length > 0) {
-      throw errors.length === 1
-        ? errors[0]
-        : new AggregateError(errors, `${errors.length} mutation effect listeners failed`);
-    }
+      if (errors.length > 0) {
+        throw errors.length === 1
+          ? errors[0]
+          : new AggregateError(errors, `${errors.length} mutation effect listeners failed`);
+      }
+    };
+    return from(0);
   }
 
   /**

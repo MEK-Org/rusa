@@ -18,7 +18,7 @@ import {
   type MeshWriteRepos,
   ObligationChangedError,
 } from "./mesh-write-operations.js";
-import { InProcessMeshWriter } from "./mesh-writer.js";
+import { InProcessMeshWriter, MeshWriteCommittedError } from "./mesh-writer.js";
 import { runMigrations } from "./migrations/runner.js";
 import { ObligationRepository } from "./repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "./repositories/sqlite-inbox-repository.js";
@@ -323,7 +323,7 @@ describe("check and act in one operation", () => {
 });
 
 describe("listener failures", () => {
-  it("never reject a committed write, and are retried from committed state on a later delivery", async () => {
+  it("report a committed write as committed, and are retried from committed state on a later delivery", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const announced: Array<{ id: string; actingPrincipal: string }> = [];
     let fail = true;
@@ -341,17 +341,27 @@ describe("listener failures", () => {
       responsive: true,
     });
 
-    // The failed delivery belongs to a write that committed: it resolves.
-    const hotfix = await writer.write("obligations.create", {
-      obligation: {
-        id: "hotfix",
-        ownerId: "actor-a",
-        title: "hotfix",
-        priority: 3,
-        responsive: true,
-      },
-    });
-    expect(hotfix.id).toBe("hotfix");
+    // The failed delivery belongs to a write that committed: the writer says
+    // so (#1289 C2, root c6814333204), carrying the committed result and the
+    // listener's failure, and claims no rollback.
+    const reported = await rejection(
+      writer.write("obligations.create", {
+        obligation: {
+          id: "hotfix",
+          ownerId: "actor-a",
+          title: "hotfix",
+          priority: 3,
+          responsive: true,
+        },
+      })
+    );
+    expect(reported).toBeInstanceOf(MeshWriteCommittedError);
+    const committed = reported as MeshWriteCommittedError;
+    expect((committed.result as { id: string }).id).toBe("hotfix");
+    expect(committed.failures.map((err) => (err as Error).message)).toEqual([
+      "inbox is unavailable",
+    ]);
+    expect(repository.require("hotfix").id).toBe("hotfix");
     expect(announced).toEqual([]);
 
     // The retry lives where delivery does and re-reads committed rows, so the
