@@ -795,34 +795,148 @@ describe.each(MESH_WRITERS)("production write operations ($name writer)", ({ nam
       createdAt: new Date().toISOString(),
     });
 
-    let deliveryAttempts = 0;
     const { writer, close } = await open(async (effect) => {
-      if (effect.kind === OBLIGATION_MUTATION_EFFECT) {
-        for (const change of effect.readyHeadChanges) {
-          if (change.head?.id === parentId) {
-            deliveryAttempts++;
-            throw new Error("simulated delivery crash");
-          }
-        }
-      }
       await deliverMeshEffect(repos, effect);
     });
 
     try {
+      await writer.write("obligations.create", {
+        obligation: { id: parentId, title: "post-commit fail", ownerId: testOwner, priority: 0 },
+      });
+
+      let deliveryAttempts = 0;
+      let statusListenerRan = false;
+      repos.obligations.setReadyHeadListener(async (change) => {
+        if (change.ownerId === testOwner) {
+          deliveryAttempts++;
+          throw new Error("nested append failed");
+        }
+      });
+      repos.obligations.setStatusChangeListener(({ changes }) => {
+        if (changes.some((c) => c.id === parentId && c.status === "done")) {
+          statusListenerRan = true;
+        }
+      });
+
       const err = await rejection(
-        writer.write("obligations.create", {
-          obligation: { id: parentId, title: "post-commit fail", ownerId: testOwner, priority: 0 },
+        writer.write("obligations.setTerminalStatus", {
+          id: parentId,
+          status: "done",
+          note: null,
+          resolutionRef: null,
+          principal: testOwner,
         })
       );
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
       expect(err.message).toMatch(/committed, but 1 of its 1 effects failed to deliver/);
 
+      // Remaining effect in deliverMutationEffect still executed per c6814333204
+      expect(statusListenerRan).toBe(true);
       // Mutation is committed in DB
-      expect(repos.obligations.get(parentId)).not.toBeNull();
+      expect(repos.obligations.get(parentId)?.status).toBe("done");
       // No automatic replay
       expect(deliveryAttempts).toBe(1);
     } finally {
+      repos.obligations.setReadyHeadListener(undefined);
+      repos.obligations.setStatusChangeListener(undefined);
       await close();
     }
+  });
+});
+
+describe("empirical latency measurements", () => {
+  it("measures SQLite worker write latency and round-trip across 500 inbox.append writes", async () => {
+    const repos = getRepositories().meshWriteRepos();
+    const writer = await openMeshDbWriter((effect) => deliverMeshEffect(repos, effect));
+    const testOwner = "owner-bench-500";
+    getRepositories().actors.upsert({
+      id: testOwner,
+      charter: testOwner,
+      parentId: null,
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+
+    const N = 500;
+    const workerTimes: number[] = [];
+
+    // Warm-up 10 writes
+    for (let i = 0; i < 10; i++) {
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            id: `warmup-${i}`,
+            actorId: testOwner,
+            source: "bench",
+            payload: { type: "warmup" } as unknown as InboxPayload,
+          },
+        ],
+      });
+    }
+
+    for (let i = 0; i < N; i++) {
+      const t0 = performance.now();
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            id: `bench-worker-${i}`,
+            actorId: testOwner,
+            source: "bench",
+            payload: { type: "bench", i } as unknown as InboxPayload,
+          },
+        ],
+      });
+      const t1 = performance.now();
+      workerTimes.push(t1 - t0);
+    }
+    await writer.close();
+
+    const directTimes: number[] = [];
+    for (let i = 0; i < N; i++) {
+      const t0 = performance.now();
+      repos.inbox.append([
+        {
+          id: `bench-direct-${i}`,
+          actorId: testOwner,
+          source: "bench",
+          payload: { type: "bench", i } as unknown as InboxPayload,
+        },
+      ]);
+      const t1 = performance.now();
+      directTimes.push(t1 - t0);
+    }
+
+    const calc = (arr: number[]) => {
+      const s = [...arr].sort((a, b) => a - b);
+      return {
+        min: s[0],
+        p50: s[Math.floor(s.length * 0.5)],
+        p95: s[Math.floor(s.length * 0.95)],
+        p99: s[Math.floor(s.length * 0.99)],
+        max: s[s.length - 1],
+        mean: s.reduce((a, b) => a + b, 0) / s.length,
+      };
+    };
+
+    const directStats = calc(directTimes);
+    const workerStats = calc(workerTimes);
+    console.log("=== EMPIRICAL MEASUREMENT: 500 INBOX.APPEND WRITES ===");
+    console.log("Direct SQLite execution (worker proxy):", {
+      mean: `${directStats.mean.toFixed(3)} ms`,
+      p50: `${directStats.p50.toFixed(3)} ms`,
+      p95: `${directStats.p95.toFixed(3)} ms`,
+      p99: `${directStats.p99.toFixed(3)} ms`,
+      max: `${directStats.max.toFixed(3)} ms`,
+    });
+    console.log("DbWriter round-trip (IPC + SQLite + deliver):", {
+      mean: `${workerStats.mean.toFixed(3)} ms`,
+      p50: `${workerStats.p50.toFixed(3)} ms`,
+      p95: `${workerStats.p95.toFixed(3)} ms`,
+      p99: `${workerStats.p99.toFixed(3)} ms`,
+      max: `${workerStats.max.toFixed(3)} ms`,
+    });
+
+    expect(directStats.p95).toBeLessThan(1.0);
+    expect(directStats.mean).toBeLessThan(0.5);
   });
 });

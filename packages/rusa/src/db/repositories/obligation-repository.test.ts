@@ -32,6 +32,8 @@ import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
 import { obligationCompletionMatchers } from "../migrations/0059_obligation_completion_matchers.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
+  type OBLIGATION_MUTATION_EFFECT,
+  type ObligationMutationEffect,
   type ObligationQueue,
   ObligationRepository,
   type ObligationStatusChange,
@@ -5558,6 +5560,27 @@ describe("ObligationRepository", () => {
         repository.setTerminalStatus("task", "cancelled", null, null, "actor-a")
       ).not.toThrow();
       expect(repository.require("task").status).toBe("cancelled");
+    });
+
+    it("catches rejections from async listeners on direct mutations without unhandled rejections (#1289 C2)", async () => {
+      let rejected = false;
+      repository.setReadyHeadListener(async () => {
+        rejected = true;
+        throw new Error("async listener failure");
+      });
+      expect(() =>
+        repository.create({ title: "task", id: "task-direct-async", ownerId: "actor-a" })
+      ).not.toThrow();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(rejected).toBe(true);
+    });
+
+    it("throws synchronously rather than producing an unhandled rejection on invalid effect kind (#1289 C2)", () => {
+      expect(() =>
+        repository.deliverMutationEffect({
+          kind: "invalid" as unknown as typeof OBLIGATION_MUTATION_EFFECT,
+        } as unknown as ObligationMutationEffect)
+      ).toThrow("not an obligation mutation effect: invalid");
     });
   });
 

@@ -1548,33 +1548,17 @@ export class ObligationRepository {
     for (const [ownerId, sequence] of committedSequences) {
       this.previousHeadSequences.set(ownerId, sequence);
     }
-    this.deliveringDirect = true;
     try {
-      void this.deliverMutationEffect(effect);
-    } finally {
-      this.deliveringDirect = false;
+      const pending = this.deliverMutationEffect(effect);
+      if (isPromiseLike(pending)) {
+        pending.catch((err) => {
+          obligationLogger().warn("obligation_direct_delivery_failed", { err });
+        });
+      }
+    } catch (err) {
+      obligationLogger().warn("obligation_direct_delivery_failed", { err });
     }
     return result;
-  }
-
-  /**
-   * Set while a mutation made outside the writer delivers its own effect.
-   * Nothing awaits that delivery, so an attention listener that answers with
-   * a promise there is reported: the runtime mutates through the mesh writer
-   * (#1289 C2), and only repositories used directly, as in their own tests,
-   * take this path.
-   */
-  private deliveringDirect = false;
-
-  private awaitListener(pending: PromiseLike<void>): PromiseLike<void> {
-    if (this.deliveringDirect) {
-      obligationLogger().warn("obligation_listener_unawaited", {
-        err: new Error(
-          "an obligation listener returned a promise for a mutation made outside the mesh writer; nothing awaits it"
-        ),
-      });
-    }
-    return pending;
   }
 
   /**
@@ -1626,36 +1610,51 @@ export class ObligationRepository {
    * responsive-ready attention, status changes, then host timers. The
    * attention and timer steps re-read committed rows, so this must run after
    * the commit, on any connection that can see it. A listener failure is
-   * logged and kept for retry from committed state on a later delivery; it
-   * never rejects, because the write it describes has already committed.
+   * logged and kept for retry from committed state on a later delivery; in the
+   * writer path it propagates so the writer reports MeshWriteCommittedError,
+   * while remaining effects still execute per c6814333204.
    *
    * The attention listeners may return a promise (#1289 C2): an attention
    * sink appends through the mesh writer, and that nested write and its own
    * effects are awaited before the next listener, so later steps and the
    * write's caller see the row. A promise is awaited only when a listener
    * returns one, so while every listener returns synchronously the whole
-   * delivery runs inside this call.
+   * delivery runs inside this call and answers synchronously.
    */
-  async deliverMutationEffect(effect: ObligationMutationEffect): Promise<void> {
+  deliverMutationEffect(effect: ObligationMutationEffect): void | Promise<void> {
     if (effect.kind !== OBLIGATION_MUTATION_EFFECT) {
       throw new Error(`not an obligation mutation effect: ${String(effect.kind)}`);
     }
     const actingPrincipal = effect.actingPrincipal;
     const afterHeads = new Map(effect.afterHeads);
 
+    const steps: (() => void | Promise<void>)[] = [];
+
     const listener = this.readyHeadListener;
     if (listener) {
       for (const change of effect.readyHeadChanges) {
-        try {
-          const pending = listener(change);
-          if (isPromiseLike(pending)) await this.awaitListener(pending);
-        } catch (err) {
-          console.warn(
-            `[obligations] ready-head listener failed for ${change.ownerId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-        }
+        steps.push(() => {
+          try {
+            const pending = listener(change);
+            if (isPromiseLike(pending)) {
+              return pending.catch((err) => {
+                console.warn(
+                  `[obligations] ready-head listener failed for ${change.ownerId}: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`
+                );
+                throw err;
+              });
+            }
+          } catch (err) {
+            console.warn(
+              `[obligations] ready-head listener failed for ${change.ownerId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+            throw err;
+          }
+        });
       }
     }
 
@@ -1685,18 +1684,36 @@ export class ObligationRepository {
 
       for (const attention of toDeliver) {
         const key = this.cancellationAttentionKey(attention);
-        try {
-          const pending = cancellationAttentionListener(attention);
-          if (isPromiseLike(pending)) await this.awaitListener(pending);
-          this.failedCancellationAttentionKeys.delete(key);
-        } catch (err) {
-          this.failedCancellationAttentionKeys.add(key);
-          console.warn(
-            `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-        }
+        steps.push(() => {
+          try {
+            const pending = cancellationAttentionListener(attention);
+            if (isPromiseLike(pending)) {
+              return pending.then(
+                () => {
+                  this.failedCancellationAttentionKeys.delete(key);
+                },
+                (err: unknown) => {
+                  this.failedCancellationAttentionKeys.add(key);
+                  console.warn(
+                    `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
+                      err instanceof Error ? err.message : String(err)
+                    }`
+                  );
+                  throw err;
+                }
+              );
+            }
+            this.failedCancellationAttentionKeys.delete(key);
+          } catch (err) {
+            this.failedCancellationAttentionKeys.add(key);
+            console.warn(
+              `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+            throw err;
+          }
+        });
       }
     }
 
@@ -1736,49 +1753,113 @@ export class ObligationRepository {
       }
 
       for (const { obligation, actingPrincipal: cause } of toDeliver.values()) {
-        try {
-          const pending = responsiveReadyListener(obligation, cause);
-          if (isPromiseLike(pending)) await this.awaitListener(pending);
-          this.failedResponsiveReadyDeliveries.delete(obligation.id);
-        } catch (err) {
-          this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
-          console.warn(
-            `[obligations] responsive-ready listener failed for ${obligation.id}: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-        }
+        steps.push(() => {
+          try {
+            const pending = responsiveReadyListener(obligation, cause);
+            if (isPromiseLike(pending)) {
+              return pending.then(
+                () => {
+                  this.failedResponsiveReadyDeliveries.delete(obligation.id);
+                },
+                (err: unknown) => {
+                  this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
+                  console.warn(
+                    `[obligations] responsive-ready listener failed for ${obligation.id}: ${
+                      err instanceof Error ? err.message : String(err)
+                    }`
+                  );
+                  throw err;
+                }
+              );
+            }
+            this.failedResponsiveReadyDeliveries.delete(obligation.id);
+          } catch (err) {
+            this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
+            console.warn(
+              `[obligations] responsive-ready listener failed for ${obligation.id}: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+            throw err;
+          }
+        });
       }
     }
 
     const statusChanges = effect.statusChanges;
     const statusChangeListener = this.statusChangeListener;
     if (statusChangeListener && statusChanges.length > 0) {
-      try {
-        statusChangeListener({ actingPrincipal, changes: statusChanges });
-      } catch (err) {
-        obligationLogger().warn("obligation_status_listener_failed", { err });
-      }
+      steps.push(() => {
+        try {
+          statusChangeListener({ actingPrincipal, changes: statusChanges });
+        } catch (err) {
+          obligationLogger().warn("obligation_status_listener_failed", { err });
+          throw err;
+        }
+      });
     }
 
     // OS scheduler side effects run only now, against the state the
     // transaction actually committed — never inside it, where a later
     // rollback couldn't take them back with it.
-    const failed: string[] = [];
-    for (const id of effect.scheduleIds) {
+    if (effect.scheduleIds.length > 0) {
+      steps.push(() => {
+        const failed: string[] = [];
+        for (const id of effect.scheduleIds) {
+          try {
+            this.reconcileObligationSchedule(id);
+            this.scheduleErrors.delete(id);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.scheduleErrors.set(id, message);
+            failed.push(id);
+            console.warn(
+              `[obligations] failed to reconcile scheduled activation for ${id}: ${message}`
+            );
+          }
+        }
+        this.scheduleReconcileRetry(failed);
+      });
+    }
+
+    const errors: unknown[] = [];
+    for (let i = 0; i < steps.length; i++) {
+      let pending: void | Promise<void>;
       try {
-        this.reconcileObligationSchedule(id);
-        this.scheduleErrors.delete(id);
+        pending = steps[i]();
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.scheduleErrors.set(id, message);
-        failed.push(id);
-        console.warn(
-          `[obligations] failed to reconcile scheduled activation for ${id}: ${message}`
-        );
+        errors.push(err);
+        continue;
+      }
+      if (isPromiseLike(pending)) {
+        return pending
+          .catch((err) => {
+            errors.push(err);
+          })
+          .then(async () => {
+            for (let j = i + 1; j < steps.length; j++) {
+              try {
+                const next = steps[j]();
+                if (isPromiseLike(next)) {
+                  await next;
+                }
+              } catch (err) {
+                errors.push(err);
+              }
+            }
+            if (errors.length > 0) {
+              throw errors.length === 1
+                ? errors[0]
+                : new AggregateError(errors, `${errors.length} mutation effect listeners failed`);
+            }
+          });
       }
     }
-    this.scheduleReconcileRetry(failed);
+    if (errors.length > 0) {
+      throw errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, `${errors.length} mutation effect listeners failed`);
+    }
   }
 
   /**
