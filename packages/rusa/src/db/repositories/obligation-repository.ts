@@ -53,32 +53,33 @@ function isPromiseLike(value: unknown): value is PromiseLike<void> {
 
 /**
  * One listener call as a delivery step, whether it answers synchronously or
- * with a promise: `settled` sees its outcome either way, and a failure is
- * rethrown so the caller can report it.
+ * with a promise: `settled` sees its outcome either way. A failure of work
+ * this mutation requires is rethrown so the caller can report it; a retry
+ * carried for an earlier mutation is not this one's to fail (#1289), so its
+ * failure is left to `settled`, which logs it and keeps it for the next try.
  */
 function listenerStep(
   call: () => void | PromiseLike<void>,
-  settled: (failure: { err: unknown } | null) => void
+  settled: (failure: { err: unknown } | null) => void,
+  required = true
 ): () => void | Promise<void> {
+  const failed = (err: unknown): void => {
+    settled({ err });
+    if (required) throw err;
+  };
   return () => {
     let pending: void | PromiseLike<void>;
     try {
       pending = call();
     } catch (err) {
-      settled({ err });
-      throw err;
+      failed(err);
+      return;
     }
     if (!isPromiseLike(pending)) {
       settled(null);
       return;
     }
-    return Promise.resolve(pending).then(
-      () => settled(null),
-      (err: unknown) => {
-        settled({ err });
-        throw err;
-      }
-    );
+    return Promise.resolve(pending).then(() => settled(null), failed);
   };
 }
 
@@ -1642,10 +1643,14 @@ export class ObligationRepository {
    * delivers them itself: ready-head changes, cancellation attention,
    * responsive-ready attention, status changes, then host timers. The
    * attention and timer steps re-read committed rows, so this must run after
-   * the commit, on any connection that can see it. A listener failure is
-   * logged and kept for retry from committed state on a later delivery; in the
-   * writer path it propagates so the writer reports MeshWriteCommittedError,
-   * while remaining effects still execute per c6814333204.
+   * the commit, on any connection that can see it. An attention listener
+   * failure is logged and kept for retry from committed state on a later
+   * delivery; in the writer path it propagates so the writer reports
+   * MeshWriteCommittedError, while remaining effects still execute per
+   * c6814333204. A retry carried here for an earlier mutation is that
+   * mutation's work, not this one's: its failure is logged and kept for the
+   * next delivery without failing this write. A status-change listener
+   * failure is only logged.
    *
    * The attention listeners may return a promise (#1289 C2): an attention
    * sink appends through the mesh writer, and that nested write and its own
@@ -1684,6 +1689,7 @@ export class ObligationRepository {
     if (cancellationAttentionListener) {
       const toDeliver = [...effect.cancellationAttention];
       const queuedKeys = new Set(toDeliver.map((a) => this.cancellationAttentionKey(a)));
+      const retryKeys = new Set<string>();
 
       // A prior mutation's delivery may have thrown (e.g. a transient inbox
       // append failure) — retry it here from current persisted truth rather
@@ -1696,6 +1702,7 @@ export class ObligationRepository {
           if (!this.failedCancellationAttentionKeys.has(key) || queuedKeys.has(key)) continue;
           toDeliver.push(attention);
           queuedKeys.add(key);
+          retryKeys.add(key);
           stillFailing.delete(key);
         }
         // Anything left here no longer matches a live dangling edge — the
@@ -1718,7 +1725,8 @@ export class ObligationRepository {
               console.warn(
                 `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${failureMessage(failure.err)}`
               );
-            }
+            },
+            !retryKeys.has(key)
           )
         );
       }
@@ -1726,7 +1734,10 @@ export class ObligationRepository {
 
     const responsiveReadyListener = this.responsiveReadyListener;
     if (responsiveReadyListener) {
-      const toDeliver = new Map<string, { obligation: Obligation; actingPrincipal: EntityId }>();
+      const toDeliver = new Map<
+        string,
+        { obligation: Obligation; actingPrincipal: EntityId; retry: boolean }
+      >();
       for (const id of new Set(effect.responsiveReadyIds)) {
         const obligation = this.get(id);
         if (!obligation) continue;
@@ -1736,7 +1747,7 @@ export class ObligationRepository {
         // change, responsively when the head is responsive — only obligations
         // behind the head need this separate attention.
         if (afterHeads.get(obligation.ownerId) === obligation.id) continue;
-        toDeliver.set(obligation.id, { obligation, actingPrincipal });
+        toDeliver.set(obligation.id, { obligation, actingPrincipal, retry: false });
       }
 
       // A prior mutation's delivery may have thrown (defensive in-process
@@ -1753,13 +1764,13 @@ export class ObligationRepository {
           if (failedCause === undefined || toDeliver.has(obligation.id)) {
             continue;
           }
-          toDeliver.set(obligation.id, { obligation, actingPrincipal: failedCause });
+          toDeliver.set(obligation.id, { obligation, actingPrincipal: failedCause, retry: true });
           stillFailing.delete(obligation.id);
         }
         for (const key of stillFailing) this.failedResponsiveReadyDeliveries.delete(key);
       }
 
-      for (const { obligation, actingPrincipal: cause } of toDeliver.values()) {
+      for (const { obligation, actingPrincipal: cause, retry } of toDeliver.values()) {
         steps.push(
           listenerStep(
             () => responsiveReadyListener(obligation, cause),
@@ -1772,7 +1783,8 @@ export class ObligationRepository {
               console.warn(
                 `[obligations] responsive-ready listener failed for ${obligation.id}: ${failureMessage(failure.err)}`
               );
-            }
+            },
+            !retry
           )
         );
       }
@@ -1781,12 +1793,13 @@ export class ObligationRepository {
     const statusChanges = effect.statusChanges;
     const statusChangeListener = this.statusChangeListener;
     if (statusChangeListener && statusChanges.length > 0) {
+      // Dashboard event fan-out, not required notification work: a failure is
+      // logged and does not report the committed write as failed.
       steps.push(() => {
         try {
           statusChangeListener({ actingPrincipal, changes: statusChanges });
         } catch (err) {
           obligationLogger().warn("obligation_status_listener_failed", { err });
-          throw err;
         }
       });
     }

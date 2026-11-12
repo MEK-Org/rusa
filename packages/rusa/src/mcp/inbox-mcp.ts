@@ -9,6 +9,7 @@ import {
   type InboxOpenQuestionSources,
 } from "../actor/inbox-open-questions.js";
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -214,18 +215,31 @@ export function createInboxMcpServer(
         }
         // Closure is decided with the mark, in one transaction, so no write
         // can land between the verdict and the entries it lets through.
-        const result = await writer.write("inbox.markHandled", {
-          actorId,
-          entryIds: ids,
-          note,
-          closure: scope.closureFor?.(ids) ?? null,
-        });
+        let result: Awaited<ReturnType<typeof writer.write<"inbox.markHandled">>>;
+        let committedFailure: MeshWriteCommittedError | undefined;
+        try {
+          result = await writer.write("inbox.markHandled", {
+            actorId,
+            entryIds: ids,
+            note,
+            closure: scope.closureFor?.(ids) ?? null,
+          });
+        } catch (err) {
+          // The mark (or the refusal, with its cleared snoozes) committed even
+          // though an effect failed: answer what committed, still as an error.
+          if (!(err instanceof MeshWriteCommittedError) || err.result == null) throw err;
+          committedFailure = err;
+          result = err.result as typeof result;
+        }
         if (result.refused) {
           throw new Error(
-            `Cannot mark handled: ${result.refused.map((shortfall) => shortfall.message).join(" ")}`
+            `Cannot mark handled: ${result.refused.map((shortfall) => shortfall.message).join(" ")}${
+              committedFailure ? ` (${committedFailure.message})` : ""
+            }`
           );
         }
         scope.onHandled?.();
+        if (committedFailure) return toolError(committedFailure);
         return toolOk({ entries: result.entries });
       } catch (err) {
         return toolError(err);

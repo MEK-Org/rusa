@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HeadClosureQuery } from "../actor/head-closure.js";
 import type { ObligationActivationScheduler } from "../actor/os-scheduler.js";
-import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
+import { createObligationsMcpServer, type ObligationsMcpOptions } from "../mcp/obligations-mcp.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxPayload } from "../repositories/inbox-repository.js";
@@ -371,6 +371,150 @@ describe("listener failures", () => {
       obligation: { id: "other", ownerId: "actor-b", title: "other" },
     });
     expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+  });
+
+  it("log a status-change listener failure without reporting the write as failed", async () => {
+    let statusListenerCalls = 0;
+    repository.setStatusChangeListener(() => {
+      statusListenerCalls++;
+      throw new Error("event fan-out is unavailable");
+    });
+    repository.create({ id: "task", ownerId: "actor-a", title: "task" });
+    statusListenerCalls = 0;
+
+    // Status changes feed dashboard event fan-out, which is background work,
+    // not required notification work (root c6814333204): the write answers.
+    const done = await writer.write("obligations.setTerminalStatus", {
+      id: "task",
+      status: "done",
+      note: null,
+      resolutionRef: null,
+      principal: "actor-a",
+    });
+    expect(done.status).toBe("done");
+    expect(statusListenerCalls).toBe(1);
+  });
+});
+
+describe("a committed write at the MCP boundary (#1289)", () => {
+  async function connect(options?: ObligationsMcpOptions): Promise<Client> {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await createObligationsMcpServer(
+      { obligations: repository, writer },
+      "actor-a",
+      options
+    ).connect(serverTransport);
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  const text = (result: CallToolResult) => {
+    const first = result.content[0];
+    return first && first.type === "text" ? first.text : "";
+  };
+
+  it("answers a create whose required nested append was refused as an error carrying the committed id, once", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The attention sink appends through the writer, as ActorMesh's does; the
+    // inbox refuses the entry, so a required effect of a committed create fails.
+    let appends = 0;
+    repository.setReadyHeadListener(async (change) => {
+      appends++;
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            id: "refused-attention",
+            actorId: change.ownerId,
+            source: "attention",
+            payload: "not-an-object" as unknown as InboxPayload,
+          },
+        ],
+      });
+    });
+    const client = await connect();
+
+    const result = (await client.callTool({
+      name: "create_obligation",
+      arguments: { owner_id: "actor-a", title: "committed once" },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    const report = JSON.parse(text(result)) as {
+      error: string;
+      committed: boolean;
+      result: { id: string; title: string };
+    };
+    expect(report.committed).toBe(true);
+    expect(report.error).toContain("committed; do not retry the mutation");
+    // The id was generated inside the write: the report is the only place the
+    // caller learns it, and it names the one row that exists.
+    const rows = repository.listOwned("actor-a").filter((o) => o.title === "committed once");
+    expect(rows.map((o) => o.id)).toEqual([report.result.id]);
+    // Nothing replayed the create or its delivery, and the refused entry is absent.
+    expect(appends).toBe(1);
+    expect(new SqliteInboxRepository(db).read("actor-a", "refused-attention")).toBeNull();
+  });
+
+  it("still evaluates the matcher of a committed create whose required append was refused", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    repository.setReadyHeadListener(async (change) => {
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            id: "refused-matcher-attention",
+            actorId: change.ownerId,
+            source: "attention",
+            payload: "not-an-object" as unknown as InboxPayload,
+          },
+        ],
+      });
+    });
+    const evaluated: string[] = [];
+    const client = await connect({
+      evaluateCompletionMatcher: async (id) => {
+        evaluated.push(id);
+        return "satisfied";
+      },
+    });
+
+    const result = (await client.callTool({
+      name: "create_obligation",
+      arguments: {
+        owner_id: "actor-a",
+        title: "matched once",
+        completion_matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    const report = JSON.parse(text(result)) as {
+      committed: boolean;
+      result: { id: string };
+      evaluation: string;
+    };
+    expect(report).toMatchObject({ committed: true, evaluation: "satisfied" });
+    expect(evaluated).toEqual([report.result.id]);
+    expect(
+      repository
+        .listOwned("actor-a")
+        .filter((o) => o.title === "matched once")
+        .map((o) => o.id)
+    ).toEqual([report.result.id]);
+  });
+
+  it("keeps a create that rolled back an ordinary error", async () => {
+    const client = await connect();
+
+    const result = (await client.callTool({
+      name: "create_obligation",
+      arguments: { owner_id: "actor-a", title: "orphan", parent_id: "missing-parent" },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    expect(text(result)).not.toContain("committed");
+    expect(() => JSON.parse(text(result))).toThrow();
+    expect(repository.listOwned("actor-a")).toEqual([]);
   });
 });
 

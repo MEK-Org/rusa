@@ -13,6 +13,7 @@ import {
   inboxClosureShortfalls,
   type MeshObligationWriter,
 } from "../db/mesh-write-operations.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
@@ -15229,6 +15230,49 @@ describe("strict obligation handling (#382, #917)", () => {
 
     expect(rejection(mesh, subject)).toBe("");
     await mesh.finishInboxRun(subject);
+  });
+
+  it("records only the closure's committed shortfalls when its write committed but an effect failed (#1289)", async () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const closed = worker(mesh, "closed");
+    const open = worker(mesh, "open");
+    repo.create({ id: "closed-head", title: "Closed head", ownerId: closed });
+    repo.create({ id: "open-head", title: "Open head", ownerId: open });
+    await selectHead(mesh, closed, "closed-head");
+    await selectHead(mesh, open, "open-head");
+    repo.setTerminalStatus("closed-head", "done", null, null, closed);
+
+    // The closure write commits and answers, then one of its effects fails.
+    const meshWriter = (mesh as unknown as { writer: Pick<MeshObligationWriter, "write"> }).writer;
+    const committedWrites: string[] = [];
+    (mesh as unknown as { writer: Pick<MeshObligationWriter, "write"> }).writer = {
+      write: (async (op: string, input: unknown) => {
+        const result = await meshWriter.write(op as never, input as never);
+        if (op !== "obligations.closureShortfalls") return result;
+        committedWrites.push(op);
+        throw new MeshWriteCommittedError(
+          `write ${op} committed, but 1 of its 1 effects failed to deliver`,
+          {
+            result,
+            failures: [new Error("attention append failed")],
+          }
+        );
+      }) as Pick<MeshObligationWriter, "write">["write"],
+    };
+
+    await mesh.finishInboxRun(closed, { successful: true });
+    await mesh.finishInboxRun(open, { successful: true });
+
+    expect(committedWrites).toHaveLength(2);
+    const rejected = events.filter((event) => event.kind === "run_return_rejected");
+    expect(rejected).toEqual([
+      expect.objectContaining({
+        actorId: open,
+        detail: expect.stringContaining("Return rejected for head obligation open-head"),
+      }),
+    ]);
+    expect(JSON.stringify(rejected)).not.toContain("closure could not be read");
   });
 
   it("preserves failed-run handling without a return rejection", async () => {

@@ -563,7 +563,7 @@ export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): Pr
 
 /**
  * The writer over the main connection (#1289), until the write worker takes
- * over. One instance per connection: its backlog is what keeps every
+ * over. One instance per connection: its delivery sequencer is what keeps every
  * converted caller's effects in commit order, so the process shares one.
  * Writes outside it, on the same connection and repository, remain the same
  * one writer and the same one sequence owner.

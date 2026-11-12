@@ -1,4 +1,5 @@
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { MeshWriteCommittedError } from "../db/mesh-writer.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
@@ -168,15 +169,35 @@ export class CompletionMatcherEvaluator {
       return "pending";
     }
     const resolutionRef = `github:${this.deps.repository}/commits/${deployed}`;
-    await this.deps.writer.write("obligations.satisfyCompletionMatcher", {
-      id: obligation.id,
-      expected: matcherKey(matcher),
-      satisfaction: {
-        resolutionRef,
-        note: `Completion matcher satisfied: instance ${this.deps.instanceName} running ${deployed.slice(0, 7)} contains ${matcher.target.slice(0, 7)}`,
-      },
-    });
+    await this.committed(
+      obligation.id,
+      this.deps.writer.write("obligations.satisfyCompletionMatcher", {
+        id: obligation.id,
+        expected: matcherKey(matcher),
+        satisfaction: {
+          resolutionRef,
+          note: `Completion matcher satisfied: instance ${this.deps.instanceName} running ${deployed.slice(0, 7)} contains ${matcher.target.slice(0, 7)}`,
+        },
+      })
+    );
     return "satisfied";
+  }
+
+  /**
+   * A write that committed is made even when one of its required effects
+   * failed (#1289): the obligation already stands as the write left it, so
+   * the evaluation answers from that and logs the failure instead of reading
+   * the commit as unchecked. Answers the committed result when the writer
+   * returned it.
+   */
+  private async committed<T>(id: string, write: Promise<T>): Promise<T | undefined> {
+    try {
+      return await write;
+    } catch (error) {
+      if (!(error instanceof MeshWriteCommittedError)) throw error;
+      this.deps.log?.(`[completion-matcher] ${id}: ${error.message}`);
+      return error.result as T | undefined;
+    }
   }
 
   private async satisfyPr(
@@ -184,26 +205,29 @@ export class CompletionMatcherEvaluator {
     matcher: CompletionMatcher,
     number: number
   ): Promise<void> {
-    await this.deps.writer.write("obligations.satisfyCompletionMatcher", {
-      id: obligation.id,
-      expected: matcherKey(matcher),
-      satisfaction: {
-        resolutionRef: matcher.target,
-        note: `Completion matcher satisfied: PR #${number} merged`,
-      },
-    });
+    await this.committed(
+      obligation.id,
+      this.deps.writer.write("obligations.satisfyCompletionMatcher", {
+        id: obligation.id,
+        expected: matcherKey(matcher),
+        satisfaction: {
+          resolutionRef: matcher.target,
+          note: `Completion matcher satisfied: PR #${number} merged`,
+        },
+      })
+    );
   }
 
   private async recordClosedUnmerged(
     obligation: Obligation,
     matcher: CompletionMatcher
   ): Promise<void> {
-    const current = await this.deps.writer.write(
-      "obligations.recordCompletionMatcherClosedUnmerged",
-      {
+    const current = await this.committed(
+      obligation.id,
+      this.deps.writer.write("obligations.recordCompletionMatcherClosedUnmerged", {
         id: obligation.id,
         expected: matcherKey(matcher),
-      }
+      })
     );
     if (!current?.completionMatcher?.closedUnmergedAt) return;
     // The durable fact is committed first. The notice is keyed by matcher

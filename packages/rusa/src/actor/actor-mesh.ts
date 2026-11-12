@@ -2272,12 +2272,20 @@ export class ActorMesh {
         closure: this.headClosureQuery(actorId, runState, runState.headObligationIds),
       });
     } catch (err) {
-      const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
-      shortfalls = [...runState.headObligationIds].map((obligationId) => ({
-        obligationId,
-        title: null,
-        reason,
-      }));
+      // A closure that committed (its due snoozes cleared) answered its
+      // shortfalls even if an effect of that write failed: use them rather
+      // than refusing every head (#1289).
+      if (err instanceof MeshWriteCommittedError && Array.isArray(err.result)) {
+        this.log(`closure at return for ${actorId}: ${err.message}`);
+        shortfalls = err.result as typeof shortfalls;
+      } else {
+        const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
+        shortfalls = [...runState.headObligationIds].map((obligationId) => ({
+          obligationId,
+          title: null,
+          reason,
+        }));
+      }
     }
     for (const { obligationId, title, reason } of shortfalls) {
       this.recordEvent({

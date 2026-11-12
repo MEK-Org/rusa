@@ -1,13 +1,16 @@
 import { Buffer } from "node:buffer";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { MeshEventSink } from "../actor/mesh-events.js";
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { committedWriteReport, MeshWriteCommittedError } from "../db/mesh-writer.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { CompletionMatcherEvaluation } from "../obligations/completion-matcher-evaluator.js";
 import {
   type CompletionMatcherInput,
   OBLIGATION_TITLE_MAX,
+  type Obligation,
   type ObligationStatus,
 } from "../obligations/obligation.js";
 import { REFERENCE_SCHEMES } from "../references/reference.js";
@@ -488,7 +491,7 @@ export function createObligationsMcpServer(
           created.completionMatcher === null ? null : await evaluateCommitted(created.id);
         return toolOk({ obligation: repository.get(created.id) ?? created, evaluation });
       } catch (err) {
-        return toolError(err);
+        return committedMatcherError(err);
       }
     }
   );
@@ -501,6 +504,17 @@ export function createObligationsMcpServer(
     } catch {
       return "unchecked";
     }
+  };
+
+  // A matcher that committed with its write is evaluated even when an effect
+  // of that write failed: a PR that already merged sends no later event, so
+  // skipping it here would leave the obligation open until boot (#1289).
+  const committedMatcherError = async (err: unknown): Promise<CallToolResult> => {
+    if (!(err instanceof MeshWriteCommittedError)) return toolError(err);
+    const committed = err.result as Obligation | null | undefined;
+    if (!committed?.completionMatcher) return toolError(err);
+    const evaluation = await evaluateCommitted(committed.id);
+    return { ...toolOk({ ...committedWriteReport(err), evaluation }), isError: true };
   };
 
   server.registerTool(
@@ -537,7 +551,7 @@ export function createObligationsMcpServer(
         const evaluation = matcher === null ? null : await evaluateCommitted(written.id);
         return toolOk({ obligation: repository.get(written.id) ?? written, evaluation });
       } catch (error) {
-        return toolError(error);
+        return committedMatcherError(error);
       }
     }
   );

@@ -62,6 +62,29 @@ export class MeshWriteCommittedError extends Error {
   }
 }
 
+/**
+ * What a caller boundary (an MCP tool result, a dashboard response) answers
+ * for a {@link MeshWriteCommittedError}: still an error, because a required
+ * effect failed, but one that says the write committed and carries its
+ * committed result (a created row's server-generated id included), so the
+ * caller can read that state instead of sending the mutation again. Wording
+ * cannot stop a caller that retries anyway; it only stops the boundary from
+ * hiding what committed. `result` is null when the result itself was lost.
+ */
+export interface CommittedWriteReport {
+  readonly error: string;
+  readonly committed: true;
+  readonly result: unknown;
+}
+
+export function committedWriteReport(err: MeshWriteCommittedError): CommittedWriteReport {
+  return {
+    error: `${err.message}. The write committed; do not retry the mutation.`,
+    committed: true,
+    result: err.result ?? null,
+  };
+}
+
 type Operations = Readonly<Record<string, (context: never, input: never) => unknown>>;
 export type WriteInput<Ops extends Operations, K extends keyof Ops> = Parameters<Ops[K]>[1];
 export type WriteOutput<Ops extends Operations, K extends keyof Ops> = ReturnType<Ops[K]>;
@@ -162,6 +185,21 @@ function settle<E>(
  * queued behind a parent that may be awaiting them. Committing never waits for
  * any delivery. While deliveries return synchronously, a write made with
  * nothing being delivered is delivered before its call returns.
+ *
+ * Contracts a change here must keep:
+ * - Effects are delivered in completion order, but a write's caller resuming
+ *   from its await is not ordered against the next delivery, which may start
+ *   first. Total FIFO across caller continuations is not the contract; making
+ *   a delivery wait for the previous caller would queue nested work behind it.
+ * - Nesting is decided by the async context a write is made in. A listener may
+ *   await only writes it makes itself, inside its own delivery; awaiting a
+ *   promise for a write made in another context (shared or coalesced) queues
+ *   that write behind the delivery awaiting it, which never settles.
+ * - Work a listener starts without awaiting, while its delivery is still open,
+ *   is nested too: it is delivered at once, interleaved with the parent's
+ *   remaining effects, not after them.
+ * - A delivery that never settles holds every later top-level delivery. There
+ *   is no timeout.
  */
 export class EffectDeliverySequencer {
   /** The delivery the current async context runs inside, while it is open. */
@@ -304,9 +342,13 @@ export interface DbWriterOptions<E> {
 
 /**
  * One write worker owning one writing connection (#1289), on the lifecycle the
- * read pool uses. Writes run in the order they were called. Each worker
- * message is its own turn of the event loop, so one write's effects and its
- * caller's continuation run before the next write's outcome is handled.
+ * read pool uses. Writes commit in the order they were called, and their
+ * effects are delivered in that order by the {@link EffectDeliverySequencer}.
+ * While a write's delivery answers synchronously, its caller's continuation
+ * also runs before the next write's outcome is handled, since each worker
+ * message is its own turn of the event loop. Once a delivery awaits, the next
+ * write's delivery may start before this write's caller resumes, as in the
+ * in-process writer: the sequencer orders deliveries, not continuations.
  */
 export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
   static async open<E, Ops extends Operations>(
