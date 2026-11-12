@@ -46,16 +46,16 @@ export function chatWriteParam(capability: string): string | undefined {
 }
 
 /**
- * Whether `capabilities` include whole-space write on `space` (`spaces/S`).
- * Deliberately exact: `chat-write:*` is not read as holding a particular space
- * for the narrower-grant rule, which the requested authority does not cover.
+ * Whether `capabilities` include whole-space write on `space` (`spaces/S`):
+ * that space's grant, or `chat-write:*`, which the write tools already read
+ * as every space. A thread grant never holds its space.
  */
 export function holdsChatWriteSpace(capabilities: readonly string[], space: string): boolean {
   return capabilities.some((capability) => {
     const param = chatWriteParam(capability);
     if (param === undefined) return false;
     const scope = parseChatWriteScope(param);
-    return scope?.kind === "space" && scope.space === space;
+    return scope?.kind === "all" || (scope?.kind === "space" && scope.space === space);
   });
 }
 

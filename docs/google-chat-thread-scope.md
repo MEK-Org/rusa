@@ -20,13 +20,12 @@ The thread form is Google's own `thread.name`, the `threadName` on a
 Grants with any other parameter are refused.
 
 **Who may grant a thread.** An actor holding whole-space
-`chat-write:spaces/S` may grant `chat-write:spaces/S/threads/T` to any
-existing actor. It needs no `capability-admin` and no ancestry, because the
+`chat-write:spaces/S`, or `chat-write:*` (which already writes every space),
+may grant `chat-write:spaces/S/threads/T` to any existing actor. It needs no `capability-admin` and no ancestry, because the
 grant is narrower than what the grantor already holds. The same rule governs
 revoking such a grant. The following can only grant a thread under the
 ordinary rules, which require `capability-admin` over the grantee:
 
-- a `chat-write:*` holder
 - a holder of a different space
 - a holder of only the thread itself, so a thread grant cannot be re-granted
 

@@ -154,10 +154,26 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
     });
 
-    it("refuses a thread grant from anyone not holding that exact space", async () => {
+    it("lets a chat-write:* holder grant and revoke a thread like a space holder", async () => {
+      await host.mesh.grantCapability("worker", T1_WRITE, "wildcard");
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
+      expect(host.mesh.hasActiveCapability("worker", SPACE_WRITE)).toBe(false);
+      // Wildcard is never a whole space to hand on, and the grantee cannot re-grant.
+      await expect(host.mesh.grantCapability("worker", SPACE_WRITE, "wildcard")).rejects.toThrow(
+        /capability-admin/
+      );
+      await expect(host.mesh.grantCapability("watcher", T1_WRITE, "worker")).rejects.toThrow(
+        /capability-admin/
+      );
+
+      await host.mesh.revokeCapability("worker", T1_WRITE, "wildcard");
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
+    });
+
+    it("refuses a thread grant from anyone not holding that space", async () => {
       await host.mesh.grantCapability("worker", T1_WRITE, "steward");
 
-      for (const grantor of ["stranger", "wildcard", "worker", "helper"]) {
+      for (const grantor of ["stranger", "worker", "helper"]) {
         await expect(
           host.mesh.grantCapability("watcher", T1_WRITE, grantor),
           `${grantor} must not grant ${T1_WRITE}`

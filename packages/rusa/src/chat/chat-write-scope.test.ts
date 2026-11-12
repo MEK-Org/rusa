@@ -43,10 +43,10 @@ describe("chat-write scopes (#1311)", () => {
     expect(gchatThreadSpace("threads/T1")).toBeUndefined();
   });
 
-  it("holds a space only by an exact whole-space grant, never by * or a thread", () => {
+  it("holds a space by its whole-space grant or by *, never by a thread", () => {
     expect(holdsChatWriteSpace(["chat-write:spaces/A"], "spaces/A")).toBe(true);
     expect(holdsChatWriteSpace(["chat-write:A"], "spaces/A")).toBe(true);
-    expect(holdsChatWriteSpace(["chat-write:*"], "spaces/A")).toBe(false);
+    expect(holdsChatWriteSpace(["chat-write:*"], "spaces/A")).toBe(true);
     expect(holdsChatWriteSpace(["chat-write:spaces/A/threads/T1"], "spaces/A")).toBe(false);
     expect(holdsChatWriteSpace(["chat-write:spaces/B", "drive-read:spaces/A"], "spaces/A")).toBe(
       false
