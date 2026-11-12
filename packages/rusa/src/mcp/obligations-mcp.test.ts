@@ -1649,4 +1649,68 @@ describe("obligations MCP", () => {
       });
     });
   });
+
+  describe("caller-side check and its write (#1289)", () => {
+    // The caller decides authority, then awaits the writer. The in-process
+    // writer commits inside the call, so nothing else on the event loop runs
+    // between the check and the commit. A microtask queued during the check
+    // is the first thing that could run after it, so it must already see the
+    // committed row. An await between the check and the write would let it
+    // run first and see the row unchanged.
+    const cases: readonly {
+      readonly tool: string;
+      readonly prepare?: () => void;
+      readonly args: Record<string, unknown>;
+    }[] = [
+      { tool: "set_checkpoint", args: { checkpoint: "standing" } },
+      { tool: "set_external_ref", args: { external_ref: "github:example/repo/issues/1" } },
+      { tool: "reassign_obligation", args: { owner_id: "actor-b" } },
+      { tool: "mark_obligation_responsive", args: {} },
+      {
+        tool: "add_obligation_prerequisite",
+        prepare: () => repository.create({ title: "first", id: "first", ownerId: "actor-a" }),
+        args: { prerequisite_id: "first" },
+      },
+      {
+        tool: "remove_obligation_prerequisite",
+        prepare: () => {
+          repository.create({ title: "first", id: "first", ownerId: "actor-a" });
+          repository.addPrerequisite("target", "first", "actor-a");
+        },
+        args: { prerequisite_id: "first" },
+      },
+    ];
+
+    it.each(cases)("$tool commits before anything queued during its check runs", async ({
+      tool,
+      prepare,
+      args,
+    }) => {
+      repository.create({ title: "target", id: "target", ownerId: "actor-a" });
+      prepare?.();
+      const before = repository.require("target");
+      let seenAfterCheck: unknown;
+      const client = await connect(
+        createObligationsMcpServer(store, "actor-a", {
+          canSetResponsive: () => true,
+          canManage: () => {
+            queueMicrotask(() => {
+              seenAfterCheck = repository.require("target");
+            });
+            return true;
+          },
+        })
+      );
+
+      const result = (await client.callTool({
+        name: tool,
+        arguments: { id: "target", ...args },
+      })) as CallToolResult;
+
+      expect(result.isError).toBeFalsy();
+      const after = repository.require("target");
+      expect(after).not.toEqual(before);
+      expect(seenAfterCheck).toEqual(after);
+    });
+  });
 });
