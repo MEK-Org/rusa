@@ -558,7 +558,7 @@ export class RunManager {
     if (target.isQueued) {
       // The new entry joins the already-accepted opportunity, which will list
       // the live worklist after admission, so it becomes seen first.
-      return this.joinQueuedOpportunity(actorId, target, opts, responsiveArrived, work.voiceAt);
+      return this.joinQueuedOpportunity(actorId, responsiveArrived, work.voiceAt);
     }
     target.requestRun(nudge);
     return true;
@@ -578,8 +578,10 @@ export class RunManager {
    *   is a fresh decision for the next dispatch, which runs normally. Unseen
    *   entries still count as arriving work there; ones that did commit are
    *   unhandled and are listed by the next run of this actor.
-   * - A replaced actor gets a fresh dispatch of its own; this continuation
-   *   never requests a run of the actor it replaced.
+   * - A replaced actor's replacement takes the work over as the actor would
+   *   have, keeping what arrived with this dispatch; this continuation never
+   *   requests a run of the actor it replaced. Running, the replacement's run
+   *   began after these entries became durable and lists them.
    * - A retired actor, or one whose work was handled meanwhile, gets nothing.
    * - Otherwise the request is made from the worklist as it stands. Still
    *   queued, it joins that opportunity as it would have before the wait.
@@ -597,20 +599,18 @@ export class RunManager {
    */
   private async joinQueuedOpportunity(
     actorId: string,
-    target: MeshActor,
-    opts: { preempt: boolean },
     responsiveArrived: boolean,
     arrivedVoiceAt: number | undefined
   ): Promise<boolean> {
     await this.markInboxSeen(actorId);
     const current = this.live.get(actorId);
-    if (current !== target) {
-      if (!current) {
-        this.log(`dispatch(${actorId}) ended — the actor was released while marking seen`);
-        return false;
-      }
-      return this.dispatchInternal(actorId, opts);
+    if (!current) {
+      this.log(`dispatch(${actorId}) ended — the actor was released while marking seen`);
+      return false;
     }
+    // A replacement built during the wait inherits this continuation, and with
+    // it what arrived: a fresh dispatch would re-read the work as seen, and so
+    // drop the voice time it brought and hold it behind a voice session.
     const status = this.recordStatus(actorId);
     if (status !== undefined && status !== "active") {
       this.log(`dispatch(${actorId}) ended — the actor retired while marking seen`);
@@ -621,7 +621,7 @@ export class RunManager {
       this.log(`dispatch(${actorId}) ended — the work was handled while marking seen`);
       return false;
     }
-    if (target.isRunning) return true;
+    if (current.isRunning) return true;
     let nudge = dispatchNudge(work);
     // A voice memo this dispatch brought is seen now, so the re-read no longer
     // dates it; the request still carries its delivery time, as one made
@@ -636,14 +636,14 @@ export class RunManager {
     // an opportunity that is now gone, so it still passes a voice hold: the
     // session-end wake leaves responsive work to the dispatch that brought it.
     if (
-      !target.isQueued &&
+      !current.isQueued &&
       !(isResponsiveNudge(nudge) && (responsiveArrived || work.unseenResponsive !== false)) &&
       this.isVoiceSessionActive(actorId)
     ) {
       this.log(`dispatch(${actorId}) held — a voice session began while marking seen`);
       return false;
     }
-    target.requestRun(nudge);
+    current.requestRun(nudge);
     return true;
   }
 
