@@ -8,10 +8,10 @@ import type { WorkerMessage, WorkerRequest } from "./worker-pool.js";
  * back, and the effects it emitted are dropped with it.
  *
  * `afterCommit` registers a callback that runs on the writing side once the
- * transaction has committed, and never if it rolls back, so a repository can
- * keep in-memory state, such as a sequence it handed out, only for writes
- * that landed. A callback that throws cannot undo the commit; the failure is
- * reported with the outcome instead.
+ * transaction has committed, and never if it rolls back or its commit fails,
+ * so a repository can keep in-memory state, such as a sequence it handed out,
+ * only for writes that landed. A callback must not throw: it runs after the
+ * commit, so a throw would report a committed write as failed.
  */
 export interface WriteContext<R, E> {
   readonly repos: R;
@@ -33,8 +33,6 @@ export type WriteOperationTable<R, E> = Readonly<
 export interface WriteOutcome<E> {
   readonly result: unknown;
   readonly effects: readonly E[];
-  /** Why each `afterCommit` callback that threw failed, in order. */
-  readonly afterCommitFailures?: readonly string[];
 }
 
 /** One emitted effect as it reaches the main thread, or why it could not. */
@@ -48,8 +46,6 @@ export interface ReturnedOutcome<E> {
   readonly unreturnableResult?: string;
   /** Every emitted effect, in order. */
   readonly effects: readonly ReturnedEffect<E>[];
-  /** See {@link WriteOutcome.afterCommitFailures}. */
-  readonly afterCommitFailures?: readonly string[];
 }
 
 /**
@@ -68,9 +64,6 @@ export function returnOutcome<E>(outcome: WriteOutcome<E>): ReturnedOutcome<E> {
       const cloned = clonePart(effect);
       return "value" in cloned ? { effect: cloned.value } : { unreturnable: cloned.reason };
     }),
-    ...(outcome.afterCommitFailures?.length
-      ? { afterCommitFailures: [...outcome.afterCommitFailures] }
-      : {}),
   };
 }
 
@@ -116,17 +109,8 @@ export function runWriteOperation<R, E>(
     afterCommit: (callback) => committed.push(callback),
   };
   const result = db.transaction(() => operation(context, input as never)).immediate();
-  const afterCommitFailures: string[] = [];
-  for (const callback of committed) {
-    try {
-      callback();
-    } catch (err) {
-      afterCommitFailures.push(err instanceof Error ? err.message : String(err));
-    }
-  }
-  return afterCommitFailures.length > 0
-    ? { result, effects, afterCommitFailures }
-    : { result, effects };
+  for (const callback of committed) callback();
+  return { result, effects };
 }
 
 /** The worker's side of the channel to the writer; a `MessagePort` is one. */

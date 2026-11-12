@@ -38,9 +38,8 @@ export class MeshWriteOutcomeUnknownError extends Error {
 }
 
 /**
- * The write committed, but its result could not be returned, one of its
- * effects could not be returned or failed when delivered, or one of its
- * after-commit steps on the writing side threw. Every other effect
+ * The write committed, but its result could not be returned, or one of its
+ * effects could not be returned or failed when delivered. Every other effect
  * was still delivered, in order. An error an operation throws itself means the
  * write rolled back.
  */
@@ -49,7 +48,7 @@ export class MeshWriteCommittedError extends Error {
   readonly committed = true;
   /** The committed result, when it reached the main thread. */
   readonly result: unknown;
-  /** Why each effect that could not be returned or delivered failed, in order, then each failed after-commit step. */
+  /** Why each effect that could not be returned or delivered failed, in order. */
   readonly failures: readonly unknown[];
 
   constructor(
@@ -106,21 +105,12 @@ function settle<E>(op: string, outcome: ReturnedOutcome<E>, deliver: DeliverEffe
       failures.push(err);
     }
   });
-  const afterCommitFailureCount = outcome.afterCommitFailures?.length ?? 0;
-  for (const reason of outcome.afterCommitFailures ?? []) {
-    failures.push(new Error(`an after-commit step failed: ${reason}`));
-  }
   const problems = [
     ...(outcome.unreturnableResult === undefined
       ? []
       : [`its result could not be returned: ${outcome.unreturnableResult}`]),
-    ...(failures.length > afterCommitFailureCount
-      ? [
-          `${failures.length - afterCommitFailureCount} of its ${effects.length} effects failed to deliver`,
-        ]
-      : []),
-    ...(afterCommitFailureCount > 0
-      ? [`${afterCommitFailureCount} of its after-commit steps failed`]
+    ...(failures.length > 0
+      ? [`${failures.length} of its ${effects.length} effects failed to deliver`]
       : []),
   ];
   if (problems.length > 0) {
