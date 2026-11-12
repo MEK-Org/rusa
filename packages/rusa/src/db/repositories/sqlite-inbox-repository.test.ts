@@ -5,10 +5,13 @@ import { ActorMesh } from "../../actor/actor-mesh.js";
 import { FakeProvider } from "../../providers/fake-provider.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import type { InboxEntry, InboxPayload } from "../../repositories/inbox-repository.js";
+import { meshWriterFor } from "../fixtures/obligation-store.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
+import { runMigrations } from "../migrations/runner.js";
 import { Repositories } from "./index.js";
+import { ObligationRepository } from "./obligation-repository.js";
 import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
 describe("SqliteInboxRepository", () => {
@@ -546,6 +549,10 @@ describe("SqliteInboxRepository", () => {
 
   it("handled_at changes only through actor mark_handled", async () => {
     vi.useFakeTimers();
+    // The mesh marks seen through its writer, which needs the whole schema.
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"));
     store.append([
       { id: "entry", actorId: "actor", source: "chat", payload: { type: "message.created" } },
     ]);
@@ -562,6 +569,7 @@ describe("SqliteInboxRepository", () => {
     const mesh = new ActorMesh({
       actors: registry,
       inboxStore: store,
+      writer: meshWriterFor(db, new ObligationRepository(db), { inbox: store, actors: registry }),
       createActor: () => {
         throw new Error("not used");
       },

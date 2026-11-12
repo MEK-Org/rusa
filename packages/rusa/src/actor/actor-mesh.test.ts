@@ -441,7 +441,7 @@ function setup(
     idgen?: () => string;
     onRunReturned?: ActorMeshOptions["onRunReturned"];
     completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
-    /** Defaults to {@link memoryMeshWriter}; pass undefined for a mesh with none. */
+    /** Defaults to {@link memoryMeshWriter}. */
     writer?: ActorMeshOptions["writer"];
     /** The obligations the default writer decides head closure over. */
     closure?: ObligationRepository;
@@ -539,7 +539,7 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    writer: "writer" in opts ? opts.writer : memoryMeshWriter(inboxStore, registry, opts.closure),
+    writer: opts.writer ?? memoryMeshWriter(inboxStore, registry, opts.closure),
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
@@ -5423,6 +5423,10 @@ describe("ActorMesh", () => {
     });
 
     it("joins the still-queued run once the delayed mark commits, with one run for all the work", async () => {
+      // run-manager.test.ts pins the per-actor order with a stand-in actor.
+      // This pins what only the real path shows: through the mesh's append
+      // notifications and the actor's concurrency gate, the notifications
+      // make one provider run, admitted after every entry is seen.
       const { mesh, tick, d, marks, w2, unhandled } = await queuedBehindConcurrency();
 
       marks.hold();
@@ -15501,6 +15505,28 @@ describe("strict obligation handling (#382, #917)", () => {
   });
 });
 
+describe("run end when finishing fails (#1289 C1b)", () => {
+  it("still accounts the run and clears its selection, and reports the failure", async () => {
+    const { mesh, logs } = setup();
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    const failure = new Error("finishing failed");
+    vi.spyOn(mesh, "finishInboxRun").mockRejectedValue(failure);
+    const accountRun = vi.spyOn(mesh, "accountRun").mockImplementation(() => {});
+    const clearSelection = vi.spyOn(mesh, "clearSelection");
+    const result = { success: true } as RunResult;
+
+    await mesh.lifecycleFor(worker).emit("onEnd", {
+      actorId: worker,
+      runId: "run-1",
+      terminal: { kind: "result", result },
+    });
+
+    expect(accountRun).toHaveBeenCalledWith(worker, result, "run-1");
+    expect(clearSelection).toHaveBeenCalledWith(worker);
+    expect(logs).toContain("lifecycle onEnd listener failed: finishing failed");
+  });
+});
+
 describe("accountRun token accounting (#443)", () => {
   let tempDir: string;
 
@@ -16045,7 +16071,8 @@ describe("accountRun token accounting (#443)", () => {
     });
 
     it("fails closed when no writer is configured (#1289)", async () => {
-      const { mesh } = setup({ writer: undefined });
+      const { mesh } = setup();
+      (mesh as unknown as { writer?: unknown }).writer = undefined;
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
       await expect(

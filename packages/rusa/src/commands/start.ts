@@ -3212,8 +3212,6 @@ async function composeStart(
         getRepositories().obligations.listDirectChildEdges(parentId),
       listPrerequisiteEdges: (dependentId) =>
         getRepositories().obligations.listPrerequisiteEdges(dependentId),
-      // Snooze expiry during a closure check is the mesh's own normalization,
-      // not the actor's write, so it is attributed to the system principal.
       // Ready-head attention carries the head's latest reassignment message (#947).
       latestReassignment: (id) => getRepositories().obligations.latestReassignment(id),
       // Retirement's fail-closed preflight (#191): every non-terminal obligation

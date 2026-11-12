@@ -601,7 +601,7 @@ export interface RetireCleanup {
   run: (record: ActorRecord) => void | Promise<void>;
 }
 
-export interface ActorMeshOptions {
+interface ActorMeshBaseOptions {
   actors: ActorRepository;
   principals?: PrincipalRepository;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
@@ -702,7 +702,8 @@ export interface ActorMeshOptions {
   /**
    * The process's shared writer (#1289). A parent's clearance of its child's
    * exhausted inbox work goes through it, so the authority check and the write
-   * it authorizes run in one transaction. Absent, that clearance is refused.
+   * it authorizes run in one transaction. Required with an inbox; see
+   * {@link ActorMeshOptions}.
    */
   writer?: Pick<MeshObligationWriter, "write">;
   /**
@@ -853,6 +854,17 @@ export interface ActorMeshOptions {
   secretsDir?: string;
   log?: (msg: string) => void;
 }
+
+/**
+ * A mesh with a durable inbox marks it seen, decides run-end closure and
+ * clears a child's exhausted work through the writer (#1289), so one needs
+ * the other.
+ */
+export type ActorMeshOptions = ActorMeshBaseOptions &
+  (
+    | { inboxStore?: undefined }
+    | { inboxStore: InboxRepository; writer: Pick<MeshObligationWriter, "write"> }
+  );
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
@@ -1353,9 +1365,11 @@ export class ActorMesh {
               return this.finishInboxRun(event.actorId, {
                 successful: terminal.result.success,
                 runId: event.runId,
-              }).then(() => {
+              }).finally(() => {
+                // The run happened even if finishing it failed: it is
+                // accounted, and a selection is run-scoped regardless of its
+                // terminal shape. A failure still reaches the lifecycle.
                 this.accountRun(event.actorId, terminal.result, event.runId);
-                // A selection is run-scoped regardless of its terminal shape.
                 this.clearSelection(event.actorId);
               });
             }
@@ -2157,6 +2171,12 @@ export class ActorMesh {
    * by. A head is closed when it is terminal, snoozed, handed off with this
    * run's checkpoint, or waiting on a new live direct child or a new unmet
    * prerequisite.
+   *
+   * Test-facing: {@link recordReturnRejections} builds the same question at
+   * return. Tests use this to probe closure mid-run without ending the run,
+   * which {@link inboxHandlingClosure} cannot stand in for: it covers only the
+   * latest selection's entries, while a run's armed heads accumulate across
+   * its selections.
    */
   runClosureQuery(actorId: string): HeadClosureQuery | null {
     actorId = this.resolveThreadId(actorId);

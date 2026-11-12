@@ -558,7 +558,7 @@ export class RunManager {
     if (target.isQueued) {
       // The new entry joins the already-accepted opportunity, which will list
       // the live worklist after admission, so it becomes seen first.
-      return this.joinQueuedOpportunity(actorId, target, opts);
+      return this.joinQueuedOpportunity(actorId, target, opts, responsiveArrived);
     }
     target.requestRun(nudge);
     return true;
@@ -589,14 +589,17 @@ export class RunManager {
    *
    * Seen work is unhandled work, so every later dispatch, and reconciliation,
    * still finds it. What it gives up by being seen is arrival: it no longer
-   * replaces a run in flight or passes a voice hold. An interrupt during the
+   * replaces a run in flight or passes a voice hold, except that responsive
+   * work which arrived with this dispatch still passes a voice hold begun
+   * during the wait, since nothing else would wake it at session end. An interrupt during the
    * wait still holds it back, because admission compares delivery times with
    * the interrupt watermark, not seen marks.
    */
   private async joinQueuedOpportunity(
     actorId: string,
     target: MeshActor,
-    opts: { preempt: boolean }
+    opts: { preempt: boolean },
+    responsiveArrived: boolean
   ): Promise<boolean> {
     await this.markInboxSeen(actorId);
     const current = this.live.get(actorId);
@@ -619,9 +622,12 @@ export class RunManager {
     }
     if (target.isRunning) return true;
     const nudge = dispatchNudge(work);
+    // Responsive work this dispatch brought marked itself seen only to join
+    // an opportunity that is now gone, so it still passes a voice hold: the
+    // session-end wake leaves responsive work to the dispatch that brought it.
     if (
       !target.isQueued &&
-      !(isResponsiveNudge(nudge) && work.unseenResponsive !== false) &&
+      !(isResponsiveNudge(nudge) && (responsiveArrived || work.unseenResponsive !== false)) &&
       this.isVoiceSessionActive(actorId)
     ) {
       this.log(`dispatch(${actorId}) held — a voice session began while marking seen`);

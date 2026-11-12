@@ -46,10 +46,7 @@ afterAll(() => {
   rmSync(defaultTestSecretsDir, { recursive: true, force: true });
 });
 
-function writerFor(
-  inbox: SqliteInboxRepository,
-  actors: InMemoryActorRepository
-): ActorMeshOptions["writer"] {
+function writerFor(inbox: SqliteInboxRepository, actors: InMemoryActorRepository) {
   const db = inboxDatabases.get(inbox);
   if (!db) throw new Error("test inbox was not made by createTestInbox");
   return meshWriterFor(db, new ObligationRepository(db), { inbox, actors });

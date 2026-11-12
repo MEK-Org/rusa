@@ -960,6 +960,37 @@ describe("RunManager", () => {
       await vi.waitFor(() => expect(actor.runs).toHaveLength(1));
     });
 
+    it("a voice session begun during the wait holds the ordinary work it joined, but not the responsive work it brought", async () => {
+      let voice = false;
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen, isVoiceSessionActive: () => voice });
+      const ordinary = queuedWithWork(h, "a1");
+      const responsive = live(h, "a2");
+      responsive.queued = true;
+      append("a2", { type: "mesh.message", priority: "responsive" });
+
+      const ordinaryDispatch = h.manager.dispatch("a1");
+      const responsiveDispatch = h.manager.dispatch("a2");
+      await settle();
+      // Both opportunities end without running the work, a voice session
+      // begins, and both marks commit.
+      ordinary.queued = false;
+      responsive.queued = false;
+      voice = true;
+      inbox.markSeen("a1");
+      inbox.markSeen("a2");
+      for (const mark of held.marks) mark.resolve();
+
+      // The session-end dispatch releases ordinary work.
+      expect(await ordinaryDispatch).toBe(false);
+      expect(ordinary.nudges).toEqual([]);
+      expect(h.logs).toContain("dispatch(a1) held — a voice session began while marking seen");
+      // Session end leaves all-responsive work to the dispatch that brought
+      // it, so seen as it now is, this dispatch still requests its run.
+      expect(await responsiveDispatch).toBe(true);
+      expect(responsive.nudges).toEqual([{ priority: "responsive" }]);
+    });
+
     it("never requests a run of an actor replaced during the wait; the replacement gets its own dispatch", async () => {
       const held = heldMarks();
       const h = setup({ markInboxSeen: held.markInboxSeen });
