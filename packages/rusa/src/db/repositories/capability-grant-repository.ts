@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import {
   type CapabilityGrant,
   type CapabilityGrantStore,
-  GrantMutationListeners,
+  GrantMutationListenerSlot,
 } from "../../actor/capability-grants.js";
 
 type GrantRow = {
@@ -31,7 +31,7 @@ function fromRow(row: GrantRow): CapabilityGrant {
  * `actors` row (0036_capability_grants).
  */
 export class DbCapabilityGrantStore implements CapabilityGrantStore {
-  readonly mutations = new GrantMutationListeners();
+  readonly mutations = new GrantMutationListenerSlot();
 
   constructor(private readonly db: Database.Database) {}
 

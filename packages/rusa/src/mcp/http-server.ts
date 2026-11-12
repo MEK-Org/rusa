@@ -342,7 +342,17 @@ export class McpHttpServer {
     return this.urlFor(name);
   }
 
-  /** Tear down a hosted server (its transports) and stop routing to it. */
+  /**
+   * Tear down a hosted server (its transports) and stop routing to it.
+   *
+   * A revocation's writer delivery awaits this (#1289 D1), and later
+   * deliveries wait behind it. That cannot deadlock only because
+   * `transport.close()` does not wait for a running request handler, which
+   * may itself be waiting on a later delivery. That holds for the locked MCP
+   * SDK 1.29.0 (webStandardStreamableHttp.ts `close()`); check it again on
+   * an SDK upgrade. grant-revocation-window.test.ts holds a handler mid-call
+   * through a revocation to pin it.
+   */
   async removeServer(name: string): Promise<void> {
     const transports = this.sessions.get(name);
     if (transports) {

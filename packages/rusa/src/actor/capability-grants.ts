@@ -97,37 +97,26 @@ export interface GrantMutationEffect {
 
 export type GrantMutationListener = (effect: GrantMutationEffect) => Promise<void> | void;
 
-const isThenable = (value: unknown): value is PromiseLike<unknown> =>
-  typeof (value as { then?: unknown } | null)?.then === "function";
-
 /**
- * The listeners a grant store's committed writes are delivered to. Delivery
- * stays synchronous while every listener does, and otherwise awaits each
- * listener in turn.
+ * The one listener a grant store's committed writes are delivered to. The
+ * mesh is the only subscriber, so a second subscription while one is held
+ * throws rather than silently sharing or replacing delivery.
  */
-export class GrantMutationListeners {
-  private readonly listeners = new Set<GrantMutationListener>();
+export class GrantMutationListenerSlot {
+  private listener: GrantMutationListener | undefined;
 
   /** Subscribe; returns the unsubscribe. */
   on(listener: GrantMutationListener): () => void {
-    this.listeners.add(listener);
+    if (this.listener) throw new Error("a grant mutation listener is already subscribed");
+    this.listener = listener;
     return () => {
-      this.listeners.delete(listener);
+      if (this.listener === listener) this.listener = undefined;
     };
   }
 
-  /** Deliver one committed write's effect to every listener. */
+  /** Deliver one committed write's effect to the listener, if any. */
   deliver(effect: GrantMutationEffect): Promise<void> | void {
-    const listeners = [...this.listeners];
-    for (let index = 0; index < listeners.length; index += 1) {
-      const out = listeners[index]?.(effect);
-      if (isThenable(out)) {
-        return (async () => {
-          await out;
-          for (const listener of listeners.slice(index + 1)) await listener(effect);
-        })();
-      }
-    }
+    return this.listener?.(effect);
   }
 }
 
@@ -138,7 +127,7 @@ export class GrantMutationListeners {
  */
 export interface CapabilityGrantStore {
   /** Where the writer delivers this store's committed grant writes (#1289 D1). */
-  readonly mutations: GrantMutationListeners;
+  readonly mutations: GrantMutationListenerSlot;
   /**
    * Grant `capability` to `actorId`. Idempotent on (actorId, capability):
    * re-granting sets/keeps it active (clearing any prior revocation) and updates
@@ -203,7 +192,7 @@ const key = (actorId: string, capability: string): string => `${actorId} ${capab
 
 /** In-memory grant store — for tests and the e2e runner. */
 export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
-  readonly mutations = new GrantMutationListeners();
+  readonly mutations = new GrantMutationListenerSlot();
   private readonly grants = new Map<string, CapabilityGrant>();
 
   grant(grant: CapabilityGrant): void {
@@ -235,7 +224,7 @@ export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
  * visible to the next actor construction without an orchestrator restart.
  */
 export class FileCapabilityGrantStore implements CapabilityGrantStore {
-  readonly mutations = new GrantMutationListeners();
+  readonly mutations = new GrantMutationListenerSlot();
   private mem = new InMemoryCapabilityGrantStore();
 
   constructor(private readonly file: string) {
