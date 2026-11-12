@@ -132,4 +132,21 @@ describe("GrantMutationListenerSlot (#1289 D1)", () => {
     expect(seen).toEqual(["next"]);
     offNext();
   });
+
+  it("keeps a re-subscribed callback when the first subscription's unsubscribe runs again", () => {
+    const slot = new GrantMutationListenerSlot();
+    const seen: GrantMutationEffect[] = [];
+    const listener = (e: GrantMutationEffect) => {
+      seen.push(e);
+    };
+    const off = slot.on(listener);
+    off();
+    const offAgain = slot.on(listener);
+    off();
+    slot.deliver(effect);
+    expect(seen).toEqual([effect]);
+    offAgain();
+    slot.deliver(effect);
+    expect(seen).toEqual([effect]);
+  });
 });

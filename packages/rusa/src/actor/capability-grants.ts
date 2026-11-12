@@ -105,12 +105,18 @@ export type GrantMutationListener = (effect: GrantMutationEffect) => Promise<voi
 export class GrantMutationListenerSlot {
   private listener: GrantMutationListener | undefined;
 
-  /** Subscribe; returns the unsubscribe. */
+  /**
+   * Subscribe; returns the unsubscribe, which acts only on its first call so
+   * a stale one never clears a later subscription, even of the same callback.
+   */
   on(listener: GrantMutationListener): () => void {
     if (this.listener) throw new Error("a grant mutation listener is already subscribed");
     this.listener = listener;
+    let subscribed = true;
     return () => {
-      if (this.listener === listener) this.listener = undefined;
+      if (!subscribed) return;
+      subscribed = false;
+      this.listener = undefined;
     };
   }
 

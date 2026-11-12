@@ -56,7 +56,8 @@ describe("a revoked grant's mounted endpoint while an earlier delivery is open (
   let delivering: Promise<void>;
   let grantableServers: Map<string, GrantableServerFactory>;
   let holdCall: Promise<void>;
-  let holdEntered: boolean;
+  let signalHoldEntered: () => void;
+  let holdEntered: Promise<void>;
   const clients: Client[] = [];
 
   beforeEach(async () => {
@@ -81,7 +82,9 @@ describe("a revoked grant's mounted endpoint while an earlier delivery is open (
 
     pingCalls = 0;
     hookEntered = false;
-    holdEntered = false;
+    holdEntered = new Promise<void>((resolve) => {
+      signalHoldEntered = resolve;
+    });
     holdCall = Promise.resolve();
     grantableServers = new Map<string, GrantableServerFactory>();
     // A fixture server under a real grantable capability name; the endpoint,
@@ -93,7 +96,7 @@ describe("a revoked grant's mounted endpoint while an earlier delivery is open (
         return toolOk({ pong: true });
       });
       server.registerTool("hold", { inputSchema: {} }, async () => {
-        holdEntered = true;
+        signalHoldEntered();
         await holdCall;
         return toolOk({ held: true });
       });
@@ -291,25 +294,27 @@ describe("a revoked grant's mounted endpoint while an earlier delivery is open (
     holdCall = new Promise<void>((resolve) => {
       releaseCall = resolve;
     });
-    const url = mount();
-    const open = await connect(url);
-    const running = open.callTool({ name: "hold", arguments: {} });
-    for (let i = 0; i < 50 && !holdEntered; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(holdEntered).toBe(true);
-    running.catch(() => {});
+    // Released however the test ends, so a regression fails here instead of
+    // leaving teardown waiting on the same held handler.
+    try {
+      const url = mount();
+      const open = await connect(url);
+      const running = open.callTool({ name: "hold", arguments: {} });
+      running.catch(() => {});
+      await holdEntered;
 
-    releaseDelivery();
-    const revoking = mesh.revokeCapability("worker", CAPABILITY, "root");
-    // The unmount closes the session's transport; that must not wait for the
-    // running handler, or every later delivery would wait behind it.
-    const outcome = await Promise.race([
-      Promise.resolve(revoking).then(() => "settled"),
-      new Promise((resolve) => setTimeout(() => resolve("stuck"), 2000)),
-    ]);
-    expect(outcome).toBe("settled");
-    expect(hookEntered).toBe(true);
-    releaseCall();
+      releaseDelivery();
+      const revoking = mesh.revokeCapability("worker", CAPABILITY, "root");
+      // The unmount closes the session's transport; that must not wait for the
+      // running handler, or every later delivery would wait behind it.
+      const outcome = await Promise.race([
+        Promise.resolve(revoking).then(() => "settled"),
+        new Promise((resolve) => setTimeout(() => resolve("stuck"), 2000)),
+      ]);
+      expect(outcome).toBe("settled");
+      expect(hookEntered).toBe(true);
+    } finally {
+      releaseCall();
+    }
   });
 });
