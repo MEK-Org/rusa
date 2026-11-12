@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 import { assembleConfiguredPortableInjection } from "../commands/start.js";
 import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { closeDb, getDb, initDb } from "../db/index.js";
+import { createInProcessMeshWriter, inboxClosureShortfalls } from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
@@ -402,6 +403,7 @@ function setup(
     idgen?: () => string;
     onRunReturned?: ActorMeshOptions["onRunReturned"];
     completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
+    writer?: ActorMeshOptions["writer"];
     inboxStore?: InboxRepository;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -496,6 +498,7 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
+    writer: opts.writer,
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
@@ -14979,7 +14982,7 @@ describe("strict obligation handling (#382, #917)", () => {
   describe("closure at successful return (#828)", () => {
     function returningMesh(counts: Map<string, number>) {
       const events: MeshEventInput[] = [];
-      const { mesh } = strictMesh(
+      const { mesh, registry } = strictMesh(
         (event) => events.push(event),
         () => counts
       );
@@ -14987,19 +14990,31 @@ describe("strict obligation handling (#382, #917)", () => {
       // would launch is the ordinary retry path covered elsewhere.
       const dispatch = vi.spyOn(mesh, "dispatch").mockReturnValue(true);
       const rejections = () => events.filter((event) => event.kind === "run_return_rejected");
-      return { mesh, dispatch, rejections };
+      /**
+       * Why the inbox tool's write would refuse to mark `entryIds` handled,
+       * or "" when it would mark them: the mesh's closure question, decided
+       * the way the write decides it (#1289).
+       */
+      const handlingRefusal = (actorId: string, entryIds: string[]) => {
+        const closure = mesh.inboxHandlingClosure(actorId, entryIds);
+        if (!closure) return "";
+        return inboxClosureShortfalls({ obligations: repo, actors: registry }, closure)
+          .map((shortfall) => `Cannot mark handled: ${shortfall.message}`)
+          .join(" ");
+      };
+      return { mesh, dispatch, rejections, handlingRefusal };
     }
 
     it("rejects a return that leaves a selected head as found: the attention stays unhandled, retries once, then escalates", () => {
       const counts = new Map<string, number>();
-      const { mesh, dispatch, rejections } = returningMesh(counts);
+      const { mesh, dispatch, rejections, handlingRefusal } = returningMesh(counts);
       const subject = worker(mesh, "returns early");
       repo.create({ id: "left-head", title: "Left head", ownerId: subject });
 
       const entryId = selectHead(mesh, subject, "left-head");
       // Delivering the attention woke the actor; only the return's own retry counts below.
       dispatch.mockClear();
-      expect(() => mesh.assertInboxEntriesHandleable(subject, [entryId])).toThrow(
+      expect(handlingRefusal(subject, [entryId])).toMatch(
         /Cannot mark handled: selected head obligation left-head \("Left head"\) was not finished or decomposed\. Reason: obligation is still ready/
       );
       mesh.finishInboxRun(subject, { successful: true, runId: "first-return" });
@@ -15040,18 +15055,16 @@ describe("strict obligation handling (#382, #917)", () => {
     });
 
     it("refuses mark handled for every entry of a direct focus selection until the focus closes", () => {
-      const { mesh } = returningMesh(new Map());
+      const { mesh, handlingRefusal } = returningMesh(new Map());
       const subject = worker(mesh, "focused");
       repo.create({ id: "focus", title: "Focus", ownerId: subject });
       selectDirectFocus(mesh, subject, "focus");
       const [entryId] = mesh.selectedInboxEntries(subject);
       if (!entryId) throw new Error("expected a selected entry");
 
-      expect(() => mesh.assertInboxEntriesHandleable(subject, [entryId])).toThrow(
-        /selected head obligation focus/
-      );
+      expect(handlingRefusal(subject, [entryId])).toMatch(/selected head obligation focus/);
       repo.setTerminalStatus("focus", "done", null, null, "system:mesh");
-      expect(() => mesh.assertInboxEntriesHandleable(subject, [entryId])).not.toThrow();
+      expect(handlingRefusal(subject, [entryId])).toBe("");
     });
 
     it("does not guard or check a return that armed nothing", () => {
@@ -15059,7 +15072,7 @@ describe("strict obligation handling (#382, #917)", () => {
       const control = worker(mesh, "message-only control");
       const entryId = selectMessage(mesh, control);
 
-      expect(() => mesh.assertInboxEntriesHandleable(control, [entryId])).not.toThrow();
+      expect(mesh.inboxHandlingClosure(control, [entryId])).toBeNull();
       mesh.finishInboxRun(control, { successful: true });
       expect(rejections()).toEqual([]);
     });
@@ -15109,14 +15122,14 @@ describe("strict obligation handling (#382, #917)", () => {
         },
       ],
     ] as const)("accepts a return that leaves the head %s", (_label, close) => {
-      const { mesh, rejections } = returningMesh(new Map());
+      const { mesh, rejections, handlingRefusal } = returningMesh(new Map());
       const subject = worker(mesh, "closes");
       const recipient = worker(mesh, "recipient");
       repo.create({ id: "head", title: "Head", ownerId: subject });
       const entryId = selectHead(mesh, subject, "head");
 
       close(subject, recipient);
-      expect(() => mesh.assertInboxEntriesHandleable(subject, [entryId])).not.toThrow();
+      expect(handlingRefusal(subject, [entryId])).toBe("");
       inboxStore.markHandled(subject, [entryId]);
       mesh.finishInboxRun(subject, { successful: true, runId: "closed-return" });
 
@@ -15542,80 +15555,98 @@ describe("accountRun token accounting (#443)", () => {
       expect(mechanical).toHaveLength(0);
     });
 
+    /**
+     * A mesh whose parent clearance commits through the writer over a durable
+     * inbox, as production's does (#1289). The writer reads the same actors
+     * and focus counts the mesh does.
+     */
+    function clearanceMesh(
+      opts: Pick<
+        Parameters<typeof setup>[0] & object,
+        "completedFocusEntryCounts" | "sharedProvider" | "events"
+      > = {}
+    ) {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      const inboxStore = new SqliteInboxRepository(db);
+      const actors = new InMemoryActorRepository();
+      const counts = opts.completedFocusEntryCounts ?? (() => new Map<string, number>());
+      const writer = createInProcessMeshWriter(db, {
+        obligations: new ObligationRepository(db),
+        inbox: inboxStore,
+        actors,
+        actorRuns: { completedFocusEntryCounts: (actorId) => counts(actorId) },
+      });
+      const fixture = setup({
+        inboxStore,
+        actors,
+        writer,
+        completedFocusEntryCounts: counts,
+        sharedProvider: opts.sharedProvider,
+        events: opts.events,
+      });
+      return { ...fixture, inboxStore, db };
+    }
+
     it("enforces authority checks for parent inbox actions (#748)", async () => {
-      const inboxStore = createMemoryInboxStore();
-      const { mesh, tick } = setup({ inboxStore });
+      let child = "";
+      const { mesh, tick, inboxStore } = clearanceMesh({
+        completedFocusEntryCounts: (actorId) =>
+          actorId === child ? new Map([["exhausted-1", 2]]) : new Map(),
+      });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
-      const child = mesh.spawn({ charter: "child", parentId: parent });
+      child = mesh.spawn({ charter: "child", parentId: parent });
       const stranger = mesh.spawn({ charter: "stranger", parentId: "root" });
       await tick();
-
-      (
-        mesh as unknown as {
-          completedFocusEntryCounts: (
-            actorId: string,
-            excludeRunId?: string
-          ) => ReadonlyMap<string, number>;
-        }
-      ).completedFocusEntryCounts = (actorId) =>
-        actorId === child ? new Map([["exhausted-1", 2]]) : new Map();
 
       inboxStore.append([
         { id: "exhausted-1", actorId: child, source: "chat", payload: payload("mesh.message") },
       ]);
 
       // Child cannot self-clear
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(child, child, ["exhausted-1"], "note")
-      ).toThrow(/self-clear/i);
-      expect(() => mesh.markChildInboxHandled(child, child, ["exhausted-1"], "handled it")).toThrow(
-        /self-clear/i
-      );
+      ).rejects.toThrow(/self-clear/i);
+      await expect(
+        mesh.markChildInboxHandled(child, child, ["exhausted-1"], "handled it")
+      ).rejects.toThrow(/self-clear/i);
 
       // Stranger cannot clear
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(stranger, child, ["exhausted-1"], "note")
-      ).toThrow(/Only the parent thread/i);
-      expect(() =>
+      ).rejects.toThrow(/Only the parent thread/i);
+      await expect(
         mesh.markChildInboxHandled(stranger, child, ["exhausted-1"], "handled it")
-      ).toThrow(/Only the parent thread/i);
+      ).rejects.toThrow(/Only the parent thread/i);
 
       // Root has no mesh parent and cannot be cleared by an actor
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, "root", ["exhausted-1"], "note")
-      ).toThrow(/Root has no parent in the mesh/i);
-      expect(() =>
+      ).rejects.toThrow(/Root has no parent in the mesh/i);
+      await expect(
         mesh.markChildInboxHandled(parent, "root", ["exhausted-1"], "handled it")
-      ).toThrow(/Root has no parent in the mesh/i);
+      ).rejects.toThrow(/Root has no parent in the mesh/i);
 
       // Empty note is rejected for both releaseChildInboxSelectionLock and markChildInboxHandled
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "   ")
-      ).toThrow(/note cannot be empty/i);
-      expect(() => mesh.markChildInboxHandled(parent, child, ["exhausted-1"], "   ")).toThrow(
-        /note cannot be empty/i
-      );
+      ).rejects.toThrow(/note cannot be empty/i);
+      await expect(
+        mesh.markChildInboxHandled(parent, child, ["exhausted-1"], "   ")
+      ).rejects.toThrow(/note cannot be empty/i);
     });
 
     it("rejects parent clearance outside the exhaustion path (#748)", async () => {
-      const inboxStore = createMemoryInboxStore();
-      const { mesh, tick } = setup({ inboxStore });
+      const { mesh, tick, inboxStore } = clearanceMesh({
+        completedFocusEntryCounts: () =>
+          new Map([
+            ["exhausted-1", 2],
+            ["unexhausted-1", 1],
+          ]),
+      });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
       await tick();
-
-      (
-        mesh as unknown as {
-          completedFocusEntryCounts: (
-            actorId: string,
-            excludeRunId?: string
-          ) => ReadonlyMap<string, number>;
-        }
-      ).completedFocusEntryCounts = () =>
-        new Map([
-          ["exhausted-1", 2],
-          ["unexhausted-1", 1],
-        ]);
 
       inboxStore.append([
         { id: "exhausted-1", actorId: child, source: "chat", payload: payload("mesh.message") },
@@ -15623,37 +15654,48 @@ describe("accountRun token accounting (#443)", () => {
       ]);
 
       // Non-exhausted entry is rejected
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, child, ["unexhausted-1"], "note")
-      ).toThrow(/not exhausted/i);
-      expect(() => mesh.markChildInboxHandled(parent, child, ["unexhausted-1"], "note")).toThrow(
-        /not exhausted/i
-      );
+      ).rejects.toThrow(/not exhausted/i);
+      await expect(
+        mesh.markChildInboxHandled(parent, child, ["unexhausted-1"], "note")
+      ).rejects.toThrow(/not exhausted/i);
 
       // Non-existent entry is rejected
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, child, ["missing-entry"], "note")
-      ).toThrow(/not found/i);
+      ).rejects.toThrow(/not found/i);
 
       // Already handled entry is rejected
       inboxStore.markHandled(child, ["exhausted-1"]);
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "note")
-      ).toThrow(/already handled/i);
+      ).rejects.toThrow(/already handled/i);
     });
 
-    it("fails closed when inboxStore is missing (#748)", () => {
-      const { mesh } = setup();
+    it("fails closed when inboxStore is missing (#748)", async () => {
+      const { mesh } = clearanceMesh();
       (mesh as unknown as { inboxStore?: unknown }).inboxStore = undefined;
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "note")
-      ).toThrow(/Inbox is not configured/i);
+      ).rejects.toThrow(/Inbox is not configured/i);
+    });
+
+    it("fails closed when no writer is configured (#1289)", async () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      await expect(
+        mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "note")
+      ).rejects.toThrow(/Inbox is not configured/i);
+      await expect(
+        mesh.markChildInboxHandled(parent, child, ["exhausted-1"], "note")
+      ).rejects.toThrow(/Inbox is not configured/i);
     });
 
     it("releases selection lock via append-only re-queue with audit trail (#748)", async () => {
-      const inboxStore = createMemoryInboxStore();
       const countsMap = new Map([["item-1", 2]]);
       // Stand in for the run repository so every retry loop stays bounded: the
       // child's released item stays exhausted, its replacement accrues one
@@ -15665,8 +15707,7 @@ describe("accountRun token accounting (#443)", () => {
       let replacementCompletedRuns: () => number = () => 0;
       let priorRuns: (actorId: string) => number = () => 0;
 
-      const { mesh, fake, tick } = setup({
-        inboxStore,
+      const { mesh, fake, tick, inboxStore } = clearanceMesh({
         completedFocusEntryCounts: (actorId) => {
           if (actorId === child) {
             return new Map([...countsMap, [replacementId, replacementCompletedRuns()]]);
@@ -15693,7 +15734,7 @@ describe("accountRun token accounting (#443)", () => {
       // Parent releases selection lock
       const initialCalls = fake(child).calls.length;
       replacementCompletedRuns = () => Math.max(0, fake(child).calls.length - initialCalls - 1);
-      const res = mesh.releaseChildInboxSelectionLock(
+      const res = await mesh.releaseChildInboxSelectionLock(
         parent,
         child,
         ["item-1"],
@@ -15728,11 +15769,9 @@ describe("accountRun token accounting (#443)", () => {
     });
 
     it("marks exhausted child work handled with audit note (#748)", async () => {
-      const inboxStore = createMemoryInboxStore();
       const countsMap = new Map([["item-1", 2]]);
 
-      const { mesh, tick } = setup({
-        inboxStore,
+      const { mesh, tick, inboxStore } = clearanceMesh({
         completedFocusEntryCounts: () => countsMap,
       });
 
@@ -15745,7 +15784,7 @@ describe("accountRun token accounting (#443)", () => {
       ]);
 
       // Parent marks handled
-      const res = mesh.markChildInboxHandled(
+      const res = await mesh.markChildInboxHandled(
         parent,
         child,
         ["item-1"],
@@ -15765,12 +15804,60 @@ describe("accountRun token accounting (#443)", () => {
       expect(mesh.hasOnlyExhaustedWork(child)).toBe(false);
     });
 
+    it.each([
+      ["idle", 0],
+      ["running other work", 1],
+    ] as const)("wakes a released child %s with exactly one dispatch (#1289)", async (state, preemptions) => {
+      let child = "";
+      const events: MeshEventInput[] = [];
+      const d = deferredProvider();
+      const { mesh, tick, inboxStore } = clearanceMesh({
+        completedFocusEntryCounts: (actorId) =>
+          actorId === child ? new Map([["item-1", 2]]) : new Map(),
+        sharedProvider: d.provider,
+        events: (event) => events.push(event),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      child = mesh.spawn({ charter: "child", parentId: parent });
+      await tick();
+      if (state === "running other work") {
+        inboxStore.append([
+          { id: "other", actorId: child, source: "chat", payload: payload("mesh.message") },
+        ]);
+        mesh.dispatch(child);
+        await tick();
+        expect(d.pending()).toBe(1);
+      }
+      // Responsive work, so every extra dispatch that finds it unseen would
+      // preempt whatever run the previous one admitted.
+      inboxStore.append([
+        {
+          id: "item-1",
+          actorId: child,
+          source: "chat",
+          payload: { ...payload("mesh.message"), priority: "responsive" },
+        },
+      ]);
+      const dispatched = vi.spyOn(mesh, "dispatch");
+
+      await mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "released");
+      await tick();
+
+      // The replacement's committed append effect is the only wake. A busy
+      // child's unrelated run is preempted once by the arriving responsive
+      // work; the run admitted for the replacement is never preempted.
+      expect(dispatched.mock.calls).toEqual([[child]]);
+      const childEvents = events.filter((event) => event.actorId === child);
+      expect(childEvents.filter((event) => event.kind === "run_preempted")).toHaveLength(
+        preemptions
+      );
+      expect(d.pending()).toBe(1);
+    });
+
     it("preserves unhandled entries if atomic replacement fails during release (#748)", async () => {
-      const inboxStore = createMemoryInboxStore();
       const countsMap = new Map([["item-1", 2]]);
 
-      const { mesh, tick } = setup({
-        inboxStore,
+      const { mesh, tick, inboxStore } = clearanceMesh({
         completedFocusEntryCounts: () => countsMap,
       });
 
@@ -15788,9 +15875,9 @@ describe("accountRun token accounting (#443)", () => {
         throw new Error("simulated sqlite insertion failure");
       };
 
-      expect(() =>
+      await expect(
         mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "releasing")
-      ).toThrow("simulated sqlite insertion failure");
+      ).rejects.toThrow("simulated sqlite insertion failure");
 
       // The original entry was NOT marked handled — it remains in the child's inbox
       const entry = inboxStore.read(child, "item-1");
@@ -15802,7 +15889,12 @@ describe("accountRun token accounting (#443)", () => {
 
       // Restore and verify release works cleanly
       inboxStore.replaceEntries = originalReplace;
-      const res = mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "retry release");
+      const res = await mesh.releaseChildInboxSelectionLock(
+        parent,
+        child,
+        ["item-1"],
+        "retry release"
+      );
       expect(res.released).toEqual(["item-1"]);
       expect(inboxStore.read(child, "item-1")?.handledAt).not.toBeNull();
     });

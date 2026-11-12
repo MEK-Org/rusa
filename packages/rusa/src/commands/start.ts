@@ -3175,6 +3175,10 @@ async function composeStart(
     withTransaction: (fn) => getDb().transaction(fn)(),
     completedFocusEntryCounts: (actorId, excludeRunId) =>
       getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
+    // Parent clearance of exhausted child work commits through the shared
+    // writer, with its authority check inside the write (#1289). Resolved
+    // lazily like the repositories above.
+    writer: { write: (op, input) => getMeshWriter().write(op, input) },
     capabilityGrants: withDefaultActorCapabilities(
       capabilityGrants,
       () => defaultActorId,
@@ -3503,11 +3507,11 @@ async function composeStart(
 
       try {
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
-          createInboxMcpServer(inboxStore, id, {
+          createInboxMcpServer({ inbox: inboxStore, writer: getMeshWriter() }, id, {
             select: inboxSelectFor(id),
             selected: () => mesh.selectedInboxEntries(id),
             onHandled: () => mesh.inboxHandled(id),
-            assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
+            closureFor: (entryIds) => mesh.inboxHandlingClosure(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
             openQuestions: inboxOpenQuestionSources(),

@@ -3,11 +3,15 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { HeadClosureQuery } from "../actor/head-closure.js";
 import type { ObligationActivationScheduler } from "../actor/os-scheduler.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { meshWriterFor } from "./fixtures/obligation-store.js";
 import {
+  createInProcessMeshWriter,
+  deliverMeshEffect,
   type MeshEffect,
   type MeshObligationWriter,
   type MeshWriteRepos,
@@ -121,11 +125,17 @@ describe("ready-head sequences", () => {
 
   it("consumes no sequence for a write that rolls back, and numbers one write's changes consecutively", async () => {
     repository.installHistoryCapture();
+    const repos: MeshWriteRepos = {
+      obligations: repository,
+      inbox: new SqliteInboxRepository(db),
+      actors: { get: () => undefined },
+      actorRuns: { completedFocusEntryCounts: () => new Map() },
+    };
     const testWriter = new InProcessMeshWriter<MeshWriteRepos, MeshEffect, typeof ops>(
       db,
-      { obligations: repository },
+      repos,
       ops,
-      (effect) => repository.deliverMutationEffect(effect)
+      (effect) => deliverMeshEffect(repos, effect)
     );
     const sequences: Array<[string, number]> = [];
     repository.setReadyHeadListener((change) =>
@@ -461,5 +471,296 @@ describe("a listener's own writes during delivery (r4545135121)", () => {
 
     expect(seenByStatusListener).toEqual([before + 1]);
     expect(inbox.countUnhandled("actor-a")).toBe(before + 1);
+  });
+});
+
+describe("inbox marks and the checks they depend on (#1289)", () => {
+  const HOUR = 60 * 60 * 1000;
+  let clock: number;
+  let inboxDb: Database.Database;
+  let obligations: ObligationRepository;
+  let inbox: SqliteInboxRepository;
+  let actors: InMemoryActorRepository;
+  let focusCounts: Map<string, Map<string, number>>;
+  let inboxWriter: MeshObligationWriter;
+
+  beforeEach(() => {
+    clock = Date.parse("2026-07-01T00:00:00.000Z");
+    inboxDb = new Database(":memory:");
+    runMigrations(inboxDb);
+    obligations = new ObligationRepository(
+      inboxDb,
+      (id) => ACTORS.includes(id),
+      () => clock
+    );
+    obligations.setPrincipalKind((id) =>
+      id === "system:mesh" ? "system" : ACTORS.includes(id) ? "actor" : undefined
+    );
+    inbox = new SqliteInboxRepository(inboxDb);
+    actors = new InMemoryActorRepository();
+    focusCounts = new Map();
+    inboxWriter = createInProcessMeshWriter(inboxDb, {
+      obligations,
+      inbox,
+      actors,
+      actorRuns: {
+        completedFocusEntryCounts: (actorId) => focusCounts.get(actorId) ?? new Map(),
+      },
+    });
+  });
+
+  afterEach(() => {
+    inboxDb.close();
+  });
+
+  /** actor-a's run selected `heads` while it owned them, with no checkpoint. */
+  const closureOf = (...heads: string[]): HeadClosureQuery => ({
+    actorId: "actor-a",
+    heads,
+    baseline: {
+      selectedHeads: new Map(
+        heads.map((id) => [
+          id,
+          { ownerId: "actor-a", checkpoint: null, checkpointAt: null, checkpointBy: null },
+        ])
+      ),
+      preExistingChildIds: new Map(),
+      preExistingPrerequisiteIds: new Map(),
+    },
+    rootId: null,
+    retiring: new Set(),
+  });
+
+  const appendTo = (actorId: string, id: string) =>
+    inbox.append([{ id, actorId, source: "chat", payload: { type: "mesh.message" } }]);
+
+  const committedSnooze = (id: string) =>
+    (
+      inboxDb.prepare("SELECT snoozed_until FROM obligations WHERE id = ?").get(id) as {
+        snoozed_until: string | null;
+      }
+    ).snoozed_until;
+
+  it("decides closure against the state the mark commits on, not when it was asked", async () => {
+    obligations.create({ id: "closes", ownerId: "actor-a", title: "closes" });
+    obligations.create({ id: "reopens", ownerId: "actor-a", title: "reopens" });
+    obligations.writeSnooze("reopens", new Date(clock + HOUR).toISOString(), "actor-a");
+    appendTo("actor-a", "for-closes");
+    appendTo("actor-a", "for-reopens");
+    // Both questions are asked first: "closes" is still ready, "reopens" is
+    // snoozed. Then other writes change both before either mark runs.
+    const closesQuestion = closureOf("closes");
+    const reopensQuestion = closureOf("reopens");
+    await inboxWriter.write("obligations.setTerminalStatus", {
+      id: "closes",
+      status: "done",
+      note: null,
+      resolutionRef: null,
+      principal: "actor-a",
+    });
+    await inboxWriter.write("obligations.setSnooze", {
+      id: "reopens",
+      until: null,
+      principal: "actor-a",
+    });
+
+    const marked = await inboxWriter.write("inbox.markHandled", {
+      actorId: "actor-a",
+      entryIds: ["for-closes"],
+      closure: closesQuestion,
+    });
+    const refused = await inboxWriter.write("inbox.markHandled", {
+      actorId: "actor-a",
+      entryIds: ["for-reopens"],
+      closure: reopensQuestion,
+    });
+
+    expect(marked.refused).toBeNull();
+    expect(inbox.read("actor-a", "for-closes")?.handledAt).toBeTruthy();
+    expect(refused.refused?.map((shortfall) => shortfall.obligationId)).toEqual(["reopens"]);
+    expect(inbox.read("actor-a", "for-reopens")?.handledAt).toBeFalsy();
+  });
+
+  it("keeps the due snoozes it cleared when closure refuses the mark", async () => {
+    // Clearing a due snooze is the mesh's normalization of state that already
+    // lapsed, so a refusal commits it rather than rolling it back, as the
+    // check did when it ran outside the write.
+    obligations.create({ id: "lapsed", ownerId: "actor-a", title: "lapsed" });
+    obligations.writeSnooze("lapsed", new Date(clock + HOUR).toISOString(), "actor-a");
+    appendTo("actor-a", "for-lapsed");
+    clock += 2 * HOUR;
+
+    const result = await inboxWriter.write("inbox.markHandled", {
+      actorId: "actor-a",
+      entryIds: ["for-lapsed"],
+      closure: closureOf("lapsed"),
+    });
+
+    expect(result.refused).toEqual([
+      expect.objectContaining({ obligationId: "lapsed", reason: "obligation is still ready" }),
+    ]);
+    expect(committedSnooze("lapsed")).toBeNull();
+    expect(obligations.listHistory("lapsed")[0]).toMatchObject({
+      mutationKind: "snooze",
+      actingPrincipal: "system:mesh",
+    });
+    expect(inbox.read("actor-a", "for-lapsed")?.handledAt).toBeFalsy();
+  });
+
+  it("rolls the cleared snoozes back with the mark when the write itself fails", async () => {
+    // Closure passes once the lapsed snooze is cleared: the head waits on a
+    // prerequisite added during the run. The mark then fails, so the whole
+    // write rolls back, the clearing included.
+    obligations.create({ id: "gated", ownerId: "actor-a", title: "gated" });
+    obligations.create({ id: "gate", ownerId: "actor-b", title: "gate" });
+    obligations.addPrerequisite("gated", "gate", "actor-a");
+    const until = new Date(clock + HOUR).toISOString();
+    obligations.writeSnooze("gated", until, "actor-a");
+    clock += 2 * HOUR;
+
+    await expect(
+      inboxWriter.write("inbox.markHandled", {
+        actorId: "actor-a",
+        entryIds: ["missing"],
+        closure: closureOf("gated"),
+      })
+    ).rejects.toThrow("inbox entry not found");
+
+    expect(committedSnooze("gated")).toBe(until);
+  });
+
+  it.each([
+    ["a missing entry", ["missing"], "inbox entry not found"],
+    ["another actor's entry", ["for-b"], "inbox entry not found"],
+    ["a repeated id", ["for-lapsed", "for-lapsed"], "1 to 100 unique entry ids"],
+  ])("throws for %s before closure could refuse and commit (#1289)", async (_, entryIds, message) => {
+    // Closure would refuse here and commit the cleared snooze, so the ids
+    // must be checked first for an invalid request to commit nothing.
+    obligations.create({ id: "lapsed", ownerId: "actor-a", title: "lapsed" });
+    const until = new Date(clock + HOUR).toISOString();
+    obligations.writeSnooze("lapsed", until, "actor-a");
+    appendTo("actor-a", "for-lapsed");
+    appendTo("actor-b", "for-b");
+    clock += 2 * HOUR;
+
+    await expect(
+      inboxWriter.write("inbox.markHandled", {
+        actorId: "actor-a",
+        entryIds,
+        closure: closureOf("lapsed"),
+      })
+    ).rejects.toThrow(message);
+
+    expect(committedSnooze("lapsed")).toBe(until);
+  });
+
+  it("delivers a mark's handled notice after it commits, before its caller continues", async () => {
+    appendTo("actor-a", "plain");
+    const order: string[] = [];
+    inbox.onItemsHandled((actorId, results) => {
+      expect(inboxDb.inTransaction).toBe(false);
+      expect(inbox.read(actorId, results[0]?.id ?? "")?.handledAt).toBeTruthy();
+      order.push(`handled:${results.map((result) => result.id).join(",")}`);
+    });
+
+    await inboxWriter.write("inbox.markHandled", { actorId: "actor-a", entryIds: ["plain"] });
+    order.push("continuation");
+
+    expect(order).toEqual(["handled:plain", "continuation"]);
+  });
+
+  describe("a parent clearing its child's exhausted work", () => {
+    const clearance = (note: string, entryIds: string[]) => ({
+      callerId: "parent",
+      childId: "child",
+      entryIds,
+      note,
+      rootId: null,
+    });
+
+    beforeEach(() => {
+      for (const [id, parentId] of [
+        ["parent", "root"],
+        ["other-parent", "root"],
+        ["child", "parent"],
+      ] as const) {
+        actors.upsert({
+          id,
+          charter: id,
+          parentId,
+          status: "active",
+          createdAt: "2026-07-01T00:00:00.000Z",
+        });
+      }
+      appendTo("child", "spent");
+      focusCounts.set("child", new Map([["spent", 2]]));
+    });
+
+    it("decides authority against what committed before it: the first clearance wins", async () => {
+      const [marked, released] = await Promise.allSettled([
+        inboxWriter.write("inbox.markChildHandled", clearance("first", ["spent"])),
+        inboxWriter.write("inbox.releaseChildSelectionLock", clearance("second", ["spent"])),
+      ]);
+
+      expect(marked.status).toBe("fulfilled");
+      expect(released).toMatchObject({
+        status: "rejected",
+        reason: expect.objectContaining({ message: "inbox entry already handled: spent" }),
+      });
+      expect(inbox.read("child", "spent")?.handledNote).toBe(
+        "Marked handled by parent (parent): first"
+      );
+      // The refused release appended no replacement.
+      expect(inbox.list("child", { status: "all" }).entries.map((entry) => entry.id)).toEqual([
+        "spent",
+      ]);
+    });
+
+    it("refuses a parent the child no longer has", async () => {
+      const child = actors.get("child");
+      if (!child) throw new Error("expected the child record");
+      actors.upsert({ ...child, parentId: "other-parent" });
+
+      await expect(
+        inboxWriter.write("inbox.markChildHandled", clearance("too late", ["spent"]))
+      ).rejects.toThrow("Only the parent thread (other-parent) can clear exhausted inbox work");
+      expect(inbox.read("child", "spent")?.handledAt).toBeFalsy();
+    });
+
+    it.each([
+      ["by its id", "configured-root"],
+      ["by the legacy alias", "root"],
+    ])("refuses clearing the configured root %s even when its record names a parent (#1289)", async (_, childId) => {
+      // Nothing makes the configured root's durable record carry a null
+      // parentId, so the rootId comparison is what refuses this, not the
+      // parentless check: without it the named parent would clear root's work.
+      actors.upsert({
+        id: "configured-root",
+        charter: "root",
+        parentId: "parent",
+        status: "active",
+        createdAt: "2026-07-01T00:00:00.000Z",
+      });
+      appendTo("configured-root", "root-spent");
+      focusCounts.set("configured-root", new Map([["root-spent", 2]]));
+
+      await expect(
+        inboxWriter.write("inbox.markChildHandled", {
+          ...clearance("not root's parent", ["root-spent"]),
+          childId,
+          rootId: "configured-root",
+        })
+      ).rejects.toThrow(/Root has no parent in the mesh/);
+      expect(inbox.read("configured-root", "root-spent")?.handledAt).toBeFalsy();
+    });
+
+    it("refuses entries that have not exhausted bounded recovery", async () => {
+      focusCounts.set("child", new Map([["spent", 1]]));
+
+      await expect(
+        inboxWriter.write("inbox.releaseChildSelectionLock", clearance("early", ["spent"]))
+      ).rejects.toThrow(/has not exhausted bounded recovery/);
+      expect(inbox.read("child", "spent")?.handledAt).toBeFalsy();
+    });
   });
 });

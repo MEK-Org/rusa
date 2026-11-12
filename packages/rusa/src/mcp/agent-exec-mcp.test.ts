@@ -46,11 +46,13 @@ import { RootControlService } from "../actor/root-control.js";
 import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
 import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import type { RusaConfig } from "../config/types.js";
+import { createInProcessMeshWriter } from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { AvailabilityHoldRepository } from "../db/repositories/availability-hold-repository.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
@@ -222,6 +224,16 @@ function setup(
     eventSourceSubscriptions,
     eventManager,
     inboxStore,
+    // Parent clearance goes through the writer, over the same inbox (#1289).
+    writer: createInProcessMeshWriter(eventDb, {
+      obligations: new ObligationRepository(eventDb),
+      inbox: inboxStore,
+      actors: registry,
+      actorRuns: {
+        completedFocusEntryCounts: (actorId) =>
+          opts.completedFocusEntryCounts?.(actorId) ?? new Map<string, number>(),
+      },
+    }),
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
     experimentEnrollments: opts.experimentEnrollments,
     // The production registry is empty between rollouts; the tools are

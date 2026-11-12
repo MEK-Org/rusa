@@ -116,7 +116,7 @@ export function getRepositories(
  */
 export function getMeshWriter(): MeshObligationWriter {
   if (!meshWriter) {
-    meshWriter = createInProcessMeshWriter(getDb(), { obligations: getRepositories().obligations });
+    meshWriter = createInProcessMeshWriter(getDb(), getRepositories().meshWriteRepos());
   }
   return meshWriter;
 }

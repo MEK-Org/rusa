@@ -7,6 +7,7 @@ import { inboxEntryHiddenFrom, sharedChatScope } from "../../dashboard/human-cha
 import type { PrincipalRef } from "../../principals/principal-ref.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import type { InboxRepository } from "../../repositories/inbox-repository.js";
+import type { MeshWriteRepos } from "../mesh-write-operations.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { AvailabilityHoldRepository } from "./availability-hold-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
@@ -180,6 +181,16 @@ export class Repositories {
    */
   setInboxListenerErrorHandler(handler: InboxListenerErrorHandler): void {
     this.sqliteInbox.setListenerErrorHandler(handler);
+  }
+
+  /** The repositories the mesh writer's operations reach (#1289). */
+  meshWriteRepos(): MeshWriteRepos {
+    return {
+      obligations: this.obligations,
+      inbox: this.sqliteInbox,
+      actors: this.actors,
+      actorRuns: this.actorRuns,
+    };
   }
 }
 

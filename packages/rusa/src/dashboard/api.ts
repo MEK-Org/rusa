@@ -102,9 +102,9 @@ export interface DashboardDataDeps {
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
   /**
-   * Where obligation writes go (#1289): the process's one writer over the
-   * same database as {@link obligations}. Absent → obligation writes are
-   * unavailable.
+   * Where obligation and inbox writes go (#1289): the process's one writer
+   * over the same database as {@link obligations} and {@link inbox}. Absent →
+   * those writes are unavailable.
    */
   obligationWriter?: MeshObligationWriter;
   /**
@@ -1627,14 +1627,16 @@ async function routeMeshApiRequest(
     // clear — and the (actor, entry) pair is checked by the store anyway.
     const inboxHandledMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/inbox\/handled$/);
     if (inboxHandledMatch) {
-      if (!deps?.inbox) {
+      // The mark goes through the process's one writer (#1289), so its
+      // committed effect reaches the inbox listeners in commit order.
+      const writer = deps?.obligationWriter;
+      if (!deps?.inbox || !writer) {
         sendJson(res, 503, { error: "inbox data unavailable" });
         return true;
       }
-      const inbox = deps.inbox;
       const actorId = decodeURIComponent(inboxHandledMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1660,12 +1662,19 @@ async function routeMeshApiRequest(
             return;
           }
           try {
-            const [result] = inbox.markHandled(
+            const written = await writer.write("inbox.markHandled", {
               actorId,
-              [entryId],
-              undefined,
-              operatorHandledNote(reason)
-            );
+              entryIds: [entryId],
+              note: operatorHandledNote(reason),
+            });
+            // No closure question is asked here, so this only narrows the
+            // type; a route that does ask must still show the operator why.
+            if (written.refused) {
+              throw new Error(
+                `Cannot mark handled: ${written.refused.map((shortfall) => shortfall.message).join(" ")}`
+              );
+            }
+            const [result] = written.entries;
             // `alreadyHandled` is reported rather than treated as an error: the
             // store leaves an existing note alone, so a double-click cannot
             // overwrite an actor's own account, and the caller's view is simply

@@ -67,11 +67,33 @@ function toEntry(row: InboxRow): InboxEntry {
  */
 export type InboxListenerErrorHandler = (error: unknown) => void;
 
+export const INBOX_MUTATION_EFFECT = "inbox.mutation";
+
+/**
+ * What one committed inbox write owes its listeners (#1289), as plain data so
+ * a writer can hand it across a thread boundary and deliver it on the main
+ * thread in commit order. See {@link SqliteInboxRepository.deliverMutationEffect}.
+ */
+export interface InboxMutationEffect {
+  kind: typeof INBOX_MUTATION_EFFECT;
+  /** Entries this write marked handled, for the handled listeners. */
+  handled: { actorId: string; results: MarkHandledResult[] } | null;
+  /** Rows this write inserted, for the appended listeners. */
+  appended: InboxEntry[];
+}
+
+/** Where a write operation takes each committed inbox write's effect (#1289). */
+export interface InboxWriteContext {
+  emit(effect: InboxMutationEffect): void;
+}
+
 /** SQLite implementation of the actor inbox persistence seam. */
 export class SqliteInboxRepository implements InboxRepository {
   private readonly listeners = new Set<InboxItemsAppendedListener>();
   private readonly handledListeners = new Set<InboxItemsHandledListener>();
   private onListenerError: InboxListenerErrorHandler = () => {};
+  /** Set while {@link inWriteOperation} runs. */
+  private writeContext: InboxWriteContext | undefined;
 
   constructor(
     private readonly db: Database.Database,
@@ -270,6 +292,12 @@ export class SqliteInboxRepository implements InboxRepository {
     at = this.now(),
     handledNote?: string
   ): MarkHandledResult[] {
+    // As for replaceEntries: inside an enclosing transaction that is not a
+    // write operation's, the handled notification would fire before the
+    // outer caller decided the write's fate.
+    if (this.db.inTransaction && !this.writeContext) {
+      throw new Error("inbox markHandled must not run inside an enclosing transaction");
+    }
     if (
       entryIds.length < 1 ||
       entryIds.length > 100 ||
@@ -307,7 +335,9 @@ export class SqliteInboxRepository implements InboxRepository {
         };
       });
     })();
-    if (results.length > 0) this.notifyItemsHandled(actorId, results);
+    if (results.length > 0) {
+      this.committed({ kind: INBOX_MUTATION_EFFECT, handled: { actorId, results }, appended: [] });
+    }
     return results;
   }
 
@@ -318,7 +348,9 @@ export class SqliteInboxRepository implements InboxRepository {
     replacements: InboxAppendInput[],
     at = this.now()
   ): { handled: MarkHandledResult[]; replacements: InboxEntry[] } {
-    if (this.db.inTransaction) {
+    // A write operation's transaction is the one exception: its effect is
+    // delivered only once that transaction has committed.
+    if (this.db.inTransaction && !this.writeContext) {
       throw new Error("inbox replaceEntries must not run inside an enclosing transaction");
     }
     if (
@@ -408,9 +440,54 @@ export class SqliteInboxRepository implements InboxRepository {
       return { handled: handledResults, insertedRows: inserted };
     })();
 
-    if (handled.length > 0) this.notifyItemsHandled(actorId, handled);
-    if (insertedRows.length > 0) this.notifyItemsAppended(insertedRows);
+    this.committed({
+      kind: INBOX_MUTATION_EFFECT,
+      handled: handled.length > 0 ? { actorId, results: handled } : null,
+      appended: insertedRows,
+    });
     return { handled, replacements: insertedRows };
+  }
+
+  /**
+   * Run `work` as part of a write operation (#1289): each inbox write it makes
+   * hands its committed consequences to `context.emit` as one
+   * {@link InboxMutationEffect} instead of notifying listeners, because the
+   * operation's transaction has not committed yet. The writer that ran the
+   * operation delivers each effect through {@link deliverMutationEffect}.
+   */
+  inWriteOperation<T>(context: InboxWriteContext, work: () => T): T {
+    if (this.writeContext) {
+      throw new Error("SqliteInboxRepository.inWriteOperation cannot be nested");
+    }
+    this.writeContext = context;
+    try {
+      return work();
+    } finally {
+      this.writeContext = undefined;
+    }
+  }
+
+  /**
+   * Deliver one committed inbox write's consequences to this repository's
+   * listeners, in the order a write outside a write operation notifies them
+   * itself: handled, then appended. A listener failure is contained and
+   * reported; it never throws, because the write has already committed.
+   */
+  deliverMutationEffect(effect: InboxMutationEffect): void {
+    if (effect.kind !== INBOX_MUTATION_EFFECT) {
+      throw new Error(`not an inbox mutation effect: ${String(effect.kind)}`);
+    }
+    if (effect.handled && effect.handled.results.length > 0) {
+      this.notifyItemsHandled(effect.handled.actorId, effect.handled.results);
+    }
+    if (effect.appended.length > 0) this.notifyItemsAppended(effect.appended);
+  }
+
+  /** Hand a committed write's effect to the write operation, or deliver it now. */
+  private committed(effect: InboxMutationEffect): void {
+    if (!effect.handled && effect.appended.length === 0) return;
+    if (this.writeContext) this.writeContext.emit(effect);
+    else this.deliverMutationEffect(effect);
   }
 
   /**
