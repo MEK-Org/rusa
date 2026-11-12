@@ -12,7 +12,9 @@ import {
   InMemoryEventSourceSubscriptionStore,
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
+import { meshWriterFor } from "../db/fixtures/obligation-store.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { Logger } from "../observability/logger.js";
@@ -89,6 +91,10 @@ describe("follower registration recovery", () => {
     runMigrations(inboxDb);
     inboxDatabases.push(inboxDb);
     const inboxStore = new SqliteInboxRepository(inboxDb);
+    const writer = meshWriterFor(inboxDb, new ObligationRepository(inboxDb), {
+      inbox: inboxStore,
+      actors,
+    });
     const principals = new PrincipalRepository(inboxDb);
     principals.createUser({ email: "operator@example.test", createdAt: "t" });
     const lifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
@@ -105,6 +111,7 @@ describe("follower registration recovery", () => {
       principals,
       rootId: "root",
       inboxStore,
+      writer,
       eventSourceOwners: new InMemoryEventSourceOwnerStore(),
       eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
       capabilityGrants: new InMemoryCapabilityGrantStore(),
@@ -192,7 +199,7 @@ describe("follower registration recovery", () => {
       },
     ]);
     if (!gapWake) throw new Error("expected the durable gap wake to be inserted");
-    expect(mesh.dispatch(worker.id)).toBe(true);
+    expect(await mesh.dispatch(worker.id)).toBe(true);
     await eventually(() => records.some((record) => record.event === "remote_wake_dropped"));
     expect(lifecycle).toEqual([]);
     // The dropped gap wake remains unseen until B registers; its later seen
@@ -282,6 +289,10 @@ describe("follower registration recovery", () => {
     runMigrations(inboxDb);
     inboxDatabases.push(inboxDb);
     const inboxStore = new SqliteInboxRepository(inboxDb);
+    const writer = meshWriterFor(inboxDb, new ObligationRepository(inboxDb), {
+      inbox: inboxStore,
+      actors,
+    });
     const principals = new PrincipalRepository(inboxDb);
     principals.createUser({ email: "operator@example.test", createdAt: "t" });
 
@@ -336,6 +347,7 @@ describe("follower registration recovery", () => {
         principals,
         rootId: root.id,
         inboxStore,
+        writer,
         eventSourceOwners: new InMemoryEventSourceOwnerStore(),
         eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
         capabilityGrants: new InMemoryCapabilityGrantStore(),
@@ -463,7 +475,7 @@ describe("follower registration recovery", () => {
       },
     ]);
     if (!firstWake) throw new Error("expected initial durable work");
-    expect(firstMesh.dispatch(worker.id)).toBe(true);
+    expect(await firstMesh.dispatch(worker.id)).toBe(true);
     await pump(origin, firstRegistration, () =>
       firstLifecycle.some((event) => event.type === "start")
     );
@@ -484,7 +496,7 @@ describe("follower registration recovery", () => {
       },
     ]);
     if (!gapWake) throw new Error("expected restart-gap durable work");
-    expect(firstMesh.dispatch(worker.id)).toBe(true);
+    expect(await firstMesh.dispatch(worker.id)).toBe(true);
     await eventually(() =>
       records.some(
         (record) =>

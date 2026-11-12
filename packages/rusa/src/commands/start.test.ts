@@ -4681,7 +4681,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Persistence alone is not a receipt. The first accepted inbox run claims
     // the entry and emits the best-effort reaction.
     expect(issueClient.commentReactionsAdded).toEqual([]);
-    mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "dummy-org/dummy-repo", commentId: 123, reaction: "eyes", scope: "issue" },
     ]);
@@ -4706,7 +4706,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(redelivery.entries).toHaveLength(1);
     expect(requestRunCalls).toHaveLength(1);
     // A retry cannot re-claim seen work and does not duplicate the reaction.
-    mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toHaveLength(1);
   });
 
@@ -5281,7 +5281,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       sender: { login: "someone-else" },
     });
 
-    mesh.actorQueued(rootId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(rootId, { responsive: false, mode: "ordinary" });
 
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "dummy-org/dummy-repo", commentId: 124, reaction: "eyes", scope: "issue" },
@@ -5394,7 +5394,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(entry?.payload).not.toHaveProperty("body");
     expect(chatClient.reactions).toEqual([]);
 
-    mesh.actorQueued(rootId, { responsive: true, mode: "ordinary" });
+    await mesh.actorQueued(rootId, { responsive: true, mode: "ordinary" });
     await vi.waitFor(() => {
       expect(chatClient.reactions).toEqual([{ messageName, emoji: "👀" }]);
     });
@@ -7225,7 +7225,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     expect(requestRunCalls).toEqual([{ actorId: workerId, reason: "{}" }]);
-    mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "uncovered-org/uncovered", commentId: 123, reaction: "eyes", scope: "issue" },
     ]);
@@ -9264,7 +9264,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // The run ends and root stays idle: no further dispatch is needed for
       // the change to be live and durable.
       running.mockReturnValue(false);
-      mesh.finishInboxRun(rootId);
+      await mesh.finishInboxRun(rootId);
       expect(mesh.actors.get(rootId)?.modelConfig).toEqual(operatorPool);
       expect(mesh.actors.get(rootId)?.desiredModelConfig).toBeUndefined();
       expect(liveRootPool(mesh)).toEqual(operatorPool);
@@ -10418,7 +10418,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // recovered run responsive (#568). The dispatch is accepted, which it is
     // only because that durable work is there to find.
     expect(dispatchSpy).toHaveBeenCalledWith("placed-worker");
-    expect(dispatchSpy.mock.results.some((r) => r.value === true)).toBe(true);
+    const dispatched = await Promise.all(dispatchSpy.mock.results.map((r) => r.value));
+    expect(dispatched).toContain(true);
 
     // The follower's poll receives both the re-attached actor's fresh init
     // and the retired actor's stop command to prevent runtime orphaning

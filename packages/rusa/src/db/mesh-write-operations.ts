@@ -201,6 +201,25 @@ export const MESH_WRITE_OPERATIONS = {
       };
     }),
 
+  /**
+   * The heads of a run that returned which are not closed (#828), decided the
+   * way the inbox mark decides it: due snoozes cleared, then closure
+   * evaluated, against this transaction's state. The cleared snoozes commit
+   * with the answer; a write that throws rolls them back.
+   */
+  "obligations.closureShortfalls": (
+    context: Context,
+    input: { readonly closure: HeadClosureQuery }
+  ): HeadClosureShortfall[] =>
+    mutating(context, () => inboxClosureShortfalls(context.repos, input.closure)),
+
+  /**
+   * Mark every unseen, unhandled entry of an actor seen: the receipt that a
+   * queued run has taken them in. It has no listeners to notify.
+   */
+  "inbox.markSeen": (context: Context, input: { readonly actorId: string }): InboxEntry[] =>
+    context.repos.inbox.markSeen(input.actorId),
+
   /** A parent marks its child's exhausted entries handled, if it still may. */
   "inbox.markChildHandled": (
     context: Context,

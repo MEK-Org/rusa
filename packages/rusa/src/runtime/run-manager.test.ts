@@ -174,6 +174,8 @@ describe("RunManager", () => {
       inbox?: InboxRepository;
       debounceMs?: number;
       onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
+      /** Answers each seen mark after it is recorded; resolves at once by default. */
+      markInboxSeen?: (actorId: string) => Promise<void>;
     } = {}
   ): Harness {
     const actors = new Map<string, FakeActor>();
@@ -199,7 +201,10 @@ describe("RunManager", () => {
       },
       recordStatus: (actorId) => statuses.get(actorId),
       isVoiceSessionActive: opts.isVoiceSessionActive,
-      markInboxSeen: (actorId) => seen.push(actorId),
+      markInboxSeen: async (actorId) => {
+        seen.push(actorId);
+        await opts.markInboxSeen?.(actorId);
+      },
       onPreempted: (actorId, phase) => preempted.push([actorId, phase]),
       ...(opts.onResponsiveArrived ? { onResponsiveArrived: opts.onResponsiveArrived } : {}),
       log: (msg) => logs.push(msg),
@@ -217,37 +222,37 @@ describe("RunManager", () => {
   }
 
   describe("content-free dispatch reads its work from durable state", () => {
-    it("is a no-op when durable state holds no work for the actor", () => {
+    it("is a no-op when durable state holds no work for the actor", async () => {
       const h = setup();
       const actor = live(h, "a1");
 
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
       expect(actor.nudges).toEqual([]);
       expect(actor.runs).toEqual([]);
       expect(h.logs).toContain("dispatch(a1) is a no-op — no durable work");
     });
 
-    it("is a no-op again once the only entry has been handled", () => {
+    it("is a no-op again once the only entry has been handled", async () => {
       const h = setup();
       const actor = live(h, "a1");
       const entry = append("a1", { type: "mesh.message" });
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
 
       inbox.markHandled("a1", [entry.id], new Date(), "done");
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
       expect(actor.nudges).toHaveLength(1);
     });
 
-    it("derives ordinary priority from an ordinary entry, with no caller input", () => {
+    it("derives ordinary priority from an ordinary entry, with no caller input", async () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "github.issue" });
 
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{}]);
     });
 
-    it("promotes to responsive when any pending entry is responsive", () => {
+    it("promotes to responsive when any pending entry is responsive", async () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "github.issue" });
@@ -261,7 +266,7 @@ describe("RunManager", () => {
         unseenResponsive: true,
         unseenInterrupting: true,
       });
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
     });
 
@@ -275,13 +280,13 @@ describe("RunManager", () => {
       expect(h.manager.durableWork("a1")).toEqual({ priority: "normal" });
     });
 
-    it("recovers voice timing from the pending voice entry rather than an argument", () => {
+    it("recovers voice timing from the pending voice entry rather than an argument", async () => {
       const h = setup();
       const actor = live(h, "a1");
       const at = new Date("2026-03-04T05:06:07.000Z");
       append("a1", { type: "human.voice", priority: "responsive" }, at);
 
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: at.getTime() }]);
     });
 
@@ -312,17 +317,17 @@ describe("RunManager", () => {
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
     });
 
-    it("refuses a retired actor and a name with no live actor", () => {
+    it("refuses a retired actor and a name with no live actor", async () => {
       const h = setup();
       live(h, "a1");
       append("a1", { type: "mesh.message" });
       append("gone", { type: "mesh.message" });
 
       h.statuses.set("a1", "retired");
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
       expect(h.logs).toContain("dispatch(a1) refused — actor is retired");
 
-      expect(h.manager.dispatch("gone")).toBe(false);
+      expect(await h.manager.dispatch("gone")).toBe(false);
       expect(h.logs).toContain("dispatch(gone) refused — no live actor");
     });
 
@@ -487,13 +492,13 @@ describe("RunManager", () => {
       await a1.finishRun();
     });
 
-    it("returns no durable work and no-ops dispatch when backed by an empty inbox repository", () => {
+    it("returns no durable work and no-ops dispatch when backed by an empty inbox repository", async () => {
       const emptyInbox = new EmptyInboxRepository();
       const h = setup({ inbox: emptyInbox });
       const actor = live(h, "a1");
 
       expect(h.manager.durableWork("a1")).toBeNull();
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
       expect(actor.nudges).toEqual([]);
     });
   });
@@ -524,7 +529,7 @@ describe("RunManager", () => {
       const actor = live(h, "a1", { debounceMs: 20 });
       append("a1", { type: "mesh.message" });
 
-      for (let i = 0; i < 5; i++) expect(h.manager.dispatch("a1")).toBe(true);
+      for (let i = 0; i < 5; i++) expect(await h.manager.dispatch("a1")).toBe(true);
       await vi.advanceTimersByTimeAsync(30);
 
       expect(actor.runs).toEqual([ORDINARY_RUN]);
@@ -564,13 +569,13 @@ describe("RunManager", () => {
   });
 
   describe("responsive interruption", () => {
-    it("replaces an in-flight run and reports the phase it interrupted", () => {
+    it("replaces an in-flight run and reports the phase it interrupted", async () => {
       const h = setup();
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
       append("a1", { type: "system.disk", priority: "responsive" });
 
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(1);
       expect(h.preempted).toEqual([["a1", "running"]]);
     });
@@ -597,7 +602,7 @@ describe("RunManager", () => {
       expect(h.preempted).toEqual([]);
     });
 
-    it("does not replace a run over responsive work that run already absorbed", () => {
+    it("does not replace a run over responsive work that run already absorbed", async () => {
       const h = setup();
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
@@ -606,7 +611,7 @@ describe("RunManager", () => {
       // The operator's message starts a run, which absorbs it. The row stays
       // unhandled for almost the whole run, because an actor marks its work
       // handled at the end.
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(1);
       inbox.markSeen("a1");
 
@@ -615,13 +620,13 @@ describe("RunManager", () => {
       // run re-selects the same entries and the next ordinary delivery aborts
       // that one too, so steady child traffic starves the operator's message.
       append("a1", { type: "mesh.message" });
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(1);
       expect(h.preempted).toEqual([["a1", "running"]]);
 
       // Genuinely new responsive work still replaces the run.
       append("a1", { type: "mesh.message", priority: "responsive" });
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(2);
       expect(h.preempted).toEqual([
         ["a1", "running"],
@@ -629,14 +634,14 @@ describe("RunManager", () => {
       ]);
     });
 
-    it("joins an active run instead of replacing it, via the internal construction port", () => {
+    it("joins an active run instead of replacing it, via the internal construction port", async () => {
       const h = setup();
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
       append("a1", { type: "event.copy", priority: "responsive" });
 
       expect(h.internalPort).toBeDefined();
-      expect(h.internalPort?.dispatchJoiningActiveRun("a1")).toBe(true);
+      expect(await h.internalPort?.dispatchJoiningActiveRun("a1")).toBe(true);
       expect(actor.preemptions).toBe(0);
       expect(h.preempted).toEqual([]);
       // Responsive scheduling and admission are kept; only the abort is not.
@@ -655,7 +660,7 @@ describe("RunManager", () => {
       principalId: "principal-1",
     } as const;
 
-    it("admits a joining row at responsive priority without replacing the run", () => {
+    it("admits a joining row at responsive priority without replacing the run", async () => {
       const h = setup();
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
@@ -666,7 +671,7 @@ describe("RunManager", () => {
         unseenResponsive: true,
         unseenInterrupting: false,
       });
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(0);
       expect(h.preempted).toEqual([]);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
@@ -774,12 +779,12 @@ describe("RunManager", () => {
   });
 
   describe("voice session admission", () => {
-    it("holds ordinary work for an active session without losing it", () => {
+    it("holds ordinary work for an active session without losing it", async () => {
       const h = setup({ isVoiceSessionActive: (id) => id === "a1" });
       const actor = live(h, "a1");
       const entry = append("a1", { type: "github.issue" });
 
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
       expect(actor.nudges).toEqual([]);
       expect(h.logs).toContain("dispatch(a1) held — active voice session");
       // Held, not dropped: the row is still the source of truth.
@@ -787,20 +792,20 @@ describe("RunManager", () => {
       expect(h.manager.durableWork("a1")).toEqual({ priority: "normal" });
     });
 
-    it("admits responsive work through the hold", () => {
+    it("admits responsive work through the hold", async () => {
       const h = setup({ isVoiceSessionActive: () => true });
       const actor = live(h, "a1");
       append("a1", { type: "mesh.message", priority: "responsive" });
 
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
     });
 
-    it("holds ordinary work arriving behind responsive work the session already holds", () => {
+    it("holds ordinary work arriving behind responsive work the session already holds", async () => {
       const h = setup({ isVoiceSessionActive: () => true });
       const actor = live(h, "a1");
       append("a1", { type: "human.voice", priority: "responsive" });
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       inbox.markSeen("a1");
 
       // The memo is still unhandled, so the actor's durable priority is still
@@ -808,20 +813,20 @@ describe("RunManager", () => {
       // execution opportunity per ordinary delivery is exactly the traffic the
       // hold exists to keep out of the conversation.
       append("a1", { type: "github.issue" });
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
       expect(actor.nudges).toHaveLength(1);
       expect(h.logs).toContain("dispatch(a1) held — active voice session");
     });
 
-    it("releases the held work on the next dispatch once the session ends", () => {
+    it("releases the held work on the next dispatch once the session ends", async () => {
       let active = true;
       const h = setup({ isVoiceSessionActive: () => active });
       const actor = live(h, "a1");
       append("a1", { type: "github.issue" });
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
 
       active = false;
-      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(await h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{}]);
     });
   });
@@ -839,6 +844,282 @@ describe("RunManager", () => {
       append("a1", { type: "mesh.message" });
       h.manager.dispatch("a1");
       expect(h.seen).toEqual(["a1"]);
+    });
+  });
+
+  describe("a join waits for its seen mark (#1289 C1b)", () => {
+    /** A seen mark held open until the test answers it: a real suspension. */
+    function heldMarks() {
+      const marks: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+      return {
+        marks,
+        markInboxSeen: () =>
+          new Promise<void>((resolve, reject) => {
+            marks.push({ resolve, reject });
+          }),
+      };
+    }
+
+    /** Let every settled continuation run. */
+    const settle = async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+
+    /** An actor with an accepted, still-queued opportunity and new work for it. */
+    function queuedWithWork(h: Harness, id = "a1") {
+      const actor = live(h, id);
+      actor.queued = true;
+      append(id, { type: "mesh.message" });
+      return actor;
+    }
+
+    it("requests the queued run only after the mark commits", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = queuedWithWork(h);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      expect(h.seen).toEqual(["a1"]);
+      expect(actor.nudges).toEqual([]);
+
+      held.marks[0].resolve();
+      expect(await dispatched).toBe(true);
+      expect(actor.nudges).toEqual([{}]);
+    });
+
+    it("a mark that did not commit requests nothing, is not retried, and does not block the next dispatch", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = queuedWithWork(h);
+
+      const rejected = h.manager.dispatch("a1");
+      // Queued behind the suspended one, it decides afresh once that settles.
+      const next = h.manager.dispatch("a1");
+      await settle();
+      expect(h.seen).toEqual(["a1"]);
+
+      // Whether it committed is unknown: the dispatch is refused, not replayed.
+      held.marks[0].reject(new Error("the write may have committed and is not retried"));
+      await expect(rejected).rejects.toThrow("may have committed");
+      await settle();
+      expect(actor.nudges).toEqual([]);
+      // The next dispatch makes its own mark; the refused one made no second.
+      expect(h.seen).toEqual(["a1", "a1"]);
+
+      held.marks[1].resolve();
+      expect(await next).toBe(true);
+      expect(actor.nudges).toEqual([{}]);
+
+      // And a dispatch after both runs on an idle chain, synchronously.
+      actor.queued = false;
+      const later = h.manager.dispatch("a1");
+      expect(actor.nudges).toEqual([{}, {}]);
+      expect(await later).toBe(true);
+    });
+
+    it("joins the opportunity still queued after the wait, as it would have before it", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = queuedWithWork(h);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      held.marks[0].resolve();
+      expect(await dispatched).toBe(true);
+      expect(actor.nudges).toEqual([{}]);
+    });
+
+    it("adds no follow-up when the queued run was admitted during the wait", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = queuedWithWork(h);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      // Admitted after the entry became durable, so that run lists it.
+      actor.queued = false;
+      Object.defineProperty(actor, "isRunning", { get: () => true });
+      held.marks[0].resolve();
+      expect(await dispatched).toBe(true);
+      expect(actor.nudges).toEqual([]);
+    });
+
+    it("requests the run for the seen work when its opportunity ended during the wait", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = queuedWithWork(h);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      // Cancelled or finished without running it: idle, with the work seen.
+      actor.queued = false;
+      held.marks[0].resolve();
+      expect(await dispatched).toBe(true);
+      expect(actor.nudges).toEqual([{}]);
+      await vi.waitFor(() => expect(actor.runs).toHaveLength(1));
+    });
+
+    it("a voice session begun during the wait holds the ordinary work it joined, but not the responsive work it brought", async () => {
+      let voice = false;
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen, isVoiceSessionActive: () => voice });
+      const ordinary = queuedWithWork(h, "a1");
+      const responsive = live(h, "a2");
+      responsive.queued = true;
+      append("a2", { type: "mesh.message", priority: "responsive" });
+
+      const ordinaryDispatch = h.manager.dispatch("a1");
+      const responsiveDispatch = h.manager.dispatch("a2");
+      await settle();
+      // Both opportunities end without running the work, a voice session
+      // begins, and both marks commit.
+      ordinary.queued = false;
+      responsive.queued = false;
+      voice = true;
+      inbox.markSeen("a1");
+      inbox.markSeen("a2");
+      for (const mark of held.marks) mark.resolve();
+
+      // The session-end dispatch releases ordinary work.
+      expect(await ordinaryDispatch).toBe(false);
+      expect(ordinary.nudges).toEqual([]);
+      expect(h.logs).toContain("dispatch(a1) held — a voice session began while marking seen");
+      // Session end leaves all-responsive work to the dispatch that brought
+      // it, so seen as it now is, this dispatch still requests its run.
+      expect(await responsiveDispatch).toBe(true);
+      expect(responsive.nudges).toEqual([{ priority: "responsive" }]);
+    });
+
+    it("never requests a run of an actor replaced during the wait; the replacement gets its own dispatch", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const original = queuedWithWork(h);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      h.manager.release("a1");
+      const replacement = live(h, "a1");
+      held.marks[0].resolve();
+
+      expect(await dispatched).toBe(true);
+      expect(original.nudges).toEqual([]);
+      expect(replacement.nudges).toEqual([{}]);
+      // The seen work is still unhandled, and the replacement runs it.
+      expect(inbox.list("a1", { status: "unhandled" }).entries).toHaveLength(1);
+      await vi.waitFor(() => expect(replacement.runs).toHaveLength(1));
+      expect(original.runs).toEqual([]);
+    });
+
+    it("ends without a request when the actor is released, retired, or its work handled during the wait", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+
+      const released = queuedWithWork(h, "a1");
+      const releasedDispatch = h.manager.dispatch("a1");
+      const retired = queuedWithWork(h, "a2");
+      const retiredDispatch = h.manager.dispatch("a2");
+      const handled = queuedWithWork(h, "a3");
+      const handledDispatch = h.manager.dispatch("a3");
+      await settle();
+      expect(h.seen).toEqual(["a1", "a2", "a3"]);
+
+      h.manager.release("a1");
+      h.statuses.set("a2", "retired");
+      inbox.markHandled(
+        "a3",
+        inbox.list("a3", { status: "unhandled" }).entries.map((entry) => entry.id)
+      );
+      for (const mark of held.marks) mark.resolve();
+
+      expect(await releasedDispatch).toBe(false);
+      expect(await retiredDispatch).toBe(false);
+      expect(await handledDispatch).toBe(false);
+      expect([released, retired, handled].map((actor) => actor.nudges)).toEqual([[], [], []]);
+      expect(h.logs).toEqual(
+        expect.arrayContaining([
+          "dispatch(a1) ended — the actor was released while marking seen",
+          "dispatch(a2) ended — the actor retired while marking seen",
+          "dispatch(a3) ended — the work was handled while marking seen",
+        ])
+      );
+    });
+
+    it("orders a same-actor dispatch arriving during the wait behind it, and a notification the mark itself causes does not deadlock it", async () => {
+      const held = heldMarks();
+      let nested: Promise<boolean> | undefined;
+      let nestedSettled = false;
+      const h = setup({
+        markInboxSeen: (actorId) => {
+          // A committed effect delivered while the mark is outstanding
+          // notifies this same actor. The mark never waits on that dispatch,
+          // so the one it queues behind can finish.
+          if (!nested) {
+            append(actorId, { type: "mesh.message" });
+            nested = h.manager.dispatch(actorId);
+            void nested.then(() => {
+              nestedSettled = true;
+            });
+          }
+          return held.markInboxSeen();
+        },
+      });
+      const actor = queuedWithWork(h);
+
+      const first = h.manager.dispatch("a1");
+      await settle();
+      // The nested dispatch is ordered behind the first, so it has made no
+      // mark of its own yet.
+      expect(h.seen).toEqual(["a1"]);
+      expect(nested).toBeDefined();
+
+      held.marks[0].resolve();
+      expect(await first).toBe(true);
+      expect(actor.nudges).toEqual([{}]);
+      expect(nestedSettled).toBe(false);
+
+      // Now it runs: the opportunity is still queued, so it marks and joins.
+      await settle();
+      expect(h.seen).toEqual(["a1", "a1"]);
+      held.marks[1].resolve();
+      expect(await nested).toBe(true);
+      expect(actor.nudges).toEqual([{}, {}]);
+    });
+
+    it("never makes another actor wait on one actor's mark", async () => {
+      const held = heldMarks();
+      const h = setup({
+        markInboxSeen: (actorId) => (actorId === "a1" ? held.markInboxSeen() : Promise.resolve()),
+      });
+      const blocked = queuedWithWork(h, "a1");
+      const other = queuedWithWork(h, "a2");
+      const idle = live(h, "a3");
+      append("a3", { type: "mesh.message" });
+
+      const waiting = h.manager.dispatch("a1");
+      expect(await h.manager.dispatch("a2")).toBe(true);
+      expect(await h.manager.dispatch("a3")).toBe(true);
+      expect(other.nudges).toEqual([{}]);
+      expect(idle.nudges).toEqual([{}]);
+      expect(blocked.nudges).toEqual([]);
+
+      held.marks[0].resolve();
+      expect(await waiting).toBe(true);
+      expect(blocked.nudges).toEqual([{}]);
+    });
+
+    it("re-reads priority after the wait instead of trusting the pre-wait read", async () => {
+      const held = heldMarks();
+      const h = setup({ markInboxSeen: held.markInboxSeen });
+      const actor = queuedWithWork(h);
+
+      const dispatched = h.manager.dispatch("a1");
+      await settle();
+      // Responsive work landed during the wait (its own dispatch is behind this one).
+      append("a1", { type: "mesh.message", priority: "responsive" });
+      held.marks[0].resolve();
+      expect(await dispatched).toBe(true);
+      expect(actor.nudges).toEqual([{ priority: "responsive" }]);
     });
   });
 
@@ -871,7 +1152,7 @@ describe("RunManager", () => {
       expect(h.manager.liveActor("w1")).toBeUndefined();
     });
 
-    it("refuses to dispatch an actor that construction never produced", () => {
+    it("refuses to dispatch an actor that construction never produced", async () => {
       const h = setup({
         constructActor: () => {
           throw new Error("boom");
@@ -881,11 +1162,11 @@ describe("RunManager", () => {
       append("w1", { type: "mesh.message", priority: "responsive" });
       expect(() => h.manager.instantiate(record("w1"))).toThrow();
 
-      expect(h.manager.dispatch("w1")).toBe(false);
+      expect(await h.manager.dispatch("w1")).toBe(false);
       expect(h.logs).toContain("dispatch(w1) refused — no live actor");
     });
 
-    it("closes and forgets one actor on release, and refuses it afterwards", () => {
+    it("closes and forgets one actor on release, and refuses it afterwards", async () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "mesh.message" });
@@ -893,7 +1174,7 @@ describe("RunManager", () => {
       h.manager.release("a1");
       expect(actor.closed).toBe(1);
       expect(h.manager.isLive("a1")).toBe(false);
-      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(await h.manager.dispatch("a1")).toBe(false);
 
       // Idempotent: a second release neither throws nor double-closes.
       h.manager.release("a1");

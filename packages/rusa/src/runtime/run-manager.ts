@@ -112,7 +112,7 @@ export interface DurableDispatchWork {
  * RunManager's public class interface.
  */
 export interface RunManagerInternalPort {
-  dispatchJoiningActiveRun(actorId: string): boolean;
+  dispatchJoiningActiveRun(actorId: string): Promise<boolean>;
 }
 
 /**
@@ -155,8 +155,12 @@ export interface RunManagerOptions {
   recordStatus: (actorId: string) => string | undefined;
   /** Leased walkie authority: ordinary work waits for the session to end. */
   isVoiceSessionActive?: (actorId: string) => boolean;
-  /** Stamp `seen` on the entries an already-queued opportunity absorbs. */
-  markInboxSeen?: (actorId: string) => void;
+  /**
+   * Stamp `seen` on the entries an already-queued opportunity absorbs. It
+   * resolves once the mark has committed and rejects when it did not, or when
+   * whether it committed is unknown; the run request it gates waits for it.
+   */
+  markInboxSeen?: (actorId: string) => Promise<void>;
   /** Report that responsive work replaced an in-flight or queued run. */
   onPreempted?: (actorId: string, phase: string) => void;
   /**
@@ -219,7 +223,7 @@ export class RunManager {
   private readonly constructActor: (record: ActorRecord) => MeshActor;
   private readonly recordStatus: (actorId: string) => string | undefined;
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
-  private readonly markInboxSeen: (actorId: string) => void;
+  private readonly markInboxSeen: (actorId: string) => Promise<void>;
   private readonly onPreempted: (actorId: string, phase: string) => void;
   private readonly onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
   private readonly isPreemptionSuppressed?: RunManagerOptions["isPreemptionSuppressed"];
@@ -240,13 +244,19 @@ export class RunManager {
    * dispatch. Bounded by {@link MAX_REPORTED_INTERRUPTION_DIAGNOSTICS}.
    */
   private readonly reportedInterruptionDiagnostics = new Set<string>();
+  /**
+   * Per actor, the settlement of the newest dispatch that suspended on a seen
+   * mark, with every dispatch queued behind it. Present only while one is
+   * outstanding; an actor with none dispatches synchronously, as before.
+   */
+  private readonly dispatchTails = new Map<string, Promise<void>>();
   private readonly log: (msg: string) => void;
 
   constructor(opts: RunManagerOptions) {
     this.inbox = opts.inbox;
     opts.onInternalPort?.({
       dispatchJoiningActiveRun: (actorId: string) =>
-        this.dispatchInternal(actorId, { preempt: false }),
+        this.serializeDispatch(actorId, { preempt: false }),
     });
     this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
     this.providerGate =
@@ -268,7 +278,7 @@ export class RunManager {
     this.constructActor = opts.constructActor;
     this.recordStatus = opts.recordStatus;
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
-    this.markInboxSeen = opts.markInboxSeen ?? (() => {});
+    this.markInboxSeen = opts.markInboxSeen ?? (async () => {});
     this.onPreempted = opts.onPreempted ?? (() => {});
     this.onResponsiveArrived = opts.onResponsiveArrived;
     this.isPreemptionSuppressed = opts.isPreemptionSuppressed;
@@ -287,9 +297,15 @@ export class RunManager {
    * one in flight — operator control, human messages and `runNow` all mean
    * "now" — while responsive work that run already absorbed leaves it alone,
    * so ordinary traffic arriving behind it cannot restart it indefinitely.
+   *
+   * It settles once the opportunity has been requested or refused. Joining an
+   * already-queued opportunity first waits for the seen mark of the entries
+   * it absorbs (#1289 C1b), so it rejects when that mark did not commit; see
+   * {@link joinQueuedOpportunity}. Dispatches of one actor take effect in call
+   * order, and those of different actors never wait on each other.
    */
-  dispatch(actorId: string): boolean {
-    return this.dispatchInternal(actorId, { preempt: true });
+  dispatch(actorId: string): Promise<boolean> {
+    return this.serializeDispatch(actorId, { preempt: true });
   }
 
   /**
@@ -432,7 +448,61 @@ export class RunManager {
     return disposition ?? undefined;
   }
 
-  private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
+  /**
+   * Run one dispatch in this actor's order. With nothing outstanding it runs
+   * at once and, unless it must wait for a seen mark, completes in this call.
+   * Otherwise it waits for the dispatch ahead of it to settle, either way: a
+   * rejected one leaves the next to decide afresh from the durable worklist.
+   *
+   * The place is taken before the dispatch runs, so a same-actor dispatch
+   * made from inside it — for instance by an effect delivered while its seen
+   * mark commits — is ordered behind it instead of interleaving with it.
+   *
+   * The only thing a suspended dispatch holds is its actor's place in this
+   * order, and the only thing it waits on is its own seen mark. A write
+   * settles after its commit and the delivery of the committed effects ahead
+   * of it, and no effect delivery waits on a dispatch: the inbox append
+   * notification defers its dispatch to a microtask and does not await it,
+   * and a dispatch queued behind this one returns its promise at once. So a
+   * nested effect never needs the place a dispatch holds while that dispatch
+   * waits for its write.
+   */
+  private serializeDispatch(actorId: string, opts: { preempt: boolean }): Promise<boolean> {
+    const ahead = this.dispatchTails.get(actorId);
+    let release!: () => void;
+    const place = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.dispatchTails.set(actorId, place);
+    const leave = () => {
+      if (this.dispatchTails.get(actorId) === place) this.dispatchTails.delete(actorId);
+      release();
+    };
+    let outcome: Promise<boolean>;
+    if (ahead) {
+      outcome = ahead.then(() => this.dispatchInternal(actorId, opts));
+    } else {
+      let immediate: boolean | Promise<boolean>;
+      try {
+        immediate = this.dispatchInternal(actorId, opts);
+      } catch (err) {
+        leave();
+        return Promise.reject(err);
+      }
+      if (typeof immediate === "boolean") {
+        leave();
+        return Promise.resolve(immediate);
+      }
+      outcome = immediate;
+    }
+    outcome.then(leave, leave);
+    return outcome;
+  }
+
+  private dispatchInternal(
+    actorId: string,
+    opts: { preempt: boolean }
+  ): boolean | Promise<boolean> {
     const status = this.recordStatus(actorId);
     if (status !== undefined && status !== "active") {
       this.log(`dispatch(${actorId}) refused — actor is retired`);
@@ -487,8 +557,81 @@ export class RunManager {
     }
     if (target.isQueued) {
       // The new entry joins the already-accepted opportunity, which will list
-      // the live worklist after admission, so it becomes seen immediately.
-      this.markInboxSeen(actorId);
+      // the live worklist after admission, so it becomes seen first.
+      return this.joinQueuedOpportunity(actorId, target, opts, responsiveArrived);
+    }
+    target.requestRun(nudge);
+    return true;
+  }
+
+  /**
+   * Mark the entries a queued opportunity absorbs seen, then request the run,
+   * re-deciding after the wait what the request is for (#1289 C1b).
+   *
+   * The mark commits before the request, so a run never reads them as not yet
+   * taken in. While it waits the actor may be replaced, retired, preempted,
+   * interrupted, admitted or finished, and the work may be handled, so nothing
+   * read before the wait is trusted after it:
+   *
+   * - A mark that did not commit, or whose commit is unknown, rejects without
+   *   a request and is not retried: retrying a write that may have committed
+   *   is a fresh decision for the next dispatch, which runs normally. Unseen
+   *   entries still count as arriving work there; ones that did commit are
+   *   unhandled and are listed by the next run of this actor.
+   * - A replaced actor gets a fresh dispatch of its own; this continuation
+   *   never requests a run of the actor it replaced.
+   * - A retired actor, or one whose work was handled meanwhile, gets nothing.
+   * - Otherwise the request is made from the worklist as it stands. Still
+   *   queued, it joins that opportunity as it would have before the wait.
+   *   Running, the run was admitted after these entries became durable and
+   *   lists them, so no follow-up is added. Idle, the opportunity was
+   *   cancelled or ended, so this requests the one that runs the seen work.
+   *
+   * Seen work is unhandled work, so every later dispatch, and reconciliation,
+   * still finds it. What it gives up by being seen is arrival: it no longer
+   * replaces a run in flight or passes a voice hold, except that responsive
+   * work which arrived with this dispatch still passes a voice hold begun
+   * during the wait, since nothing else would wake it at session end. An interrupt during the
+   * wait still holds it back, because admission compares delivery times with
+   * the interrupt watermark, not seen marks.
+   */
+  private async joinQueuedOpportunity(
+    actorId: string,
+    target: MeshActor,
+    opts: { preempt: boolean },
+    responsiveArrived: boolean
+  ): Promise<boolean> {
+    await this.markInboxSeen(actorId);
+    const current = this.live.get(actorId);
+    if (current !== target) {
+      if (!current) {
+        this.log(`dispatch(${actorId}) ended — the actor was released while marking seen`);
+        return false;
+      }
+      return this.dispatchInternal(actorId, opts);
+    }
+    const status = this.recordStatus(actorId);
+    if (status !== undefined && status !== "active") {
+      this.log(`dispatch(${actorId}) ended — the actor retired while marking seen`);
+      return false;
+    }
+    const work = this.durableWork(actorId);
+    if (!work) {
+      this.log(`dispatch(${actorId}) ended — the work was handled while marking seen`);
+      return false;
+    }
+    if (target.isRunning) return true;
+    const nudge = dispatchNudge(work);
+    // Responsive work this dispatch brought marked itself seen only to join
+    // an opportunity that is now gone, so it still passes a voice hold: the
+    // session-end wake leaves responsive work to the dispatch that brought it.
+    if (
+      !target.isQueued &&
+      !(isResponsiveNudge(nudge) && (responsiveArrived || work.unseenResponsive !== false)) &&
+      this.isVoiceSessionActive(actorId)
+    ) {
+      this.log(`dispatch(${actorId}) held — a voice session began while marking seen`);
+      return false;
     }
     target.requestRun(nudge);
     return true;

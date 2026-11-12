@@ -8,7 +8,11 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 import { assembleConfiguredPortableInjection } from "../commands/start.js";
 import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { closeDb, getDb, initDb } from "../db/index.js";
-import { createInProcessMeshWriter, inboxClosureShortfalls } from "../db/mesh-write-operations.js";
+import {
+  createInProcessMeshWriter,
+  inboxClosureShortfalls,
+  type MeshObligationWriter,
+} from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
@@ -95,6 +99,7 @@ import {
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import { GracefulShutdown } from "./graceful-shutdown.js";
+import type { HeadClosureQuery } from "./head-closure.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import {
   AtEnqueueUnconfirmedError,
@@ -379,6 +384,39 @@ afterAll(() => {
   rmSync(defaultTestSecretsDir, { recursive: true, force: true });
 });
 
+type TestActors = InMemoryActorRepository | SqliteActorRepository;
+
+/** Each test mesh's actor registry, for helpers handed only the mesh. */
+const meshRegistries = new WeakMap<ActorMesh, TestActors>();
+
+/**
+ * The writes a mesh makes itself (#1289), applied to the stores a test over
+ * the in-memory inbox reads. Head closure is decided over `closure`, the way
+ * the production writer decides it. Tests of the write path itself use the
+ * production writer over a durable inbox.
+ */
+function memoryMeshWriter(
+  inbox: InboxRepository,
+  actors: TestActors,
+  closure: ObligationRepository | undefined
+): Pick<MeshObligationWriter, "write"> {
+  const write = async (op: string, input: unknown): Promise<unknown> => {
+    switch (op) {
+      case "inbox.markSeen":
+        return inbox.markSeen((input as { actorId: string }).actorId);
+      case "obligations.closureShortfalls":
+        if (!closure) throw new Error("this test mesh has no obligations to decide closure on");
+        return inboxClosureShortfalls(
+          { obligations: closure, actors },
+          (input as { closure: HeadClosureQuery }).closure
+        );
+      default:
+        throw new Error(`this test mesh's writer does not make ${op}`);
+    }
+  };
+  return { write } as Pick<MeshObligationWriter, "write">;
+}
+
 function setup(
   opts: {
     supportedVoices?: VoiceDefinition[];
@@ -403,7 +441,10 @@ function setup(
     idgen?: () => string;
     onRunReturned?: ActorMeshOptions["onRunReturned"];
     completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
+    /** Defaults to {@link memoryMeshWriter}. */
     writer?: ActorMeshOptions["writer"];
+    /** The obligations the default writer decides head closure over. */
+    closure?: ObligationRepository;
     inboxStore?: InboxRepository;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -498,7 +539,7 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    writer: opts.writer,
+    writer: opts.writer ?? memoryMeshWriter(inboxStore, registry, opts.closure),
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
@@ -620,6 +661,7 @@ function setup(
     seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
   }
 
+  meshRegistries.set(mesh, registry);
   const rawSpawn = mesh.spawn.bind(mesh);
   const testMesh = mesh as unknown as ActorMesh & {
     spawn: (req: Partial<SpawnRequest> & { charter: string; parentId: string | null }) => string;
@@ -1514,18 +1556,18 @@ describe("ActorMesh", () => {
     expect(first.logs).not.toContain(`dispatch(${worker}) refused — no live actor`);
   });
 
-  it("re-derives a remote reattach dispatch from the durable inbox (#568)", () => {
+  it("re-derives a remote reattach dispatch from the durable inbox (#568)", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, logs } = setup({ inboxStore });
     const id = mesh.spawn({ charter: "remote", parentId: "root" });
 
     // Nothing unhandled: the reattach dispatch is advisory and finds no work,
     // so an idle follower is not woken at all.
-    expect(mesh.dispatch(id)).toBe(false);
+    expect(await mesh.dispatch(id)).toBe(false);
     expect(logs).toContain(`dispatch(${id}) is a no-op — no durable work`);
 
     inboxStore.append([{ actorId: id, source: "mesh:root", payload: payload("mesh.message") }]);
-    expect(mesh.dispatch(id)).toBe(true);
+    expect(await mesh.dispatch(id)).toBe(true);
 
     // A responsive item the follower never observed (delivered during a
     // transport gap) is what makes the reattach dispatch responsive. The caller
@@ -1537,14 +1579,14 @@ describe("ActorMesh", () => {
         payload: { ...payload("mesh.message"), priority: "responsive" },
       },
     ]);
-    expect(mesh.dispatch(id)).toBe(true);
+    expect(await mesh.dispatch(id)).toBe(true);
 
     inboxStore.markHandled(id, [urgent.id]);
     inboxStore.markHandled(
       id,
       inboxStore.entries.filter((e) => e.actorId === id && e.handledAt === null).map((e) => e.id)
     );
-    expect(mesh.dispatch(id)).toBe(false);
+    expect(await mesh.dispatch(id)).toBe(false);
   });
 
   it("warns when constructed without durable inbox storage", () => {
@@ -2152,7 +2194,7 @@ describe("ActorMesh", () => {
           (entry.payload as { type?: string }).type === "obligation.ready_head"
       );
 
-    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    await mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
     mesh.actorStarted("root");
 
     // The shape a real root produced on 2026-08-30: create the parent, then
@@ -2166,7 +2208,7 @@ describe("ActorMesh", () => {
     ).toBe(false);
     expect(headEntries()).toHaveLength(0);
 
-    mesh.finishInboxRun("root");
+    await mesh.finishInboxRun("root");
     await tick();
 
     const delivered = headEntries();
@@ -2184,11 +2226,11 @@ describe("ActorMesh", () => {
           (entry.payload as { type?: string }).type === "obligation.ready_head"
       );
 
-    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    await mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
     mesh.actorStarted("root");
     mesh.deliverReadyHeadAttention("root", { id: "b", intent: null }, "a");
     mesh.deliverReadyHeadAttention("root", { id: "a", intent: null }, "b");
-    mesh.finishInboxRun("root");
+    await mesh.finishInboxRun("root");
     await tick();
 
     // Churned and settled back: waking an actor about the head it already had
@@ -2207,13 +2249,13 @@ describe("ActorMesh", () => {
           (entry.payload as { type?: string }).type === "obligation.ready_head"
       );
 
-    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    await mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
     mesh.actorStarted("root");
     mesh.deliverReadyHeadAttention("root", { id: "parent", intent: null }, null);
     // Filing a question owned by the operator under it leaves root waiting with
     // nothing ready — there is no obligation to point it at.
     mesh.deliverReadyHeadAttention("root", null, "parent");
-    mesh.finishInboxRun("root");
+    await mesh.finishInboxRun("root");
     await tick();
 
     expect(headEntries()).toHaveLength(0);
@@ -3231,7 +3273,7 @@ describe("ActorMesh", () => {
         payload: { type: "github.issue" },
       },
     ]);
-    expect(mesh.dispatch(worker)).toBe(false);
+    expect(await mesh.dispatch(worker)).toBe(false);
     mesh.deliverWake(worker, "cron maintenance");
     await tick();
 
@@ -3330,7 +3372,7 @@ describe("ActorMesh", () => {
     const [sourceNormal] = inboxStore.append([
       { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
-    expect(mesh.dispatch(source)).toBe(false);
+    expect(await mesh.dispatch(source)).toBe(false);
 
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
@@ -3364,7 +3406,7 @@ describe("ActorMesh", () => {
     inboxStore.append([
       { actorId: target, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
-    expect(mesh.dispatch(target)).toBe(false);
+    expect(await mesh.dispatch(target)).toBe(false);
     holder = "";
     expect(mesh.notifyVoiceSessionEnded(target)).toBe(true);
     await tick();
@@ -4575,9 +4617,9 @@ describe("ActorMesh", () => {
     env.mesh.selectInboxEntries(id, [entries[0].id]);
     expect(env.mesh.selectedInboxEntries(id)).toEqual([entries[0].id]);
 
-    expect(() =>
+    await expect(
       env.mesh.finishInboxRun(id, { successful: true, runId: "test-run" })
-    ).not.toThrow();
+    ).resolves.toBeUndefined();
 
     expect(env.mesh.selectedInboxEntries(id)).toEqual([]);
     expect(env.logs.some((l) => l.includes("hook exploded"))).toBe(true);
@@ -5278,6 +5320,311 @@ describe("ActorMesh", () => {
     await tick();
     d.releaseAll();
     await tick();
+  });
+
+  describe("a join waits for its seen mark (#1289 C1b)", () => {
+    /**
+     * The test mesh's writer with its seen marks held on demand: while held, a
+     * mark neither commits nor settles until released, as a queued write.
+     */
+    function heldSeenWriter(inboxStore: InboxRepository, actors: InMemoryActorRepository) {
+      const base = memoryMeshWriter(inboxStore, actors, undefined);
+      let gate: Promise<void> | null = null;
+      let open = () => {};
+      let held = 0;
+      return {
+        writer: {
+          write: async (op: string, input: unknown) => {
+            if (op === "inbox.markSeen" && gate) {
+              held += 1;
+              await gate;
+            }
+            return base.write(op as never, input as never);
+          },
+        } as Pick<MeshObligationWriter, "write">,
+        hold: () => {
+          gate = new Promise<void>((resolve) => {
+            open = resolve;
+          });
+        },
+        release: () => {
+          gate = null;
+          open();
+        },
+        held: () => held,
+      };
+    }
+
+    async function queuedBehindConcurrency() {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const actors = new InMemoryActorRepository();
+      const marks = heldSeenWriter(inboxStore, actors);
+      const harness = setup({
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+        inboxStore,
+        actors,
+        writer: marks.writer,
+      });
+      const { mesh, tick } = harness;
+      const w1 = mesh.spawn({ charter: "w1", parentId: "root" });
+      const w2 = mesh.spawn({ charter: "w2", parentId: "root" });
+      mesh.sendMessage(w1, "go", "root");
+      mesh.sendMessage(w2, "go", "root");
+      await tick();
+      expect(mesh.activeRunState(w1)).toEqual({ actorId: w1, phase: "running" });
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "queued" });
+      expect(d.pending()).toBe(1);
+      const unhandled = (actorId: string) =>
+        inboxStore.list(actorId, { status: "unhandled" }).entries;
+      return { ...harness, d, inboxStore, marks, w1, w2, unhandled };
+    }
+
+    it("keeps an interrupt made during the mark, and recovers the seen work on the next delivery", async () => {
+      const { mesh, tick, d, marks, w2, unhandled, inboxStore } = await queuedBehindConcurrency();
+
+      marks.hold();
+      mesh.sendMessage(w2, "more", "root");
+      await tick();
+      // The join is suspended on its own mark: nothing committed or requested.
+      expect(marks.held()).toBe(1);
+      expect(unhandled(w2).map((entry) => entry.seenAt === null)).toEqual([true, false]);
+
+      // The operator interrupts the queued run while the mark is outstanding.
+      expect(mesh.interrupt(w2, "root")).toMatchObject({ interrupted: true });
+      expect(mesh.activeRunState(w2)).toBeNull();
+
+      marks.release();
+      await tick();
+      // The mark committed, and the interrupt still holds both entries back.
+      expect(unhandled(w2).map((entry) => entry.seenAt === null)).toEqual([false, false]);
+      d.releaseAll();
+      await tick();
+      expect(d.pending()).toBe(0);
+      expect(mesh.activeRunState(w2)).toBeNull();
+
+      // A delivery after the interrupt starts the run, and the seen work is
+      // still unhandled for it to list.
+      inboxStore.append([
+        {
+          actorId: w2,
+          source: "mesh:root",
+          deliveredAt: new Date(Date.now() + 1000),
+          payload: payload("mesh.message"),
+        },
+      ]);
+      await tick();
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "running" });
+      expect(d.pending()).toBe(1);
+      expect(unhandled(w2)).toHaveLength(3);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("joins the still-queued run once the delayed mark commits, with one run for all the work", async () => {
+      // run-manager.test.ts pins the per-actor order with a stand-in actor.
+      // This pins what only the real path shows: through the mesh's append
+      // notifications and the actor's concurrency gate, the notifications
+      // make one provider run, admitted after every entry is seen.
+      const { mesh, tick, d, marks, w2, unhandled } = await queuedBehindConcurrency();
+
+      marks.hold();
+      mesh.sendMessage(w2, "more", "root");
+      mesh.sendMessage(w2, "and more", "root");
+      await tick();
+      // The second notification is ordered behind the first, so only one mark
+      // is outstanding.
+      expect(marks.held()).toBe(1);
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "queued" });
+
+      marks.release();
+      await tick();
+      expect(unhandled(w2).every((entry) => entry.seenAt !== null)).toBe(true);
+      d.releaseAll();
+      await tick();
+      // w2's one queued run is admitted with every entry already seen.
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "running" });
+      expect(d.pending()).toBe(1);
+      d.releaseAll();
+      await tick();
+      expect(d.pending()).toBe(0);
+    });
+
+    it("rejects a join whose mark fails, and the next delivery joins normally", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const actors = new InMemoryActorRepository();
+      const base = memoryMeshWriter(inboxStore, actors, undefined);
+      let failNext = false;
+      let marksMade = 0;
+      const { mesh, tick, logs } = setup({
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+        inboxStore,
+        actors,
+        writer: {
+          write: async (op: string, input: unknown) => {
+            if (op === "inbox.markSeen") {
+              marksMade += 1;
+              if (failNext) {
+                failNext = false;
+                throw new Error("seen mark refused");
+              }
+            }
+            return base.write(op as never, input as never);
+          },
+        } as Pick<MeshObligationWriter, "write">,
+      });
+      const w1 = mesh.spawn({ charter: "w1", parentId: "root" });
+      const w2 = mesh.spawn({ charter: "w2", parentId: "root" });
+      mesh.sendMessage(w1, "go", "root");
+      mesh.sendMessage(w2, "go", "root");
+      await tick();
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "queued" });
+      const before = marksMade;
+
+      failNext = true;
+      mesh.sendMessage(w2, "more", "root");
+      await tick();
+      // Refused once, not replayed, reported by the notification's owner.
+      expect(marksMade).toBe(before + 1);
+      expect(logs).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(
+            new RegExp(`message delivery dispatch for ${w2} failed: seen mark refused`)
+          ),
+        ])
+      );
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "queued" });
+
+      mesh.sendMessage(w2, "again", "root");
+      await tick();
+      expect(marksMade).toBe(before + 2);
+      expect(
+        inboxStore.list(w2, { status: "unhandled" }).entries.every((entry) => entry.seenAt !== null)
+      ).toBe(true);
+      d.releaseAll();
+      await tick();
+      expect(mesh.activeRunState(w2)).toEqual({ actorId: w2, phase: "running" });
+      d.releaseAll();
+      await tick();
+    });
+
+    it("reports a queue-gate mark that fails and still runs the queued work once", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const actors = new InMemoryActorRepository();
+      const base = memoryMeshWriter(inboxStore, actors, undefined);
+      let refuse = false;
+      const { mesh, tick, logs } = setup({
+        sharedProvider: d.provider,
+        inboxStore,
+        actors,
+        writer: {
+          write: async (op: string, input: unknown) => {
+            if (op === "inbox.markSeen" && refuse) throw new Error("seen mark refused");
+            return base.write(op as never, input as never);
+          },
+        } as Pick<MeshObligationWriter, "write">,
+      });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+      refuse = true;
+      mesh.sendMessage(worker, "go", "root");
+      await tick();
+      // The lifecycle reports the listener failure, as it did for a sync
+      // throw before the writer; the run is not lost and starts once, with
+      // its entry unseen but unhandled in its worklist.
+      expect(logs).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/lifecycle onQueued listener failed: .*seen mark refused/),
+        ])
+      );
+      expect(mesh.activeRunState(worker)).toEqual({ actorId: worker, phase: "running" });
+      expect(d.pending()).toBe(1);
+      expect(inboxStore.list(worker, { status: "unhandled" }).entries.map((e) => e.seenAt)).toEqual(
+        [null]
+      );
+      refuse = false;
+      d.releaseAll();
+      await tick();
+    });
+
+    it("applies the staged pool and flushes run-end work before the follow-up's held mark, and the work arriving meanwhile joins that one follow-up", async () => {
+      const deferred = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const actors = new InMemoryActorRepository();
+      const marks = heldSeenWriter(inboxStore, actors);
+      const modelAtMark: string[] = [];
+      const runStarts: Array<{ model: string; unseen: number }> = [];
+      let worker = "";
+      const modelOf = () => actors.get(worker)?.modelConfig?.[0]?.model ?? "";
+      const { mesh, tick } = setup({
+        inboxStore,
+        actors,
+        writer: {
+          write: async (op: string, input: unknown) => {
+            if (op === "inbox.markSeen") modelAtMark.push(modelOf());
+            return marks.writer.write(op as never, input as never);
+          },
+        } as Pick<MeshObligationWriter, "write">,
+        sharedProvider: {
+          name: "deferred",
+          providerName: "deferred",
+          run: async (opts) => {
+            runStarts.push({
+              model: modelOf(),
+              unseen: inboxStore
+                .list(worker, { status: "unhandled" })
+                .entries.filter((entry) => entry.seenAt === null).length,
+            });
+            return deferred.provider.run(opts);
+          },
+        },
+      });
+      worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "deferred", model: "model-a" },
+        context: { type: "portable", mode: "tail" },
+      });
+
+      mesh.sendMessage(worker, "run 1", "root");
+      await tick();
+      expect(runStarts).toEqual([{ model: "model-a", unseen: 0 }]);
+      mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
+      // Work for the run after this one, and its marks held from here on.
+      marks.hold();
+      mesh.sendMessage(worker, "run 2", "root");
+      await tick();
+      const marksBeforeEnd = marks.held();
+
+      deferred.releaseAll();
+      await tick();
+      // Run 1 ended: its pending target is applied, and only then does the
+      // follow-up queue and make its (held) mark. It has not started.
+      expect(marks.held()).toBeGreaterThan(marksBeforeEnd);
+      expect(modelAtMark.at(-1)).toBe("model-b");
+      expect(runStarts).toHaveLength(1);
+
+      // More work while that mark is outstanding: ordered behind it.
+      mesh.sendMessage(worker, "run 3", "root");
+      await tick();
+      expect(runStarts).toHaveLength(1);
+
+      marks.release();
+      await tick();
+      // One follow-up, on the applied pool, with all its work seen at start.
+      expect(runStarts).toEqual([
+        { model: "model-a", unseen: 0 },
+        { model: "model-b", unseen: 0 },
+      ]);
+      deferred.releaseAll();
+      await tick();
+      expect(runStarts).toHaveLength(2);
+      expect(mesh.activeRunState(worker)).toBeNull();
+    });
   });
 
   it("retires a queued thread with forceQueued, cancelling the start before provider runs ", async () => {
@@ -6646,7 +6993,7 @@ describe("ActorMesh", () => {
     expect(registry.get("root")?.desiredModelConfig).toBeUndefined();
   });
 
-  it("lets only the root set its own portable model at its run boundary", () => {
+  it("lets only the root set its own portable model at its run boundary", async () => {
     const events: MeshEventInput[] = [];
     const modelSets: Array<{ actorId: string; newModel: string; record: ActorRecord }> = [];
     const { mesh, registry, root } = setup({
@@ -6680,7 +7027,7 @@ describe("ActorMesh", () => {
     ).toThrow(/cannot set its own model/);
 
     running.mockReturnValue(false);
-    mesh.finishInboxRun("root");
+    await mesh.finishInboxRun("root");
 
     expect(registry.get("root")?.modelConfig).toEqual([
       { provider: "codex", model: "gpt-5.6-sol" },
@@ -13964,12 +14311,12 @@ describe("strict obligation handling (#382, #917)", () => {
       events,
       completedFocusEntryCounts,
       inboxStore,
+      closure: repo,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     repo.setActorExists((id) => fixture.registry.get(id)?.status === "active");
@@ -13985,9 +14332,13 @@ describe("strict obligation handling (#382, #917)", () => {
     return fixture;
   }
 
-  function selectHead(mesh: ActorMesh, actorId: string, obligationId: string): string {
+  async function selectHead(
+    mesh: ActorMesh,
+    actorId: string,
+    obligationId: string
+  ): Promise<string> {
     mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
-    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
     const entry = inboxStore.entries.find(
       (candidate) =>
         candidate.actorId === actorId &&
@@ -13999,9 +14350,13 @@ describe("strict obligation handling (#382, #917)", () => {
     return entry.id;
   }
 
-  function selectDirectFocus(mesh: ActorMesh, actorId: string, obligationId: string): void {
+  async function selectDirectFocus(
+    mesh: ActorMesh,
+    actorId: string,
+    obligationId: string
+  ): Promise<void> {
     mesh.sendMessage(actorId, "focus this obligation", "root");
-    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
     const entry = inboxStore.entries
       .filter(
         (candidate) => candidate.actorId === actorId && candidate.payload.type === "mesh.message"
@@ -14011,9 +14366,9 @@ describe("strict obligation handling (#382, #917)", () => {
     mesh.selectInboxEntries(actorId, [entry.id], undefined, obligationId);
   }
 
-  function selectMessage(mesh: ActorMesh, actorId: string): string {
+  async function selectMessage(mesh: ActorMesh, actorId: string): Promise<string> {
     mesh.sendMessage(actorId, "no obligation here", "root");
-    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
     const entry = inboxStore.entries
       .filter(
         (candidate) => candidate.actorId === actorId && candidate.payload.type === "mesh.message"
@@ -14024,10 +14379,16 @@ describe("strict obligation handling (#382, #917)", () => {
     return entry.id;
   }
 
-  /** Every closure shortfall the armed run would be rejected for, one per line. */
+  /**
+   * Every closure shortfall the armed run would be rejected for, one per line,
+   * decided the way the writer decides it at return (#1289).
+   */
   function rejection(mesh: ActorMesh, actorId: string): string {
-    return mesh
-      .headClosureShortfalls(actorId)
+    const query = mesh.runClosureQuery(actorId);
+    const actors = meshRegistries.get(mesh);
+    if (!query) return "";
+    if (!actors) throw new Error("expected a mesh built by setup()");
+    return inboxClosureShortfalls({ obligations: repo, actors }, query)
       .map((shortfall) => shortfall.message)
       .join("\n");
   }
@@ -14040,7 +14401,7 @@ describe("strict obligation handling (#382, #917)", () => {
     });
   }
 
-  it("enforces every worker without enrollment and records an actionable rejection at return", () => {
+  it("enforces every worker without enrollment and records an actionable rejection at return", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = strictMesh((event) => events.push(event));
     const first = worker(mesh, "first");
@@ -14048,8 +14409,8 @@ describe("strict obligation handling (#382, #917)", () => {
     repo.create({ id: "strict-head", title: "Strict head", ownerId: first });
     repo.create({ id: "other-head", title: "Other head", ownerId: second });
 
-    selectHead(mesh, first, "strict-head");
-    selectHead(mesh, second, "other-head");
+    await selectHead(mesh, first, "strict-head");
+    await selectHead(mesh, second, "other-head");
 
     expect(rejection(mesh, first)).toMatch(
       /selected head obligation strict-head \("Strict head"\) was not finished or decomposed/
@@ -14057,8 +14418,8 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, second)).toMatch(
       /selected head obligation other-head \("Other head"\) was not finished or decomposed/
     );
-    mesh.finishInboxRun(first, { successful: true });
-    mesh.finishInboxRun(second, { successful: true });
+    await mesh.finishInboxRun(first, { successful: true });
+    await mesh.finishInboxRun(second, { successful: true });
     expect(events.filter((event) => event.kind === "run_return_rejected")).toEqual([
       expect.objectContaining({
         actorId: first,
@@ -14073,12 +14434,12 @@ describe("strict obligation handling (#382, #917)", () => {
     ]);
   });
 
-  it("arms strict handling from the focused obligation status at selection", () => {
+  it("arms strict handling from the focused obligation status at selection", async () => {
     const { mesh } = strictMesh();
 
     const directReady = worker(mesh, "direct ready");
     repo.create({ id: "direct-ready", title: "Direct ready", ownerId: directReady });
-    selectDirectFocus(mesh, directReady, "direct-ready");
+    await selectDirectFocus(mesh, directReady, "direct-ready");
     expect(mesh.runDisciplineNotice(directReady)).toContain("direct-ready");
     expect(rejection(mesh, directReady)).toMatch(/selected head obligation direct-ready/);
 
@@ -14086,7 +14447,7 @@ describe("strict obligation handling (#382, #917)", () => {
     repo.create({ id: "direct-waiting", title: "Direct waiting", ownerId: directWaiting });
     repo.create({ id: "direct-blocker", title: "Direct blocker", ownerId: directWaiting });
     repo.addPrerequisite("direct-waiting", "direct-blocker", "system:mesh");
-    selectDirectFocus(mesh, directWaiting, "direct-waiting");
+    await selectDirectFocus(mesh, directWaiting, "direct-waiting");
     expect(mesh.runDisciplineNotice(directWaiting)).toBeUndefined();
     // The selection-time decision remains stable when the focused work becomes ready later.
     repo.setTerminalStatus("direct-blocker", "done", null, null, "system:mesh");
@@ -14104,7 +14465,7 @@ describe("strict obligation handling (#382, #917)", () => {
       creatorId: staleHead,
     });
     expect(repo.get("stale-head")?.status).toBe("waiting");
-    mesh.actorQueued(staleHead, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(staleHead, { responsive: false, mode: "ordinary" });
     const staleEntry = inboxStore.entries.find(
       (candidate) =>
         candidate.actorId === staleHead &&
@@ -14118,12 +14479,12 @@ describe("strict obligation handling (#382, #917)", () => {
 
     const currentHead = worker(mesh, "current ready-head");
     repo.create({ id: "current-head", title: "Current head", ownerId: currentHead });
-    selectHead(mesh, currentHead, "current-head");
+    await selectHead(mesh, currentHead, "current-head");
     expect(mesh.runDisciplineNotice(currentHead)).toContain("current-head");
     expect(rejection(mesh, currentHead)).toMatch(/selected head obligation current-head/);
   });
 
-  it("unions selected ready heads with owned direct focus without arming foreign focus", () => {
+  it("unions selected ready heads with owned direct focus without arming foreign focus", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh, "union subject");
     const other = worker(mesh, "other owner");
@@ -14134,7 +14495,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // An explicit foreign focus cannot replace the selected head's closure
     // requirement. It remains resolver context, not this actor's commitment.
     mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
-    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const headEntry = inboxStore.entries.find(
       (entry) =>
         entry.actorId === subject &&
@@ -14150,7 +14511,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     // When both are owned and ready, each selection-time focus remains armed.
     mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
-    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const secondHeadEntry = inboxStore.entries
       .filter(
         (entry) =>
@@ -14168,13 +14529,13 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, subject)).toBe("");
   });
 
-  it("does not arm a ready head reassigned to another actor before selection", () => {
+  it("does not arm a ready head reassigned to another actor before selection", async () => {
     const { mesh } = strictMesh();
     const formerOwner = worker(mesh, "former owner");
     const newOwner = worker(mesh, "new owner");
     repo.create({ id: "moved-head", title: "Moved head", ownerId: formerOwner });
     mesh.deliverReadyHeadAttention(formerOwner, { id: "moved-head", intent: "moved" }, null);
-    mesh.actorQueued(formerOwner, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(formerOwner, { responsive: false, mode: "ordinary" });
     const movedEntry = inboxStore.entries.find(
       (entry) =>
         entry.actorId === formerOwner &&
@@ -14192,7 +14553,7 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, formerOwner)).toBe("");
   });
 
-  it("accepts terminal exits and a worker-created live child", () => {
+  it("accepts terminal exits and a worker-created live child", async () => {
     const { mesh } = strictMesh();
     for (const [id, terminal] of [
       ["done", "done"],
@@ -14201,7 +14562,7 @@ describe("strict obligation handling (#382, #917)", () => {
     ] as const) {
       const subject = worker(mesh, id);
       repo.create({ id, title: id, ownerId: subject });
-      selectHead(mesh, subject, id);
+      await selectHead(mesh, subject, id);
       if (terminal === "scheduled") {
         repo.setRecurrence(id, { policy: "cron", cronExpr: "0 0 * * *" }, "system:mesh");
         repo.setTerminalStatus(id, "done", null, null, "system:mesh");
@@ -14213,7 +14574,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     const subject = worker(mesh, "decomposer");
     repo.create({ id: "parent", title: "Parent", ownerId: subject });
-    selectHead(mesh, subject, "parent");
+    await selectHead(mesh, subject, "parent");
     repo.create({
       id: "child",
       parentId: "parent",
@@ -14224,11 +14585,11 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, subject)).toBe("");
   });
 
-  it("rejects an other-authored child after ready selection, but accepts a newly added unmet prerequisite", () => {
+  it("rejects an other-authored child after ready selection, but accepts a newly added unmet prerequisite", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
     repo.create({ id: "parent", title: "Parent", ownerId: subject });
-    selectHead(mesh, subject, "parent");
+    await selectHead(mesh, subject, "parent");
     repo.create({
       id: "other-child",
       parentId: "parent",
@@ -14243,11 +14604,11 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, subject)).toBe("");
   });
 
-  it("does not accept a cancelled prerequisite and clears enforcement on an abandoned run", () => {
+  it("does not accept a cancelled prerequisite and clears enforcement on an abandoned run", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
     repo.create({ id: "first", title: "First", ownerId: subject });
-    selectHead(mesh, subject, "first");
+    await selectHead(mesh, subject, "first");
     repo.create({ id: "cancelled-gate", title: "Cancelled gate", ownerId: subject });
     repo.setTerminalStatus("cancelled-gate", "cancelled", null, null, "system:mesh");
     repo.addPrerequisite("first", "cancelled-gate", "system:mesh");
@@ -14259,7 +14620,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     // The next selection arms only its own head, not the abandoned one.
     repo.create({ id: "after-failure", title: "After failure", ownerId: subject });
-    selectHead(mesh, subject, "after-failure");
+    await selectHead(mesh, subject, "after-failure");
     expect(rejection(mesh, subject)).toMatch(/selected head obligation after-failure/);
     expect(rejection(mesh, subject)).not.toMatch(/first/);
   });
@@ -14320,8 +14681,12 @@ describe("strict obligation handling (#382, #917)", () => {
   }
 
   /** Select the latest head attention already delivered, without injecting any. */
-  function selectDeliveredHead(mesh: ActorMesh, actorId: string, obligationId: string): void {
-    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+  async function selectDeliveredHead(
+    mesh: ActorMesh,
+    actorId: string,
+    obligationId: string
+  ): Promise<void> {
+    await mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
     const entry = headEntries(actorId, obligationId).at(-1);
     if (!entry) throw new Error(`expected delivered ready-head attention for ${actorId}`);
     mesh.selectInboxEntries(actorId, [entry.id]);
@@ -14337,7 +14702,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     // Attention arrives through the production listener, not an injection.
     repo.create({ id: "review", title: "Review", ownerId: reviewer });
-    selectDeliveredHead(mesh, reviewer, "review");
+    await selectDeliveredHead(mesh, reviewer, "review");
 
     // Checkpoint first, reassign second: the reviewer and implementer are
     // siblings, so the owner-or-ancestor policy admits the reviewer's write
@@ -14364,7 +14729,7 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(headEntries(implementer, "review")).toHaveLength(1);
 
     expect(rejection(mesh, reviewer)).toBe("");
-    mesh.finishInboxRun(reviewer);
+    await mesh.finishInboxRun(reviewer);
     expect(repo.get("review")).toMatchObject({
       id: "review",
       ownerId: implementer,
@@ -14376,7 +14741,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // Correction and re-review: the same obligation travels back the same way,
     // as a second, distinct wake for the reviewer.
     expect(headEntries(reviewer, "review")).toHaveLength(1);
-    selectDeliveredHead(mesh, implementer, "review");
+    await selectDeliveredHead(mesh, implementer, "review");
     expect(
       (
         await callTool(implementerMcp, "set_checkpoint", {
@@ -14400,12 +14765,12 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(repo.listDirectChildEdges("review")).toEqual([]);
   });
 
-  it("recovers a handed-off head into the recipient's queue after the process is interrupted before delivery", () => {
+  it("recovers a handed-off head into the recipient's queue after the process is interrupted before delivery", async () => {
     const { mesh, registry } = strictMesh();
     const reviewer = worker(mesh, "reviewer");
     const implementer = worker(mesh, "implementer");
     repo.create({ id: "review", title: "Review", ownerId: reviewer });
-    selectHead(mesh, reviewer, "review");
+    await selectHead(mesh, reviewer, "review");
     repo.setCheckpoint("review", "Findings recorded; implementer should correct.", reviewer);
     // No listener is wired: the row and head transition commit, and the
     // process dies before anything reaches the recipient's inbox.
@@ -14418,12 +14783,12 @@ describe("strict obligation handling (#382, #917)", () => {
     const resumed = setup({
       actors: registry,
       inboxStore,
+      closure: repo,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     resumed.mesh.rehydrateAll();
@@ -14441,7 +14806,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
     // Run 1: checkpoint, then leave legally on a new unmet prerequisite.
     repo.create({ id: "stale", title: "Stale standing", ownerId: source });
-    selectDeliveredHead(mesh, source, "stale");
+    await selectDeliveredHead(mesh, source, "stale");
     expect(
       (
         await callTool(sourceMcp, "set_checkpoint", {
@@ -14453,13 +14818,13 @@ describe("strict obligation handling (#382, #917)", () => {
     repo.create({ id: "gate", title: "Gate", ownerId: recipient });
     repo.addPrerequisite("stale", "gate", source);
     expect(rejection(mesh, source)).toBe("");
-    mesh.finishInboxRun(source);
+    await mesh.finishInboxRun(source);
 
     // The gate clears and the head comes back to the source. Run 2 hands it off
     // without saying where round two stands: the standing it carries describes
     // the previous run, so the transfer is not a checkpointed handoff.
     repo.setTerminalStatus("gate", "done", null, null, recipient);
-    selectDeliveredHead(mesh, source, "stale");
+    await selectDeliveredHead(mesh, source, "stale");
     expect(
       (await callTool(sourceMcp, "reassign_obligation", { id: "stale", owner_id: recipient }))
         .isError
@@ -14473,7 +14838,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // no transfer is attributed to its run.
     repo.create({ id: "moved", title: "Moved before selection", ownerId: source });
     repo.reassign("moved", recipient, "root");
-    mesh.actorQueued(source, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(source, { responsive: false, mode: "ordinary" });
     const stale = inboxStore.entries.find(
       (entry) =>
         entry.actorId === source &&
@@ -14486,7 +14851,7 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, source)).toBe("");
   });
 
-  it("records a head unreadable at selection and fails closed on a handoff of it", () => {
+  it("records a head unreadable at selection and fails closed on a handoff of it", async () => {
     // A concurrent write can leave a head briefly unreadable exactly when it is
     // selected. Selection still admits it — every other exit is judged from the
     // live row — but the run has no baseline to attribute a transfer to, and a
@@ -14494,19 +14859,19 @@ describe("strict obligation handling (#382, #917)", () => {
     const unreadable = new Set<string>(["unreadable"]);
     const { mesh } = setup({
       inboxStore,
+      closure: repo,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => (unreadable.has(id) ? null : repo.get(id)),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     const source = worker(mesh, "source");
     const recipient = worker(mesh, "recipient");
 
     repo.create({ id: "unreadable", title: "Unreadable at selection", ownerId: source });
-    selectHead(mesh, source, "unreadable");
+    await selectHead(mesh, source, "unreadable");
 
     // The row reads again and the same head is selected a second time inside
     // this run: the null baseline stands, so the handoff still has nothing to
@@ -14531,7 +14896,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // The same unreadable selection still leaves the other exits open.
     unreadable.add("closed");
     repo.create({ id: "closed", title: "Closed after an unreadable selection", ownerId: source });
-    selectHead(mesh, source, "closed");
+    await selectHead(mesh, source, "closed");
     unreadable.delete("closed");
     repo.setTerminalStatus("closed", "done", null, null, source);
     expect(rejection(mesh, source)).toBe("");
@@ -14548,14 +14913,14 @@ describe("strict obligation handling (#382, #917)", () => {
 
     // Missing checkpoint: a real ownership transfer alone remains insufficient.
     repo.create({ id: "missing-checkpoint", title: "Missing checkpoint", ownerId: source });
-    selectHead(mesh, source, "missing-checkpoint");
+    await selectHead(mesh, source, "missing-checkpoint");
     expect((await handoff("missing-checkpoint", recipient)).isError).toBeFalsy();
     expect(rejection(mesh, source)).toMatch(/without a checkpoint written by this actor/);
     mesh.abandonInboxRun(source);
 
     // Self-reassignment is a no-op, even with a fresh checkpoint.
     repo.create({ id: "self", title: "Self handoff", ownerId: source });
-    selectHead(mesh, source, "self");
+    await selectHead(mesh, source, "self");
     repo.setCheckpoint("self", "I cannot hand this off to myself.", source);
     expect((await handoff("self", source)).isError).toBeFalsy();
     expect(rejection(mesh, source)).toMatch(/obligation is still ready/);
@@ -14565,7 +14930,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // transfer fails and the source still owns the selected head.
     mesh.retire(retired);
     repo.create({ id: "failed", title: "Failed handoff", ownerId: source });
-    selectHead(mesh, source, "failed");
+    await selectHead(mesh, source, "failed");
     repo.setCheckpoint("failed", "Transfer attempt failed; source still owns it.", source);
     expect((await handoff("failed", retired)).isError).toBe(true);
     expect(repo.get("failed")?.ownerId).toBe(source);
@@ -14575,7 +14940,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // The operator is a legitimate owner but not an actor any inbox wakes, so
     // handing the head to a human is a question for a person, not a handoff.
     repo.create({ id: "to-human", title: "Human handoff", ownerId: source });
-    selectHead(mesh, source, "to-human");
+    await selectHead(mesh, source, "to-human");
     repo.setCheckpoint("to-human", "Needs an operator decision.", source);
     expect((await handoff("to-human", "00000000-0000-4000-8000-000000000001")).isError).toBeFalsy();
     expect(rejection(mesh, source)).toMatch(/not an active actor that can be woken/);
@@ -14584,13 +14949,13 @@ describe("strict obligation handling (#382, #917)", () => {
     // Nothing mints a system owner through the surface; the repository accepts
     // this direct mutation and enforcement still fails closed on it.
     repo.create({ id: "to-system", title: "System handoff", ownerId: source });
-    selectHead(mesh, source, "to-system");
+    await selectHead(mesh, source, "to-system");
     repo.setCheckpoint("to-system", "Nobody will be woken for this.", source);
     repo.reassign("to-system", "system:mesh", source);
     expect(rejection(mesh, source)).toMatch(/not an active actor that can be woken/);
   });
 
-  it("rejects a handoff to an ancestor that is mid-retirement even though its record still reads active", () => {
+  it("rejects a handoff to an ancestor that is mid-retirement even though its record still reads active", async () => {
     // Retirement marks each actor retired only on the way back out of the
     // subtree, so the parent still reads active while its child's onRetire
     // fires. A handoff landing there during that window is accepted by the
@@ -14599,12 +14964,12 @@ describe("strict obligation handling (#382, #917)", () => {
     let parentStatusDuringTeardown: string | undefined;
     const { mesh, registry } = setup({
       inboxStore,
+      closure: repo,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
       onRetire: (record) => {
         if (record.id !== child) return;
@@ -14617,7 +14982,7 @@ describe("strict obligation handling (#382, #917)", () => {
     const parent = worker(mesh, "retiring parent");
     const child = mesh.spawn({ charter: "retiring child", parentId: parent });
     repo.create({ id: "to-retiring", title: "Handoff into teardown", ownerId: source });
-    selectHead(mesh, source, "to-retiring");
+    await selectHead(mesh, source, "to-retiring");
     repo.setCheckpoint("to-retiring", "Handing this to the parent.", source);
 
     mesh.retire(parent);
@@ -14633,12 +14998,12 @@ describe("strict obligation handling (#382, #917)", () => {
     const { mesh, registry } = setup({
       rootId,
       inboxStore,
+      closure: repo,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     const source = worker(mesh, "source");
@@ -14647,7 +15012,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // Over the MCP, root is addressed by its real id; the literal alias names
     // no record and is refused by the production owner resolver.
     repo.create({ id: "to-root", title: "Escalate to root", ownerId: source });
-    selectHead(mesh, source, "to-root");
+    await selectHead(mesh, source, "to-root");
     repo.setCheckpoint("to-root", "Needs root's decision; standing recorded.", source);
     expect(
       (await callTool(sourceMcp, "reassign_obligation", { id: "to-root", owner_id: "root" }))
@@ -14658,22 +15023,22 @@ describe("strict obligation handling (#382, #917)", () => {
         .isError
     ).toBeFalsy();
     expect(rejection(mesh, source)).toBe("");
-    mesh.finishInboxRun(source);
+    await mesh.finishInboxRun(source);
 
     // A row that says "root" — written by a surface that still uses the legacy
     // address — is the same active recipient, not an unknown actor.
     repo.create({ id: "to-root-alias", title: "Escalate to root alias", ownerId: source });
-    selectHead(mesh, source, "to-root-alias");
+    await selectHead(mesh, source, "to-root-alias");
     repo.setCheckpoint("to-root-alias", "Standing recorded for root.", source);
     repo.reassign("to-root-alias", "root", source);
     expect(rejection(mesh, source)).toBe("");
-    mesh.finishInboxRun(source);
+    await mesh.finishInboxRun(source);
 
     // Symmetrically, a head whose row names root by its alias was owned by
     // root at selection, so root itself can hand it down. Root is held to the
     // same closure as any worker — no enrollment, no exemption (#917).
     repo.create({ id: "from-root", title: "Delegated by root", ownerId: "root" });
-    selectHead(mesh, rootId, "from-root");
+    await selectHead(mesh, rootId, "from-root");
     expect(mesh.runDisciplineNotice(rootId)).toContain("from-root");
     expect(rejection(mesh, rootId)).toMatch(/selected head obligation from-root/);
     repo.setCheckpoint("from-root", "Standing recorded; worker should take it.", rootId);
@@ -14681,13 +15046,13 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, rootId)).toBe("");
   });
 
-  it("does not constrain runs selected from regular messages rather than head attention", () => {
+  it("does not constrain runs selected from regular messages rather than head attention", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
 
     repo.create({ id: "ob-unrelated", title: "Unrelated Task", ownerId: subject });
     mesh.sendMessage(subject, "general message", "root");
-    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const msgEntry = inboxStore.entries.find(
       (e) => e.actorId === subject && e.payload.type === "mesh.message"
     );
@@ -14695,10 +15060,10 @@ describe("strict obligation handling (#382, #917)", () => {
     mesh.selectInboxEntries(subject, [msgEntry.id]);
 
     expect(rejection(mesh, subject)).toBe("");
-    mesh.finishInboxRun(subject);
+    await mesh.finishInboxRun(subject);
   });
 
-  it("evaluates standing/apex nodes when re-readied, and accepts question child for operator continuation", () => {
+  it("evaluates standing/apex nodes when re-readied, and accepts question child for operator continuation", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
 
@@ -14714,7 +15079,7 @@ describe("strict obligation handling (#382, #917)", () => {
     repo.setTerminalStatus("initial-child", "done", null, null, "system:mesh");
     expect(repo.get("standing-effort")?.status).toBe("ready");
 
-    selectHead(mesh, subject, "standing-effort");
+    await selectHead(mesh, subject, "standing-effort");
 
     expect(rejection(mesh, subject)).toMatch(
       /selected head obligation standing-effort \("Standing Maintenance"\) was not finished or decomposed/
@@ -14730,18 +15095,18 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(repo.get("standing-effort")?.status).toBe("waiting");
 
     expect(rejection(mesh, subject)).toBe("");
-    mesh.finishInboxRun(subject);
+    await mesh.finishInboxRun(subject);
   });
 
-  it("preserves failed-run handling without a return rejection", () => {
+  it("preserves failed-run handling without a return rejection", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = strictMesh((event) => events.push(event));
     const subject = worker(mesh);
 
     repo.create({ id: "ob-crashed", title: "Crashing Task", ownerId: subject });
-    selectHead(mesh, subject, "ob-crashed");
+    await selectHead(mesh, subject, "ob-crashed");
 
-    expect(() => mesh.finishInboxRun(subject, { successful: false })).not.toThrow();
+    await expect(mesh.finishInboxRun(subject, { successful: false })).resolves.toBeUndefined();
     expect(repo.get("ob-crashed")?.status).toBe("ready");
     expect(events.some((event) => event.kind === "run_return_rejected")).toBe(false);
   });
@@ -14789,7 +15154,7 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1", "head-2"]);
   });
 
-  it("tells the run its discipline at the selection that arms enforcement, and says nothing to a run that armed nothing", () => {
+  it("tells the run its discipline at the selection that arms enforcement, and says nothing to a run that armed nothing", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh, "told");
     const control = worker(mesh, "message-only control");
@@ -14798,8 +15163,8 @@ describe("strict obligation handling (#382, #917)", () => {
     // Nothing is in force before the selection that arms it.
     expect(mesh.runDisciplineNotice(subject)).toBeUndefined();
 
-    selectHead(mesh, subject, "told-head");
-    selectMessage(mesh, control);
+    await selectHead(mesh, subject, "told-head");
+    await selectMessage(mesh, control);
 
     const notice = mesh.runDisciplineNotice(subject);
     expect(notice).not.toMatch(/experiment/i);
@@ -14815,14 +15180,14 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, control)).toBe("");
   });
 
-  it("names every armed head and holds each of them to a legal exit when one selection arms several", () => {
+  it("names every armed head and holds each of them to a legal exit when one selection arms several", async () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh, "two heads");
     repo.create({ id: "first-head", title: "First head", ownerId: subject });
     repo.create({ id: "second-head", title: "Second head", ownerId: subject });
     mesh.deliverReadyHeadAttention(subject, { id: "first-head", intent: "first" }, null);
     mesh.deliverReadyHeadAttention(subject, { id: "second-head", intent: "second" }, "first-head");
-    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
     const entryIds = inboxStore.entries
       .filter(
         (entry) => entry.actorId === subject && entry.payload.type === "obligation.ready_head"
@@ -14849,7 +15214,7 @@ describe("strict obligation handling (#382, #917)", () => {
     expect(rejection(mesh, subject)).toBe("");
   });
 
-  it("refuses head selection for every actor, root included, when the mesh has no closure reads", () => {
+  it("refuses head selection for every actor, root included, when the mesh has no closure reads", async () => {
     // A partial port — every embedder built before #382 has one — must not
     // quietly skip closure.
     const { mesh } = setup({
@@ -14864,7 +15229,7 @@ describe("strict obligation handling (#382, #917)", () => {
       [subject, "partial-head"],
       ["root", "partial-root-head"],
     ] as const) {
-      expect(() => selectHead(mesh, actorId, obligationId)).toThrow(
+      await expect(selectHead(mesh, actorId, obligationId)).rejects.toThrow(
         /this mesh has no obligation closure port .* wired, and every head selection is held to strict closure/
       );
       // Nothing was armed and nothing was committed, so no return can pass
@@ -14873,7 +15238,7 @@ describe("strict obligation handling (#382, #917)", () => {
     }
 
     // A run that selects no head needs no closure reads.
-    expect(() => selectMessage(mesh, subject)).not.toThrow();
+    await expect(selectMessage(mesh, subject)).resolves.toBeDefined();
     expect(rejection(mesh, subject)).toBe("");
   });
 
@@ -14899,52 +15264,52 @@ describe("strict obligation handling (#382, #917)", () => {
       return setup({
         inboxStore,
         now: () => new Date(clock).toISOString(),
+        closure: repo,
         obligations: {
           findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
           get: (id) => repo.get(id),
           listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
           listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-          expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
         },
       });
     }
 
-    it("names snooze as an exit in both the discipline notice and the rejection (#819)", () => {
+    it("names snooze as an exit in both the discipline notice and the rejection (#819)", async () => {
       const { mesh } = snoozeMesh();
       const subject = worker(mesh, "told about snooze");
       repo.create({ id: "head", title: "Head", ownerId: subject });
-      selectHead(mesh, subject, "head");
+      await selectHead(mesh, subject, "head");
       const snoozeExit = "snooze it until a future time with `set_snooze`";
       expect(mesh.runDisciplineNotice(subject)).toContain(snoozeExit);
       expect(rejection(mesh, subject)).toContain(snoozeExit);
     });
 
-    it("closes a ready head snoozed during the run", () => {
+    it("closes a ready head snoozed during the run", async () => {
       const { mesh } = snoozeMesh();
       const subject = worker(mesh, "snoozes mid-run");
       repo.create({ id: "head", title: "Head", ownerId: subject });
-      selectHead(mesh, subject, "head");
+      await selectHead(mesh, subject, "head");
       expect(rejection(mesh, subject)).toMatch(/selected head obligation head/);
 
       repo.writeSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
       expect(rejection(mesh, subject)).toBe("");
     });
 
-    it("closes a directly focused ready obligation snoozed before the run", () => {
+    it("closes a directly focused ready obligation snoozed before the run", async () => {
       const { mesh } = snoozeMesh();
       const subject = worker(mesh, "snoozed before");
       repo.create({ id: "deferred", title: "Deferred", ownerId: subject });
       repo.writeSnooze("deferred", new Date(T0 + HOUR).toISOString(), subject);
-      selectDirectFocus(mesh, subject, "deferred");
+      await selectDirectFocus(mesh, subject, "deferred");
       expect(rejection(mesh, subject)).toBe("");
     });
 
-    it("closes a waiting head that gained no new work once it is snoozed", () => {
+    it("closes a waiting head that gained no new work once it is snoozed", async () => {
       const { mesh } = snoozeMesh();
       const subject = worker(mesh, "waiting head");
       const other = worker(mesh, "someone else");
       repo.create({ id: "head", title: "Head", ownerId: subject });
-      selectHead(mesh, subject, "head");
+      await selectHead(mesh, subject, "head");
       // Someone else's child makes the head wait without this run decomposing it.
       repo.create({
         id: "theirs",
@@ -14962,11 +15327,11 @@ describe("strict obligation handling (#382, #917)", () => {
       expect(repo.get("head")?.status).toBe("waiting");
     });
 
-    it("an expired snooze is cleared at return and the ordinary check applies again", () => {
+    it("an expired snooze is cleared at return and the ordinary check applies again", async () => {
       const { mesh } = snoozeMesh();
       const subject = worker(mesh, "expires mid-run");
       repo.create({ id: "head", title: "Head", ownerId: subject });
-      selectHead(mesh, subject, "head");
+      await selectHead(mesh, subject, "head");
       repo.writeSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
 
       clock = T0 + HOUR;
@@ -14988,7 +15353,7 @@ describe("strict obligation handling (#382, #917)", () => {
       );
       // The bounded retry is asserted as the decision to dispatch; the run it
       // would launch is the ordinary retry path covered elsewhere.
-      const dispatch = vi.spyOn(mesh, "dispatch").mockReturnValue(true);
+      const dispatch = vi.spyOn(mesh, "dispatch").mockResolvedValue(true);
       const rejections = () => events.filter((event) => event.kind === "run_return_rejected");
       /**
        * Why the inbox tool's write would refuse to mark `entryIds` handled,
@@ -15005,19 +15370,19 @@ describe("strict obligation handling (#382, #917)", () => {
       return { mesh, dispatch, rejections, handlingRefusal };
     }
 
-    it("rejects a return that leaves a selected head as found: the attention stays unhandled, retries once, then escalates", () => {
+    it("rejects a return that leaves a selected head as found: the attention stays unhandled, retries once, then escalates", async () => {
       const counts = new Map<string, number>();
       const { mesh, dispatch, rejections, handlingRefusal } = returningMesh(counts);
       const subject = worker(mesh, "returns early");
       repo.create({ id: "left-head", title: "Left head", ownerId: subject });
 
-      const entryId = selectHead(mesh, subject, "left-head");
+      const entryId = await selectHead(mesh, subject, "left-head");
       // Delivering the attention woke the actor; only the return's own retry counts below.
       dispatch.mockClear();
       expect(handlingRefusal(subject, [entryId])).toMatch(
         /Cannot mark handled: selected head obligation left-head \("Left head"\) was not finished or decomposed\. Reason: obligation is still ready/
       );
-      mesh.finishInboxRun(subject, { successful: true, runId: "first-return" });
+      await mesh.finishInboxRun(subject, { successful: true, runId: "first-return" });
 
       expect(rejections()).toEqual([
         expect.objectContaining({
@@ -15037,9 +15402,9 @@ describe("strict obligation handling (#382, #917)", () => {
       // budget is spent, and the parent is told.
       dispatch.mockClear();
       counts.set(entryId, 1);
-      mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+      await mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
       mesh.selectInboxEntries(subject, [entryId]);
-      mesh.finishInboxRun(subject, { successful: true, runId: "retry-return" });
+      await mesh.finishInboxRun(subject, { successful: true, runId: "retry-return" });
 
       expect(rejections()).toHaveLength(2);
       expect(inboxStore.read(subject, entryId)?.handledAt).toBeFalsy();
@@ -15054,11 +15419,11 @@ describe("strict obligation handling (#382, #917)", () => {
       );
     });
 
-    it("refuses mark handled for every entry of a direct focus selection until the focus closes", () => {
+    it("refuses mark handled for every entry of a direct focus selection until the focus closes", async () => {
       const { mesh, handlingRefusal } = returningMesh(new Map());
       const subject = worker(mesh, "focused");
       repo.create({ id: "focus", title: "Focus", ownerId: subject });
-      selectDirectFocus(mesh, subject, "focus");
+      await selectDirectFocus(mesh, subject, "focus");
       const [entryId] = mesh.selectedInboxEntries(subject);
       if (!entryId) throw new Error("expected a selected entry");
 
@@ -15067,13 +15432,13 @@ describe("strict obligation handling (#382, #917)", () => {
       expect(handlingRefusal(subject, [entryId])).toBe("");
     });
 
-    it("does not guard or check a return that armed nothing", () => {
+    it("does not guard or check a return that armed nothing", async () => {
       const { mesh, rejections } = returningMesh(new Map());
       const control = worker(mesh, "message-only control");
-      const entryId = selectMessage(mesh, control);
+      const entryId = await selectMessage(mesh, control);
 
       expect(mesh.inboxHandlingClosure(control, [entryId])).toBeNull();
-      mesh.finishInboxRun(control, { successful: true });
+      await mesh.finishInboxRun(control, { successful: true });
       expect(rejections()).toEqual([]);
     });
 
@@ -15121,22 +15486,44 @@ describe("strict obligation handling (#382, #917)", () => {
           repo.addPrerequisite("head", "gate", "system:mesh");
         },
       ],
-    ] as const)("accepts a return that leaves the head %s", (_label, close) => {
+    ] as const)("accepts a return that leaves the head %s", async (_label, close) => {
       const { mesh, rejections, handlingRefusal } = returningMesh(new Map());
       const subject = worker(mesh, "closes");
       const recipient = worker(mesh, "recipient");
       repo.create({ id: "head", title: "Head", ownerId: subject });
-      const entryId = selectHead(mesh, subject, "head");
+      const entryId = await selectHead(mesh, subject, "head");
 
       close(subject, recipient);
       expect(handlingRefusal(subject, [entryId])).toBe("");
       inboxStore.markHandled(subject, [entryId]);
-      mesh.finishInboxRun(subject, { successful: true, runId: "closed-return" });
+      await mesh.finishInboxRun(subject, { successful: true, runId: "closed-return" });
 
       // Nothing is rejected and nothing is left for the bounded retry.
       expect(rejections()).toEqual([]);
       expect(inboxStore.read(subject, entryId)?.handledAt).toBeTruthy();
     });
+  });
+});
+
+describe("run end when finishing fails (#1289 C1b)", () => {
+  it("still accounts the run and clears its selection, and reports the failure", async () => {
+    const { mesh, logs } = setup();
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    const failure = new Error("finishing failed");
+    vi.spyOn(mesh, "finishInboxRun").mockRejectedValue(failure);
+    const accountRun = vi.spyOn(mesh, "accountRun").mockImplementation(() => {});
+    const clearSelection = vi.spyOn(mesh, "clearSelection");
+    const result = { success: true } as RunResult;
+
+    await mesh.lifecycleFor(worker).emit("onEnd", {
+      actorId: worker,
+      runId: "run-1",
+      terminal: { kind: "result", result },
+    });
+
+    expect(accountRun).toHaveBeenCalledWith(worker, result, "run-1");
+    expect(clearSelection).toHaveBeenCalledWith(worker);
+    expect(logs).toContain("lifecycle onEnd listener failed: finishing failed");
   });
 });
 
@@ -15546,7 +15933,7 @@ describe("accountRun token accounting (#443)", () => {
       mesh.selectInboxEntries("root", ["root-item"]);
       // Root finishes run without handling, reaching recovery limit
       completed = 2;
-      mesh.finishInboxRun("root", { successful: true, runId: "root-run-1" });
+      await mesh.finishInboxRun("root", { successful: true, runId: "root-run-1" });
 
       expect(() => mesh.selectInboxEntries("root", ["root-item"])).toThrow(/needs attention/i);
       // No mechanical notices appended anywhere
@@ -15685,6 +16072,7 @@ describe("accountRun token accounting (#443)", () => {
 
     it("fails closed when no writer is configured (#1289)", async () => {
       const { mesh } = setup();
+      (mesh as unknown as { writer?: unknown }).writer = undefined;
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
       await expect(

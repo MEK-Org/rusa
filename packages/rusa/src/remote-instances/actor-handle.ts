@@ -760,15 +760,14 @@ export class ActorHandle implements MeshActor {
 
   private redispatchDroppedWork(): void {
     this.redispatchOwed = false;
-    try {
-      this.opts.context.mesh.reconcileActorInbox(this.id);
-    } catch (error) {
-      // A missed nudge over durable state; boot reconciliation still lists it.
+    // Not awaited: the admission is already dropped either way. A missed
+    // nudge over durable state is logged; boot reconciliation still lists it.
+    this.opts.context.mesh.reconcileActorInbox(this.id).catch((error: unknown) => {
       this.log.warn("remote_redispatch_failed", {
         actorId: this.id,
         error: error instanceof Error ? error.message : String(error),
       });
-    }
+    });
   }
 
   private enqueueReceive(message: ActorEvent): void {

@@ -36,11 +36,11 @@ export function registerFollowerRegistrationRecovery({
     for (const record of actors.list()) {
       if (record.executionConfig?.executionTarget !== followerId) continue;
       if (record.status !== "active" || !mesh.get(record.id)) continue;
-      try {
-        mesh.dispatch(record.id);
-      } catch (err) {
-        log.warn("follower_release_dispatch_failed", { actorId: record.id, followerId, err });
-      }
+      mesh
+        .dispatch(record.id)
+        .catch((err) =>
+          log.warn("follower_release_dispatch_failed", { actorId: record.id, followerId, err })
+        );
     }
   });
   const unregisterRegister = hub.onRegister((follower: RemoteInstance) => {
@@ -51,23 +51,32 @@ export function registerFollowerRegistrationRecovery({
         continue;
       }
       const existing = mesh.get(record.id);
+      const dispatch = () =>
+        mesh.dispatch(record.id).catch((err) =>
+          log.warn("follower_register_dispatch_failed", {
+            actorId: record.id,
+            followerId: follower.id,
+            err,
+          })
+        );
       if (!existing) {
         mesh.rehydrate(record);
-        mesh.dispatch(record.id);
+        void dispatch();
         continue;
       }
       const reattachable = existing as ReattachableActor;
       if (typeof reattachable.attachHost !== "function") continue;
       try {
         reattachable.attachHost(hub.rebindHost(follower.id, record.id));
-        mesh.dispatch(record.id);
       } catch (err) {
         log.warn("follower_reconnect_attach_failed", {
           actorId: record.id,
           followerId: follower.id,
           err,
         });
+        continue;
       }
+      void dispatch();
     }
   });
   return () => {
