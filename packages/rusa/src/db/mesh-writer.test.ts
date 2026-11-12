@@ -39,8 +39,6 @@ let workerPath: string;
 /** The same worker built as another build would be. */
 let otherBuildWorkerPath: string;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const exists = (id: string) => getRepositories().obligations.get(id) !== null;
 const countTitled = (title: string) =>
   (
@@ -344,7 +342,6 @@ describe("DbWriter", () => {
       expect(err).not.toBeInstanceOf(DbWriteUnavailableError);
       // The replacement takes the write lock the dead worker held, and serves.
       await writer.write("create", input("after-mid-transaction"));
-      await sleep(100);
       expect(exists("w-mid-transaction")).toBe(false);
       expect(exists("w-after-mid-transaction")).toBe(true);
     } finally {
@@ -361,7 +358,6 @@ describe("DbWriter", () => {
       expect(err).toBeInstanceOf(MeshWriteOutcomeUnknownError);
       expect(err.message).toMatch(/may have committed and is not retried/);
       await writer.write("create", input("after-exit-after-commit"));
-      await sleep(100);
       expect(countTitled(title)).toBe(1);
     } finally {
       await writer.close();

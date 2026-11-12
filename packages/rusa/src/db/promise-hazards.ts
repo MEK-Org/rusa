@@ -20,10 +20,12 @@
  *
  * Both checks are scoped to this package's own declarations: a call counts
  * when the function it resolves to is declared under one of `srcRoots`, and a
- * void target counts when it is. A promise chained into `.then`/`.catch`, passed to
- * `void`, assigned, returned or awaited is handled by construction, because the
- * statement is then not a bare call of a package function. Callbacks typed by
- * libraries (`forEach`, event emitters) are out of scope.
+ * void target counts when it is. A promise given a rejection handler
+ * (`.catch`, or `.then` with two arguments), passed to `void`, assigned,
+ * returned or awaited is handled by construction, because the statement is
+ * then not a bare call of a package function; `.then` with one argument and
+ * `.finally` are looked through. Callbacks typed by libraries (`forEach`,
+ * event emitters) are out of scope.
  */
 
 import { relative, sep } from "node:path";
@@ -101,8 +103,20 @@ export function findPromiseHazards(
 
   const visit = (node: ts.Node): void => {
     if (ts.isExpressionStatement(node)) {
-      let call: ts.Expression = node.expression;
-      while (ts.isParenthesizedExpression(call)) call = call.expression;
+      const unwrap = (expression: ts.Expression): ts.Expression =>
+        ts.isParenthesizedExpression(expression) ? unwrap(expression.expression) : expression;
+      let call = unwrap(node.expression);
+      // A continuation without a rejection handler leaves the promise it
+      // continues as unawaited as before, so look through it to the call.
+      while (
+        ts.isCallExpression(call) &&
+        ts.isPropertyAccessExpression(call.expression) &&
+        isThenable(checker.getTypeAtLocation(call.expression.expression)) &&
+        (call.expression.name.text === "finally" ||
+          (call.expression.name.text === "then" && call.arguments.length < 2))
+      ) {
+        call = unwrap(call.expression.expression);
+      }
       if (
         ts.isCallExpression(call) &&
         isThenable(checker.getTypeAtLocation(call)) &&

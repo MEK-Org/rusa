@@ -85,6 +85,24 @@ export function record(writer: MeshWriter): void {
     ).toEqual(["unawaited src/caller.ts:3 writer.write", "unawaited src/caller.ts:4 appendEntry"]);
   });
 
+  it("catches an unawaited write continued without a rejection handler", () => {
+    expect(
+      hazardsIn({
+        "chained.ts": `import { appendEntry, type MeshWriter } from "./ports.js";
+export function record(writer: MeshWriter, log: string[]): void {
+  writer.write("a", {}).then((created) => log.push(created.id));
+  appendEntry("b").finally(() => log.push("b"));
+  writer.write("c", {}).then((created) => created.id).finally(() => log.push("c"));
+}
+`,
+      })
+    ).toEqual([
+      "unawaited src/chained.ts:3 writer.write",
+      "unawaited src/chained.ts:4 appendEntry",
+      "unawaited src/chained.ts:5 writer.write",
+    ]);
+  });
+
   it("catches an async implementation assigned to a void-returning port, every way in", () => {
     expect(
       hazardsIn({
@@ -109,6 +127,10 @@ onEvent(asyncListener);
 const holder = { deliver: asyncListener };
 export const structuralSink: EffectSink = holder;
 export const listener: Listener = asyncListener;
+async function deliver(effect: string): Promise<void> {
+  await appendEntry(effect);
+}
+export const shorthandSink: EffectSink = { deliver };
 `,
       })
     ).toEqual([
@@ -117,6 +139,7 @@ export const listener: Listener = asyncListener;
       "async-into-void src/listeners.ts:2 class member .deliver",
       "async-into-void src/listeners.ts:20 property .deliver",
       "async-into-void src/listeners.ts:21 reference asyncListener",
+      "async-into-void src/listeners.ts:25 reference deliver",
       "async-into-void src/listeners.ts:8 object method .deliver",
     ]);
   });
@@ -153,6 +176,11 @@ export async function record(writer: MeshWriter): Promise<unknown> {
   await writer.write("a", {});
   void writer.write("b", {});
   writer.write("c", {}).catch(() => undefined);
+  writer.write("c2", {}).then(
+    (created) => created.id,
+    () => undefined
+  );
+  writer.write("c3", {}).finally(() => undefined).catch(() => undefined);
   const pending = writer.write("d", {});
   await pending;
   return writer.write("e", {});
