@@ -222,12 +222,12 @@ export class CompletionMatcherEvaluator {
     obligation: Obligation,
     matcher: CompletionMatcher
   ): Promise<void> {
-    const current = await this.committed(
-      obligation.id,
-      this.deps.writer.write("obligations.recordCompletionMatcherClosedUnmerged", {
+    const current = await this.deps.writer.write(
+      "obligations.recordCompletionMatcherClosedUnmerged",
+      {
         id: obligation.id,
         expected: matcherKey(matcher),
-      })
+      }
     );
     if (!current?.completionMatcher?.closedUnmergedAt) return;
     // The durable fact is committed first. The notice is keyed by matcher

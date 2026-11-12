@@ -18,7 +18,11 @@ import {
   type MeshWriteRepos,
   ObligationChangedError,
 } from "./mesh-write-operations.js";
-import { InProcessMeshWriter, MeshWriteCommittedError } from "./mesh-writer.js";
+import {
+  EffectDeliveryFailure,
+  InProcessMeshWriter,
+  MeshWriteCommittedError,
+} from "./mesh-writer.js";
 import { runMigrations } from "./migrations/runner.js";
 import { ObligationRepository } from "./repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "./repositories/sqlite-inbox-repository.js";
@@ -358,9 +362,13 @@ describe("listener failures", () => {
     expect(reported).toBeInstanceOf(MeshWriteCommittedError);
     const committed = reported as MeshWriteCommittedError;
     expect((committed.result as { id: string }).id).toBe("hotfix");
-    expect(committed.failures.map((err) => (err as Error).message)).toEqual([
-      "inbox is unavailable",
-    ]);
+    // The failure names the missing consequence; the listener's own error
+    // stays its cause, for in-process diagnostics and the server log.
+    expect(committed.failures).toHaveLength(1);
+    const failure = committed.failures[0];
+    expect(failure).toBeInstanceOf(EffectDeliveryFailure);
+    expect((failure as Error).message).toBe("responsive-ready attention was not delivered");
+    expect(((failure as Error).cause as Error).message).toBe("inbox is unavailable");
     expect(repository.require("hotfix").id).toBe("hotfix");
     expect(announced).toEqual([]);
 
@@ -444,9 +452,16 @@ describe("a committed write at the MCP boundary (#1289)", () => {
       error: string;
       committed: boolean;
       result: { id: string; title: string };
+      failures: string[];
     };
     expect(report.committed).toBe(true);
     expect(report.error).toContain("committed; do not retry the mutation");
+    // The caller learns which consequence is missing, not only how many, but
+    // not the nested error's text, which describes another write's entry and
+    // stays in the server log as before effects could fail a write.
+    expect(report.failures).toEqual(["the owner's ready-head attention was not delivered"]);
+    expect(text(result)).not.toContain("inbox payload must be an object");
+
     // The id was generated inside the write: the report is the only place the
     // caller learns it, and it names the one row that exists.
     const rows = repository.listOwned("actor-a").filter((o) => o.title === "committed once");
@@ -472,8 +487,18 @@ describe("a committed write at the MCP boundary (#1289)", () => {
     });
     const evaluated: string[] = [];
     const client = await connect({
+      // Evaluation really closes the obligation, as a merged PR would; the
+      // report must carry the row as evaluation left it.
       evaluateCompletionMatcher: async (id) => {
         evaluated.push(id);
+        repository.setReadyHeadListener(() => {});
+        await writer.write("obligations.setTerminalStatus", {
+          id,
+          status: "done",
+          note: "merged",
+          resolutionRef: null,
+          principal: "actor-a",
+        });
         return "satisfied";
       },
     });
@@ -490,10 +515,11 @@ describe("a committed write at the MCP boundary (#1289)", () => {
     expect(result.isError).toBe(true);
     const report = JSON.parse(text(result)) as {
       committed: boolean;
-      result: { id: string };
+      result: { id: string; status: string };
       evaluation: string;
     };
     expect(report).toMatchObject({ committed: true, evaluation: "satisfied" });
+    expect(report.result.status).toBe("done");
     expect(evaluated).toEqual([report.result.id]);
     expect(
       repository

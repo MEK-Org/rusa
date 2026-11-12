@@ -63,6 +63,22 @@ export class MeshWriteCommittedError extends Error {
 }
 
 /**
+ * One committed effect that was not delivered, described for the write's
+ * caller (#1289). `message` names only the kind of consequence that is
+ * missing, never the nested error's text: that text can describe another
+ * actor's entry or row, and before effects could fail a write it reached only
+ * the server log, where it is still written. The underlying error stays in
+ * `cause` for in-process diagnostics.
+ */
+export class EffectDeliveryFailure extends Error {
+  override readonly name = "EffectDeliveryFailure";
+
+  constructor(reason: string, cause: unknown) {
+    super(reason, { cause });
+  }
+}
+
+/**
  * What a caller boundary (an MCP tool result, a dashboard response) answers
  * for a {@link MeshWriteCommittedError}: still an error, because a required
  * effect failed, but one that says the write committed and carries its
@@ -70,11 +86,16 @@ export class MeshWriteCommittedError extends Error {
  * caller can read that state instead of sending the mutation again. Wording
  * cannot stop a caller that retries anyway; it only stops the boundary from
  * hiding what committed. `result` is null when the result itself was lost.
+ * `failures` names, in order, each consequence that could not be returned or
+ * delivered, so the caller can tell which is missing; it carries only an
+ * {@link EffectDeliveryFailure}'s caller-safe reason, never a nested error's
+ * own text.
  */
 export interface CommittedWriteReport {
   readonly error: string;
   readonly committed: true;
   readonly result: unknown;
+  readonly failures: readonly string[];
 }
 
 export function committedWriteReport(err: MeshWriteCommittedError): CommittedWriteReport {
@@ -82,6 +103,9 @@ export function committedWriteReport(err: MeshWriteCommittedError): CommittedWri
     error: `${err.message}. The write committed; do not retry the mutation.`,
     committed: true,
     result: err.result ?? null,
+    failures: err.failures.map((failure) =>
+      failure instanceof EffectDeliveryFailure ? failure.message : "an effect was not delivered"
+    ),
   };
 }
 
@@ -149,8 +173,9 @@ function settle<E>(
       const item = effects[index] as (typeof effects)[number];
       if ("unreturnable" in item) {
         failures.push(
-          new Error(
-            `effect ${index + 1} of ${effects.length} could not be returned: ${item.unreturnable}`
+          new EffectDeliveryFailure(
+            `effect ${index + 1} of ${effects.length} could not be returned from the writer`,
+            new Error(item.unreturnable)
           )
         );
         continue;

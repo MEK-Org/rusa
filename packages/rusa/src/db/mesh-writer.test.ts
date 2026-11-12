@@ -20,12 +20,14 @@ import {
   type MeshWriteOperations,
 } from "./mesh-write-operations.js";
 import {
+  committedWriteReport,
   DbWriteBuildMismatchError,
   DbWriteQueueFullError,
   DbWriter,
   DbWriterClosedError,
   DbWriteUnavailableError,
   type DeliverEffect,
+  EffectDeliveryFailure,
   InProcessMeshWriter,
   MeshWriteCommittedError,
   MeshWriteOutcomeUnknownError,
@@ -204,6 +206,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
       expect(committed.committed).toBe(true);
       expect(committed.result).toEqual({ id: id("effect-failed") });
       expect(committed.failures.map(String)).toEqual(["Error: listener broke"]);
+      // A caller sees that an effect is missing, never a nested error's text.
+      expect(committedWriteReport(committed).failures).toEqual(["an effect was not delivered"]);
+      expect(JSON.stringify(committedWriteReport(committed))).not.toContain("listener broke");
       expect(delivered).toEqual([`announced:${id("effect-failed")}`]);
       expect(exists(id("effect-failed"))).toBe(true);
     } finally {
@@ -241,7 +246,7 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
       const committed = err as MeshWriteCommittedError;
       expect(committed.result).toEqual({ id: id("bad-effect") });
       expect(committed.failures.map(String)).toEqual([
-        expect.stringMatching(/^Error: effect 2 of 2 could not be returned: /),
+        "EffectDeliveryFailure: effect 2 of 2 could not be returned from the writer",
       ]);
       expect(delivered).toEqual([`created:${id("bad-effect")}`]);
       expect(exists(id("bad-effect"))).toBe(true);
@@ -780,7 +785,10 @@ describe.each(MESH_WRITERS)("production write operations ($name writer)", ({ nam
       expect(refusal).not.toBeInstanceOf(MeshWriteCommittedError);
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
       expect((err as MeshWriteCommittedError).result).toMatchObject({ id: parentId });
-      expect((err as MeshWriteCommittedError).failures).toEqual([refusal]);
+      const failures = (err as MeshWriteCommittedError).failures;
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toBeInstanceOf(EffectDeliveryFailure);
+      expect((failures[0] as Error).cause).toBe(refusal);
       expect(repos.obligations.get(parentId)).not.toBeNull();
       expect(repos.inbox.read(testOwner, "bad-entry")).toBeNull();
       expect(attempts).toBe(1);
@@ -912,7 +920,9 @@ describe.each(MESH_WRITERS)("production write operations ($name writer)", ({ nam
       const errC = await rejection(cancel(c));
       expect(errC).toBeInstanceOf(MeshWriteCommittedError);
       expect((errC as MeshWriteCommittedError).failures).toHaveLength(1);
-      expect(String((errC as MeshWriteCommittedError).failures[0])).toContain(`${c}-dep`);
+      const failureC = (errC as MeshWriteCommittedError).failures[0] as Error;
+      expect(failureC.message).toBe("a dependent's cancellation attention was not delivered");
+      expect(String(failureC.cause)).toContain(`${c}-dep`);
 
       // Once appends recover, the next write delivers both kept retries.
       failing.clear();

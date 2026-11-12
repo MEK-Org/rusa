@@ -44,6 +44,7 @@ import {
 import { createLogger, type Logger } from "../../observability/logger.js";
 import type { PrincipalKind } from "../../principals/principal-ref.js";
 import { asGitHubIssue } from "../../references/reference.js";
+import { EffectDeliveryFailure } from "../mesh-writer.js";
 
 let _obligationLogger: Logger | undefined;
 /** A listener's answer that must be awaited before delivery moves on (#1289 C2). */
@@ -54,18 +55,21 @@ function isPromiseLike(value: unknown): value is PromiseLike<void> {
 /**
  * One listener call as a delivery step, whether it answers synchronously or
  * with a promise: `settled` sees its outcome either way. A failure of work
- * this mutation requires is rethrown so the caller can report it; a retry
- * carried for an earlier mutation is not this one's to fail (#1289), so its
- * failure is left to `settled`, which logs it and keeps it for the next try.
+ * this mutation requires is rethrown, as an {@link EffectDeliveryFailure}
+ * naming `requiredReason`, so the caller can report which consequence is
+ * missing without seeing the listener error's own text, which `settled` logs.
+ * A retry carried for an earlier mutation (no `requiredReason`) is not this
+ * one's to fail (#1289), so its failure is left to `settled`, which logs it
+ * and keeps it for the next try.
  */
 function listenerStep(
   call: () => void | PromiseLike<void>,
   settled: (failure: { err: unknown } | null) => void,
-  required = true
+  requiredReason: string | undefined
 ): () => void | Promise<void> {
   const failed = (err: unknown): void => {
     settled({ err });
-    if (required) throw err;
+    if (requiredReason !== undefined) throw new EffectDeliveryFailure(requiredReason, err);
   };
   return () => {
     let pending: void | PromiseLike<void>;
@@ -1679,7 +1683,8 @@ export class ObligationRepository {
               console.warn(
                 `[obligations] ready-head listener failed for ${change.ownerId}: ${failureMessage(failure.err)}`
               );
-            }
+            },
+            "the owner's ready-head attention was not delivered"
           )
         );
       }
@@ -1726,7 +1731,9 @@ export class ObligationRepository {
                 `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${failureMessage(failure.err)}`
               );
             },
-            !retryKeys.has(key)
+            retryKeys.has(key)
+              ? undefined
+              : "a dependent's cancellation attention was not delivered"
           )
         );
       }
@@ -1784,7 +1791,7 @@ export class ObligationRepository {
                 `[obligations] responsive-ready listener failed for ${obligation.id}: ${failureMessage(failure.err)}`
               );
             },
-            !retry
+            retry ? undefined : "responsive-ready attention was not delivered"
           )
         );
       }

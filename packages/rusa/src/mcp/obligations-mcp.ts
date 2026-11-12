@@ -508,13 +508,16 @@ export function createObligationsMcpServer(
 
   // A matcher that committed with its write is evaluated even when an effect
   // of that write failed: a PR that already merged sends no later event, so
-  // skipping it here would leave the obligation open until boot (#1289).
+  // skipping it here would leave the obligation open until boot (#1289). As on
+  // the success path, the row is re-read after evaluation so a satisfied
+  // matcher is not reported beside the pre-evaluation status.
   const committedMatcherError = async (err: unknown): Promise<CallToolResult> => {
     if (!(err instanceof MeshWriteCommittedError)) return toolError(err);
     const committed = err.result as Obligation | null | undefined;
     if (!committed?.completionMatcher) return toolError(err);
     const evaluation = await evaluateCommitted(committed.id);
-    return { ...toolOk({ ...committedWriteReport(err), evaluation }), isError: true };
+    const result = repository.get(committed.id) ?? committed;
+    return { ...toolOk({ ...committedWriteReport(err), result, evaluation }), isError: true };
   };
 
   server.registerTool(
