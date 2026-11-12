@@ -2604,14 +2604,17 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       h.events.filter((e) => e.actorId === id && e.event.type === "runStart");
 
     it("ignores interrupt during held leader onEnd without advancing watermark or auditing (#1303)", async () => {
-      let hold: Promise<void> | undefined;
       let release = () => {};
+      const hold = new Promise<void>((r) => {
+        release = r;
+      });
+      let gateOnEnd = true;
       let inOnEnd = 0;
       const h = setup({
         delayMs: 250,
         lifecycle: () => ({
           onEnd: async () => {
-            if (!hold) return;
+            if (!gateOnEnd) return;
             inOnEnd++;
             await hold;
             inOnEnd--;
@@ -2631,9 +2634,6 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       while (Date.now() < until) {}
       h.dispatchNormal(id, "test:during-run");
 
-      hold = new Promise<void>((r) => {
-        release = r;
-      });
       await waitUntil(() => inOnEnd === 1, 5000);
 
       const rt = h.runtime(id);
@@ -2646,7 +2646,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
         h.meshEvents.filter((e) => e.kind === "root_control_action" && e.actorId === id)
       ).toHaveLength(0);
 
-      hold = undefined;
+      gateOnEnd = false;
       release();
 
       // Follow-up run starts and processes the work delivered during the run.
@@ -2793,20 +2793,31 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     }, 15000);
 
     it("ignores responsive preemption during held onEnd (#1303)", async () => {
-      let hold: Promise<void> | undefined;
       let release = () => {};
+      const hold = new Promise<void>((r) => {
+        release = r;
+      });
+      let gateOnEnd = true;
       let inOnEnd = 0;
       const h = setup({
         delayMs: 250,
         lifecycle: () => ({
           onEnd: async () => {
-            if (!hold) return;
+            if (!gateOnEnd) return;
             inOnEnd++;
             await hold;
             inOnEnd--;
           },
         }),
       });
+
+      const sentCommands: unknown[] = [];
+      const origFlush = h.remote.flush.bind(h.remote);
+      h.remote.flush = () => {
+        sentCommands.push(...h.remote.commands);
+        origFlush();
+      };
+
       const id = h.spawn("Run long");
       await waitUntil(() => started(h, id).length === 1);
       const first = h.inboxStore.list(id, { status: "unhandled" }).entries;
@@ -2815,9 +2826,6 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
         first.map((e) => e.id)
       );
 
-      hold = new Promise<void>((r) => {
-        release = r;
-      });
       h.dispatchNormal(id, "test:during-run");
       await waitUntil(() => inOnEnd === 1, 5000);
 
@@ -2825,10 +2833,19 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       const res = rt.preemptForResponsive();
       expect(res).toEqual({ preempted: false });
       expect(
+        sentCommands.filter(
+          (cmd) =>
+            typeof cmd === "object" &&
+            cmd !== null &&
+            "message" in cmd &&
+            (cmd as { message?: { type?: string } }).message?.type === "preempt"
+        )
+      ).toHaveLength(0);
+      expect(
         h.meshEvents.filter((e) => e.kind === "run_preempted" && e.actorId === id)
       ).toHaveLength(0);
 
-      hold = undefined;
+      gateOnEnd = false;
       release();
 
       await waitUntil(() => started(h, id).length === 2, 5000);

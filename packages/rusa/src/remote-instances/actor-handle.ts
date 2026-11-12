@@ -342,14 +342,7 @@ export class ActorHandle implements MeshActor {
    * it would only set a false watermark that strands work delivered during the run.
    */
   private get finalizing(): boolean {
-    return (
-      !this.closed &&
-      this.channel.connected &&
-      !this.stateStale &&
-      this.finalizingRunId !== undefined &&
-      !this.runOpen &&
-      this.admittedAt === undefined
-    );
+    return this.finalizingRunId !== undefined;
   }
 
   requestRun(nudge?: RunNudge): void {
@@ -490,10 +483,10 @@ export class ActorHandle implements MeshActor {
     runStartTime?: Date;
     wasQueued?: boolean;
   } {
-    if (this.finalizing) return { interrupted: false };
     const now = new Date();
     const admitted = [...this.gates.values()].some((gate) => gate.handle.started);
     if (this.isRunning || admitted) {
+      if (this.finalizing) return { interrupted: false };
       if (this.closed || !this.send({ type: "interrupt", by })) return { interrupted: false };
       // The follower's prompt is the admission reply's snapshot, built just
       // after admittedAt, so that instant bounds what the run saw. runStartedAt
@@ -541,7 +534,6 @@ export class ActorHandle implements MeshActor {
       });
       return { preempted: false };
     }
-    if (this.finalizing) return { preempted: false };
     this.applyPreempt();
     return { preempted: false };
   }
@@ -1098,6 +1090,7 @@ export class ActorHandle implements MeshActor {
         this.opts.saveSession(message.sessionId);
         break;
       case "queued":
+        this.finalizingRunId = undefined;
         this.queuedRunId = message.runId ?? randomUUID();
         this.queuedMode = message.mode;
         return ctx.lifecycle.emit("onQueued", {
