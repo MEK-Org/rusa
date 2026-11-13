@@ -277,7 +277,9 @@ export function dashboardSubstageObserver(): DashboardSubstageObserver | undefin
 /**
  * Where the current request's standalone read reports its timing, captured now
  * so the answer lands on this request's row however it is delivered; undefined
- * outside a timed request. Only the request's first read is recorded.
+ * outside a timed request. Each substage keeps its first record
+ * ({@link DashboardPhaseClock.recordSubstage}), so a later read in the same
+ * request cannot overwrite the first read's figures.
  */
 export function dashboardReadTimingObserver():
   | ((timing: {
@@ -288,10 +290,7 @@ export function dashboardReadTimingObserver():
   | undefined {
   const clock = requestScope.getStore()?.clock;
   if (!clock) return undefined;
-  let reported = false;
   return (timing) => {
-    if (reported) return;
-    reported = true;
     if (timing.queuedMs !== undefined) clock.recordSubstage("readQueueMs", timing.queuedMs);
     if (timing.executionMs !== undefined) clock.recordSubstage("readExecMs", timing.executionMs);
     if (timing.transferMs !== undefined) clock.recordSubstage("readTransferMs", timing.transferMs);

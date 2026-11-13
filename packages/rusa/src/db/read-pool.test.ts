@@ -186,8 +186,9 @@ afterAll(() => {
   if (buildDir) rmSync(buildDir, { recursive: true, force: true });
 });
 
-const openPool = (options: { size?: number; maxQueued?: number; dbPath?: string } = {}) =>
-  DbReadPool.open({ dbPath: meshDbPath(home), worker: workerUrl, ...options });
+const openPool = (
+  options: { size?: number; maxQueued?: number; dbPath?: string; logger?: Logger } = {}
+) => DbReadPool.open({ dbPath: meshDbPath(home), worker: workerUrl, ...options });
 
 describe("DbReadPool", () => {
   it("control: the same long statement on the main thread holds the event loop", async () => {
@@ -401,8 +402,20 @@ describe("DbReadPool", () => {
 
   it("splits a read's time into queue wait, execution and round trip, for one queued behind a long read", async () => {
     // One worker, so the second read has to wait for the first (#1323).
-    const pool = await openPool({ size: 1 });
+    const records: Array<{ event: string; fields?: LogFields }> = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: (event, fields) => records.push({ event, fields }),
+      warn: () => {},
+      error: () => {},
+      child: () => logger,
+    };
+    const pool = await openPool({ size: 1, logger });
     try {
+      // Once its workers are ready, the pool logs its size and queue bound.
+      expect(records.filter((record) => record.event === "db_read_pool_ready")).toEqual([
+        { event: "db_read_pool_ready", fields: { size: 1, maxQueued: 256 } },
+      ]);
       const timings: Record<string, ReadTiming> = {};
       const longStarted = performance.now();
       const long = testReads(pool).read("hold", { ms: 600 }, (t) => {
@@ -478,25 +491,6 @@ describe("DbReadPool", () => {
       expect(substages.readTransferMs).toBeLessThan(200);
     } finally {
       await new Promise((resolve) => server.close(resolve));
-      await pool.close();
-    }
-  });
-
-  it("logs its size once its workers are ready", async () => {
-    const records: Array<{ event: string; fields?: LogFields }> = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: (event, fields) => records.push({ event, fields }),
-      warn: () => {},
-      error: () => {},
-      child: () => logger,
-    };
-    const pool = await DbReadPool.open({ dbPath: meshDbPath(home), worker: workerUrl, logger });
-    try {
-      expect(records.filter((record) => record.event === "db_read_pool_ready")).toEqual([
-        { event: "db_read_pool_ready", fields: { size: 2, maxQueued: 256 } },
-      ]);
-    } finally {
       await pool.close();
     }
   });

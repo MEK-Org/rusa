@@ -22,12 +22,7 @@ import {
 import { gchatThreadSpace } from "../chat/chat-write-scope.js";
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import { committedWriteReport, MeshWriteCommittedError } from "../db/mesh-writer.js";
-import {
-  type DbReads,
-  inProcessReads,
-  type ReadOutput,
-  type ReadTiming,
-} from "../db/read-operations.js";
+import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
 import { DbReadUnavailableError } from "../db/read-pool.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type {
@@ -765,14 +760,7 @@ function readsOf(deps: DashboardDataDeps): DbReads {
   // (#1323): queue wait, execution and the worker round trip.
   return {
     read: (op, input, onTiming) => {
-      const observe = dashboardReadTimingObserver();
-      const report =
-        observe && onTiming
-          ? (timing: ReadTiming) => {
-              observe(timing);
-              onTiming(timing);
-            }
-          : (observe ?? onTiming);
+      const report = onTiming ?? dashboardReadTimingObserver();
       return report ? reads.read(op, input, report) : reads.read(op, input);
     },
   };

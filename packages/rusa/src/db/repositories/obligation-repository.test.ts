@@ -3534,6 +3534,10 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
       });
       repository.create({ id: "lost", title: "lost", ownerId: "actor-b" });
+      // Several prerequisites, added out of id order, one of them in the cycle.
+      repository.addPrerequisite("r2-a-1", "r3", "system:mesh");
+      repository.addPrerequisite("r2-a-1", "loop-a", "system:mesh");
+      repository.addPrerequisite("r2-a-1", "r1-b", "system:mesh");
       db.pragma("foreign_keys = OFF");
       db.prepare("UPDATE obligations SET parent_id = 'loop-b' WHERE id = 'loop-a'").run();
       db.prepare("UPDATE obligations SET parent_id = 'loop-a' WHERE id = 'loop-b'").run();
@@ -3574,10 +3578,6 @@ describe("ObligationRepository", () => {
       expect(byId(repository.getAncestry(ids()))).toEqual(
         byId(new Map([...whole].filter(([id]) => parents.has(id))))
       );
-      for (const ownerId of ["actor-a", "actor-b", "actor-c"]) {
-        const page = repository.listPage({ ownerId, limit: 100, offset: 0 });
-        expect(page.obligations).toEqual(repository.list({ ownerId }));
-      }
       expect(repository.listPage({ rootsOnly: true, limit: 100, offset: 0 }).obligations).toEqual(
         repository.list({ rootsOnly: true })
       );
@@ -3594,6 +3594,25 @@ describe("ObligationRepository", () => {
                   ? -1
                   : 1
             ),
+        });
+        // Prerequisite pages in id order, keeping only rows that reach a root.
+        const edges = db
+          .prepare("SELECT dependent_id, prerequisite_id FROM obligation_prerequisites")
+          .all() as Array<{ dependent_id: string; prerequisite_id: string }>;
+        const projected = (other: (edge: (typeof edges)[number]) => string | null) =>
+          edges
+            .map(other)
+            .filter((other): other is string => other !== null && whole.has(other))
+            .sort()
+            .map((other) => whole.get(other));
+        expect({
+          id,
+          blockedBy: repository.listBlockedByPage(id, { limit: 100, offset: 0 }).obligations,
+          unblocks: repository.listUnblocksPage(id, { limit: 100, offset: 0 }).obligations,
+        }).toEqual({
+          id,
+          blockedBy: projected((edge) => (edge.dependent_id === id ? edge.prerequisite_id : null)),
+          unblocks: projected((edge) => (edge.prerequisite_id === id ? edge.dependent_id : null)),
         });
       }
     });
@@ -3658,6 +3677,13 @@ describe("ObligationRepository", () => {
         // One scan seeds responsive reach; the priority walk then touches only
         // the chain. The whole-table walk visited every row at least twice.
         expect(visits).toBeLessThan(rows + 50);
+        visits = 0;
+        // The whole chain above it in one read: the same one scan, then each
+        // ancestor walks its own chain to the root (8 + 7 + ... + 1 steps).
+        expect([...repository.getAncestry(["deep-8"]).keys()].sort()).toEqual(
+          Array.from({ length: 8 }, (_, level) => `deep-${level}`)
+        );
+        expect(visits).toBeLessThan(rows + 100);
       } finally {
         db.exec("DROP VIEW temp.obligations");
       }

@@ -486,6 +486,11 @@ const EFFECTIVE_PRIORITY_CTE = `
  * and id, as the root-down walk does. The row is kept only once the walk
  * reaches a root, so a parent cycle drops out here too, and `UNION` ends the
  * walk around one: a repeated step is an identical row.
+ *
+ * The scope alone decides which rows a statement projects: joining
+ * `effective_priority` keeps exactly those, and SQLite drives the projection
+ * from it by primary key. A statement adds no `WHERE` of its own that would
+ * have to repeat the scope.
  */
 function scopedEffectivePriorityCte(scope: string): string {
   return `
@@ -2507,12 +2512,10 @@ export class ObligationRepository {
         `${scopedEffectivePriorityCte(
           "SELECT prerequisite_id FROM obligation_prerequisites WHERE dependent_id = ?"
         )} ${PROJECTED_OBLIGATION}
-         JOIN obligation_prerequisites edge ON edge.prerequisite_id = obligation.id
-         WHERE edge.dependent_id = ?
-         ORDER BY edge.prerequisite_id
+         ORDER BY obligation.id
          LIMIT ? OFFSET ?`
       )
-      .all(id, id, limit + 1, offset) as ObligationRow[];
+      .all(id, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE dependent_id = ?`)
@@ -2536,12 +2539,10 @@ export class ObligationRepository {
         `${scopedEffectivePriorityCte(
           "SELECT dependent_id FROM obligation_prerequisites WHERE prerequisite_id = ?"
         )} ${PROJECTED_OBLIGATION}
-         JOIN obligation_prerequisites edge ON edge.dependent_id = obligation.id
-         WHERE edge.prerequisite_id = ?
-         ORDER BY edge.dependent_id
+         ORDER BY obligation.id
          LIMIT ? OFFSET ?`
       )
-      .all(id, id, limit + 1, offset) as ObligationRow[];
+      .all(id, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ?`)
@@ -2617,10 +2618,8 @@ export class ObligationRepository {
 
   get(id: string): Obligation | null {
     const row = this.db
-      .prepare(
-        `${scopedEffectivePriorityCte("SELECT ?")} ${PROJECTED_OBLIGATION} WHERE obligation.id = ?`
-      )
-      .get(id, id) as ObligationRow | undefined;
+      .prepare(`${scopedEffectivePriorityCte("SELECT ?")} ${PROJECTED_OBLIGATION}`)
+      .get(id) as ObligationRow | undefined;
     return row ? toObligation(row) : null;
   }
 
@@ -2709,11 +2708,10 @@ export class ObligationRepository {
           `SELECT obligation.id FROM obligations obligation
            WHERE obligation.parent_id = ?${blockingClause}`
         )} ${PROJECTED_OBLIGATION}
-         WHERE obligation.parent_id = ?${blockingClause}
          ORDER BY effective_priority.effective_priority, obligation.id
          LIMIT ? OFFSET ?`
       )
-      .all(parentId, parentId, limit + 1, offset) as ObligationRow[];
+      .all(parentId, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(
@@ -2982,23 +2980,23 @@ export class ObligationRepository {
       );
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    // An owner's page or the roots page orders few rows, or rows with no
-    // ancestors to walk, so it derives priority for just those (#1323). A page
-    // filtered only by status or queue can admit most of the table, where one
+    // The roots page's rows have no ancestors to walk, so it derives priority
+    // for just those (#1323). Any other filter can admit rows whose ancestry
+    // covers most of the table (one owner can hold half of it), where one
     // root-down walk is cheaper than walking every admitted row's ancestry.
-    const scoped = clauses.length > 0 && (Boolean(options.ownerId) || Boolean(options.rootsOnly));
-    const cte = scoped
-      ? scopedEffectivePriorityCte(`SELECT obligation.id FROM obligations obligation ${where}`)
-      : EFFECTIVE_PRIORITY_CTE;
-    const scopeParams = scoped ? params : [];
     const rows = this.db
       .prepare(
-        `${cte} ${PROJECTED_OBLIGATION}
-         ${where}
-         ORDER BY ${OWNER_QUEUE_ORDER_SQL}
-         LIMIT ? OFFSET ?`
+        options.rootsOnly
+          ? `${scopedEffectivePriorityCte(`SELECT obligation.id FROM obligations obligation ${where}`)}
+             ${PROJECTED_OBLIGATION}
+             ORDER BY ${OWNER_QUEUE_ORDER_SQL}
+             LIMIT ? OFFSET ?`
+          : `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+             ${where}
+             ORDER BY ${OWNER_QUEUE_ORDER_SQL}
+             LIMIT ? OFFSET ?`
       )
-      .all(...scopeParams, ...params, limit + 1, offset) as ObligationRow[];
+      .all(...params, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(`SELECT COUNT(*) AS count FROM obligations obligation ${where}`)

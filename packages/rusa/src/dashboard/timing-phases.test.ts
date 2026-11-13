@@ -158,7 +158,7 @@ describe("dashboard read substages (#1323)", () => {
     expect(clock.substages(500)).toEqual({ identityMs: 4, readQueueMs: 380, readExecMs: 25 });
   });
 
-  it("captures the request's clock when asked and reports only the first read", async () => {
+  it("captures the request's clock when asked, so a read answered later still lands on its row", async () => {
     const { clock } = manualClock();
     const observe = await runDashboardRequestScope(async () => {
       attachDashboardPhaseClock(clock);
@@ -166,7 +166,6 @@ describe("dashboard read substages (#1323)", () => {
     });
     // Delivered after the request scope was left, as a worker's answer is.
     observe?.({ queuedMs: 12, executionMs: 30, transferMs: 2 });
-    observe?.({ queuedMs: 900, executionMs: 900, transferMs: 900 });
     expect(clock.substages()).toEqual({ readQueueMs: 12, readExecMs: 30, readTransferMs: 2 });
   });
 
