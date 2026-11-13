@@ -607,17 +607,21 @@ export async function composeFollowerStart(
     await flush();
   };
 
+  // Register only once the startup probe has settled. Shutdown releases this
+  // peer before the probe resource, so stop waiting when polling stops; callers
+  // check `stopped` before registering.
+  const startupCatalogsOrStop = () =>
+    Promise.race([
+      startupCatalogs,
+      new Promise<void>((resolve) => {
+        if (stopPolling.signal.aborted) resolve();
+        else stopPolling.signal.addEventListener("abort", () => resolve(), { once: true });
+      }),
+    ]);
+
   const startPolling = () => {
     polling = (async () => {
-      // Register only once the startup probe has settled. Shutdown releases
-      // this peer before the probe resource, so stop waiting on its abort.
-      await Promise.race([
-        startupCatalogs,
-        new Promise<void>((resolve) => {
-          if (stopPolling.signal.aborted) resolve();
-          else stopPolling.signal.addEventListener("abort", () => resolve(), { once: true });
-        }),
-      ]);
+      await startupCatalogsOrStop();
       let backoffMs = 500;
       while (!stopped) {
         if (!session) {
@@ -665,7 +669,13 @@ export async function composeFollowerStart(
 
   if (opts?.e2e?.onFollowerReady) {
     if (opts.e2e.connectPeer !== false) {
-      await startupCatalogs;
+      await startupCatalogsOrStop();
+      if (stopped) {
+        // A signal closed the scope during the startup probe. The peer
+        // disposer has already run, so a session registered now would leak.
+        log.info("follower_stopped_before_registration", { leader: leaderUrl.origin });
+        return;
+      }
       const ok = await registerWithLeader();
       if (!ok) {
         throw new Error(`Follower e2e registration with leader ${leaderUrl.origin} failed`);

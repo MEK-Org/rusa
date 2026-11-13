@@ -1695,12 +1695,15 @@ describe("follower model catalog lifecycle (#878)", () => {
    * With `viaPoll`, the follower runs its daemon poll loop and the leader
    * dispatches the actor in its first poll reply, the moment the follower is
    * registered. Otherwise `runStart` registers before returning the handles.
+   * With `deferStart`, the caller awaits `started` itself and the handles may
+   * never arrive.
    */
   async function bootAgyFollower(opts: {
     modelsMode: SyntheticAgyModelsMode;
     selected: { model: string; effort?: string };
     seed?: (home: string) => void;
     viaPoll?: boolean;
+    deferStart?: boolean;
   }) {
     const home = makeTempHome();
     process.env.RUSA_HOME = home;
@@ -1783,7 +1786,7 @@ describe("follower model catalog lifecycle (#878)", () => {
       instance: { id: "follower-node-catalog" },
     });
 
-    await runStart({
+    const started = runStart({
       e2e: {
         connectPeer: !opts.viaPoll,
         followerPolling: opts.viaPoll,
@@ -1792,10 +1795,16 @@ describe("follower model catalog lifecycle (#878)", () => {
         },
       },
     });
-    if (!handles) throw new Error("follower handles not initialized");
-    const follower = handles;
+    if (!opts.deferStart) {
+      await started;
+      if (!handles) throw new Error("follower handles not initialized");
+    }
+    const follower = () => {
+      if (!handles) throw new Error("follower handles not initialized");
+      return handles;
+    };
 
-    const init = () => follower.instance.dispatch(initCommand());
+    const init = () => follower().instance.dispatch(initCommand());
 
     /** Wait for the actor's finished local run row. */
     const finishedRun = async (): Promise<ActorRunRow> => {
@@ -1815,7 +1824,7 @@ describe("follower model catalog lifecycle (#878)", () => {
       await waitUntil(() =>
         events.some((e) => e.actorId === actorId && e.message?.type === "ready")
       );
-      follower.instance.dispatch({ actorId, message: { type: "wake" } });
+      follower().instance.dispatch({ actorId, message: { type: "wake" } });
       return finishedRun();
     };
 
@@ -1828,20 +1837,25 @@ describe("follower model catalog lifecycle (#878)", () => {
       return index >= 0 ? argv?.[index + 1] : undefined;
     };
 
+    let closing: Promise<void> | undefined;
     return {
       home,
       binDir,
       events,
       registrations,
+      started,
+      ready: () => handles !== undefined,
       init,
       runOnce,
       finishedRun,
       launchArgv,
       flagValue,
-      shutdown: async () => {
-        await follower.shutdown();
-        await leader.close();
-      },
+      /** Idempotent, so a test can time it and still release in `finally`. */
+      shutdown: () =>
+        (closing ??= (async () => {
+          await handles?.shutdown();
+          await leader.close();
+        })()),
     };
   }
 
@@ -1976,39 +1990,83 @@ describe("follower model catalog lifecycle (#878)", () => {
     }
   }, 20_000);
 
+  /** The hanging synthetic probe's pid, once it has started, and a liveness check. */
+  async function hangingProbe(binDir: string) {
+    const pidFile = join(binDir, "models-pid");
+    await waitUntil(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "");
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    return {
+      alive: () => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    };
+  }
+
+  const countScrapes = (home: string) => {
+    const db = new Database(join(home, "data", "mesh.db"));
+    try {
+      return db.prepare("SELECT COUNT(*) AS n FROM model_scrapes").get();
+    } finally {
+      db.close();
+    }
+  };
+
   it("stops an in-flight probe before the database closes on shutdown", async () => {
     const f = await bootAgyFollower({
       modelsMode: "hang",
       selected: { model: "gemini-3.9-carbon", effort: "high" },
       viaPoll: true,
     });
-    const pidFile = join(f.binDir, "models-pid");
-    await waitUntil(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "");
-    const pid = Number(readFileSync(pidFile, "utf8").trim());
-    const alive = () => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    expect(alive()).toBe(true);
-    // Registration is still waiting on the probe.
-    expect(f.registrations).toEqual([]);
-    const shutdownStarted = Date.now();
-    await f.shutdown();
-    // Shutdown interrupts the wait rather than sitting out the probe timeout.
-    expect(Date.now() - shutdownStarted).toBeLessThan(5000);
-    expect(f.registrations).toEqual([]);
-    // Killed during shutdown; allow the runtime to reap it.
-    await waitUntil(() => !alive(), 2000);
-    // An aborted probe is not a failed scrape: nothing was written behind the close.
-    const db = new Database(join(f.home, "data", "mesh.db"));
     try {
-      expect(db.prepare("SELECT COUNT(*) AS n FROM model_scrapes").get()).toEqual({ n: 0 });
+      const probe = await hangingProbe(f.binDir);
+      expect(probe.alive()).toBe(true);
+      // Registration is still waiting on the probe.
+      expect(f.registrations).toEqual([]);
+      const shutdownStarted = Date.now();
+      await f.shutdown();
+      // Shutdown interrupts the wait rather than sitting out the probe timeout.
+      expect(Date.now() - shutdownStarted).toBeLessThan(5000);
+      expect(f.registrations).toEqual([]);
+      // Killed during shutdown; allow the runtime to reap it.
+      await waitUntil(() => !probe.alive(), 2000);
+      // An aborted probe is not a failed scrape: nothing was written behind the close.
+      expect(countScrapes(f.home)).toEqual({ n: 0 });
     } finally {
-      db.close();
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  it("does not register when a signal stops the follower during its startup probe", async () => {
+    const priorListeners = new Set(process.listeners("SIGTERM"));
+    // Without polling, startup registers directly once the probe settles.
+    const f = await bootAgyFollower({
+      modelsMode: "hang",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      deferStart: true,
+    });
+    try {
+      const probe = await hangingProbe(f.binDir);
+      expect(f.registrations).toEqual([]);
+      // Invoke only the follower's signal handler, which closes the scope;
+      // process.exit is mocked here.
+      const onSignal = process.listeners("SIGTERM").filter((l) => !priorListeners.has(l));
+      expect(onSignal).toHaveLength(1);
+      onSignal[0]?.("SIGTERM");
+      await f.started;
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, 5000);
+      expect(process.exit).toHaveBeenCalledWith(0);
+      // The peer disposer ran before the probe was aborted; nothing registered after it.
+      expect(f.registrations).toEqual([]);
+      expect(f.ready()).toBe(false);
+      await waitUntil(() => !probe.alive(), 2000);
+      expect(countScrapes(f.home)).toEqual({ n: 0 });
+    } finally {
+      await f.shutdown();
     }
   }, 20_000);
 });
