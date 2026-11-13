@@ -424,30 +424,43 @@ const TERMINAL_STATUS_SQL = OBLIGATION_STATUSES.filter(isTerminalObligationStatu
  * edge is removed, so a blocker is never left responsive merely because it
  * once was one. `UNION` deduplicates reached ids, which is what terminates
  * the recursion on any cycle.
+ *
+ * Each edge kind is its own recursive step, so every step follows an index
+ * (`idx_obligations_parent`, the prerequisites primary key) from the ids
+ * reached so far. Joining the reach against one union of every live edge
+ * instead read the whole table on each step (#1323).
  */
-const EFFECTIVE_PRIORITY_CTE = `
-  WITH RECURSIVE responsive_reach(id) AS (
+const RESPONSIVE_REACH_CTE = `
+  responsive_reach(id) AS (
     SELECT id
     FROM obligations
     WHERE responsive = 1
       AND status NOT IN (${TERMINAL_STATUS_SQL})
     UNION
-    SELECT edge.target_id
+    SELECT child.id
     FROM responsive_reach
-    JOIN (
-      SELECT parent_id AS source_id, id AS target_id
-      FROM obligations
-      WHERE parent_id IS NOT NULL
-        AND status NOT IN (${TERMINAL_STATUS_SQL})
-      UNION ALL
-      SELECT op.dependent_id, op.prerequisite_id
-      FROM obligation_prerequisites op
-      JOIN obligations dependent ON dependent.id = op.dependent_id
-      JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
-      WHERE dependent.status NOT IN (${TERMINAL_STATUS_SQL})
-        AND prerequisite.status NOT IN (${TERMINAL_STATUS_SQL})
-    ) edge ON edge.source_id = responsive_reach.id
-  ),
+    JOIN obligations child ON child.parent_id = responsive_reach.id
+    WHERE child.status NOT IN (${TERMINAL_STATUS_SQL})
+    UNION
+    SELECT edge.prerequisite_id
+    FROM responsive_reach
+    JOIN obligation_prerequisites edge ON edge.dependent_id = responsive_reach.id
+    JOIN obligations dependent ON dependent.id = edge.dependent_id
+    JOIN obligations prerequisite ON prerequisite.id = edge.prerequisite_id
+    WHERE dependent.status NOT IN (${TERMINAL_STATUS_SQL})
+      AND prerequisite.status NOT IN (${TERMINAL_STATUS_SQL})
+  )
+`;
+
+/**
+ * Effective priority and responsiveness of every obligation, walking down
+ * from every root: a row whose parent chain never reaches a root (a parent
+ * cycle) has none, so it drops out of every projected read. For reads that
+ * need only some rows, {@link scopedEffectivePriorityCte} gives the same
+ * values for just those rows.
+ */
+const EFFECTIVE_PRIORITY_CTE = `
+  WITH RECURSIVE ${RESPONSIVE_REACH_CTE},
   effective_priority(id, effective_priority, priority_source_id, effective_responsive) AS (
     SELECT id, priority, id, id IN (SELECT id FROM responsive_reach)
     FROM obligations
@@ -461,6 +474,45 @@ const EFFECTIVE_PRIORITY_CTE = `
     JOIN effective_priority parent ON parent.id = child.parent_id
   )
 `;
+
+/**
+ * {@link EFFECTIVE_PRIORITY_CTE}'s rows for only the ids `scope` selects, so a
+ * read that projects a handful of rows does work proportional to them and
+ * their ancestry rather than to the whole table (#1323). `scope` is a SELECT
+ * of ids; its parameters bind before the statement's own.
+ *
+ * Each scoped row walks up its own parent chain, carrying the nearest explicit
+ * priority and its source; with none, the root's own (possibly null) priority
+ * and id, as the root-down walk does. The row is kept only once the walk
+ * reaches a root, so a parent cycle drops out here too, and `UNION` ends the
+ * walk around one: a repeated step is an identical row.
+ */
+function scopedEffectivePriorityCte(scope: string): string {
+  return `
+  WITH RECURSIVE ${RESPONSIVE_REACH_CTE},
+  lineage(target_id, parent_id, effective_priority, priority_source_id) AS (
+    SELECT id, parent_id, priority, id
+    FROM obligations
+    WHERE id IN (${scope})
+    UNION
+    SELECT lineage.target_id,
+           ancestor.parent_id,
+           COALESCE(lineage.effective_priority, ancestor.priority),
+           CASE
+             WHEN lineage.effective_priority IS NULL THEN ancestor.id
+             ELSE lineage.priority_source_id
+           END
+    FROM lineage
+    JOIN obligations ancestor ON ancestor.id = lineage.parent_id
+  ),
+  effective_priority(id, effective_priority, priority_source_id, effective_responsive) AS (
+    SELECT target_id, effective_priority, priority_source_id,
+           target_id IN (SELECT id FROM responsive_reach)
+    FROM lineage
+    WHERE parent_id IS NULL
+  )
+`;
+}
 
 /**
  * Ready work that should draw automatic attention now: `ready` and not snoozed
@@ -2452,13 +2504,15 @@ export class ObligationRepository {
     const { limit, offset } = validatePage(options);
     const rows = this.db
       .prepare(
-        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+        `${scopedEffectivePriorityCte(
+          "SELECT prerequisite_id FROM obligation_prerequisites WHERE dependent_id = ?"
+        )} ${PROJECTED_OBLIGATION}
          JOIN obligation_prerequisites edge ON edge.prerequisite_id = obligation.id
          WHERE edge.dependent_id = ?
          ORDER BY edge.prerequisite_id
          LIMIT ? OFFSET ?`
       )
-      .all(id, limit + 1, offset) as ObligationRow[];
+      .all(id, id, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE dependent_id = ?`)
@@ -2479,13 +2533,15 @@ export class ObligationRepository {
     const { limit, offset } = validatePage(options);
     const rows = this.db
       .prepare(
-        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+        `${scopedEffectivePriorityCte(
+          "SELECT dependent_id FROM obligation_prerequisites WHERE prerequisite_id = ?"
+        )} ${PROJECTED_OBLIGATION}
          JOIN obligation_prerequisites edge ON edge.dependent_id = obligation.id
          WHERE edge.prerequisite_id = ?
          ORDER BY edge.dependent_id
          LIMIT ? OFFSET ?`
       )
-      .all(id, limit + 1, offset) as ObligationRow[];
+      .all(id, id, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ?`)
@@ -2561,9 +2617,39 @@ export class ObligationRepository {
 
   get(id: string): Obligation | null {
     const row = this.db
-      .prepare(`${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION} WHERE obligation.id = ?`)
-      .get(id) as ObligationRow | undefined;
+      .prepare(
+        `${scopedEffectivePriorityCte("SELECT ?")} ${PROJECTED_OBLIGATION} WHERE obligation.id = ?`
+      )
+      .get(id, id) as ObligationRow | undefined;
     return row ? toObligation(row) : null;
+  }
+
+  /**
+   * Every obligation above any of `ids` in one read, by id: each parent,
+   * grandparent and so on up to its root, each once. An id that `get` would
+   * not return (missing, or in a parent cycle) is absent, so a caller walking
+   * the parent chain through this map stops where repeated `get` calls would.
+   */
+  getAncestry(ids: readonly string[]): Map<string, Obligation> {
+    const ancestors = new Map<string, Obligation>();
+    if (ids.length === 0) return ancestors;
+    const rows = this.db
+      .prepare(
+        `${scopedEffectivePriorityCte(
+          `WITH RECURSIVE up(id) AS (
+             SELECT parent_id FROM obligations
+             WHERE id IN (SELECT value FROM json_each(?)) AND parent_id IS NOT NULL
+             UNION
+             SELECT parent.parent_id FROM up
+             JOIN obligations parent ON parent.id = up.id
+             WHERE parent.parent_id IS NOT NULL
+           )
+           SELECT id FROM up`
+        )} ${PROJECTED_OBLIGATION}`
+      )
+      .all(JSON.stringify(ids)) as ObligationRow[];
+    for (const row of rows) ancestors.set(row.id, toObligation(row));
+    return ancestors;
   }
 
   require(id: string): Obligation {
@@ -2619,12 +2705,15 @@ export class ObligationRepository {
       : "";
     const rows = this.db
       .prepare(
-        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+        `${scopedEffectivePriorityCte(
+          `SELECT obligation.id FROM obligations obligation
+           WHERE obligation.parent_id = ?${blockingClause}`
+        )} ${PROJECTED_OBLIGATION}
          WHERE obligation.parent_id = ?${blockingClause}
          ORDER BY effective_priority.effective_priority, obligation.id
          LIMIT ? OFFSET ?`
       )
-      .all(parentId, limit + 1, offset) as ObligationRow[];
+      .all(parentId, parentId, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(
@@ -2893,14 +2982,23 @@ export class ObligationRepository {
       );
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    // An owner's page or the roots page orders few rows, or rows with no
+    // ancestors to walk, so it derives priority for just those (#1323). A page
+    // filtered only by status or queue can admit most of the table, where one
+    // root-down walk is cheaper than walking every admitted row's ancestry.
+    const scoped = clauses.length > 0 && (Boolean(options.ownerId) || Boolean(options.rootsOnly));
+    const cte = scoped
+      ? scopedEffectivePriorityCte(`SELECT obligation.id FROM obligations obligation ${where}`)
+      : EFFECTIVE_PRIORITY_CTE;
+    const scopeParams = scoped ? params : [];
     const rows = this.db
       .prepare(
-        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+        `${cte} ${PROJECTED_OBLIGATION}
          ${where}
          ORDER BY ${OWNER_QUEUE_ORDER_SQL}
          LIMIT ? OFFSET ?`
       )
-      .all(...params, limit + 1, offset) as ObligationRow[];
+      .all(...scopeParams, ...params, limit + 1, offset) as ObligationRow[];
     const total = (
       this.db
         .prepare(`SELECT COUNT(*) AS count FROM obligations obligation ${where}`)

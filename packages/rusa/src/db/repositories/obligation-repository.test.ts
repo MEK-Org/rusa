@@ -3480,6 +3480,190 @@ describe("ObligationRepository", () => {
     expect(() => insertInterval.run("ok-interval", 60)).not.toThrow();
   });
 
+  describe("scoped effective priority (#1323)", () => {
+    /**
+     * A tree with every case the whole-table walk decides: priorities set and
+     * inherited at several depths, responsive reach through children and
+     * prerequisites, terminal nodes that stop it, plus a parent cycle and a
+     * dangling parent that never reach a root.
+     */
+    function buildMixedForest(): void {
+      repository.create({ id: "r1", title: "r1", ownerId: "actor-a", priority: 3 });
+      repository.create({ id: "r1-a", title: "r1-a", parentId: "r1", ownerId: "actor-b" });
+      repository.create({
+        id: "r1-a-x",
+        title: "r1-a-x",
+        parentId: "r1-a",
+        ownerId: "actor-a",
+        priority: 7,
+      });
+      repository.create({
+        id: "r1-a-x-1",
+        title: "r1-a-x-1",
+        parentId: "r1-a-x",
+        ownerId: "actor-c",
+      });
+      repository.create({ id: "r1-a-y", title: "r1-a-y", parentId: "r1-a", ownerId: "actor-a" });
+      repository.create({
+        id: "r1-b",
+        title: "r1-b",
+        parentId: "r1",
+        ownerId: "actor-b",
+        priority: 1,
+      });
+      repository.create({ id: "r1-b-1", title: "r1-b-1", parentId: "r1-b", ownerId: "actor-b" });
+      repository.create({ id: "r2", title: "r2", ownerId: "actor-b", priority: 2 });
+      repository.create({ id: "r2-a", title: "r2-a", parentId: "r2", ownerId: "actor-a" });
+      repository.create({ id: "r2-a-1", title: "r2-a-1", parentId: "r2-a", ownerId: "actor-c" });
+      repository.create({ id: "r3", title: "r3", ownerId: "actor-c", priority: 9 });
+      repository.create({ id: "r3-a", title: "r3-a", parentId: "r3", ownerId: "actor-c" });
+      // Responsive reach: down through live children, across prerequisites.
+      repository.markResponsive("r1-a", "system:mesh");
+      repository.addPrerequisite("r1-a-y", "r2-a", "system:mesh");
+      repository.addPrerequisite("r1-b-1", "r3-a", "system:mesh");
+      // A terminal child stops reach below it; a terminal prerequisite is skipped.
+      repository.setTerminalStatus("r1-a-x-1", "done", null, null, "system:mesh");
+      repository.setTerminalStatus("r3-a", "done", null, null, "system:mesh");
+      // Two rows whose parents point at each other, and one whose parent is gone.
+      repository.create({ id: "loop-a", title: "loop-a", ownerId: "actor-a" });
+      repository.create({ id: "loop-b", title: "loop-b", ownerId: "actor-a" });
+      repository.create({
+        id: "loop-b-1",
+        title: "loop-b-1",
+        parentId: "loop-b",
+        ownerId: "actor-a",
+      });
+      repository.create({ id: "lost", title: "lost", ownerId: "actor-b" });
+      db.pragma("foreign_keys = OFF");
+      db.prepare("UPDATE obligations SET parent_id = 'loop-b' WHERE id = 'loop-a'").run();
+      db.prepare("UPDATE obligations SET parent_id = 'loop-a' WHERE id = 'loop-b'").run();
+      db.prepare("UPDATE obligations SET parent_id = 'gone' WHERE id = 'lost'").run();
+      db.pragma("foreign_keys = ON");
+      // `create` always stores a priority; rows from before it did inherit.
+      db.prepare(
+        `UPDATE obligations SET priority = NULL
+         WHERE id NOT IN ('r1', 'r1-a-x', 'r1-b', 'r2', 'r3')`
+      ).run();
+    }
+
+    const ids = () =>
+      (db.prepare("SELECT id FROM obligations ORDER BY id").all() as Array<{ id: string }>).map(
+        (row) => row.id
+      );
+
+    it("derives the same priority, source and responsiveness per row as the whole-table walk", () => {
+      buildMixedForest();
+      // `list()` still projects through the whole-table walk.
+      const whole = new Map(repository.list().map((row) => [row.id, row]));
+      expect(whole.get("r1-a-x-1")).toMatchObject({
+        effectivePriority: 7,
+        prioritySourceId: "r1-a-x",
+      });
+      expect(whole.get("r1-a-y")).toMatchObject({ effectivePriority: 3, prioritySourceId: "r1" });
+      expect(whole.get("r2-a")?.effectiveResponsive).toBe(true);
+      expect(whole.get("r1-a-x-1")?.effectiveResponsive).toBe(false);
+      expect(whole.get("r3-a")?.effectiveResponsive).toBe(false);
+      for (const id of ["loop-a", "loop-b", "loop-b-1", "lost"]) expect(whole.has(id)).toBe(false);
+
+      for (const id of ids()) {
+        expect({ id, row: repository.get(id) }).toEqual({ id, row: whole.get(id) ?? null });
+      }
+      // Every row that is some row's parent, as the whole-table walk sees it.
+      const parents = new Set([...whole.values()].map((row) => row.parentId));
+      const byId = (map: Map<string, Obligation>) => [...map].sort(([a], [b]) => (a < b ? -1 : 1));
+      expect(byId(repository.getAncestry(ids()))).toEqual(
+        byId(new Map([...whole].filter(([id]) => parents.has(id))))
+      );
+      for (const ownerId of ["actor-a", "actor-b", "actor-c"]) {
+        const page = repository.listPage({ ownerId, limit: 100, offset: 0 });
+        expect(page.obligations).toEqual(repository.list({ ownerId }));
+      }
+      expect(repository.listPage({ rootsOnly: true, limit: 100, offset: 0 }).obligations).toEqual(
+        repository.list({ rootsOnly: true })
+      );
+      for (const id of ids()) {
+        const children = repository.listChildrenPage(id, { limit: 100, offset: 0 }).obligations;
+        expect({ id, children }).toEqual({
+          id,
+          children: [...whole.values()]
+            .filter((row) => row.parentId === id)
+            .sort((a, b) =>
+              a.effectivePriority !== b.effectivePriority
+                ? a.effectivePriority - b.effectivePriority
+                : a.id < b.id
+                  ? -1
+                  : 1
+            ),
+        });
+      }
+    });
+
+    it("reads one obligation in one pass over the table plus its own ancestry, not a whole-tree walk", () => {
+      // A deep chain among many unrelated rows.
+      repository.create({ id: "deep-0", title: "deep-0", ownerId: "actor-a", priority: 4 });
+      for (let level = 1; level <= 8; level += 1) {
+        repository.create({
+          id: `deep-${level}`,
+          title: `deep-${level}`,
+          parentId: `deep-${level - 1}`,
+          ownerId: "actor-a",
+        });
+      }
+      // Unrelated work: 50 roots of 19 children each, cloned from one row so
+      // the setup stays fast.
+      repository.create({ id: "template", title: "other", ownerId: "actor-b", priority: 1 });
+      const columns = (
+        db.prepare("PRAGMA table_info(obligations)").all() as Array<{ name: string }>
+      ).map((column) => column.name);
+      const clone = db.prepare(
+        `INSERT INTO obligations (${columns.join(", ")})
+         SELECT ${columns
+           .map((column) =>
+             column === "id"
+               ? "@id"
+               : column === "parent_id"
+                 ? "@parentId"
+                 : column === "priority"
+                   ? "@priority"
+                   : column
+           )
+           .join(", ")}
+         FROM obligations WHERE id = 'template'`
+      );
+      db.transaction(() => {
+        for (let root = 0; root < 50; root += 1) {
+          clone.run({ id: `other-${root}`, parentId: null, priority: root });
+          for (let child = 0; child < 19; child += 1) {
+            clone.run({ id: `other-${root}-${child}`, parentId: `other-${root}`, priority: null });
+          }
+        }
+      })();
+      db.prepare("UPDATE obligations SET priority = NULL WHERE id GLOB 'deep-[1-9]'").run();
+      const rows = ids().length;
+      // Count each visit to an obligation row: a temporary view by the same
+      // name shadows the table for the repository's own statements.
+      let visits = 0;
+      db.function("visit_obligation", { deterministic: false }, () => {
+        visits += 1;
+        return 1;
+      });
+      db.exec(
+        "CREATE TEMP VIEW obligations AS SELECT * FROM main.obligations WHERE visit_obligation()"
+      );
+      try {
+        expect(repository.get("deep-8")).toMatchObject({
+          effectivePriority: 4,
+          prioritySourceId: "deep-0",
+        });
+        // One scan seeds responsive reach; the priority walk then touches only
+        // the chain. The whole-table walk visited every row at least twice.
+        expect(visits).toBeLessThan(rows + 50);
+      } finally {
+        db.exec("DROP VIEW temp.obligations");
+      }
+    });
+  });
+
   describe("list and listPage", () => {
     it("filters obligations by ownerId, status, and rootsOnly with pagination", () => {
       repository.create({

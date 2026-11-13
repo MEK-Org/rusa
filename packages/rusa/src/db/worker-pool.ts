@@ -11,16 +11,39 @@ export interface WorkerRequest {
 
 /**
  * A worker's answer: `ready` once its connection is open, carrying the build of
- * the code it runs (`BUILD_ID`), then one per request.
+ * the code it runs (`BUILD_ID`), then one per request. `executionMs` is the
+ * worker's own time running that request, when it measures one.
  */
 export type WorkerMessage =
   | { readonly type: "ready"; readonly build: string | null }
-  | { readonly type: "result"; readonly id: number; readonly value: unknown }
+  | {
+      readonly type: "result";
+      readonly id: number;
+      readonly value: unknown;
+      readonly executionMs?: number;
+    }
   | {
       readonly type: "error";
       readonly id: number;
       readonly error: { readonly name: string; readonly message: string };
+      readonly executionMs?: number;
     };
+
+/**
+ * Where one answered request's time went (#1323), in milliseconds:
+ *
+ * - `queuedMs`: from admission until a worker was handed the request, waiting
+ *   behind other requests or for a worker to start.
+ * - `executionMs`: the worker's own time running it, as the worker measured.
+ * - `transferMs`: the rest of the round trip from hand-off to answer — both
+ *   message crossings, including the result's structured clone, and either
+ *   thread's event-loop delay. Present only with `executionMs`.
+ */
+export interface WorkerRequestTiming {
+  readonly queuedMs: number;
+  readonly executionMs?: number;
+  readonly transferMs?: number;
+}
 
 /**
  * The errors a pool raises for its own reasons, as opposed to an error an
@@ -63,6 +86,9 @@ interface PendingRequest {
   readonly request: WorkerRequest;
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
+  readonly admittedAt: number;
+  dispatchedAt?: number;
+  readonly onTiming?: (timing: WorkerRequestTiming) => void;
 }
 
 interface Slot {
@@ -119,7 +145,16 @@ export class DbWorkerPool {
     for (let index = 0; index < size; index++) this.slots.push(this.spawn());
   }
 
-  request(op: string, input: unknown): Promise<unknown> {
+  /**
+   * Run `op` on the next free worker. `onTiming` hears where the time went once
+   * a worker answers, just before the promise settles; a request refused or
+   * lost to a stopped worker reports nothing.
+   */
+  request(
+    op: string,
+    input: unknown,
+    onTiming?: (timing: WorkerRequestTiming) => void
+  ): Promise<unknown> {
     const { label } = this.errors;
     if (this.closed) return Promise.reject(this.errors.closed(`${label} pool is closed`));
     if (this.failure) return Promise.reject(this.failure);
@@ -137,6 +172,8 @@ export class DbWorkerPool {
         request: { id: this.nextId++, op, input: snapshot },
         resolve,
         reject,
+        admittedAt: performance.now(),
+        onTiming,
       };
       const idle = this.slots.find((slot) => slot.ready && slot.current === null);
       if (idle) this.dispatch(idle, pending);
@@ -229,6 +266,7 @@ export class DbWorkerPool {
 
   private dispatch(slot: Slot, pending: PendingRequest): void {
     slot.current = pending;
+    pending.dispatchedAt = performance.now();
     slot.worker.postMessage(pending.request);
   }
 
@@ -268,6 +306,7 @@ export class DbWorkerPool {
     const pending = slot.current;
     if (!pending || pending.request.id !== message.id) return;
     slot.current = null;
+    pending.onTiming?.(timingOf(pending, message.executionMs));
     if (message.type === "result") pending.resolve(message.value);
     else {
       const error = new Error(message.error.message);
@@ -343,4 +382,16 @@ export class DbWorkerPool {
       this.drained = null;
     }
   }
+}
+
+function timingOf(pending: PendingRequest, executionMs: number | undefined): WorkerRequestTiming {
+  const answeredAt = performance.now();
+  const dispatchedAt = pending.dispatchedAt ?? answeredAt;
+  const queuedMs = dispatchedAt - pending.admittedAt;
+  if (executionMs === undefined) return { queuedMs };
+  return {
+    queuedMs,
+    executionMs,
+    transferMs: Math.max(0, answeredAt - dispatchedAt - executionMs),
+  };
 }

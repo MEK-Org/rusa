@@ -4,6 +4,7 @@ import {
   attachDashboardPhaseClock,
   beginDashboardRoutePhase,
   DashboardPhaseClock,
+  dashboardReadTimingObserver,
   dashboardSubstageObserver,
   measureDashboardPhase,
   runDashboardRequestScope,
@@ -139,6 +140,45 @@ describe("dashboard request substages (#990)", () => {
   it("is a no-op outside a timed request", () => {
     expect(() => startDashboardSubstage("codecMs")()).not.toThrow();
     expect(dashboardSubstageObserver()).toBeUndefined();
+  });
+});
+
+describe("dashboard read substages (#1323)", () => {
+  it("records a read measured elsewhere once, rounded, beside interval substages", () => {
+    const { clock, at } = manualClock();
+    at(0);
+    const endIdentity = clock.startSubstage("identityMs");
+    at(4);
+    endIdentity();
+    clock.recordSubstage("readQueueMs", 380.4);
+    clock.recordSubstage("readExecMs", 24.6);
+    // A second record of the same substage never replaces the first.
+    clock.recordSubstage("readQueueMs", 1);
+    clock.recordSubstage("readTransferMs", Number.NaN);
+    expect(clock.substages(500)).toEqual({ identityMs: 4, readQueueMs: 380, readExecMs: 25 });
+  });
+
+  it("captures the request's clock when asked and reports only the first read", async () => {
+    const { clock } = manualClock();
+    const observe = await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(clock);
+      return dashboardReadTimingObserver();
+    });
+    // Delivered after the request scope was left, as a worker's answer is.
+    observe?.({ queuedMs: 12, executionMs: 30, transferMs: 2 });
+    observe?.({ queuedMs: 900, executionMs: 900, transferMs: 900 });
+    expect(clock.substages()).toEqual({ readQueueMs: 12, readExecMs: 30, readTransferMs: 2 });
+  });
+
+  it("leaves queue and transfer absent for an in-process read, and is absent outside a request", () => {
+    const { clock } = manualClock();
+    const observe = runDashboardRequestScope(() => {
+      attachDashboardPhaseClock(clock);
+      return dashboardReadTimingObserver();
+    });
+    observe?.({ executionMs: 7 });
+    expect(clock.substages()).toEqual({ readExecMs: 7 });
+    expect(dashboardReadTimingObserver()).toBeUndefined();
   });
 });
 

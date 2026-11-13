@@ -62,6 +62,19 @@ export type DashboardServerPhaseDurations = Partial<Record<DashboardServerPhase,
  *   from call until it returns or throws. Present only for a request that
  *   passed body validation and operator resolution.
  *
+ * - `readQueueMs`: the request's first standalone read (#1323), from admission
+ *   to the read pool until a worker was handed it: time waiting behind other
+ *   reads, or for a worker to start. Absent when the read ran in-process.
+ * - `readExecMs`: that read's own run inside its read transaction, timed on
+ *   the thread that ran it.
+ * - `readTransferMs`: the rest of that read's round trip to the worker: both
+ *   message crossings, including the result's structured clone, and either
+ *   thread's event-loop delay. Absent when the read ran in-process.
+ *
+ * The three read substages split one read, so unlike the others they add up:
+ * their sum is that read's time from admission to answer, all inside `route`.
+ * A read refused before it ran (queue full, pool closed) reports none.
+ *
  * Actor-list substages occur only on the actor-list route and actor chat
  * substages only on the actor chat POST; both sit inside `route`.
  * Like phases they measure elapsed time, including scheduling delays, not CPU
@@ -85,6 +98,9 @@ export const DASHBOARD_SERVER_SUBSTAGE_INTERVALS = [
   "actorMetadataMs",
   "actorChatBodyMs",
   "actorChatSendMs",
+  "readQueueMs",
+  "readExecMs",
+  "readTransferMs",
 ] as const;
 
 export type DashboardServerSubstageInterval = (typeof DASHBOARD_SERVER_SUBSTAGE_INTERVALS)[number];
@@ -116,6 +132,7 @@ const noop = () => {};
 export class DashboardPhaseClock implements DashboardSubstageObserver {
   private readonly intervals = new Map<DashboardServerPhase, Interval[]>();
   private readonly substageIntervals = new Map<DashboardServerSubstageInterval, Interval>();
+  private readonly recordedSubstages = new Map<DashboardServerSubstageInterval, number>();
   private revocation: boolean | undefined;
   private endRoute: (() => void) | undefined;
   private routeStarted = false;
@@ -149,6 +166,16 @@ export class DashboardPhaseClock implements DashboardSubstageObserver {
   }
 
   /**
+   * Record a substage measured elsewhere, such as on a read worker, as a
+   * duration. Like an interval, only the first record of a substage counts.
+   */
+  recordSubstage(substage: DashboardServerSubstageInterval, ms: number): void {
+    if (this.substageIntervals.has(substage) || this.recordedSubstages.has(substage)) return;
+    if (!Number.isFinite(ms)) return;
+    this.recordedSubstages.set(substage, ms);
+  }
+
+  /**
    * Interval substages reached so far, clipped at the terminal like phases.
    * The caller snapshots the result; a callback arriving after the row was
    * recorded cannot change it.
@@ -156,6 +183,11 @@ export class DashboardPhaseClock implements DashboardSubstageObserver {
   substages(endedAt: number = this.clock()): DashboardServerSubstages {
     const result: DashboardServerSubstages = {};
     for (const substage of DASHBOARD_SERVER_SUBSTAGE_INTERVALS) {
+      const recorded = this.recordedSubstages.get(substage);
+      if (recorded !== undefined) {
+        result[substage] = Math.round(Math.max(0, recorded));
+        continue;
+      }
       const interval = this.substageIntervals.get(substage);
       if (!interval || interval[0] > endedAt) continue;
       const end = Math.min(interval[1] ?? endedAt, endedAt);
@@ -240,6 +272,30 @@ export function startDashboardSubstage(substage: DashboardServerSubstageInterval
  */
 export function dashboardSubstageObserver(): DashboardSubstageObserver | undefined {
   return requestScope.getStore()?.clock;
+}
+
+/**
+ * Where the current request's standalone read reports its timing, captured now
+ * so the answer lands on this request's row however it is delivered; undefined
+ * outside a timed request. Only the request's first read is recorded.
+ */
+export function dashboardReadTimingObserver():
+  | ((timing: {
+      readonly queuedMs?: number;
+      readonly executionMs?: number;
+      readonly transferMs?: number;
+    }) => void)
+  | undefined {
+  const clock = requestScope.getStore()?.clock;
+  if (!clock) return undefined;
+  let reported = false;
+  return (timing) => {
+    if (reported) return;
+    reported = true;
+    if (timing.queuedMs !== undefined) clock.recordSubstage("readQueueMs", timing.queuedMs);
+    if (timing.executionMs !== undefined) clock.recordSubstage("readExecMs", timing.executionMs);
+    if (timing.transferMs !== undefined) clock.recordSubstage("readTransferMs", timing.transferMs);
+  };
 }
 
 export async function measureDashboardPhase<T>(

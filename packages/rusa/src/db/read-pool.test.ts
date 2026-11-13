@@ -9,7 +9,14 @@ import Database from "better-sqlite3";
 import { build } from "tsup";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type DashboardDataDeps, handleMeshApiRequest } from "../dashboard/api.js";
+import {
+  attachDashboardPhaseClock,
+  DashboardPhaseClock,
+  runDashboardRequestScope,
+} from "../dashboard/timing-phases.js";
+import type { LogFields, Logger } from "../observability/logger.js";
 import { closeDb, getRepositories, initDb, meshDbPath } from "./index.js";
+import type { ReadTiming } from "./read-operations.js";
 import {
   bundledReadWorker,
   DbReadPool,
@@ -95,7 +102,7 @@ if (mode === "gated" || mode === "held") {
 
 /** The test worker's extra operations, which the production table does not name. */
 interface TestReads {
-  read(op: "hold", input: { ms: number }): Promise<number>;
+  read(op: "hold", input: { ms: number }, onTiming?: (timing: ReadTiming) => void): Promise<number>;
   read(op: "countAcrossHold", input: { ms: number }): Promise<{ before: number; after: number }>;
   read(op: "exit", input: Record<string, never>): Promise<never>;
 }
@@ -387,6 +394,108 @@ describe("DbReadPool", () => {
       );
       await expect(running).resolves.toBe(200);
       await expect(queued).resolves.toBeNull();
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("splits a read's time into queue wait, execution and round trip, for one queued behind a long read", async () => {
+    // One worker, so the second read has to wait for the first (#1323).
+    const pool = await openPool({ size: 1 });
+    try {
+      const timings: Record<string, ReadTiming> = {};
+      const longStarted = performance.now();
+      const long = testReads(pool).read("hold", { ms: 600 }, (t) => {
+        timings.long = t;
+      });
+      await sleep(50);
+      const shortStarted = performance.now();
+      const short = testReads(pool).read("hold", { ms: 40 }, (t) => {
+        timings.short = t;
+      });
+      await short;
+      const shortWall = performance.now() - shortStarted;
+      await long;
+      const longWall = performance.now() - longStarted;
+
+      const { long: l, short: q } = timings as {
+        long: Required<ReadTiming>;
+        short: Required<ReadTiming>;
+      };
+      // The long read had a free worker: its time is its own execution.
+      expect(l.queuedMs).toBeLessThan(100);
+      expect(l.executionMs).toBeGreaterThanOrEqual(590);
+      // The short read spent most of its life queued behind the long one,
+      // and its execution is only its own statement.
+      expect(q.queuedMs).toBeGreaterThanOrEqual(450);
+      expect(q.executionMs).toBeGreaterThanOrEqual(35);
+      expect(q.executionMs).toBeLessThan(300);
+      for (const [timing, wall] of [
+        [l, longWall],
+        [q, shortWall],
+      ] as const) {
+        expect(timing.transferMs).toBeGreaterThanOrEqual(0);
+        expect(timing.transferMs).toBeLessThan(200);
+        // The three parts add up to the read's own time from admission to answer.
+        const sum = timing.queuedMs + timing.executionMs + timing.transferMs;
+        expect(sum).toBeLessThanOrEqual(wall + 1);
+        expect(sum).toBeGreaterThan(wall - 100);
+      }
+    } finally {
+      await pool.close();
+    }
+  });
+
+  it("records a route's read queue wait, execution and round trip on the request's timing row", async () => {
+    const pool = await openPool({ size: 1 });
+    const deps = {
+      reads: pool,
+      obligations: getRepositories().obligations,
+    } as unknown as DashboardDataDeps;
+    const server: Server = createServer((req, res) => {
+      const clock = new DashboardPhaseClock();
+      clocks.push(clock);
+      void runDashboardRequestScope(async () => {
+        attachDashboardPhaseClock(clock);
+        await handleMeshApiRequest(req, res, new URL(req.url ?? "/", "http://localhost"), deps);
+      });
+    });
+    const clocks: DashboardPhaseClock[] = [];
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const running = testReads(pool).read("hold", { ms: 500 });
+      await sleep(50);
+      const response = await fetch(`${base}/api/mesh/obligations/root-a`);
+      expect(response.status).toBe(200);
+      await running;
+      expect(clocks).toHaveLength(1);
+      const substages = clocks[0].substages();
+      expect(substages.readQueueMs).toBeGreaterThanOrEqual(350);
+      expect(substages.readExecMs).toBeGreaterThanOrEqual(0);
+      expect(substages.readExecMs).toBeLessThan(300);
+      expect(substages.readTransferMs).toBeGreaterThanOrEqual(0);
+      expect(substages.readTransferMs).toBeLessThan(200);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await pool.close();
+    }
+  });
+
+  it("logs its size once its workers are ready", async () => {
+    const records: Array<{ event: string; fields?: LogFields }> = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: (event, fields) => records.push({ event, fields }),
+      warn: () => {},
+      error: () => {},
+      child: () => logger,
+    };
+    const pool = await DbReadPool.open({ dbPath: meshDbPath(home), worker: workerUrl, logger });
+    try {
+      expect(records.filter((record) => record.event === "db_read_pool_ready")).toEqual([
+        { event: "db_read_pool_ready", fields: { size: 2, maxQueued: 256 } },
+      ]);
     } finally {
       await pool.close();
     }
