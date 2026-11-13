@@ -211,6 +211,15 @@ export class McpHttpServer {
   private readonly tokenToName = new Map<string, string>();
   /** Per mounted server: the safe label recorded for it, never its raw name. */
   private readonly serverLabels = new Map<string, string>();
+  /** Per-request admission for a mount; a refused request 404s like an unknown path. */
+  private readonly authorizers = new Map<string, () => boolean>();
+  /**
+   * Per session: the admission that was current when its server was built.
+   * Re-adding a mount replaces its factory and admission but keeps open
+   * sessions, whose servers still hold what they were built with, so their
+   * requests are admitted against their own admission, not the mount's latest.
+   */
+  private readonly sessionAuthorizers = new WeakMap<StreamableHTTPServerTransport, () => boolean>();
   /** Per server-name: session id -> monotonic creation time for close diagnostics. */
   private readonly sessionStartedAt = new Map<string, Map<string, number>>();
   private readonly log: Logger;
@@ -316,8 +325,14 @@ export class McpHttpServer {
    * per-actor endpoint (e.g. the agent-execution server for one actor, with its
    * id baked in). Returns the loopback URL to hand the actor's provider.
    */
-  addServer(name: string, factory: () => McpServer, opts?: { logLabel?: string }): string {
+  addServer(
+    name: string,
+    factory: () => McpServer,
+    opts?: { logLabel?: string; authorize?: () => boolean }
+  ): string {
     this.factories[name] = factory;
+    if (opts?.authorize) this.authorizers.set(name, opts.authorize);
+    else this.authorizers.delete(name);
     if (!this.sessions.has(name)) this.sessions.set(name, new Map());
     if (!this.sessionStartedAt.has(name)) this.sessionStartedAt.set(name, new Map());
     this.serverLabels.set(
@@ -327,7 +342,17 @@ export class McpHttpServer {
     return this.urlFor(name);
   }
 
-  /** Tear down a hosted server (its transports) and stop routing to it. */
+  /**
+   * Tear down a hosted server (its transports) and stop routing to it.
+   *
+   * A revocation's writer delivery awaits this (#1289 D1), and later
+   * deliveries wait behind it. That cannot deadlock only because
+   * `transport.close()` does not wait for a running request handler, which
+   * may itself be waiting on a later delivery. That holds for the locked MCP
+   * SDK 1.29.0 (webStandardStreamableHttp.ts `close()`); check it again on
+   * an SDK upgrade. grant-revocation-window.test.ts holds a handler mid-call
+   * through a revocation to pin it.
+   */
   async removeServer(name: string): Promise<void> {
     const transports = this.sessions.get(name);
     if (transports) {
@@ -342,6 +367,7 @@ export class McpHttpServer {
     }
     this.sessionStartedAt.delete(name);
     this.serverLabels.delete(name);
+    this.authorizers.delete(name);
     delete this.factories[name];
     const token = this.nameToToken.get(name);
     if (token) {
@@ -382,7 +408,18 @@ export class McpHttpServer {
       return;
     }
     const name = this.serverNameFor(req.url);
-    if (!name) {
+    // Routing must use the complete header. Its separately bounded form is for
+    // diagnostics only: trimming before Map#get changes which session receives
+    // a request.
+    let sessionId =
+      typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
+    const presented = name && sessionId ? this.sessions.get(name)?.get(sessionId) : undefined;
+    const authorize = presented
+      ? this.sessionAuthorizers.get(presented)
+      : name
+        ? this.authorizers.get(name)
+        : undefined;
+    if (!name || authorize?.() === false) {
       res.writeHead(404, { "content-type": "text/plain" });
       res.end("not found");
       return;
@@ -394,11 +431,6 @@ export class McpHttpServer {
     // Read the mount label once, at arrival: a session close can outlive the
     // mount, and every record for this request should name the mount that served it.
     const server = this.serverLabel(name);
-    // Routing must use the complete header. Its separately bounded form is for
-    // diagnostics only: trimming before Map#get changes which session receives
-    // a request.
-    let sessionId =
-      typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
     let loggedSessionId = boundedMetadata(sessionId);
     // Capture this before body parsing so an arrival record answers whether the
     // client presented a currently live session, even if parsing or dispatch stalls.
@@ -494,8 +526,14 @@ export class McpHttpServer {
               });
             }
           };
+          // Read the factory and its admission together: the mount may have
+          // been replaced while the body was read, and this session's later
+          // requests are admitted against what its server is built from.
+          const factory = this.factories[name];
+          const sessionAuthorize = this.authorizers.get(name);
+          if (sessionAuthorize) this.sessionAuthorizers.set(newTransport, sessionAuthorize);
           this.log.info("mcp_session_connecting", requestFields());
-          await this.factories[name]().connect(newTransport);
+          await factory().connect(newTransport);
           this.log.info("mcp_session_connected", requestFields());
           transport = newTransport;
         }

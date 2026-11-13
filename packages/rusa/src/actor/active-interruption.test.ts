@@ -12,6 +12,7 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import { createHarness, waitUntil } from "../remote-instances/harness.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { Actor } from "./actor.js";
+import type { ActorLifecycleListener } from "./actor-lifecycle.js";
 import { ActorMesh, type ActorMeshOptions, type SpawnRequest } from "./actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
 import {
@@ -58,6 +59,8 @@ function setup(opts: {
   sharedProvider?: CodingProvider;
   inboxStore?: SqliteInboxRepository;
   events?: MeshEventInput[];
+  /** A further lifecycle listener on every actor, ahead of the Actor's own. */
+  lifecycle?: ActorLifecycleListener;
 }) {
   const registry = new InMemoryActorRepository();
   const inboxStore = opts.inboxStore ?? createTestInbox();
@@ -94,6 +97,7 @@ function setup(opts: {
     responsiveInterruption: opts.responsiveInterruption,
     responsiveInterruptionMode: opts.responsiveInterruptionMode,
     createActor: (ctx) => {
+      if (opts.lifecycle) ctx.lifecycle.add(opts.lifecycle);
       const provider = opts.sharedProvider ?? new FakeProvider(() => Promise.resolve({}));
       return new Actor({
         id: ctx.record.id,
@@ -684,4 +688,126 @@ describe("Active JEV invalidation preempts only for remaining responsive work (#
     expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(false);
     for (const run of t.runs) run.settle();
   });
+});
+
+// A run that has claimed its terminal outcome and is awaiting its onEnd
+// listeners is finished: an interrupt or responsive preemption landing in that
+// window must neither strand work delivered during the run nor record a
+// preemption of the finished run (#1299). The extra onEnd listener is held open
+// on a promise to make the window observable; it models an async listener, not
+// real listener timing.
+describe("interrupt and responsive preemption while a run's onEnd is pending (#1299)", () => {
+  function setupHeldOnEnd() {
+    const events: MeshEventInput[] = [];
+    const runs: Array<{ settle: () => void }> = [];
+    const provider = new FakeProvider((opts) => {
+      const signal = opts.signal ?? new AbortController().signal;
+      return new Promise<Partial<RunResult>>((resolve, reject) => {
+        runs.push({ settle: () => resolve({}) });
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    let hold: Promise<void> | undefined;
+    let release: (() => void) | undefined;
+    let inOnEnd = 0;
+    const t = setup({
+      sharedProvider: provider,
+      events,
+      lifecycle: {
+        onEnd: async () => {
+          if (!hold) return;
+          inOnEnd++;
+          await hold;
+          inOnEnd--;
+        },
+      },
+    });
+    const worker = t.mesh.spawn({ charter: "worker", parentId: "root" });
+    return {
+      ...t,
+      events,
+      runs,
+      worker,
+      inOnEnd: () => inOnEnd,
+      /** Finish the run's provider turn and hold its onEnd fanout open. */
+      async settleIntoOnEnd() {
+        hold = new Promise<void>((r) => {
+          release = r;
+        });
+        runs[0]?.settle();
+        await t.tick();
+        expect(inOnEnd).toBe(1);
+      },
+      release() {
+        const r = release;
+        hold = undefined;
+        release = undefined;
+        r?.();
+      },
+    };
+  }
+
+  /** The worker's first run, executing, with the task that woke it already handled. */
+  async function firstRunExecuting(t: ReturnType<typeof setupHeldOnEnd>) {
+    const [first] = t.inboxStore.append([
+      { actorId: t.worker, source: "test", payload: { type: "task", id: "first" } },
+    ]);
+    t.mesh.dispatch(t.worker);
+    await t.tick();
+    expect(t.runs).toHaveLength(1);
+    t.inboxStore.markHandled(t.worker, [first.id]);
+  }
+
+  const preempted = (t: ReturnType<typeof setupHeldOnEnd>) =>
+    t.events
+      .filter((e) => e.kind === "run_preempted" && e.actorId === t.worker)
+      .map((e) => ({ detail: e.detail, payload: e.payload }));
+
+  it("a responsive arrival records no preemption of the finished run and still gets its replacement", async () => {
+    const t = setupHeldOnEnd();
+    await firstRunExecuting(t);
+    await t.settleIntoOnEnd();
+
+    t.mesh.sendMessage(t.worker, "operator responsive", TEST_USER_ID, "s1");
+    await t.tick();
+    expect(t.runs).toHaveLength(1);
+    expect(preempted(t)).toEqual([]);
+
+    t.release();
+    await t.tick();
+    await t.tick();
+    expect(t.runs).toHaveLength(2);
+    expect(preempted(t)).toEqual([]);
+    for (const r of t.runs) r.settle();
+  });
+
+  // `none` is the harness control: without an interrupt, the held onEnd still
+  // lets the work delivered during the run reach a second run.
+  for (const mode of ["in-onEnd", "none"] as const) {
+    it(`work delivered during the run gets a second run (interrupt ${mode})`, async () => {
+      const t = setupHeldOnEnd();
+      await firstRunExecuting(t);
+      const [second] = t.inboxStore.append([
+        { actorId: t.worker, source: "test", payload: { type: "task", id: "second" } },
+      ]);
+      t.mesh.dispatch(t.worker);
+      await t.tick();
+      await t.settleIntoOnEnd();
+      const result = mode === "in-onEnd" ? t.mesh.interrupt(t.worker, "root") : undefined;
+      await t.tick();
+      t.release();
+      await t.tick();
+      await t.tick();
+      expect(t.runs).toHaveLength(2);
+      const unhandled = t.inboxStore
+        .list(t.worker, { status: "unhandled" })
+        .entries.map((e) => e.id);
+      expect(unhandled).toContain(second.id);
+      expect(t.mesh.hasRunnableInbox(t.worker)).toBe(true);
+      expect(t.mesh.runningThreadIds().has(t.worker)).toBe(true);
+      // The interrupt found the run already finished, so it reported nothing to interrupt.
+      if (mode === "in-onEnd") expect(result).toEqual({ interrupted: false, status: "idle" });
+      for (const r of t.runs) r.settle();
+    });
+  }
 });

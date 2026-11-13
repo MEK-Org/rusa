@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type Database from "better-sqlite3";
 import type { Logger } from "../observability/logger.js";
 import { DbWorkerPool, type WorkerPoolErrors } from "./worker-pool.js";
@@ -61,6 +62,53 @@ export class MeshWriteCommittedError extends Error {
   }
 }
 
+/**
+ * One committed effect that was not delivered, described for the write's
+ * caller (#1289). `message` names only the kind of consequence that is
+ * missing, never the nested error's text: that text can describe another
+ * actor's entry or row, and before effects could fail a write it reached only
+ * the server log, where it is still written. The underlying error stays in
+ * `cause` for in-process diagnostics.
+ */
+export class EffectDeliveryFailure extends Error {
+  override readonly name = "EffectDeliveryFailure";
+
+  constructor(reason: string, cause: unknown) {
+    super(reason, { cause });
+  }
+}
+
+/**
+ * What a caller boundary (an MCP tool result, a dashboard response) answers
+ * for a {@link MeshWriteCommittedError}: still an error, because a required
+ * effect failed, but one that says the write committed and carries its
+ * committed result (a created row's server-generated id included), so the
+ * caller can read that state instead of sending the mutation again. Wording
+ * cannot stop a caller that retries anyway; it only stops the boundary from
+ * hiding what committed. `result` is null when the result itself was lost.
+ * `failures` names, in order, each consequence that could not be returned or
+ * delivered, so the caller can tell which is missing; it carries only an
+ * {@link EffectDeliveryFailure}'s caller-safe reason, never a nested error's
+ * own text.
+ */
+export interface CommittedWriteReport {
+  readonly error: string;
+  readonly committed: true;
+  readonly result: unknown;
+  readonly failures: readonly string[];
+}
+
+export function committedWriteReport(err: MeshWriteCommittedError): CommittedWriteReport {
+  return {
+    error: `${err.message}. The write committed; do not retry the mutation.`,
+    committed: true,
+    result: err.result ?? null,
+    failures: err.failures.map((failure) =>
+      failure instanceof EffectDeliveryFailure ? failure.message : "an effect was not delivered"
+    ),
+  };
+}
+
 type Operations = Readonly<Record<string, (context: never, input: never) => unknown>>;
 export type WriteInput<Ops extends Operations, K extends keyof Ops> = Parameters<Ops[K]>[1];
 export type WriteOutput<Ops extends Operations, K extends keyof Ops> = ReturnType<Ops[K]>;
@@ -78,48 +126,177 @@ export interface MeshWriter<Ops extends Operations> {
   ): Promise<WriteOutput<Ops, K>>;
 }
 
-/** Hands one committed effect to the runtime. Synchronous by contract. */
-export type DeliverEffect<E> = (effect: E) => void;
+/**
+ * Hands one committed effect to the runtime (#1289 C2). Delivery may await
+ * required work, including a nested write and that write's own effects; the
+ * next effect of the same write is not delivered until it settles.
+ */
+export type DeliverEffect<E> = (effect: E) => void | Promise<void>;
+
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  typeof (value as PromiseLike<unknown> | null)?.then === "function";
 
 /**
  * Deliver every effect, in order, then answer the result. An effect that could
  * not be returned or whose delivery fails does not stop the ones after it, and
  * a result that could not be returned stops none of them, because each effect
- * describes something that has already committed.
+ * describes something that has already committed. A delivery that returns a
+ * promise is awaited before the next effect; while every delivery returns
+ * synchronously, so does this.
  */
-function settle<E>(op: string, outcome: ReturnedOutcome<E>, deliver: DeliverEffect<E>): unknown {
+function settle<E>(
+  op: string,
+  outcome: ReturnedOutcome<E>,
+  deliver: DeliverEffect<E>
+): unknown | Promise<unknown> {
   const { effects } = outcome;
   const failures: unknown[] = [];
-  effects.forEach((item, index) => {
-    if ("unreturnable" in item) {
-      failures.push(
-        new Error(
-          `effect ${index + 1} of ${effects.length} could not be returned: ${item.unreturnable}`
-        )
-      );
-      return;
+  const finish = (): unknown => {
+    const problems = [
+      ...(outcome.unreturnableResult === undefined
+        ? []
+        : [`its result could not be returned: ${outcome.unreturnableResult}`]),
+      ...(failures.length > 0
+        ? [`${failures.length} of its ${effects.length} effects failed to deliver`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      throw new MeshWriteCommittedError(`write ${op} committed, but ${problems.join("; and ")}`, {
+        result: outcome.result,
+        failures,
+      });
     }
-    try {
-      deliver(item.effect);
-    } catch (err) {
-      failures.push(err);
+    return outcome.result;
+  };
+  const from = (start: number): unknown | Promise<unknown> => {
+    for (let index = start; index < effects.length; index++) {
+      const item = effects[index] as (typeof effects)[number];
+      if ("unreturnable" in item) {
+        failures.push(
+          new EffectDeliveryFailure(
+            `effect ${index + 1} of ${effects.length} could not be returned from the writer`,
+            new Error(item.unreturnable)
+          )
+        );
+        continue;
+      }
+      let pending: void | Promise<void>;
+      try {
+        pending = deliver(item.effect);
+      } catch (err) {
+        failures.push(err);
+        continue;
+      }
+      if (isThenable(pending)) {
+        return Promise.resolve(pending).then(
+          () => from(index + 1),
+          (err: unknown) => {
+            failures.push(err);
+            return from(index + 1);
+          }
+        );
+      }
     }
-  });
-  const problems = [
-    ...(outcome.unreturnableResult === undefined
-      ? []
-      : [`its result could not be returned: ${outcome.unreturnableResult}`]),
-    ...(failures.length > 0
-      ? [`${failures.length} of its ${effects.length} effects failed to deliver`]
-      : []),
-  ];
-  if (problems.length > 0) {
-    throw new MeshWriteCommittedError(`write ${op} committed, but ${problems.join("; and ")}`, {
-      result: outcome.result,
-      failures,
+    return finish();
+  };
+  return from(0);
+}
+
+/**
+ * Orders the delivery of committed writes' effects (#1289 C2). Writes made at
+ * the top level deliver one at a time, in the order they committed. A write
+ * made while an earlier write's effects are being delivered is nested: its
+ * effects are delivered at once, inside the parent's delivery, rather than
+ * queued behind a parent that may be awaiting them. Committing never waits for
+ * any delivery. While deliveries return synchronously, a write made with
+ * nothing being delivered is delivered before its call returns.
+ *
+ * Contracts a change here must keep:
+ * - Effects are delivered in completion order, but a write's caller resuming
+ *   from its await is not ordered against the next delivery, which may start
+ *   first. Total FIFO across caller continuations is not the contract; making
+ *   a delivery wait for the previous caller would queue nested work behind it.
+ * - Nesting is decided by the async context a write is made in. A listener may
+ *   await only writes it makes itself, inside its own delivery; awaiting a
+ *   promise for a write made in another context (shared or coalesced) queues
+ *   that write behind the delivery awaiting it, which never settles.
+ * - Work a listener starts without awaiting, while its delivery is still open,
+ *   is nested too: it is delivered at once, interleaved with the parent's
+ *   remaining effects, not after them.
+ * - A delivery that never settles holds every later top-level delivery. There
+ *   is no timeout.
+ */
+export class EffectDeliverySequencer {
+  /** The delivery the current async context runs inside, while it is open. */
+  private readonly scope = new AsyncLocalStorage<{ open: boolean }>();
+  private readonly queue: (() => unknown)[] = [];
+  private busy = false;
+
+  /** Whether the current async context runs inside an open delivery. */
+  delivering(): boolean {
+    return this.scope.getStore()?.open === true;
+  }
+
+  /** Deliver one committed write's effects, in its turn or nested in its parent's. */
+  deliver<T>(work: () => T | Promise<T>): Promise<T> {
+    // A delivery that has finished no longer holds the ordering, so work its
+    // listeners started without awaiting takes its turn like any other write.
+    if (this.scope.getStore()?.open) {
+      try {
+        return Promise.resolve(this.scoped(work));
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    }
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push(() => {
+        let out: T | Promise<T>;
+        try {
+          out = this.scoped(work);
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        if (!isThenable(out)) {
+          resolve(out);
+          return;
+        }
+        return Promise.resolve(out).then(resolve, reject);
+      });
+      if (!this.busy) this.pump();
     });
   }
-  return outcome.result;
+
+  private scoped<T>(work: () => T | Promise<T>): T | Promise<T> {
+    const scope = { open: true };
+    let out: T | Promise<T>;
+    try {
+      out = this.scope.run(scope, work);
+    } catch (err) {
+      scope.open = false;
+      throw err;
+    }
+    if (!isThenable(out)) {
+      scope.open = false;
+      return out;
+    }
+    return Promise.resolve(out).finally(() => {
+      scope.open = false;
+    });
+  }
+
+  private pump(): void {
+    this.busy = true;
+    for (let job = this.queue.shift(); job; job = this.queue.shift()) {
+      const out = job();
+      if (isThenable(out)) {
+        const next = () => this.pump();
+        out.then(next, next);
+        return;
+      }
+    }
+    this.busy = false;
+  }
 }
 
 /**
@@ -140,9 +317,7 @@ export class InProcessMeshWriter<R, E, Ops extends WriteOperationTable<R, E>>
     private readonly deliver: DeliverEffect<E>
   ) {}
 
-  /** Committed writes waiting for their effects to be delivered, in commit order. */
-  private readonly backlog: (() => void)[] = [];
-  private delivering = false;
+  private readonly sequencer = new EffectDeliverySequencer();
 
   write<K extends keyof Ops & string>(
     op: K,
@@ -163,27 +338,10 @@ export class InProcessMeshWriter<R, E, Ops extends WriteOperationTable<R, E>>
     } catch (err) {
       return Promise.reject(err);
     }
-    return new Promise((resolve, reject) => {
-      this.backlog.push(() => {
-        try {
-          resolve(settle(op, outcome, this.deliver) as WriteOutput<Ops, K>);
-        } catch (err) {
-          reject(err);
-        }
-      });
-      // A write made while an earlier one's effects are being delivered has
-      // committed after it, so its effects wait for the earlier write's rest.
-      if (!this.delivering) this.drain();
-    });
-  }
-
-  private drain(): void {
-    this.delivering = true;
-    try {
-      for (let job = this.backlog.shift(); job; job = this.backlog.shift()) job();
-    } finally {
-      this.delivering = false;
-    }
+    // A top-level write made while an earlier one's effects are being
+    // delivered has committed after it, so its effects wait for the earlier
+    // write's rest. A write that delivery awaits is delivered inside it.
+    return this.sequencer.deliver(() => settle(op, outcome, this.deliver) as WriteOutput<Ops, K>);
   }
 }
 
@@ -214,9 +372,13 @@ export interface DbWriterOptions<E> {
 
 /**
  * One write worker owning one writing connection (#1289), on the lifecycle the
- * read pool uses. Writes run in the order they were called. Each worker
- * message is its own turn of the event loop, so one write's effects and its
- * caller's continuation run before the next write's outcome is handled.
+ * read pool uses. Writes commit in the order they were called, and their
+ * effects are delivered in that order by the {@link EffectDeliverySequencer}.
+ * While a write's delivery answers synchronously, its caller's continuation
+ * also runs before the next write's outcome is handled, since each worker
+ * message is its own turn of the event loop. Once a delivery awaits, the next
+ * write's delivery may start before this write's caller resumes, as in the
+ * in-process writer: the sequencer orders deliveries, not continuations.
  */
 export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
   static async open<E, Ops extends Operations>(
@@ -238,15 +400,31 @@ export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
     private readonly deliver: DeliverEffect<E>
   ) {}
 
+  private readonly sequencer = new EffectDeliverySequencer();
+  /** Accepted writes whose callers have not been answered yet. */
+  private readonly accepted = new Set<Promise<unknown>>();
+  private closing: Promise<void> | null = null;
+
   write<K extends keyof Ops & string>(
     op: K,
     input: WriteInput<Ops, K>
   ): Promise<WriteOutput<Ops, K>> {
-    return this.pool
+    // Once closing, a write made inside an open delivery is still part of an
+    // accepted write that has not been answered, so it is accepted too.
+    if (this.closing && !this.sequencer.delivering()) {
+      return Promise.reject(new DbWriterClosedError("write pool is closed"));
+    }
+    const answered = this.pool
       .request(op, input)
-      .then(
-        (outcome) => settle(op, outcome as ReturnedOutcome<E>, this.deliver) as WriteOutput<Ops, K>
+      .then((outcome) =>
+        this.sequencer.deliver(
+          () => settle(op, outcome as ReturnedOutcome<E>, this.deliver) as WriteOutput<Ops, K>
+        )
       );
+    this.accepted.add(answered);
+    const forget = () => this.accepted.delete(answered);
+    answered.then(forget, forget);
+    return answered;
   }
 
   /** See {@link DbWorkerPool.restore}. */
@@ -254,8 +432,17 @@ export class DbWriter<E, Ops extends Operations> implements MeshWriter<Ops> {
     this.pool.restore();
   }
 
-  /** Refuse new writes, finish every accepted one, then stop the worker. Idempotent. */
+  /**
+   * Refuse new writes, finish every accepted one, then stop the worker.
+   * Idempotent. An accepted write is finished when its caller is answered,
+   * after its effects' delivery, including writes that delivery makes. A
+   * delivery that never settles therefore holds close too.
+   */
   close(): Promise<void> {
-    return this.pool.close();
+    this.closing ??= (async () => {
+      while (this.accepted.size > 0) await Promise.allSettled([...this.accepted]);
+      await this.pool.close();
+    })();
+    return this.closing;
   }
 }

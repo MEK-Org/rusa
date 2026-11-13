@@ -2693,6 +2693,247 @@ describe("Actor", () => {
     });
   });
 
+  describe("a run awaiting its terminal onEnd is finished (#1299)", () => {
+    /** A gate whose starts wait to be started by the test, and cancel like a queued reservation. */
+    function heldGate() {
+      const starts: Array<{ start: () => void; readonly cancelled: boolean }> = [];
+      const gate: NonNullable<ActorOptions["gate"]> = <T>(
+        fn: (selected: RawProviderModelConfig) => Promise<T>,
+        candidates: readonly RawProviderModelConfig[]
+      ): RunStartHandle<T> => {
+        let resolve!: (value: T) => void;
+        let reject!: (err: unknown) => void;
+        const result = new Promise<T>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        let started = false;
+        let cancelled = false;
+        starts.push({
+          start: () => {
+            started = true;
+            void fn(candidates[0] as RawProviderModelConfig).then(resolve, reject);
+          },
+          get cancelled() {
+            return cancelled;
+          },
+        });
+        return {
+          result,
+          get started() {
+            return started;
+          },
+          promote: () => {},
+          cancel: () => {
+            if (started || cancelled) return false;
+            cancelled = true;
+            reject(new RunStartCancelledError());
+            return true;
+          },
+        };
+      };
+      return { gate, starts };
+    }
+
+    it("leaves interrupt and preemption as no-ops during a result onEnd and keeps the merged follow-up", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const provider = new FakeProvider(() => new Promise<RunResult>((r) => (resolveRun = r)));
+      let releaseEnd: (() => void) | undefined;
+      let ends = 0;
+      const queued: Array<{ responsive: boolean; mode: string }> = [];
+      const cancelled = vi.fn();
+      const actor = makeActor(
+        {
+          onQueued: (event) => {
+            queued.push(event);
+          },
+          onRunEnd: () => {
+            if (++ends === 1) return new Promise<void>((r) => (releaseEnd = r));
+          },
+          onQueuedRunCancelled: cancelled,
+        },
+        provider
+      );
+
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(provider.calls).toHaveLength(1);
+      // A responsive follow-up coalesces while the first run executes.
+      actor.requestRun({ priority: "responsive", mode: "yield-elicitation" });
+      resolveRun({ success: true, exitCode: 0, output: "done" });
+      await flush();
+      expect(releaseEnd).toBeDefined();
+      expect(actor.isRunning).toBe(true);
+
+      expect(actor.interrupt("root")).toEqual({ interrupted: false });
+      expect(actor.getInterruptedWatermark()).toBeNull();
+      expect(actor.preemptForResponsive()).toEqual({ preempted: false });
+      // Later delivery merges into the retained follow-up rather than replacing it.
+      actor.requestRun({ mode: "yield-elicitation" });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(provider.calls).toHaveLength(1);
+
+      releaseEnd?.();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(provider.calls).toHaveLength(2);
+      expect(queued).toEqual([
+        { responsive: false, mode: "ordinary" },
+        { responsive: true, mode: "yield-elicitation" },
+      ]);
+      resolveRun({ success: true, exitCode: 0, output: "done" });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(provider.calls).toHaveLength(2);
+      expect(cancelled).not.toHaveBeenCalled();
+    });
+
+    it("treats an abandoned onEnd the same, then still cancels the next preflight and queued start", async () => {
+      const provider = new FakeProvider(() => ({ success: true, exitCode: 0, output: "ok" }));
+      const { gate, starts } = heldGate();
+      let releaseAbandon: (() => void) | undefined;
+      let abandons = 0;
+      let holdBeforeRun = false;
+      let releaseBeforeRun: ((ok: boolean) => void) | undefined;
+      let preflights = 0;
+      const queuedRuns = vi.fn();
+      const cancelled = vi.fn();
+      const actor = makeActor(
+        {
+          gate,
+          beforeRun: () => {
+            preflights++;
+            if (!holdBeforeRun) return true;
+            holdBeforeRun = false;
+            return new Promise<boolean>((r) => (releaseBeforeRun = r));
+          },
+          onQueued: queuedRuns,
+          onRunAbandoned: () => {
+            if (++abandons === 1) return new Promise<void>((r) => (releaseAbandon = r));
+          },
+          onQueuedRunCancelled: cancelled,
+        },
+        provider
+      );
+
+      // Run 1 reaches the gate, and dropping its queued start abandons it.
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(starts).toHaveLength(1);
+      expect(actor.cancelQueuedRun({ retain: false })).toBe(true);
+      await flush();
+      expect(releaseAbandon).toBeDefined();
+      expect(actor.isRunning).toBe(false);
+      expect(actor.isBusy).toBe(true);
+
+      // Its abandoned onEnd is pending: the opportunity is already finished.
+      expect(actor.interrupt("root")).toEqual({ interrupted: false });
+      expect(actor.getInterruptedWatermark()).toBeNull();
+      expect(actor.preemptForResponsive()).toEqual({ preempted: false });
+
+      // Run 2 is a genuine later admission; preemption while its beforeRun is
+      // held still cancels it, and the responsive replacement runs instead.
+      holdBeforeRun = true;
+      actor.requestRun({ priority: "responsive" });
+      releaseAbandon?.();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(releaseBeforeRun).toBeDefined();
+      expect(actor.preemptForResponsive()).toEqual({ preempted: true, phase: "queued" });
+      actor.requestRun({ priority: "responsive" });
+      releaseBeforeRun?.(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(preflights).toBe(3);
+      expect(queuedRuns).toHaveBeenCalledTimes(2);
+
+      // Run 3 waits at the gate; an interrupt cancels that real queued start.
+      expect(starts).toHaveLength(2);
+      expect(actor.interrupt("root")).toMatchObject({ interrupted: true, wasQueued: true });
+      expect(starts[1]?.cancelled).toBe(true);
+      expect(cancelled).toHaveBeenCalledTimes(2);
+      await flush();
+
+      // Nothing stale suppresses the next run: it is admitted and starts.
+      actor.clearInterruptWatermark();
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(starts).toHaveLength(3);
+      starts[2]?.start();
+      await flush();
+      expect(provider.calls).toHaveLength(1);
+    });
+
+    it("a voice nudge during held onEnd does not coalesce-kill the finished run, preserves pending yield-elicitation metadata, and preserves next abandon classification", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const provider = new FakeProvider(() => new Promise<RunResult>((r) => (resolveRun = r)));
+      const { gate, starts } = heldGate();
+      let releaseEnd: (() => void) | undefined;
+      let ends = 0;
+      const coalesceEvents: Array<{ count: number; ageMs: number }> = [];
+      const queued: Array<{ responsive: boolean; mode: string }> = [];
+      const abandonedReasons: string[] = [];
+
+      const actor = makeActor(
+        {
+          gate,
+          onQueued: (event) => queued.push(event),
+          onRunEnd: () => {
+            if (++ends === 1) return new Promise<void>((r) => (releaseEnd = r));
+          },
+          onCoalesceAborted: (count, ageMs) => coalesceEvents.push({ count, ageMs }),
+          onRunAbandoned: (event) => {
+            abandonedReasons.push(event.reason);
+          },
+        },
+        provider
+      );
+
+      // Run 1 starts (ordinary)
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(starts).toHaveLength(1);
+      starts[0]?.start();
+      await flush();
+      expect(provider.calls).toHaveLength(1);
+
+      // A responsive yield-elicitation follow-up coalesces while the first run executes
+      actor.requestRun({ priority: "responsive", mode: "yield-elicitation" });
+
+      // Run 1 finishes execution and enters held onEnd
+      resolveRun({ success: true, exitCode: 0, output: "done" });
+      await flush();
+      expect(releaseEnd).toBeDefined();
+      expect(actor.isRunning).toBe(true);
+
+      // A voice nudge arrives while onEnd is held
+      const voiceTime = Date.now();
+      actor.requestRun({
+        priority: "responsive",
+        mode: "yield-elicitation",
+        voiceTimestamp: voiceTime,
+      });
+      await vi.advanceTimersByTimeAsync(10);
+
+      // 1. Verify no spurious coalesce-kill event was emitted for the finished run
+      expect(coalesceEvents).toEqual([]);
+
+      // 2. Release onEnd so Run 2 (the follow-up) queues at the gate
+      releaseEnd?.();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(starts).toHaveLength(2);
+
+      // Cancel Run 2 at the gate
+      expect(actor.cancelQueuedRun({ retain: false })).toBe(true);
+      await flush();
+
+      // 3. Verify next run's abandon reason is "start-cancelled", NOT "coalesced"
+      expect(abandonedReasons).toEqual(["start-cancelled"]);
+
+      // 4. Verify queued events: Run 1 was ordinary, Run 2 preserved responsive yield-elicitation
+      expect(queued).toEqual([
+        { responsive: false, mode: "ordinary" },
+        { responsive: true, mode: "yield-elicitation" },
+      ]);
+    });
+  });
+
   describe("sandbox mount teardown on all exit paths ", () => {
     let teardownSpy: ReturnType<typeof vi.spyOn>;
 

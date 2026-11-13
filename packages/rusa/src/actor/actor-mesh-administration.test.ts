@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
+import { memoryGrantWriter } from "../db/fixtures/memory-grant-writer.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorMesh } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
@@ -16,6 +17,7 @@ import {
   seedConfiguredActorGrants,
 } from "./administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "./experiments.js";
 
 /** A fixture rollout: the production experiment registry is empty between rollouts. */
 const FIXTURE_EXPERIMENT = "fixture_rollout";
@@ -56,11 +58,14 @@ function record(
 function setup() {
   const actors = new InMemoryActorRepository();
   const grants = new InMemoryCapabilityGrantStore();
+  const experiments = new InMemoryExperimentEnrollmentStore();
   const mesh = new ActorMesh({
     actors,
     rootId: "configured",
     experimentRegistry: { [FIXTURE_EXPERIMENT]: { intent: "Exercise the rollout seam." } },
     capabilityGrants: grants,
+    experimentEnrollments: experiments,
+    writer: memoryGrantWriter({ actors, grants, experiments }),
     secretsDir,
     grantableCapabilities: new Set([
       ...GRANTABLE,
@@ -99,9 +104,9 @@ describe("capability administration is grant-derived", () => {
       grantedAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() =>
+    await expect(
       mesh.grantCapability("steward-child", "understanding-write", "0b2c3d4e-steward")
-    ).not.toThrow();
+    ).resolves.not.toThrow();
     expect(mesh.activeCapabilitiesFor("steward-child")).toContain("understanding-write");
     await expect(
       mesh.revokeCapability("steward-child", "understanding-write", "0b2c3d4e-steward")
@@ -109,36 +114,36 @@ describe("capability administration is grant-derived", () => {
     expect(mesh.activeCapabilitiesFor("steward-child")).not.toContain("understanding-write");
 
     // Subtree boundary: a sibling and another top-level tree are out of reach.
-    expect(() =>
+    await expect(
       mesh.grantCapability("sibling", "understanding-write", "0b2c3d4e-steward")
-    ).toThrow(/own subtree/);
-    expect(() =>
+    ).rejects.toThrow(/own subtree/);
+    await expect(
       mesh.grantCapability("other-child", "understanding-write", "0b2c3d4e-steward")
-    ).toThrow(/own subtree/);
+    ).rejects.toThrow(/own subtree/);
   });
 
-  it("refuses an ungranted parentless record and the literal root address", () => {
+  it("refuses an ungranted parentless record and the literal root address", async () => {
     const { mesh } = setup();
-    expect(() =>
+    await expect(
       mesh.grantCapability("other-child", "understanding-write", "other-parentless")
-    ).toThrow(/capability-admin/);
-    expect(() => mesh.grantCapability("sibling", "understanding-write", "configured")).toThrow(
-      /capability-admin/
-    );
-    expect(() => mesh.grantCapability("sibling", "understanding-write", "root")).toThrow(
+    ).rejects.toThrow(/capability-admin/);
+    await expect(
+      mesh.grantCapability("sibling", "understanding-write", "configured")
+    ).rejects.toThrow(/capability-admin/);
+    await expect(mesh.grantCapability("sibling", "understanding-write", "root")).rejects.toThrow(
       /capability-admin/
     );
     expect(mesh.activeCapabilitiesFor("sibling")).toEqual([]);
   });
 
-  it("keeps the parent-grantable secret path for an ungranted parent", () => {
+  it("keeps the parent-grantable secret path for an ungranted parent", async () => {
     const { mesh } = setup();
-    expect(() =>
+    await expect(
       mesh.grantCapability("steward-child", "secret:gemini-api-key", "0b2c3d4e-steward")
-    ).not.toThrow();
-    expect(() =>
+    ).resolves.not.toThrow();
+    await expect(
       mesh.grantCapability("steward-child", "understanding-write", "0b2c3d4e-steward")
-    ).toThrow(/capability-admin/);
+    ).rejects.toThrow(/capability-admin/);
   });
 
   it("withdraws grant authority the moment capability-admin is revoked", async () => {
@@ -155,15 +160,15 @@ describe("capability administration is grant-derived", () => {
       CAPABILITY_ADMIN_CAPABILITY,
       "0b2c3d4e-steward"
     );
-    expect(() =>
+    await expect(
       mesh.grantCapability("steward-child", "understanding-write", "0b2c3d4e-steward")
-    ).toThrow(/capability-admin/);
+    ).rejects.toThrow(/capability-admin/);
   });
 
-  it("lets a capability-admin holder delegate an administrative capability into its subtree", () => {
+  it("lets a capability-admin holder delegate an administrative capability into its subtree", async () => {
     const { grants, mesh } = setup();
     seedConfiguredActorGrants(grants, "configured", () => "2026-01-01T00:00:00Z");
-    mesh.grantCapability("0b2c3d4e-steward", EXPERIMENT_ADMIN_CAPABILITY, "configured");
+    await mesh.grantCapability("0b2c3d4e-steward", EXPERIMENT_ADMIN_CAPABILITY, "configured");
     expect(mesh.hasActiveCapability("0b2c3d4e-steward", EXPERIMENT_ADMIN_CAPABILITY)).toBe(true);
     expect(mesh.hasActiveCapability("steward-child", EXPERIMENT_ADMIN_CAPABILITY)).toBe(false);
   });
@@ -177,35 +182,35 @@ describe("capability administration is grant-derived", () => {
   it("never grants a host-global capability through the mesh, even to a capability-admin holder itself", async () => {
     const { grants, mesh } = setup();
     seedConfiguredActorGrants(grants, "configured", () => "2026-01-01T00:00:00Z");
-    mesh.grantCapability("0b2c3d4e-steward", CAPABILITY_ADMIN_CAPABILITY, "configured");
+    await mesh.grantCapability("0b2c3d4e-steward", CAPABILITY_ADMIN_CAPABILITY, "configured");
     for (const capability of HOST_GLOBAL_CAPABILITIES) {
       // Downward from the seeded holder.
-      expect(() => mesh.grantCapability("0b2c3d4e-steward", capability, "configured")).toThrow(
-        /host-global/
-      );
+      await expect(
+        mesh.grantCapability("0b2c3d4e-steward", capability, "configured")
+      ).rejects.toThrow(/host-global/);
       // The delegated holder granting to itself — the escalation path.
-      expect(() =>
+      await expect(
         mesh.grantCapability("0b2c3d4e-steward", capability, "0b2c3d4e-steward")
-      ).toThrow(/host-global/);
+      ).rejects.toThrow(/host-global/);
       expect(mesh.hasActiveCapability("0b2c3d4e-steward", capability)).toBe(false);
       // A holder revoking from itself works, and cannot re-grant afterwards.
       expect(mesh.hasActiveCapability("configured", capability)).toBe(true);
       await mesh.revokeCapability("configured", capability, "configured");
       expect(mesh.hasActiveCapability("configured", capability)).toBe(false);
-      expect(() => mesh.grantCapability("configured", capability, "configured")).toThrow(
+      await expect(mesh.grantCapability("configured", capability, "configured")).rejects.toThrow(
         /host-global/
       );
     }
     // A wiring that lists a host-global name as grantable does not widen this:
     // the mesh strips it, so the allow-list it reports never advertises one.
-    expect(() =>
+    await expect(
       mesh.grantCapability("steward-child", "understanding-write", "0b2c3d4e-steward")
-    ).not.toThrow();
+    ).resolves.not.toThrow();
   });
 });
 
 describe("experiment administration is grant-derived", () => {
-  it("authorizes a capable opaque-id actor over its subtree only", () => {
+  it("authorizes a capable opaque-id actor over its subtree only", async () => {
     const { grants, mesh } = setup();
     grants.grant({
       actorId: "0b2c3d4e-steward",
@@ -214,24 +219,28 @@ describe("experiment administration is grant-derived", () => {
       grantedAt: "2026-01-01T00:00:00Z",
     });
     expect(
-      mesh.enrollActorInExperiment("steward-child", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
+      await mesh.enrollActorInExperiment("steward-child", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
     ).toEqual({ actorId: "steward-child", changed: true });
-    expect(() =>
+    await expect(
       mesh.enrollActorInExperiment("sibling", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
-    ).toThrow(/own subtree/);
+    ).rejects.toThrow(/own subtree/);
     expect(
-      mesh.unenrollActorFromExperiment("steward-child", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
+      await mesh.unenrollActorFromExperiment(
+        "steward-child",
+        FIXTURE_EXPERIMENT,
+        "0b2c3d4e-steward"
+      )
     ).toEqual({ actorId: "steward-child", changed: true });
   });
 
-  it("refuses an ungranted parentless record", () => {
+  it("refuses an ungranted parentless record", async () => {
     const { mesh } = setup();
-    expect(() =>
+    await expect(
       mesh.enrollActorInExperiment("other-child", FIXTURE_EXPERIMENT, "other-parentless")
-    ).toThrow(/experiment-admin/);
-    expect(() => mesh.enrollActorInExperiment("sibling", FIXTURE_EXPERIMENT, "configured")).toThrow(
-      /experiment-admin/
-    );
+    ).rejects.toThrow(/experiment-admin/);
+    await expect(
+      mesh.enrollActorInExperiment("sibling", FIXTURE_EXPERIMENT, "configured")
+    ).rejects.toThrow(/experiment-admin/);
   });
 });
 
@@ -288,16 +297,18 @@ describe("the configured actor's seeded access", () => {
   it("preserves every current administrative operation after the one-time seed", async () => {
     const { grants, mesh } = setup();
     seedConfiguredActorGrants(grants, "configured", () => "2026-01-01T00:00:00Z");
-    expect(() =>
+    await expect(
       mesh.grantCapability("sibling", "understanding-write", "configured")
-    ).not.toThrow();
+    ).resolves.not.toThrow();
     await expect(
       mesh.revokeCapability("sibling", "understanding-write", "root")
     ).resolves.toBeUndefined();
-    expect(mesh.enrollActorInExperiment("steward-child", FIXTURE_EXPERIMENT, "root")).toEqual({
-      actorId: "steward-child",
-      changed: true,
-    });
+    expect(await mesh.enrollActorInExperiment("steward-child", FIXTURE_EXPERIMENT, "root")).toEqual(
+      {
+        actorId: "steward-child",
+        changed: true,
+      }
+    );
     expect(() =>
       mesh.setActorModel(
         "configured",
@@ -311,11 +322,11 @@ describe("the configured actor's seeded access", () => {
     expect(mesh.hasActiveCapability("other-parentless", ACTOR_ADMIN_CAPABILITY)).toBe(false);
   });
 
-  it("does not reach into another top-level tree even when seeded", () => {
+  it("does not reach into another top-level tree even when seeded", async () => {
     const { grants, mesh } = setup();
     seedConfiguredActorGrants(grants, "configured", () => "2026-01-01T00:00:00Z");
-    expect(() => mesh.grantCapability("other-child", "understanding-write", "configured")).toThrow(
-      /own subtree/
-    );
+    await expect(
+      mesh.grantCapability("other-child", "understanding-write", "configured")
+    ).rejects.toThrow(/own subtree/);
   });
 });

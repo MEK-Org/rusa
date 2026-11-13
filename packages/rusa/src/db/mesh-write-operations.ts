@@ -1,5 +1,19 @@
 import type Database from "better-sqlite3";
 import {
+  type CapabilityGrant,
+  type CapabilityGrantStore,
+  type CapabilityPolicy,
+  effectiveCapabilities,
+  GRANT_MUTATION_EFFECT,
+  type GrantMutationEffect,
+} from "../actor/capability-grants.js";
+import type { ExperimentEnrollment, ExperimentEnrollmentStore } from "../actor/experiments.js";
+import {
+  assertExperimentAuthority,
+  assertGrantAuthority,
+  type GrantAuthorityReader,
+} from "../actor/grant-authority.js";
+import {
   evaluateHeadClosure,
   type HeadClosureQuery,
   type HeadClosureShortfall,
@@ -8,10 +22,15 @@ import {
   assertParentExhaustedInboxAuthority,
   type ParentInboxAuthorityReader,
 } from "../actor/parent-inbox-authority.js";
+import { isHumanOperatorPrincipal, type RootControlPrincipal } from "../actor/root-control.js";
 import type { CompletionMatcher, CompletionMatcherInput } from "../obligations/obligation.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
-import type { InboxEntry, MarkHandledResult } from "../repositories/inbox-repository.js";
+import type {
+  InboxAppendInput,
+  InboxEntry,
+  MarkHandledResult,
+} from "../repositories/inbox-repository.js";
 import { InProcessMeshWriter, type MeshWriter } from "./mesh-writer.js";
 import type { ActorRunRepository } from "./repositories/actor-run-repository.js";
 import type {
@@ -38,10 +57,12 @@ export interface MeshWriteRepos {
   readonly inbox: SqliteInboxRepository;
   readonly actors: Pick<ActorRepository, "get">;
   readonly actorRuns: Pick<ActorRunRepository, "completedFocusEntryCounts">;
+  readonly grants: CapabilityGrantStore;
+  readonly experiments: Pick<ExperimentEnrollmentStore, "enroll" | "unenroll">;
 }
 
 /** What a committed write owes the main thread. */
-export type MeshEffect = ObligationMutationEffect | InboxMutationEffect;
+export type MeshEffect = ObligationMutationEffect | InboxMutationEffect | GrantMutationEffect;
 
 type Context = WriteContext<MeshWriteRepos, MeshEffect>;
 
@@ -138,6 +159,21 @@ function parentAuthorityReader(repos: MeshWriteRepos): ParentInboxAuthorityReade
   };
 }
 
+/**
+ * The grant and experiment authority checks' reads, over the writing
+ * connection: actor records and grant rows as this transaction sees them,
+ * combined with the caller's policy (#1289 D1).
+ */
+function grantAuthorityReader(
+  repos: Pick<MeshWriteRepos, "actors" | "grants">,
+  policy: CapabilityPolicy | null
+): GrantAuthorityReader {
+  return {
+    actor: (id) => repos.actors.get(id),
+    capabilities: (id) => effectiveCapabilities(repos.grants.list(), id, policy),
+  };
+}
+
 /** A parent clearing a child's exhausted inbox work. */
 interface ParentClearance {
   /** The caller as it named itself; the audit note keeps this form. */
@@ -212,6 +248,16 @@ export const MESH_WRITE_OPERATIONS = {
     input: { readonly closure: HeadClosureQuery }
   ): HeadClosureShortfall[] =>
     mutating(context, () => inboxClosureShortfalls(context.repos, input.closure)),
+
+  /**
+   * Append inbox entries, answering only the rows this call inserted: an id
+   * already present is left as it is (#1289 C2). The inserted rows are
+   * delivered to the append listeners once this commits.
+   */
+  "inbox.append": (
+    context: Context,
+    input: { readonly entries: readonly InboxAppendInput[] }
+  ): InboxEntry[] => writing(context, (repos) => repos.inbox.append([...input.entries])),
 
   /**
    * Mark an actor's entries seen: the receipt that a queued run has taken them
@@ -524,6 +570,140 @@ export const MESH_WRITE_OPERATIONS = {
       obligations.recordCompletionMatcherClosedUnmerged(input.id, input.expected)
     ),
 
+  /**
+   * Grant a capability, if the grantor still may (#1289 D1). The grantor's
+   * authority is decided from this transaction's grant rows and actor tree,
+   * so a revocation or reparent committed before this runs refuses it with
+   * nothing written. The capability's own validity (allow-list, host-global
+   * and operator-provisioned refusals, secret containment) is static and was
+   * checked by the caller.
+   */
+  "grants.grant": (
+    context: Context,
+    input: { readonly grant: CapabilityGrant; readonly policy: CapabilityPolicy | null }
+  ): void => {
+    const { grant, policy } = input;
+    assertGrantAuthority(grantAuthorityReader(context.repos, policy), {
+      grantorId: grant.grantedBy,
+      granteeId: grant.actorId,
+      capability: grant.capability,
+      verb: "grant",
+    });
+    context.repos.grants.grant(grant);
+    context.emit({
+      kind: GRANT_MUTATION_EFFECT,
+      change: "granted",
+      actorId: grant.actorId,
+      capability: grant.capability,
+      by: grant.grantedBy,
+    });
+  },
+
+  /** Revoke a capability, if the revoker still may (#1289 D1); see grants.grant. */
+  "grants.revoke": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly capability: string;
+      readonly revokedBy: string;
+      readonly at: string;
+      readonly policy: CapabilityPolicy | null;
+    }
+  ): void => {
+    assertGrantAuthority(grantAuthorityReader(context.repos, input.policy), {
+      grantorId: input.revokedBy,
+      granteeId: input.actorId,
+      capability: input.capability,
+      verb: "revoke",
+    });
+    context.repos.grants.revoke(input.actorId, input.capability, input.at);
+    // Announced even when nothing was active, so a stale mount is still torn down.
+    context.emit({
+      kind: GRANT_MUTATION_EFFECT,
+      change: "revoked",
+      actorId: input.actorId,
+      capability: input.capability,
+      by: input.revokedBy,
+    });
+  },
+
+  /**
+   * Set or clear an operator-provisioned grant for an actor that exists, and
+   * answer the row's state as this transaction leaves it (#1289 D1). The
+   * caller authenticates the operator and passes that principal; the
+   * operation refuses one that is not a human operator, with the same
+   * predicate the caller uses, and records it as the grantor. No actor grant
+   * confers this, so no grant row is consulted to allow it.
+   */
+  "grants.setOperatorProvisioned": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly capability: string;
+      readonly active: boolean;
+      readonly principal: RootControlPrincipal;
+      readonly at: string;
+    }
+  ): { readonly known: boolean; readonly active: boolean } => {
+    if (!isHumanOperatorPrincipal(input.principal)) {
+      throw new Error(`only an authenticated human operator may provision ${input.capability}`);
+    }
+    const { grants, actors } = context.repos;
+    if (!actors.get(input.actorId)) return { known: false, active: false };
+    if (input.active) {
+      grants.grant({
+        actorId: input.actorId,
+        capability: input.capability,
+        grantedBy: `operator:${input.principal}`,
+        grantedAt: input.at,
+      });
+    } else {
+      grants.revoke(input.actorId, input.capability, input.at);
+    }
+    return { known: true, active: grants.activeFor(input.actorId).includes(input.capability) };
+  },
+
+  /**
+   * Enroll an actor in an experiment, if the enroller still may and the actor
+   * is not retired (#1289 D1). Answers whether this call enrolled it.
+   */
+  "experiments.enroll": (
+    context: Context,
+    input: { readonly enrollment: ExperimentEnrollment; readonly policy: CapabilityPolicy | null }
+  ): boolean => {
+    const { enrollment, policy } = input;
+    const record = assertExperimentAuthority(grantAuthorityReader(context.repos, policy), {
+      callerId: enrollment.enrolledBy,
+      actorId: enrollment.actorId,
+      verb: "enroll",
+    });
+    if (record.status === "retired") {
+      throw new Error(`Cannot enroll a retired thread: ${enrollment.actorId}`);
+    }
+    return context.repos.experiments.enroll(enrollment);
+  },
+
+  /**
+   * Remove an enrollment, if the caller still may (#1289 D1). Answers whether
+   * a real enrollment was removed.
+   */
+  "experiments.unenroll": (
+    context: Context,
+    input: {
+      readonly actorId: string;
+      readonly experiment: string;
+      readonly unenrolledBy: string;
+      readonly policy: CapabilityPolicy | null;
+    }
+  ): boolean => {
+    assertExperimentAuthority(grantAuthorityReader(context.repos, input.policy), {
+      callerId: input.unenrolledBy,
+      actorId: input.actorId,
+      verb: "unenroll",
+    });
+    return context.repos.experiments.unenroll(input.actorId, input.experiment);
+  },
+
   /** A host timer fired: activate or release whatever has come due. */
   "obligations.wakeScheduled": (
     context: Context,
@@ -538,16 +718,19 @@ export type MeshObligationWriter = MeshWriter<MeshWriteOperations>;
 
 /**
  * Deliver one committed effect on the main thread, to the main thread's
- * repository: its listeners, retry state and host scheduler live there.
+ * repository: its listeners, retry state and host scheduler live there. An
+ * obligation effect's attention sinks append through the writer, so its
+ * delivery settles once those nested writes and their effects have (#1289 C2).
  */
-export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): void {
+export function deliverMeshEffect(repos: MeshWriteRepos, effect: MeshEffect): Promise<void> | void {
   if (effect.kind === INBOX_MUTATION_EFFECT) repos.inbox.deliverMutationEffect(effect);
-  else repos.obligations.deliverMutationEffect(effect);
+  else if (effect.kind === GRANT_MUTATION_EFFECT) return repos.grants.mutations.deliver(effect);
+  else return repos.obligations.deliverMutationEffect(effect);
 }
 
 /**
  * The writer over the main connection (#1289), until the write worker takes
- * over. One instance per connection: its backlog is what keeps every
+ * over. One instance per connection: its delivery sequencer is what keeps every
  * converted caller's effects in commit order, so the process shares one.
  * Writes outside it, on the same connection and repository, remain the same
  * one writer and the same one sequence owner.

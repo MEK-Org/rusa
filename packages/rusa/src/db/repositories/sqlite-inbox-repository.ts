@@ -116,7 +116,9 @@ export class SqliteInboxRepository implements InboxRepository {
     // fate the outer caller decides, so no after-commit notification could be
     // honest, and a silently deferred row is reconciled only by the next
     // boot/resume sweep. Refuse before any write rather than defer.
-    if (this.db.inTransaction) {
+    // A write operation's transaction is the exception: its writer delivers
+    // the effect only once that transaction commits (#1289 C2).
+    if (this.db.inTransaction && !this.writeContext) {
       throw new Error("inbox append must not run inside an enclosing transaction");
     }
     const insert = this.db.prepare(
@@ -161,10 +163,11 @@ export class SqliteInboxRepository implements InboxRepository {
       }
       return insertedRows;
     })();
-    // Notify only once the rows are durable: the transaction above has
-    // committed, and nothing here is awaited, so the appending caller's own
-    // wake still follows in the same turn.
-    if (inserted.length > 0) this.notifyItemsAppended(inserted);
+    // Notify only once the rows are durable: outside a write operation the
+    // transaction above has committed, and nothing here is awaited, so the
+    // appending caller's own wake still follows in the same turn; inside one,
+    // its writer delivers the effect once the operation commits.
+    this.committed({ kind: INBOX_MUTATION_EFFECT, handled: null, appended: inserted });
     return inserted;
   }
 

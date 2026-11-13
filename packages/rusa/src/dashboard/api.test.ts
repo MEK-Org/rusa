@@ -38,7 +38,7 @@ import { createLogger } from "../observability/logger.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import type { InboxEntry } from "../repositories/inbox-repository.js";
+import type { InboxEntry, InboxPayload } from "../repositories/inbox-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
@@ -5591,6 +5591,64 @@ describe("handleMeshApiRequest", () => {
         await settled(res);
         expect(res.statusCode).toBe(400);
       });
+
+      it("answers a create whose required nested append was refused with its committed id, once (#1289)", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        actors.upsert(rec(UUID_A, "root", "active"));
+        const writer = deps.obligationWriter;
+        if (!writer) throw new Error("fixture has no obligation writer");
+        // Ready-head attention goes only to actor owners, as start wires it.
+        obligations.setActorExists((id) => id === UUID_A);
+        let appends = 0;
+        obligations.setReadyHeadListener(async (change) => {
+          appends++;
+          await writer.write("inbox.append", {
+            entries: [
+              {
+                id: "refused-attention",
+                actorId: change.ownerId,
+                source: "attention",
+                payload: "not-an-object" as unknown as InboxPayload,
+              },
+            ],
+          });
+        });
+
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations",
+          JSON.stringify({ ownerId: UUID_A, title: "Committed once" })
+        );
+        await settled(res);
+
+        // Not a 400: the request was fine and the row exists; the server's
+        // required effect failed after the commit.
+        expect(res.statusCode).toBe(500);
+        const data = JSON.parse(res.body);
+        expect(data.committed).toBe(true);
+        expect(data.error).toContain("committed; do not retry the mutation");
+        const rows = obligations.listOwned(UUID_A).filter((o) => o.title === "Committed once");
+        expect(rows.map((o) => o.id)).toEqual([data.result.id]);
+        expect(appends).toBe(1);
+        expect(inbox.read(UUID_A, "refused-attention")).toBeNull();
+      });
+
+      it("keeps a create that rolled back an ordinary 400", async () => {
+        actors.upsert(rec(UUID_A, "root", "active"));
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations",
+          JSON.stringify({ ownerId: UUID_A, title: "Orphan", parentId: "missing-parent" })
+        );
+        await settled(res);
+        expect(res.statusCode).toBe(400);
+        const data = JSON.parse(res.body);
+        expect(data.committed).toBeUndefined();
+        expect(data.error).not.toContain("committed");
+        expect(obligations.listOwned(UUID_A)).toEqual([]);
+      });
     });
 
     describe("POST /api/mesh/obligations/:id/status", () => {
@@ -5612,6 +5670,36 @@ describe("handleMeshApiRequest", () => {
         const data = JSON.parse(res.body);
         expect(data.ok).toBe(true);
         expect(data.obligation.status).toBe("done");
+      });
+
+      it("answers a committed status change whose required attention failed with what committed (#1289)", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        actors.upsert(rec(UUID_A, "root", "active"));
+        obligations.setActorExists((id) => id === UUID_A);
+        obligations.create({ title: "task-c", id: "task-c", ownerId: UUID_A });
+        let announced = 0;
+        obligations.setReadyHeadListener(() => {
+          announced++;
+          throw new Error("attention append failed");
+        });
+
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/task-c/status",
+          JSON.stringify({ status: "done" })
+        );
+        await settled(res);
+
+        expect(res.statusCode).toBe(500);
+        const data = JSON.parse(res.body);
+        expect(data).toMatchObject({
+          committed: true,
+          error: expect.stringContaining("committed; do not retry the mutation"),
+          result: { id: "task-c", status: "done" },
+        });
+        expect(obligations.get("task-c")?.status).toBe("done");
+        expect(announced).toBe(1);
       });
 
       it("404s when obligation not found", async () => {

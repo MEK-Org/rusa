@@ -333,12 +333,12 @@ describe("submit_manual_reading (#690)", () => {
       const readerSpecs = hub.toolUrls(
         "mac",
         "reader",
-        mountGrantedServers("reader", [QUOTA_MANUAL_MCP_NAME], servers, mcpHttp)
+        mountGrantedServers("reader", () => [QUOTA_MANUAL_MCP_NAME], servers, mcpHttp)
       );
       const bystanderSpecs = hub.toolUrls(
         "mac",
         "bystander",
-        mountGrantedServers("bystander", [], servers, mcpHttp)
+        mountGrantedServers("bystander", () => [], servers, mcpHttp)
       );
       expect(bystanderSpecs).toEqual([]);
       const [spec] = readerSpecs;

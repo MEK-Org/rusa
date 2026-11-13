@@ -11,6 +11,7 @@ import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
 } from "../actor/event-subscriptions.js";
+import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
@@ -140,6 +141,7 @@ export function createHarness(options: {
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
   const capabilityGrants = new InMemoryCapabilityGrantStore();
+  const experimentEnrollments = new InMemoryExperimentEnrollmentStore();
   const pacer = options.pacer;
   // Dispatch reads work and priority back out of durable inbox state, so these
   // tests need a real store rather than a stub: the production SQLite one over
@@ -155,6 +157,8 @@ export function createHarness(options: {
     inbox: inboxStore,
     actors,
     actorRuns: new ActorRunRepository(inboxDb),
+    grants: capabilityGrants,
+    experiments: experimentEnrollments,
   });
   const principals = new PrincipalRepository(inboxDb);
   const user = principals.createUser({ email: "operator@example.test", createdAt: "t" });
@@ -170,6 +174,7 @@ export function createHarness(options: {
     maxConcurrent: options.maxConcurrent ?? 1,
     isHalted: options.isHalted,
     capabilityGrants,
+    experimentEnrollments,
     grantableCapabilities: new Set([COMPUTER_USE_CAPABILITY]),
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,

@@ -24,6 +24,7 @@ import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
 } from "../actor/event-subscriptions.js";
+import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { RusaConfig } from "../config/types.js";
 import { createInProcessMeshWriter } from "../db/mesh-write-operations.js";
@@ -205,12 +206,15 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
     inboxDb.close();
   });
   const inboxStore = new SqliteInboxRepository(inboxDb);
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
   // The mesh's own writes (#1289) commit as in production, over the same database.
   const writer = createInProcessMeshWriter(inboxDb, {
     obligations: new ObligationRepository(inboxDb),
     inbox: inboxStore,
     actors,
     actorRuns: new ActorRunRepository(inboxDb),
+    grants: capabilityGrants,
+    experiments: new InMemoryExperimentEnrollmentStore(),
   });
   const principals = new PrincipalRepository(inboxDb);
   principals.createUser({ email: "operator@example.test", createdAt: "t" });
@@ -236,7 +240,7 @@ async function leaderWithFollowers(opts: { store?: FollowerUpdateTriggerStore })
     writer,
     eventSourceOwners: new InMemoryEventSourceOwnerStore(),
     eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
-    capabilityGrants: new InMemoryCapabilityGrantStore(),
+    capabilityGrants,
     recordChat: () => "message",
     supportsExecutionTarget: (target) => target.length > 0,
     // The production worker factory, so these cases cover its hold wiring.

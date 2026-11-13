@@ -351,7 +351,7 @@ export class Actor {
       log: opts.log ? (m) => opts.log?.(`${m}\n`) : undefined,
       run: (nudge) => this.runOnce(nudge),
       onIdle: () => this.continueOrIdle(),
-      isKillable: () => this.killable && this.pendingStart === undefined,
+      isKillable: () => this.killable && this.pendingStart === undefined && !this.finalizing,
       voiceCoalesceMaxAgeMs: opts.voiceCoalesceMaxAgeMs ?? 8000,
       abortRun: (count, ageMs) => {
         this.opts.onCoalesceAborted?.(count, ageMs);
@@ -500,6 +500,7 @@ export class Actor {
    * requests its responsive replacement.
    */
   preemptForResponsive(): { preempted: false } | { preempted: true; phase: "running" | "queued" } {
+    if (this.finalizing) return { preempted: false };
     this.admissionEpoch++;
     const phase = this.executing
       ? "running"
@@ -544,6 +545,7 @@ export class Actor {
     runStartTime?: Date;
     wasQueued?: boolean;
   } {
+    if (this.finalizing) return { interrupted: false };
     this.admissionEpoch++;
     const now = new Date();
     this.runner.cancelPending();
@@ -563,6 +565,24 @@ export class Actor {
       return { interrupted: true, runStartTime: now, wasQueued: true };
     }
     return { interrupted: false };
+  }
+
+  /**
+   * True while the current opportunity has claimed its terminal outcome and is
+   * awaiting its `onEnd` fanout, on both the result and the abandoned path
+   * (#1299). That opportunity is finished: interrupting or preempting it would
+   * only cancel the coalesced follow-up and, for an interrupt, hide work
+   * delivered during the run behind an end-of-run watermark. The follow-up
+   * itself is the runner's dirty bit and starts once finalization settles.
+   *
+   * `runEndReported` alone is not enough: it stays true after the run and is
+   * reset only once the next admission passes its async `beforeRun`, which must
+   * stay cancellable. `currentRunId` scopes it to this opportunity, because
+   * `runOnce` clears it after the terminal fanout and sets it only after
+   * resetting `runEndReported`.
+   */
+  private get finalizing(): boolean {
+    return this.currentRunId !== undefined && this.runEndReported;
   }
 
   getInterruptedWatermark(): Date | null {

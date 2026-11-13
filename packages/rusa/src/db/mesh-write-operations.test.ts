@@ -3,11 +3,14 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
 import type { HeadClosureQuery } from "../actor/head-closure.js";
 import type { ObligationActivationScheduler } from "../actor/os-scheduler.js";
-import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
+import { createObligationsMcpServer, type ObligationsMcpOptions } from "../mcp/obligations-mcp.js";
 import { ObligationValidationError } from "../obligations/obligation.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import type { InboxPayload } from "../repositories/inbox-repository.js";
 import { meshWriterFor } from "./fixtures/obligation-store.js";
 import {
   createInProcessMeshWriter,
@@ -17,7 +20,11 @@ import {
   type MeshWriteRepos,
   ObligationChangedError,
 } from "./mesh-write-operations.js";
-import { InProcessMeshWriter } from "./mesh-writer.js";
+import {
+  EffectDeliveryFailure,
+  InProcessMeshWriter,
+  MeshWriteCommittedError,
+} from "./mesh-writer.js";
 import { runMigrations } from "./migrations/runner.js";
 import { ObligationRepository } from "./repositories/obligation-repository.js";
 import { SqliteInboxRepository } from "./repositories/sqlite-inbox-repository.js";
@@ -93,7 +100,9 @@ describe("delivery order", () => {
 
   it("delivers writes' effects in commit order", async () => {
     const heads: string[] = [];
-    repository.setReadyHeadListener((change) => heads.push(change.head?.id ?? "none"));
+    repository.setReadyHeadListener((change) => {
+      heads.push(change.head?.id ?? "none");
+    });
 
     const first = writer.write("obligations.create", {
       obligation: { id: "first", ownerId: "actor-a", title: "first" },
@@ -130,6 +139,8 @@ describe("ready-head sequences", () => {
       inbox: new SqliteInboxRepository(db),
       actors: { get: () => undefined },
       actorRuns: { completedFocusEntryCounts: () => new Map() },
+      grants: new InMemoryCapabilityGrantStore(),
+      experiments: new InMemoryExperimentEnrollmentStore(),
     };
     const testWriter = new InProcessMeshWriter<MeshWriteRepos, MeshEffect, typeof ops>(
       db,
@@ -138,9 +149,9 @@ describe("ready-head sequences", () => {
       (effect) => deliverMeshEffect(repos, effect)
     );
     const sequences: Array<[string, number]> = [];
-    repository.setReadyHeadListener((change) =>
-      sequences.push([change.head?.id ?? "none", change.sequence])
-    );
+    repository.setReadyHeadListener((change) => {
+      sequences.push([change.head?.id ?? "none", change.sequence]);
+    });
     repository.create({ id: "base", ownerId: "actor-a", title: "base" });
     expect(sequences).toEqual([["base", 1]]);
 
@@ -320,7 +331,7 @@ describe("check and act in one operation", () => {
 });
 
 describe("listener failures", () => {
-  it("never reject a committed write, and are retried from committed state on a later delivery", async () => {
+  it("report a committed write as committed, and are retried from committed state on a later delivery", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const announced: Array<{ id: string; actingPrincipal: string }> = [];
     let fail = true;
@@ -338,17 +349,31 @@ describe("listener failures", () => {
       responsive: true,
     });
 
-    // The failed delivery belongs to a write that committed: it resolves.
-    const hotfix = await writer.write("obligations.create", {
-      obligation: {
-        id: "hotfix",
-        ownerId: "actor-a",
-        title: "hotfix",
-        priority: 3,
-        responsive: true,
-      },
-    });
-    expect(hotfix.id).toBe("hotfix");
+    // The failed delivery belongs to a write that committed: the writer says
+    // so (#1289 C2, root c6814333204), carrying the committed result and the
+    // listener's failure, and claims no rollback.
+    const reported = await rejection(
+      writer.write("obligations.create", {
+        obligation: {
+          id: "hotfix",
+          ownerId: "actor-a",
+          title: "hotfix",
+          priority: 3,
+          responsive: true,
+        },
+      })
+    );
+    expect(reported).toBeInstanceOf(MeshWriteCommittedError);
+    const committed = reported as MeshWriteCommittedError;
+    expect((committed.result as { id: string }).id).toBe("hotfix");
+    // The failure names the missing consequence; the listener's own error
+    // stays its cause, for in-process diagnostics and the server log.
+    expect(committed.failures).toHaveLength(1);
+    const failure = committed.failures[0];
+    expect(failure).toBeInstanceOf(EffectDeliveryFailure);
+    expect((failure as Error).message).toBe("responsive-ready attention was not delivered");
+    expect(((failure as Error).cause as Error).message).toBe("inbox is unavailable");
+    expect(repository.require("hotfix").id).toBe("hotfix");
     expect(announced).toEqual([]);
 
     // The retry lives where delivery does and re-reads committed rows, so the
@@ -358,6 +383,168 @@ describe("listener failures", () => {
       obligation: { id: "other", ownerId: "actor-b", title: "other" },
     });
     expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+  });
+
+  it("log a status-change listener failure without reporting the write as failed", async () => {
+    let statusListenerCalls = 0;
+    repository.setStatusChangeListener(() => {
+      statusListenerCalls++;
+      throw new Error("event fan-out is unavailable");
+    });
+    repository.create({ id: "task", ownerId: "actor-a", title: "task" });
+    statusListenerCalls = 0;
+
+    // Status changes feed dashboard event fan-out, which is background work,
+    // not required notification work (root c6814333204): the write answers.
+    const done = await writer.write("obligations.setTerminalStatus", {
+      id: "task",
+      status: "done",
+      note: null,
+      resolutionRef: null,
+      principal: "actor-a",
+    });
+    expect(done.status).toBe("done");
+    expect(statusListenerCalls).toBe(1);
+  });
+});
+
+describe("a committed write at the MCP boundary (#1289)", () => {
+  async function connect(options?: ObligationsMcpOptions): Promise<Client> {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await createObligationsMcpServer(
+      { obligations: repository, writer },
+      "actor-a",
+      options
+    ).connect(serverTransport);
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  const text = (result: CallToolResult) => {
+    const first = result.content[0];
+    return first && first.type === "text" ? first.text : "";
+  };
+
+  it("answers a create whose required nested append was refused as an error carrying the committed id, once", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The attention sink appends through the writer, as ActorMesh's does; the
+    // inbox refuses the entry, so a required effect of a committed create fails.
+    let appends = 0;
+    repository.setReadyHeadListener(async (change) => {
+      appends++;
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            id: "refused-attention",
+            actorId: change.ownerId,
+            source: "attention",
+            payload: "not-an-object" as unknown as InboxPayload,
+          },
+        ],
+      });
+    });
+    const client = await connect();
+
+    const result = (await client.callTool({
+      name: "create_obligation",
+      arguments: { owner_id: "actor-a", title: "committed once" },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    const report = JSON.parse(text(result)) as {
+      error: string;
+      committed: boolean;
+      result: { id: string; title: string };
+      failures: string[];
+    };
+    expect(report.committed).toBe(true);
+    expect(report.error).toContain("committed; do not retry the mutation");
+    // The caller learns which consequence is missing, not only how many, but
+    // not the nested error's text, which describes another write's entry and
+    // stays in the server log as before effects could fail a write.
+    expect(report.failures).toEqual(["the owner's ready-head attention was not delivered"]);
+    expect(text(result)).not.toContain("inbox payload must be an object");
+
+    // The id was generated inside the write: the report is the only place the
+    // caller learns it, and it names the one row that exists.
+    const rows = repository.listOwned("actor-a").filter((o) => o.title === "committed once");
+    expect(rows.map((o) => o.id)).toEqual([report.result.id]);
+    // Nothing replayed the create or its delivery, and the refused entry is absent.
+    expect(appends).toBe(1);
+    expect(new SqliteInboxRepository(db).read("actor-a", "refused-attention")).toBeNull();
+  });
+
+  it("still evaluates the matcher of a committed create whose required append was refused", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    repository.setReadyHeadListener(async (change) => {
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            id: "refused-matcher-attention",
+            actorId: change.ownerId,
+            source: "attention",
+            payload: "not-an-object" as unknown as InboxPayload,
+          },
+        ],
+      });
+    });
+    const evaluated: string[] = [];
+    const client = await connect({
+      // Evaluation really closes the obligation, as a merged PR would; the
+      // report must carry the row as evaluation left it.
+      evaluateCompletionMatcher: async (id) => {
+        evaluated.push(id);
+        repository.setReadyHeadListener(() => {});
+        await writer.write("obligations.setTerminalStatus", {
+          id,
+          status: "done",
+          note: "merged",
+          resolutionRef: null,
+          principal: "actor-a",
+        });
+        return "satisfied";
+      },
+    });
+
+    const result = (await client.callTool({
+      name: "create_obligation",
+      arguments: {
+        owner_id: "actor-a",
+        title: "matched once",
+        completion_matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    const report = JSON.parse(text(result)) as {
+      committed: boolean;
+      result: { id: string; status: string };
+      evaluation: string;
+    };
+    expect(report).toMatchObject({ committed: true, evaluation: "satisfied" });
+    expect(report.result.status).toBe("done");
+    expect(evaluated).toEqual([report.result.id]);
+    expect(
+      repository
+        .listOwned("actor-a")
+        .filter((o) => o.title === "matched once")
+        .map((o) => o.id)
+    ).toEqual([report.result.id]);
+  });
+
+  it("keeps a create that rolled back an ordinary error", async () => {
+    const client = await connect();
+
+    const result = (await client.callTool({
+      name: "create_obligation",
+      arguments: { owner_id: "actor-a", title: "orphan", parent_id: "missing-parent" },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    expect(text(result)).not.toContain("committed");
+    expect(() => JSON.parse(text(result))).toThrow();
+    expect(repository.listOwned("actor-a")).toEqual([]);
   });
 });
 
@@ -436,22 +623,25 @@ describe("host timers", () => {
 });
 
 describe("a listener's own writes during delivery (r4545135121)", () => {
-  // Listeners record attention with synchronous appends on the main
-  // connection, never through the writer. Delivery runs on the main thread in
-  // both writers, so such an append commits before the next effect is
-  // delivered and before the write's caller continues, whichever writer
-  // committed the write.
+  // Attention sinks append through the writer (#1289 C2), and delivery awaits
+  // that nested write before the next effect is delivered and before the
+  // write's caller continues, whichever writer committed the write.
   it("is visible to later effects of the same write and to its caller's continuation", async () => {
     const inbox = new SqliteInboxRepository(db);
     const seenByStatusListener: number[] = [];
-    repository.setReadyHeadListener((change) => {
-      inbox.append([
-        {
-          actorId: change.ownerId,
-          source: "obligation-ready-head",
-          payload: { type: "obligation.ready_head", sequence: change.sequence },
-        },
-      ]);
+    repository.setReadyHeadListener(async (change) => {
+      await writer.write("inbox.append", {
+        entries: [
+          {
+            actorId: change.ownerId,
+            source: "obligation-ready-head",
+            payload: {
+              type: "obligation.ready_head",
+              sequence: change.sequence,
+            } as unknown as InboxPayload,
+          },
+        ],
+      });
     });
     repository.setStatusChangeListener(() =>
       seenByStatusListener.push(inbox.countUnhandled("actor-a"))
@@ -506,6 +696,8 @@ describe("inbox marks and the checks they depend on (#1289)", () => {
       actorRuns: {
         completedFocusEntryCounts: (actorId) => focusCounts.get(actorId) ?? new Map(),
       },
+      grants: new InMemoryCapabilityGrantStore(),
+      experiments: new InMemoryExperimentEnrollmentStore(),
     });
   });
 

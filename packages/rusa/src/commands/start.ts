@@ -30,6 +30,7 @@ import type { ActorRecord, ExecutionConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   defaultActorBootstrapCapabilities,
+  defaultActorCapabilityPolicy,
   defaultGrantRecipient,
   HOST_GLOBAL_CAPABILITIES,
   OBLIGATIONS_ADMIN_CAPABILITY,
@@ -1355,25 +1356,30 @@ async function composeStart(
   // closed, and in a process that runs more than one instance (the tests, the
   // e2e manager) a prior shutdown can land mid-startup. The sink is filled in
   // once the mesh exists; until then a head change is simply not routed.
-  let readyHeadSink: ((change: ReadyHeadChange) => void) | undefined;
-  getRepositories().obligations.setReadyHeadListener((change) => readyHeadSink?.(change));
+  // A sink answers with its attention append, which delivery awaits (#1289 C2).
+  let readyHeadSink: ((change: ReadyHeadChange) => Promise<unknown>) | undefined;
+  getRepositories().obligations.setReadyHeadListener(async (change) => {
+    await readyHeadSink?.(change);
+  });
 
   // #212 cancellation-repair attention: same deferred-sink shape as the
   // ready-head listener above, and for the same reason — the mesh doesn't
   // exist yet at this point in startup.
-  let prerequisiteCancellationSink: ((attention: PrerequisiteAttention) => void) | undefined;
-  getRepositories().obligations.setCancellationAttentionListener((attention) =>
-    prerequisiteCancellationSink?.(attention)
-  );
+  let prerequisiteCancellationSink:
+    | ((attention: PrerequisiteAttention) => Promise<unknown>)
+    | undefined;
+  getRepositories().obligations.setCancellationAttentionListener(async (attention) => {
+    await prerequisiteCancellationSink?.(attention);
+  });
 
   // #531 responsive-ready attention: same deferred-sink shape as the two
   // listeners above — the mesh doesn't exist yet at this point in startup.
   let responsiveReadySink:
-    | ((obligation: Obligation, actingPrincipal: EntityId) => void)
+    | ((obligation: Obligation, actingPrincipal: EntityId) => Promise<unknown>)
     | undefined;
-  getRepositories().obligations.setResponsiveReadyListener((obligation, actingPrincipal) =>
-    responsiveReadySink?.(obligation, actingPrincipal)
-  );
+  getRepositories().obligations.setResponsiveReadyListener(async (obligation, actingPrincipal) => {
+    await responsiveReadySink?.(obligation, actingPrincipal);
+  });
 
   // #773 status changes for open dashboards: same deferred-sink shape again.
   let statusChangeSink: ((change: ObligationStatusChange) => void) | undefined;
@@ -1863,7 +1869,7 @@ async function composeStart(
   // Same deferred-sink shape as the obligation listeners above: the mesh does
   // not exist yet, and boot reconciliation re-derives anything missed.
   let completionMatcherClosedUnmergedSink:
-    | ((ownerId: string, obligationId: string, matcherSetAt: string) => void)
+    | ((ownerId: string, obligationId: string, matcherSetAt: string) => Promise<unknown>)
     | undefined;
   const completionMatcherEvaluator = new CompletionMatcherEvaluator({
     obligations: getRepositories().obligations,
@@ -1876,8 +1882,9 @@ async function composeStart(
         : Promise.reject(new Error("local checkout unavailable")),
     repository: completionMatcherRepository,
     instanceName: rootHandle ?? "rusa",
-    onClosedUnmerged: (obligation, matcher) =>
-      completionMatcherClosedUnmergedSink?.(obligation.ownerId, obligation.id, matcher.setAt),
+    onClosedUnmerged: async (obligation, matcher) => {
+      await completionMatcherClosedUnmergedSink?.(obligation.ownerId, obligation.id, matcher.setAt);
+    },
     log: (message) => log.warn("completion_matcher_warning", { message }),
   });
   const validateCompletionMatcher = async (matcher: CompletionMatcherInput): Promise<void> => {
@@ -2441,6 +2448,10 @@ async function composeStart(
   });
   let impliedOwnerId = defaultGrantRecipient(actors.list())?.id;
   let defaultActorId = impliedOwnerId;
+  const capabilityPolicy = defaultActorCapabilityPolicy(
+    () => defaultActorId,
+    defaultActorBootstrapCapabilities(config)
+  );
   const rootSourceSync = reconcileEventSources(
     persistentEventSourceOwners,
     configuredRoots,
@@ -2787,7 +2798,7 @@ async function composeStart(
     if (!workerMcp) return;
     const mounted = mountGrantedServers(
       actorId,
-      mesh.activeCapabilitiesFor(actorId),
+      () => mesh.activeCapabilitiesFor(actorId),
       grantableServers,
       mcpHttp
     );
@@ -3179,11 +3190,10 @@ async function composeStart(
     // writer, with its authority check inside the write (#1289). Resolved
     // lazily like the repositories above.
     writer: { write: (op, input) => getMeshWriter().write(op, input) },
-    capabilityGrants: withDefaultActorCapabilities(
-      capabilityGrants,
-      () => defaultActorId,
-      defaultActorBootstrapCapabilities(config)
-    ),
+    // One policy for the mesh's grant view and its grant writes' authority
+    // checks (#1289 D1), so the two cannot describe different authority.
+    capabilityGrants: withDefaultActorCapabilities(capabilityGrants, capabilityPolicy),
+    capabilityPolicy,
     // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
     // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
     // a restart; the registry of legal experiment names stays in code.
@@ -3641,7 +3651,12 @@ async function composeStart(
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
         // are aggregated by their base name and passed to the factory.
         workerMcp.push(
-          ...mountGrantedServers(id, mesh.activeCapabilitiesFor(rec.id), grantableServers, mcpHttp)
+          ...mountGrantedServers(
+            id,
+            () => mesh.activeCapabilitiesFor(rec.id),
+            grantableServers,
+            mcpHttp
+          )
         );
 
         // Each worker gets its own private working directory and nothing else: its
@@ -3997,7 +4012,7 @@ async function composeStart(
   // that is still undefined.
   //
   // Boot sweep below over `readyHeadRecords()` reconciles heads at startup.
-  readyHeadSink = ({ ownerId, epoch, head, previousHeadId, sequence }) => {
+  readyHeadSink = ({ ownerId, epoch, head, previousHeadId, sequence }) =>
     mesh.deliverReadyHeadAttention(
       ownerId,
       head === null
@@ -4007,21 +4022,17 @@ async function composeStart(
       sequence,
       epoch
     );
-  };
-  prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
+  prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) =>
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
-  };
-  completionMatcherClosedUnmergedSink = (ownerId, obligationId, matcherSetAt) => {
+  completionMatcherClosedUnmergedSink = (ownerId, obligationId, matcherSetAt) =>
     mesh.deliverCompletionMatcherClosedUnmergedAttention(ownerId, obligationId, matcherSetAt);
-  };
   statusChangeSink = (change) => mesh.recordEvent(obligationStatusChangedEvent(change));
-  responsiveReadySink = (obligation, actingPrincipal) => {
+  responsiveReadySink = (obligation, actingPrincipal) =>
     mesh.deliverResponsiveReadyAttention(
       obligation.ownerId,
       { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
       actingPrincipal === obligation.ownerId
     );
-  };
 
   // A lifted halt can reopen a lane that unclaimed work is waiting on, and
   // replaying nothing would otherwise leave the admission list unscanned.
@@ -4193,24 +4204,26 @@ async function composeStart(
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
-  getRepositories().obligations.reconcileScheduledObligations();
+  await getRepositories().obligations.reconcileScheduledObligations((id, principal) =>
+    getMeshWriter().write("obligations.wakeScheduled", { id, principal })
+  );
   try {
-    mesh.reconcileReadyHeads(getRepositories().obligations);
+    await mesh.reconcileReadyHeads(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
   try {
-    mesh.reconcileCancelledPrerequisiteAttention(getRepositories().obligations);
+    await mesh.reconcileCancelledPrerequisiteAttention(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
   try {
-    mesh.reconcileResponsiveReadyAttention(getRepositories().obligations);
+    await mesh.reconcileResponsiveReadyAttention(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
   try {
-    mesh.reconcileCompletionMatcherClosedUnmergedAttention(getRepositories().obligations);
+    await mesh.reconcileCompletionMatcherClosedUnmergedAttention(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
@@ -4592,7 +4605,11 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
-          operatorActors: new OperatorActorControl(mesh, capabilityGrants, rootId),
+          operatorActors: new OperatorActorControl(
+            mesh,
+            { write: (op, input) => getMeshWriter().write(op, input) },
+            rootId
+          ),
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the

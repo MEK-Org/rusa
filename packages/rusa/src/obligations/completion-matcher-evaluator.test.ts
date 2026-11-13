@@ -228,6 +228,54 @@ describe("CompletionMatcherEvaluator", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("answers satisfied, logged, when the completion committed but its required attention failed (#1289)", async () => {
+    repository.create({ id: "matched", title: "matched", ownerId: "actor-a" });
+    repository.setCompletionMatcher("matched", { kind: "pr_merged", pr }, "actor-a");
+    repository.create({ id: "deploy", title: "deploy", ownerId: "actor-b" });
+    repository.setCompletionMatcher(
+      "deploy",
+      { kind: "deployed", commit: "a".repeat(40) },
+      "actor-b"
+    );
+    // Completing an owner's head announces its new (empty) head: required work.
+    repository.setActorExists((id) => id === "actor-a" || id === "actor-b");
+    const announced: string[] = [];
+    repository.setReadyHeadListener((change) => {
+      announced.push(change.ownerId);
+      throw new Error("attention append failed");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.fn();
+    try {
+      await expect(
+        evaluator({ state: "closed", merged: true }, vi.fn(), log).evaluate("matched")
+      ).resolves.toBe("satisfied");
+      const deployed = new CompletionMatcherEvaluator({
+        obligations: repository,
+        writer,
+        issueClient: { getPullRequestDetails: vi.fn() },
+        deployedSha: () => "b".repeat(40),
+        isAncestor: vi.fn(async () => true),
+        repository: "MEK-Org/rusa",
+        instanceName: "test-instance",
+        log,
+      });
+      await expect(deployed.evaluate("deploy")).resolves.toBe("satisfied");
+    } finally {
+      warn.mockRestore();
+      repository.setReadyHeadListener(undefined);
+    }
+    expect(repository.require("matched").status).toBe("done");
+    expect(repository.require("deploy").status).toBe("done");
+    expect(announced).toEqual(["actor-a", "actor-b"]);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^\[completion-matcher\] matched: write obligations\.satisfyCompletionMatcher committed/
+      )
+    );
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("[completion-matcher] deploy:"));
+  });
+
   it("logs a deployed matcher left pending by an unknown running revision", async () => {
     repository.create({ id: "deploy", title: "deploy", ownerId: "actor-a" });
     repository.setCompletionMatcher(

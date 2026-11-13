@@ -5,6 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { grant, IU, testCapabilityGrantStoreContract } from "./capability-grant-store.contract.js";
 import {
   FileCapabilityGrantStore,
+  GRANT_MUTATION_EFFECT,
+  type GrantMutationEffect,
+  GrantMutationListenerSlot,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
   PARENT_GRANTABLE_SECRET_FILENAMES,
@@ -78,5 +81,72 @@ describe("FileCapabilityGrantStore", () => {
   it("starts empty when the file is missing", () => {
     const store = new FileCapabilityGrantStore(join(dir, "does-not-exist.json"));
     expect(store.list()).toEqual([]);
+  });
+});
+
+describe("GrantMutationListenerSlot (#1289 D1)", () => {
+  const effect: GrantMutationEffect = {
+    kind: GRANT_MUTATION_EFFECT,
+    change: "granted",
+    actorId: "worker",
+    capability: "understanding-write",
+    by: "root",
+  };
+
+  it("delivers to its one listener and stays synchronous when the listener is", () => {
+    const slot = new GrantMutationListenerSlot();
+    expect(slot.deliver(effect)).toBeUndefined();
+    const seen: GrantMutationEffect[] = [];
+    slot.on((e) => {
+      seen.push(e);
+    });
+    expect(slot.deliver(effect)).toBeUndefined();
+    expect(seen).toEqual([effect]);
+  });
+
+  it("returns an async listener's promise so the writer awaits it", async () => {
+    const slot = new GrantMutationListenerSlot();
+    let settled = false;
+    slot.on(async () => {
+      await Promise.resolve();
+      settled = true;
+    });
+    const out = slot.deliver(effect);
+    expect(out).toBeInstanceOf(Promise);
+    await out;
+    expect(settled).toBe(true);
+  });
+
+  it("refuses a second subscriber until the first unsubscribes", () => {
+    const slot = new GrantMutationListenerSlot();
+    const off = slot.on(() => {});
+    expect(() => slot.on(() => {})).toThrow("already subscribed");
+    off();
+    const seen: string[] = [];
+    const offNext = slot.on(() => {
+      seen.push("next");
+    });
+    // A stale unsubscribe does not remove a later listener.
+    off();
+    slot.deliver(effect);
+    expect(seen).toEqual(["next"]);
+    offNext();
+  });
+
+  it("keeps a re-subscribed callback when the first subscription's unsubscribe runs again", () => {
+    const slot = new GrantMutationListenerSlot();
+    const seen: GrantMutationEffect[] = [];
+    const listener = (e: GrantMutationEffect) => {
+      seen.push(e);
+    };
+    const off = slot.on(listener);
+    off();
+    const offAgain = slot.on(listener);
+    off();
+    slot.deliver(effect);
+    expect(seen).toEqual([effect]);
+    offAgain();
+    slot.deliver(effect);
+    expect(seen).toEqual([effect]);
   });
 });

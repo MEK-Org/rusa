@@ -77,12 +77,63 @@ export interface CapabilityGrant {
   revokedAt?: string;
 }
 
+/** The kind of a committed grant or revocation's writer effect (#1289 D1). */
+export const GRANT_MUTATION_EFFECT = "grant.mutation";
+
+/**
+ * What one committed grant or revocation owes the mesh (#1289 D1), as plain
+ * data so it can cross the writer boundary. The writer delivers it in commit
+ * order with every other write's effects, so the mesh's event and mount hooks
+ * land in that order too.
+ */
+export interface GrantMutationEffect {
+  readonly kind: typeof GRANT_MUTATION_EFFECT;
+  readonly change: "granted" | "revoked";
+  readonly actorId: string;
+  readonly capability: string;
+  /** The grantor or revoker. */
+  readonly by: string;
+}
+
+export type GrantMutationListener = (effect: GrantMutationEffect) => Promise<void> | void;
+
+/**
+ * The one listener a grant store's committed writes are delivered to. The
+ * mesh is the only subscriber, so a second subscription while one is held
+ * throws rather than silently sharing or replacing delivery.
+ */
+export class GrantMutationListenerSlot {
+  private listener: GrantMutationListener | undefined;
+
+  /**
+   * Subscribe; returns the unsubscribe, which acts only on its first call so
+   * a stale one never clears a later subscription, even of the same callback.
+   */
+  on(listener: GrantMutationListener): () => void {
+    if (this.listener) throw new Error("a grant mutation listener is already subscribed");
+    this.listener = listener;
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.listener = undefined;
+    };
+  }
+
+  /** Deliver one committed write's effect to the listener, if any. */
+  deliver(effect: GrantMutationEffect): Promise<void> | void {
+    return this.listener?.(effect);
+  }
+}
+
 /**
  * Persistence boundary for capability grants — mirrors {@link ActorRepository}:
  * a local JSON file in production ({@link FileCapabilityGrantStore}), in-memory
  * for tests. Keyed on (actorId, capability); one record per pair.
  */
 export interface CapabilityGrantStore {
+  /** Where the writer delivers this store's committed grant writes (#1289 D1). */
+  readonly mutations: GrantMutationListenerSlot;
   /**
    * Grant `capability` to `actorId`. Idempotent on (actorId, capability):
    * re-granting sets/keeps it active (clearing any prior revocation) and updates
@@ -97,10 +148,57 @@ export interface CapabilityGrantStore {
   activeFor(actorId: string): string[];
 }
 
+/**
+ * Authority that no grant row records: the boot-selected default actor's
+ * role-derived capabilities, and the grantor whose legacy rows confer
+ * nothing (#1087). It is process configuration, fixed once chosen, so a
+ * write operation receives it as input; the grant rows it is combined with
+ * are still the transaction's.
+ *
+ * Passing it as input is safe only because `recipientId` is write-once: it
+ * moves from `undefined` to an id at most once and never changes after that.
+ * So a snapshot taken before the transaction can only under-grant. A change
+ * that lets the default actor be re-selected breaks that guarantee. Such a
+ * change must resolve the recipient inside the write operation from durable
+ * rows instead.
+ */
+export interface CapabilityPolicy {
+  /** The actor holding `capabilities` without a grant row, once one is selected. */
+  readonly recipientId: string | undefined;
+  readonly capabilities: readonly string[];
+  /** Rows granted by this grantor are kept for audit but confer nothing. */
+  readonly ignoredGrantor: string;
+}
+
+/**
+ * The capabilities `actorId` holds: its active grant rows, minus those the
+ * policy ignores, plus the policy's role capabilities when it is the
+ * recipient. Without a policy, every active row counts.
+ */
+export function effectiveCapabilities(
+  grants: readonly CapabilityGrant[],
+  actorId: string,
+  policy: CapabilityPolicy | null
+): string[] {
+  const rows = grants
+    .filter(
+      (grant) =>
+        grant.actorId === actorId &&
+        !grant.revokedAt &&
+        (policy === null || grant.grantedBy !== policy.ignoredGrantor)
+    )
+    .map((grant) => grant.capability);
+  if (policy === null) return rows;
+  return [
+    ...new Set([...rows, ...(actorId === policy.recipientId ? policy.capabilities : [])]),
+  ].sort();
+}
+
 const key = (actorId: string, capability: string): string => `${actorId} ${capability}`;
 
 /** In-memory grant store — for tests and the e2e runner. */
 export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
+  readonly mutations = new GrantMutationListenerSlot();
   private readonly grants = new Map<string, CapabilityGrant>();
 
   grant(grant: CapabilityGrant): void {
@@ -132,6 +230,7 @@ export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
  * visible to the next actor construction without an orchestrator restart.
  */
 export class FileCapabilityGrantStore implements CapabilityGrantStore {
+  readonly mutations = new GrantMutationListenerSlot();
   private mem = new InMemoryCapabilityGrantStore();
 
   constructor(private readonly file: string) {

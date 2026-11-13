@@ -1067,7 +1067,7 @@ export function createAgentExecMcpServer(
     },
     async ({ actor_id, capability }) => {
       try {
-        mesh.grantCapability(actor_id, capability, selfId);
+        await mesh.grantCapability(actor_id, capability, selfId);
         return toolOk(`granted ${capability} to ${actor_id}`);
       } catch (err) {
         return toolError(err);
@@ -1557,7 +1557,11 @@ export function createAgentExecMcpServer(
         try {
           // Echo the canonical id the row is keyed on, not the address typed,
           // so the response correlates with list_actor_experiments.
-          const { actorId, changed } = mesh.enrollActorInExperiment(actor_id, experiment, selfId);
+          const { actorId, changed } = await mesh.enrollActorInExperiment(
+            actor_id,
+            experiment,
+            selfId
+          );
           return toolOk({ actor_id: actorId, experiment, enrolled: true, changed });
         } catch (err) {
           return toolError(err);
@@ -1584,7 +1588,7 @@ export function createAgentExecMcpServer(
         const denied = assertExperimentAdmin();
         if (denied) return denied;
         try {
-          const { actorId, changed } = mesh.unenrollActorFromExperiment(
+          const { actorId, changed } = await mesh.unenrollActorFromExperiment(
             actor_id,
             experiment,
             selfId

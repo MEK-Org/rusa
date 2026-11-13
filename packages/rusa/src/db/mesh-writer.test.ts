@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "tsup";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type { InboxPayload } from "../repositories/inbox-repository.js";
 import {
   TEST_WRITE_OPERATIONS,
   type TestEffect,
@@ -12,12 +13,21 @@ import {
 } from "./fixtures/test-write-operations.js";
 import { closeDb, getDb, getRepositories, initDb, meshDbPath } from "./index.js";
 import {
+  deliverMeshEffect,
+  MESH_WRITE_OPERATIONS,
+  type MeshEffect,
+  type MeshObligationWriter,
+  type MeshWriteOperations,
+} from "./mesh-write-operations.js";
+import {
+  committedWriteReport,
   DbWriteBuildMismatchError,
   DbWriteQueueFullError,
   DbWriter,
   DbWriterClosedError,
   DbWriteUnavailableError,
   type DeliverEffect,
+  EffectDeliveryFailure,
   InProcessMeshWriter,
   MeshWriteCommittedError,
   MeshWriteOutcomeUnknownError,
@@ -38,6 +48,8 @@ let owner: string;
 let workerPath: string;
 /** The same worker built as another build would be. */
 let otherBuildWorkerPath: string;
+/** The test worker running production mesh write operations. */
+let meshWorkerPath: string;
 
 const exists = (id: string) => getRepositories().obligations.get(id) !== null;
 const countTitled = (title: string) =>
@@ -69,6 +81,7 @@ beforeAll(async () => {
   buildDir = join(packageRoot, "node_modules", ".cache", `mesh-writer-test-${process.pid}`);
   mkdirSync(buildDir, { recursive: true });
   const entry = join(here, "fixtures", "test-write-worker.ts");
+  const meshEntry = join(here, "fixtures", "test-mesh-write-worker.ts");
   const options = {
     config: false,
     format: ["esm" as const],
@@ -77,7 +90,14 @@ beforeAll(async () => {
     silent: true,
     clean: false,
   };
-  await build({ ...options, entry: { "test-write-worker": entry }, outDir: buildDir });
+  await build({
+    ...options,
+    entry: {
+      "test-write-worker": entry,
+      "test-mesh-write-worker": meshEntry,
+    },
+    outDir: buildDir,
+  });
   await build({
     ...options,
     entry: { "test-write-worker": entry },
@@ -86,6 +106,7 @@ beforeAll(async () => {
   });
   workerPath = join(buildDir, "test-write-worker.js");
   otherBuildWorkerPath = join(buildDir, "other", "test-write-worker.js");
+  meshWorkerPath = join(buildDir, "test-mesh-write-worker.js");
 }, 60_000);
 
 afterAll(() => {
@@ -154,7 +175,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("rejects a rolled-back write with the operation's own error and delivers nothing", async () => {
     const delivered: TestEffect[] = [];
-    const { writer, close } = await open((effect) => delivered.push(effect));
+    const { writer, close } = await open((effect) => {
+      delivered.push(effect);
+    });
     try {
       const err = await rejection(writer.write("fail", input("rolled-back")));
       expect(err.name).toBe("WriteConflictError");
@@ -183,6 +206,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
       expect(committed.committed).toBe(true);
       expect(committed.result).toEqual({ id: id("effect-failed") });
       expect(committed.failures.map(String)).toEqual(["Error: listener broke"]);
+      // A caller sees that an effect is missing, never a nested error's text.
+      expect(committedWriteReport(committed).failures).toEqual(["an effect was not delivered"]);
+      expect(JSON.stringify(committedWriteReport(committed))).not.toContain("listener broke");
       expect(delivered).toEqual([`announced:${id("effect-failed")}`]);
       expect(exists(id("effect-failed"))).toBe(true);
     } finally {
@@ -192,7 +218,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("delivers every effect when only the committed result cannot be returned", async () => {
     const delivered: string[] = [];
-    const { writer, close } = await open((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    const { writer, close } = await open((effect) => {
+      delivered.push(`${effect.kind}:${effect.id}`);
+    });
     try {
       const err = await rejection(writer.write("uncloneable", input("uncloneable")));
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
@@ -209,14 +237,16 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("delivers the other effects and the result when one effect cannot be returned", async () => {
     const delivered: string[] = [];
-    const { writer, close } = await open((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    const { writer, close } = await open((effect) => {
+      delivered.push(`${effect.kind}:${effect.id}`);
+    });
     try {
       const err = await rejection(writer.write("uncloneableEffect", input("bad-effect")));
       expect(err).toBeInstanceOf(MeshWriteCommittedError);
       const committed = err as MeshWriteCommittedError;
       expect(committed.result).toEqual({ id: id("bad-effect") });
       expect(committed.failures.map(String)).toEqual([
-        expect.stringMatching(/^Error: effect 2 of 2 could not be returned: /),
+        "EffectDeliveryFailure: effect 2 of 2 could not be returned from the writer",
       ]);
       expect(delivered).toEqual([`created:${id("bad-effect")}`]);
       expect(exists(id("bad-effect"))).toBe(true);
@@ -227,7 +257,9 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
 
   it("refuses an input that cannot be cloned without attempting it, then keeps serving", async () => {
     const delivered: TestEffect[] = [];
-    const { writer, close } = await open((effect) => delivered.push(effect));
+    const { writer, close } = await open((effect) => {
+      delivered.push(effect);
+    });
     try {
       const bad = { ...input("bad-input"), callback: () => undefined };
       const err = await rejection(writer.write("create", bad));
@@ -245,28 +277,71 @@ describe.each(WRITERS)("$name writer", ({ name, open }) => {
     }
   });
 
-  it("lets a delivery read committed state and write again, delivered in commit order", async () => {
+  it("delivers a write its delivery awaits inside that delivery, before the parent's later effects", async () => {
     const log: string[] = [];
-    let nested: Promise<unknown> | undefined;
-    const { writer, close } = await open((effect) => {
+    const { writer, close } = await open(async (effect) => {
       log.push(`${effect.kind}:${effect.id}`);
       if (effect.kind === "created" && effect.id === id("parent")) {
-        // A listener's own read and write, as the inbox listeners do today.
+        // A listener's own read and awaited write, as the attention sinks make (#1289 C2).
         log.push(`read:${getRepositories().obligations.get(id("parent"))?.title}`);
-        nested = writer.write("create", input("child"));
+        await writer.write("create", input("child"));
+        log.push(`child-settled:${exists(id("child"))}`);
       }
     });
     try {
       await writer.write("create", input("parent"));
-      await nested;
+      log.push("parent-continues");
       expect(log).toEqual([
         `created:${id("parent")}`,
         `read:${id("parent")}`,
-        `announced:${id("parent")}`,
         `created:${id("child")}`,
         `announced:${id("child")}`,
+        "child-settled:true",
+        `announced:${id("parent")}`,
+        "parent-continues",
       ]);
-      expect(exists(id("child"))).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("refuses an invalid nested write inside delivery, lets the listener catch the refusal, and finishes the parent write", async () => {
+    let refusalError: Error | undefined;
+    const { writer, close } = await open(async (effect) => {
+      if (effect.kind === "created" && effect.id === id("nested-refusal-parent")) {
+        try {
+          await writer.write("fail", input("nested-refusal-child"));
+        } catch (err) {
+          refusalError = err as Error;
+        }
+      }
+    });
+    try {
+      const res = await writer.write("create", input("nested-refusal-parent"));
+      expect(res.id).toBe(id("nested-refusal-parent"));
+      expect(refusalError?.name).toBe("WriteConflictError");
+      expect(exists(id("nested-refusal-parent"))).toBe(true);
+      expect(exists(id("nested-refusal-child"))).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  it("reports a committed write whose effect delivery throws as MeshWriteCommittedError, without replay or rollback", async () => {
+    let deliveryAttempts = 0;
+    const { writer, close } = await open((effect) => {
+      if (effect.id === id("post-commit-fail")) {
+        deliveryAttempts++;
+        throw new Error("listener delivery explosion");
+      }
+    });
+    try {
+      const err = await rejection(writer.write("create", input("post-commit-fail")));
+      expect(err).toBeInstanceOf(MeshWriteCommittedError);
+      expect(err.message).toMatch(/committed, but \d+ of its 2 effects failed to deliver/);
+      expect(exists(id("post-commit-fail"))).toBe(true);
+      expect(deliveryAttempts).toBe(2);
+      expect(countTitled(id("post-commit-fail"))).toBe(1);
     } finally {
       await close();
     }
@@ -283,7 +358,9 @@ describe("InProcessMeshWriter", () => {
       getDb(),
       repos(),
       TEST_WRITE_OPERATIONS,
-      (effect: TestEffect) => log.push(`${effect.kind}:${effect.id}`)
+      (effect: TestEffect) => {
+        log.push(`${effect.kind}:${effect.id}`);
+      }
     );
     const pending = writer.write("create", input("at-call"));
     log.push(`after-call:${exists("ip-at-call")}`);
@@ -297,7 +374,9 @@ describe("InProcessMeshWriter", () => {
       getDb(),
       repos(),
       TEST_WRITE_OPERATIONS,
-      (effect: TestEffect) => delivered.push(effect)
+      (effect: TestEffect) => {
+        delivered.push(effect);
+      }
     );
     let pending: Promise<unknown> | undefined;
     getDb().transaction(() => {
@@ -314,7 +393,9 @@ describe("DbWriter", () => {
 
   it("delivers one write's effects and runs its continuation before the next write's", async () => {
     const log: string[] = [];
-    const writer = await openDbWriter((effect) => log.push(`${effect.kind}:${effect.id}`));
+    const writer = await openDbWriter((effect) => {
+      log.push(`${effect.kind}:${effect.id}`);
+    });
     try {
       const labels = ["fifo-1", "fifo-2", "fifo-3"];
       await Promise.all(
@@ -409,7 +490,9 @@ describe("DbWriter", () => {
 
   it("finishes accepted writes on close and refuses new ones", async () => {
     const delivered: string[] = [];
-    const writer = await openDbWriter((effect) => delivered.push(`${effect.kind}:${effect.id}`));
+    const writer = await openDbWriter((effect) => {
+      delivered.push(`${effect.kind}:${effect.id}`);
+    });
     const held = writer.write("hold", { ...input("drain-held"), ms: 200 });
     const queued = writer.write("create", input("drain-queued"));
     const closing = writer.close();
@@ -428,6 +511,47 @@ describe("DbWriter", () => {
     expect(exists("w-after-close")).toBe(false);
   });
 
+  it("finishes an accepted write whose delivery is suspended on close, including the write it makes", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const log: string[] = [];
+    let writer: DbWriter<TestEffect, TestWriteOperations> | undefined;
+    writer = await openDbWriter(async (effect) => {
+      log.push(`${effect.kind}:${effect.id}`);
+      if (effect.kind === "created" && effect.id === "w-close-parent") {
+        await gate;
+        const nested = await writer?.write("create", input("close-nested"));
+        log.push(`nested:${nested?.id}`);
+      }
+    });
+    const parent = writer.write("create", input("close-parent"));
+    // Wait until the parent's delivery is suspended: the worker has answered
+    // and the pool holds no request.
+    await vi.waitFor(() => expect(log).toContain("created:w-close-parent"));
+    let closed = false;
+    const closing = writer.close().then(() => {
+      closed = true;
+    });
+    const refused = await rejection(writer.write("create", input("close-after")));
+    expect(refused).toBeInstanceOf(DbWriterClosedError);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(closed).toBe(false);
+    release();
+    await expect(parent).resolves.toEqual({ id: "w-close-parent" });
+    await closing;
+    expect(log).toEqual([
+      "created:w-close-parent",
+      "created:w-close-nested",
+      "announced:w-close-nested",
+      "nested:w-close-nested",
+      "announced:w-close-parent",
+    ]);
+    expect(exists("w-close-nested")).toBe(true);
+    expect(exists("w-close-after")).toBe(false);
+  });
+
   it("refuses a worker that loaded another build", async () => {
     const err = await rejection(
       DbWriter.open<TestEffect, TestWriteOperations>({
@@ -440,5 +564,418 @@ describe("DbWriter", () => {
     expect(err.message).toMatch(
       /write worker runs build other-build, but this process runs \(none\); writes resume/
     );
+  });
+});
+
+interface OpenedMeshWriter {
+  readonly writer: MeshObligationWriter;
+  close(): Promise<void>;
+}
+
+const openMeshDbWriter = (
+  deliver: DeliverEffect<MeshEffect>,
+  options: { maxQueued?: number } = {}
+) =>
+  DbWriter.open<MeshEffect, MeshWriteOperations>({
+    dbPath: meshDbPath(home),
+    worker: meshWorkerPath,
+    deliver,
+    ...options,
+  });
+
+const MESH_WRITERS: {
+  name: string;
+  open(deliver: DeliverEffect<MeshEffect>): Promise<OpenedMeshWriter>;
+}[] = [
+  {
+    name: "in-process",
+    open: async (deliver) => ({
+      writer: new InProcessMeshWriter(
+        getDb(),
+        getRepositories().meshWriteRepos(),
+        MESH_WRITE_OPERATIONS,
+        deliver
+      ),
+      close: async () => undefined,
+    }),
+  },
+  {
+    name: "worker",
+    open: async (deliver) => {
+      const writer = await openMeshDbWriter(deliver);
+      return { writer, close: () => writer.close() };
+    },
+  },
+];
+
+describe.each(MESH_WRITERS)("production write operations ($name writer)", ({ name, open }) => {
+  it("delivers the obligation → attention append → append notification chain, and interleaves an independent write", async () => {
+    const repos = getRepositories().meshWriteRepos();
+    const log: string[] = [];
+    const testOwner = `owner-chain-${name}`;
+    const independentOwner = `owner-indep-${name}`;
+    const headId = `head-ob-${name}`;
+    const behindId = `behind-ob-${name}`;
+    const independentId = `independent-ob-${name}`;
+    const attnId = `attn-${behindId}`;
+
+    for (const actorId of [testOwner, independentOwner]) {
+      getRepositories().actors.upsert({
+        id: actorId,
+        charter: actorId,
+        parentId: null,
+        status: "active",
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    // Set up two obligations: head (priority 0) and behind (priority 1).
+    // Completing head produces a readyHeadChange for behind, and a statusChange for head.
+    repos.obligations.create({ id: headId, title: "head", ownerId: testOwner, priority: 0 });
+    repos.obligations.create({ id: behindId, title: "behind", ownerId: testOwner, priority: 1 });
+
+    let independentSettled = false;
+    let releaseBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+
+    const unsubscribeInbox = repos.inbox.onItemsAppended((items) => {
+      log.push(`inbox:appended:${items.map((i) => i.id).join(",")}`);
+    });
+
+    let currentWriter: MeshObligationWriter | undefined;
+
+    // The production listeners' shape: the ready-head sink appends through the
+    // writer and awaits it; status fan-out reads committed state.
+    repos.obligations.setReadyHeadListener(async (change) => {
+      log.push(`ready-head:${change.ownerId}:${change.head?.id ?? "none"}`);
+      if (change.head?.id !== behindId) return;
+      log.push("sink:nested-append-start");
+      if (!currentWriter) throw new Error("writer not ready");
+      const appended = await currentWriter.write("inbox.append", {
+        entries: [
+          {
+            id: attnId,
+            actorId: testOwner,
+            source: `obligation:${behindId}`,
+            payload: {
+              type: "obligation.ready_head",
+              obligationId: behindId,
+            } as unknown as InboxPayload,
+          },
+        ],
+      });
+      log.push(`sink:nested-append-settled:${appended.map((e) => e.id).join(",")}`);
+
+      log.push("sink:awaiting-barrier");
+      await barrier;
+      log.push("sink:barrier-released");
+    });
+    repos.obligations.setStatusChangeListener(({ changes }) => {
+      for (const change of changes) {
+        log.push(`status-change:${change.id}:${change.status}`);
+        const entry = repos.inbox.read(testOwner, attnId);
+        log.push(`status-listener:saw-attn:${entry !== null}`);
+      }
+    });
+
+    const { writer, close } = await open((effect) => deliverMeshEffect(repos, effect));
+    currentWriter = writer;
+
+    try {
+      const parentPromise = writer.write("obligations.setTerminalStatus", {
+        id: headId,
+        status: "done",
+        note: null,
+        resolutionRef: null,
+        principal: testOwner,
+      });
+
+      while (!log.includes("sink:awaiting-barrier")) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      log.push("main:submitting-independent");
+      const independentPromise = writer
+        .write("obligations.create", {
+          obligation: {
+            id: independentId,
+            title: "independent title",
+            ownerId: independentOwner,
+            priority: 0,
+          },
+        })
+        .then((res) => {
+          independentSettled = true;
+          log.push("independent-settled");
+          return res;
+        });
+
+      const db = getDb();
+      while (
+        (
+          db.prepare("SELECT COUNT(*) AS n FROM obligations WHERE id = ?").get(independentId) as {
+            n: number;
+          }
+        ).n === 0
+      ) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      log.push("independent-committed-in-db");
+      expect(independentSettled).toBe(false);
+
+      releaseBarrier();
+
+      await parentPromise;
+      log.push("parent-settled");
+
+      expect(repos.inbox.read(testOwner, attnId)).not.toBeNull();
+
+      await independentPromise;
+
+      const expected =
+        name === "in-process"
+          ? [
+              `ready-head:${testOwner}:${behindId}`,
+              "sink:nested-append-start",
+              `inbox:appended:${attnId}`,
+              `sink:nested-append-settled:${attnId}`,
+              "sink:awaiting-barrier",
+              "main:submitting-independent",
+              "independent-committed-in-db",
+              "sink:barrier-released",
+              `status-change:${headId}:done`,
+              "status-listener:saw-attn:true",
+              "parent-settled",
+              `ready-head:${independentOwner}:${independentId}`,
+              "independent-settled",
+            ]
+          : [
+              `ready-head:${testOwner}:${behindId}`,
+              "sink:nested-append-start",
+              `inbox:appended:${attnId}`,
+              `sink:nested-append-settled:${attnId}`,
+              "sink:awaiting-barrier",
+              "main:submitting-independent",
+              "independent-committed-in-db",
+              "sink:barrier-released",
+              `status-change:${headId}:done`,
+              "status-listener:saw-attn:true",
+              `ready-head:${independentOwner}:${independentId}`,
+              "parent-settled",
+              "independent-settled",
+            ];
+      expect(log).toEqual(expected);
+    } finally {
+      unsubscribeInbox();
+      repos.obligations.setReadyHeadListener(undefined);
+      repos.obligations.setStatusChangeListener(undefined);
+      await close();
+    }
+  });
+
+  it("refuses an invalid nested write inside delivery and reports the committed parent as MeshWriteCommittedError", async () => {
+    const repos = getRepositories().meshWriteRepos();
+    const testOwner = `owner-refusal-${name}`;
+    const parentId = `parent-refusal-${name}`;
+    getRepositories().actors.upsert({
+      id: testOwner,
+      charter: testOwner,
+      parentId: null,
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+
+    let currentWriter: MeshObligationWriter | undefined;
+    let refusal: unknown;
+    let attempts = 0;
+    // Like ActorMesh.appendInbox, the sink rethrows a refusal: the attention
+    // was required work, so the committed parent must say it failed.
+    repos.obligations.setReadyHeadListener(async (change) => {
+      if (change.head?.id !== parentId) return;
+      attempts++;
+      if (!currentWriter) throw new Error("writer not ready");
+      try {
+        await currentWriter.write("inbox.append", {
+          entries: [
+            {
+              id: "bad-entry",
+              actorId: testOwner,
+              source: "bad-source",
+              payload: "not-an-object" as unknown as InboxPayload,
+            },
+          ],
+        });
+      } catch (err) {
+        refusal = err;
+        throw err;
+      }
+    });
+
+    const { writer, close } = await open((effect) => deliverMeshEffect(repos, effect));
+    currentWriter = writer;
+
+    try {
+      const err = await rejection(
+        writer.write("obligations.create", {
+          obligation: { id: parentId, title: "refusal test", ownerId: testOwner, priority: 0 },
+        })
+      );
+      expect(refusal).toBeInstanceOf(Error);
+      expect(refusal).not.toBeInstanceOf(MeshWriteCommittedError);
+      expect(err).toBeInstanceOf(MeshWriteCommittedError);
+      expect((err as MeshWriteCommittedError).result).toMatchObject({ id: parentId });
+      const failures = (err as MeshWriteCommittedError).failures;
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toBeInstanceOf(EffectDeliveryFailure);
+      expect((failures[0] as Error).cause).toBe(refusal);
+      expect(repos.obligations.get(parentId)).not.toBeNull();
+      expect(repos.inbox.read(testOwner, "bad-entry")).toBeNull();
+      expect(attempts).toBe(1);
+    } finally {
+      repos.obligations.setReadyHeadListener(undefined);
+      await close();
+    }
+  });
+
+  it("reports a committed write whose effect delivery throws as MeshWriteCommittedError, without replay or rollback", async () => {
+    const repos = getRepositories().meshWriteRepos();
+    const testOwner = `owner-postfail-${name}`;
+    const parentId = `parent-postfail-${name}`;
+    getRepositories().actors.upsert({
+      id: testOwner,
+      charter: testOwner,
+      parentId: null,
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+
+    const { writer, close } = await open(async (effect) => {
+      await deliverMeshEffect(repos, effect);
+    });
+
+    try {
+      await writer.write("obligations.create", {
+        obligation: { id: parentId, title: "post-commit fail", ownerId: testOwner, priority: 0 },
+      });
+
+      let deliveryAttempts = 0;
+      let statusListenerRan = false;
+      repos.obligations.setReadyHeadListener(async (change) => {
+        if (change.ownerId === testOwner) {
+          deliveryAttempts++;
+          throw new Error("nested append failed");
+        }
+      });
+      repos.obligations.setStatusChangeListener(({ changes }) => {
+        if (changes.some((c) => c.id === parentId && c.status === "done")) {
+          statusListenerRan = true;
+        }
+      });
+
+      const err = await rejection(
+        writer.write("obligations.setTerminalStatus", {
+          id: parentId,
+          status: "done",
+          note: null,
+          resolutionRef: null,
+          principal: testOwner,
+        })
+      );
+      expect(err).toBeInstanceOf(MeshWriteCommittedError);
+      expect(err.message).toMatch(/committed, but 1 of its 1 effects failed to deliver/);
+
+      // Remaining effect in deliverMutationEffect still executed per c6814333204
+      expect(statusListenerRan).toBe(true);
+      // Mutation is committed in DB
+      expect(repos.obligations.get(parentId)?.status).toBe("done");
+      // No automatic replay
+      expect(deliveryAttempts).toBe(1);
+    } finally {
+      repos.obligations.setReadyHeadListener(undefined);
+      repos.obligations.setStatusChangeListener(undefined);
+      await close();
+    }
+  });
+
+  it("keeps an earlier write's failed attention for retry without failing an unrelated write, and still fails a write's own", async () => {
+    const repos = getRepositories().meshWriteRepos();
+    const testOwner = `owner-retry-${name}`;
+    getRepositories().actors.upsert({
+      id: testOwner,
+      charter: testOwner,
+      parentId: null,
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+    const a = `retry-a-${name}`;
+    const c = `retry-c-${name}`;
+    for (const gate of [a, c]) {
+      repos.obligations.create({ id: `${gate}-gate`, title: gate, ownerId: testOwner });
+      repos.obligations.create({
+        id: `${gate}-dep`,
+        title: `${gate} dependent`,
+        ownerId: testOwner,
+        blockedBy: [`${gate}-gate`],
+      });
+    }
+    const failing = new Set([`${a}-dep`, `${c}-dep`]);
+    const attempts: string[] = [];
+    const delivered: string[] = [];
+    repos.obligations.setCancellationAttentionListener(async (attention) => {
+      attempts.push(attention.dependentId);
+      if (failing.has(attention.dependentId)) {
+        throw new Error(`append failed for ${attention.dependentId}`);
+      }
+      delivered.push(attention.dependentId);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { writer, close } = await open((effect) => deliverMeshEffect(repos, effect));
+    const cancel = (gate: string) =>
+      writer.write("obligations.setTerminalStatus", {
+        id: `${gate}-gate`,
+        status: "cancelled",
+        note: null,
+        resolutionRef: null,
+        principal: testOwner,
+      });
+
+    try {
+      // A's own attention fails: A's committed write says so.
+      const errA = await rejection(cancel(a));
+      expect(errA).toBeInstanceOf(MeshWriteCommittedError);
+
+      // B is unrelated. A's retry rides along and fails again, but that is
+      // A's work: B resolves, and A stays kept for retry, logged.
+      warn.mockClear();
+      const b = await writer.write("obligations.create", {
+        obligation: { id: `retry-b-${name}`, title: "unrelated", ownerId: testOwner, priority: 9 },
+      });
+      expect(b.id).toBe(`retry-b-${name}`);
+      expect(attempts.filter((id) => id === `${a}-dep`)).toHaveLength(2);
+      expect(warn.mock.calls.flat().join("\n")).toContain(`append failed for ${a}-dep`);
+
+      // C's own attention fails while A's retry fails beside it: C rejects
+      // for its own failure only.
+      const errC = await rejection(cancel(c));
+      expect(errC).toBeInstanceOf(MeshWriteCommittedError);
+      expect((errC as MeshWriteCommittedError).failures).toHaveLength(1);
+      const failureC = (errC as MeshWriteCommittedError).failures[0] as Error;
+      expect(failureC.message).toBe("a dependent's cancellation attention was not delivered");
+      expect(String(failureC.cause)).toContain(`${c}-dep`);
+
+      // Once appends recover, the next write delivers both kept retries.
+      failing.clear();
+      await writer.write("obligations.create", {
+        obligation: { id: `retry-d-${name}`, title: "recovery", ownerId: testOwner, priority: 9 },
+      });
+      expect(delivered).toEqual(expect.arrayContaining([`${a}-dep`, `${c}-dep`]));
+      expect(attempts.filter((id) => id === `${a}-dep`)).toHaveLength(4);
+    } finally {
+      warn.mockRestore();
+      repos.obligations.setCancellationAttentionListener(undefined);
+      await close();
+    }
   });
 });

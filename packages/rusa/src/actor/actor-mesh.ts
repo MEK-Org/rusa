@@ -72,8 +72,6 @@ import {
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   ACTOR_ADMIN_CAPABILITY,
-  CAPABILITY_ADMIN_CAPABILITY,
-  EXPERIMENT_ADMIN_CAPABILITY,
   HOST_GLOBAL_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
   OBLIGATIONS_ADMIN_CAPABILITY,
@@ -81,6 +79,8 @@ import {
 } from "./administrative-capabilities.js";
 import {
   type CapabilityGrantStore,
+  type CapabilityPolicy,
+  type GrantMutationEffect,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
@@ -109,6 +109,11 @@ import {
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
 } from "./experiments.js";
+import {
+  assertGrantAuthority,
+  type GrantAuthorityReader,
+  isAncestorIn,
+} from "./grant-authority.js";
 import { generateHandle } from "./handle-generator.js";
 import {
   type HeadClosureQuery,
@@ -137,6 +142,12 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 export const SCHEDULER_SENDER_ID = "scheduler";
 
 type ResponsiveReadyAttention = { id: string; intent: string | null; readyCount?: number };
+/** The net head change a run made to its own queue, taken at the run's end. */
+type RunHeadAttention = {
+  from: string | null;
+  to: { id: string; intent: string | null; responsive?: boolean };
+  epoch: string;
+};
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -726,7 +737,9 @@ interface ActorMeshBaseOptions {
   /**
    * Called after a capability grant is durably recorded, for live resource
    * wiring the mesh does not own. The production wiring uses this to mount the
-   * endpoint and update the actor's provider config for its next run.
+   * endpoint and update the actor's provider config for its next run. Runs in
+   * the grant's writer effect delivery, in commit order (#1289 D1); it must
+   * not await a write it did not make.
    */
   onCapabilityGranted?: (actorId: string, capability: string) => void;
   /**
@@ -734,6 +747,9 @@ interface ActorMeshBaseOptions {
    * teardown the mesh doesn't own — namely unmounting the granted MCP endpoint so
    * revocation takes effect IMMEDIATELY (a 404), not only at the actor's next
    * reconstruction. Invoked in a try/catch so a hook throw can't break revoke.
+   * A writer revocation runs it in that write's effect delivery, in commit
+   * order (#1289 D1), and later deliveries wait until it settles; it must not
+   * await a write it did not make.
    */
   onCapabilityRevoked?: (actorId: string, capability: string) => Promise<void> | void;
   /**
@@ -765,6 +781,15 @@ interface ActorMeshBaseOptions {
    * {@link grantableCapabilities}).
    */
   capabilityGrants?: CapabilityGrantStore;
+  /**
+   * Authority no grant row records (#1087): the default actor's role-derived
+   * capabilities, and the grantor whose rows confer nothing. Grant and
+   * experiment writes decide authority from it plus the transaction's grant
+   * rows (#1289 D1), so it must describe the same view as
+   * {@link capabilityGrants}' `activeFor`; the wiring builds both from one
+   * policy. Without it, every active grant row counts.
+   */
+  capabilityPolicy?: () => CapabilityPolicy;
   /**
    * Durable store of per-actor experiment enrollments (#394). Defaults to an
    * in-memory store; the wiring supplies the SQLite-backed one, which is what
@@ -981,6 +1006,7 @@ export class ActorMesh {
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
+  private readonly capabilityPolicy: () => CapabilityPolicy | null;
   private readonly experimentRegistry: ExperimentRegistry;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
@@ -991,6 +1017,7 @@ export class ActorMesh {
   private readonly inboxStore?: InboxRepository;
   private unsubscribeInboxAppends?: () => void;
   private unsubscribeInboxHandled?: () => void;
+  private unsubscribeGrantMutations?: () => void;
   private dispatchJoiningActiveRunPort?: (actorId: string) => Promise<boolean>;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet, with
@@ -1101,6 +1128,7 @@ export class ActorMesh {
     this.validateContext = opts.validateContext;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
+    this.capabilityPolicy = opts.capabilityPolicy ?? (() => null);
     this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
@@ -1186,6 +1214,11 @@ export class ActorMesh {
     this.onRevive = opts.onRevive;
     this.onCapabilityGranted = opts.onCapabilityGranted;
     this.onCapabilityRevoked = opts.onCapabilityRevoked;
+    // The writer delivers each committed grant or revocation here, in commit
+    // order with every other write's effects (#1289 D1).
+    this.unsubscribeGrantMutations = this.grants.mutations.on((effect) =>
+      this.deliverGrantMutation(effect)
+    );
     this.onModelSet = opts.onModelSet;
     this.retireCleanups = [
       ...(opts.retireCleanups ?? []),
@@ -1357,9 +1390,10 @@ export class ActorMesh {
             this.actorStarted(event.actorId);
           },
           onEnd: (event) => {
-            // Only a result waits on a write (its closure check), so only it
-            // returns a promise; an abandoned run ends synchronously, and the
-            // listeners after this one see it at once.
+            // A result waits on its closure check. An abandoned run waits
+            // only on appending attention its run buffered (#1289 C2); with
+            // none it ends synchronously, and the listeners after this one
+            // see it at once.
             const { terminal } = event;
             if (terminal.kind === "result") {
               return this.finishInboxRun(event.actorId, {
@@ -1373,13 +1407,16 @@ export class ActorMesh {
                 this.clearSelection(event.actorId);
               });
             }
-            this.abandonInboxRun(event.actorId);
+            const flushed = this.abandonInboxRun(event.actorId);
             // A launched run that ended without a result still ended: a pool
             // staged while it ran is due now, not at some later dispatch (#652).
             if (terminal.started) {
               this.applyPendingTarget(event.actorId);
             }
             this.clearSelection(event.actorId);
+            // Its buffered attention is appended through the writer; the end
+            // settles once those rows have (#1289 C2).
+            return flushed;
           },
         },
         ...this.lifecycleListeners,
@@ -1531,11 +1568,11 @@ export class ActorMesh {
    * attention after restart, without colliding with an earlier handled repair
    * entry from a previous process generation.
    */
-  reconcileReadyHeads(obligations: {
+  async reconcileReadyHeads(obligations: {
     readyHeadEpoch: string;
     readyHeadRecords(): Iterable<{ ownerId: string; headId: string; responsive: boolean }>;
     get(id: string): { id: string; intent: string | null } | null;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const { ownerId, headId, responsive } of obligations.readyHeadRecords()) {
@@ -1545,7 +1582,7 @@ export class ActorMesh {
         if (!record || record.status !== "active") continue;
         const head = obligations.get(headId);
         if (!head) continue;
-        this.appendReadyHeadEntry(
+        await this.appendReadyHeadEntry(
           actorId,
           { id: head.id, intent: head.intent, responsive },
           null,
@@ -2262,12 +2299,20 @@ export class ActorMesh {
         closure: this.headClosureQuery(actorId, runState, runState.headObligationIds),
       });
     } catch (err) {
-      const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
-      shortfalls = [...runState.headObligationIds].map((obligationId) => ({
-        obligationId,
-        title: null,
-        reason,
-      }));
+      // A closure that committed (its due snoozes cleared) answered its
+      // shortfalls even if an effect of that write failed: use them rather
+      // than refusing every head (#1289).
+      if (err instanceof MeshWriteCommittedError && Array.isArray(err.result)) {
+        this.log(`closure at return for ${actorId}: ${err.message}`);
+        shortfalls = err.result as typeof shortfalls;
+      } else {
+        const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
+        shortfalls = [...runState.headObligationIds].map((obligationId) => ({
+          obligationId,
+          title: null,
+          reason,
+        }));
+      }
     }
     for (const { obligationId, title, reason } of shortfalls) {
       this.recordEvent({
@@ -2316,8 +2361,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    this.flushRunHeadAttention(actorId);
-    this.flushRunResponsiveReadyAttention(actorId);
+    await this.flushRunAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
@@ -2569,13 +2613,55 @@ export class ActorMesh {
    * It does not consume a staged model change itself: the lifecycle `onEnd`
    * applies one only when the abandoned run had actually launched.
    */
-  abandonInboxRun(actorId: string): void {
+  abandonInboxRun(actorId: string): Promise<void> | undefined {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    this.flushRunHeadAttention(actorId);
-    this.flushRunResponsiveReadyAttention(actorId);
+    return this.flushRunAttention(actorId);
+  }
+
+  /**
+   * Close the run's head window and deliver what it buffered (#1289 C2). The
+   * window closes and both buffers are taken before anything is awaited, so
+   * attention arriving while the appends are in flight is delivered as an
+   * idle actor's rather than buffered into a run that has ended. The appends
+   * go through the writer and are awaited, so the run's end, and the next run
+   * that waits on it, sees their rows. One failing does not stop the other;
+   * neither rejects, because the run has ended either way. A run that
+   * buffered nothing returns nothing to await and ends at once.
+   */
+  private flushRunAttention(actorId: string): Promise<void> | undefined {
+    const head = this.takeRunHeadAttention(actorId);
+    const responsive = this.runResponsiveReadyAttention.get(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
+    if (!head && !(responsive && responsive.size > 0)) return undefined;
+    return this.appendRunAttention(actorId, head, responsive);
+  }
+
+  private async appendRunAttention(
+    actorId: string,
+    head: RunHeadAttention | null,
+    responsive: ReadonlyMap<string, ResponsiveReadyAttention> | undefined
+  ): Promise<void> {
+    if (head) {
+      try {
+        await this.appendReadyHeadEntry(actorId, head.to, head.from, null, head.epoch);
+      } catch (err) {
+        this.log(
+          `run-end ready-head attention for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    if (responsive && responsive.size > 0) {
+      try {
+        await this.flushRunResponsiveReadyAttention(actorId, responsive);
+      } catch (err) {
+        this.log(
+          `run-end responsive-ready attention for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
   }
 
   /**
@@ -2587,20 +2673,20 @@ export class ActorMesh {
    * waiting parent, typically because the actor filed a question for a human
    * under it), there is nothing to point at, so nothing is delivered.
    */
-  private flushRunHeadAttention(actorId: string): void {
+  private takeRunHeadAttention(actorId: string): RunHeadAttention | null {
     this.actorsInRun.delete(actorId);
     const net = this.runHeadNet.get(actorId);
     this.runHeadNet.delete(actorId);
-    if (!net) return;
+    if (!net) return null;
     // It settled back where it started, or it ended with no head at all — in
     // the last case there is no obligation to point the actor at.
     if (net.to === null || net.to.id === net.from) {
       this.log(
         `ready-head attention for ${actorId} suppressed at run end: net ${net.from ?? "none"} -> ${net.to?.id ?? "none"}`
       );
-      return;
+      return null;
     }
-    this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
+    return { from: net.from, to: net.to, epoch: net.epoch };
   }
 
   /**
@@ -2612,10 +2698,11 @@ export class ActorMesh {
    * listener is the sole scheduling seam: valid rows are committed together so
    * one actor receives at most one advisory dispatch attempt.
    */
-  private flushRunResponsiveReadyAttention(actorId: string): void {
-    const pending = this.runResponsiveReadyAttention.get(actorId);
-    this.runResponsiveReadyAttention.delete(actorId);
-    if (!pending || pending.size === 0 || !this.inboxStore) return;
+  private async flushRunResponsiveReadyAttention(
+    actorId: string,
+    pending: ReadonlyMap<string, ResponsiveReadyAttention>
+  ): Promise<void> {
+    if (!this.inboxStore) return;
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return;
 
@@ -2650,7 +2737,7 @@ export class ActorMesh {
       }
       entries.push(this.responsiveReadyAttentionEntry(actorId, obligation));
     }
-    if (entries.length > 0) this.inboxStore.append(entries);
+    if (entries.length > 0) await this.appendInbox(entries);
   }
 
   /**
@@ -2694,7 +2781,7 @@ export class ActorMesh {
     previousHeadId: string | null = null,
     sequence: number | null = null,
     epoch: string = this.directReadyHeadEpoch
-  ): boolean {
+  ): Promise<boolean> {
     actorId = this.resolveThreadId(actorId);
     // Mid-run: accumulate rather than deliver. `from` is fixed by the first
     // change of the run so the collapsed entry describes where the run started,
@@ -2702,20 +2789,43 @@ export class ActorMesh {
     if (this.actorsInRun.has(actorId)) {
       const net = this.runHeadNet.get(actorId);
       this.runHeadNet.set(actorId, { from: net ? net.from : previousHeadId, to: head, epoch });
-      return false;
+      return Promise.resolve(false);
     }
-    if (head === null) return false;
+    if (head === null) return Promise.resolve(false);
     return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence, epoch);
   }
 
-  private appendReadyHeadEntry(
+  /**
+   * Append inbox entries through the writer (#1289 C2), answering the rows
+   * this call inserted. The append's own effect (its listeners' bookkeeping)
+   * is delivered before this settles. A write that committed counts as made
+   * even if its effects or its answer were lost: its inserted rows are
+   * answered when the writer returned them, and none otherwise. One that did
+   * not commit, or may not have, rejects and is not retried here.
+   */
+  private async appendInbox(entries: InboxAppendInput[]): Promise<InboxEntry[]> {
+    if (!this.writer) throw new Error("this mesh has no writer configured");
+    try {
+      return await this.writer.write("inbox.append", { entries });
+    } catch (err) {
+      if (!(err instanceof MeshWriteCommittedError)) throw err;
+      this.log(`inbox append: ${err.message}`);
+      return Array.isArray(err.result) ? (err.result as InboxEntry[]) : [];
+    }
+  }
+
+  /**
+   * The actor's state is read before the append is awaited. The row's wake is
+   * the advisory one the append seam owes it, which re-reads its target.
+   */
+  private async appendReadyHeadEntry(
     actorId: string,
     head: { id: string; intent: string | null; responsive?: boolean },
     previousHeadId: string | null,
     sequence: number | null,
     /** Epoch from the repository whose sequence produced this transition. */
     epoch: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!this.inboxStore) return false;
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
@@ -2730,7 +2840,7 @@ export class ActorMesh {
     );
     const responsive = head.responsive === true;
     const latestReassignment = this.readLatestReassignment(head.id);
-    const entries = this.inboxStore.append([
+    const entries = await this.appendInbox([
       {
         id: entryId,
         actorId,
@@ -2744,17 +2854,16 @@ export class ActorMesh {
           ...(latestReassignment ? { latestReassignment } : {}),
           // A responsive head's attention is immediately responsive work:
           // it preempts where the inbox model admits preemption. The priority
-          // written here is the only thing that makes the dispatch below
-          // responsive.
+          // written here is the only thing that makes the dispatch the append
+          // seam owes this row responsive.
           ...(responsive ? { priority: "responsive" as const } : {}),
         } as unknown as InboxPayload,
       },
     ]);
-    if (entries.length === 0) {
-      return false;
-    }
-    this.wake(actorId, "ready-head attention");
-    return true;
+    // The after-commit append seam owes the row its one ordinary, preemptive
+    // wake (#632). A second wake here would be a second dispatch of the same
+    // work, now that the append is awaited and the seam's drain runs first.
+    return entries.length > 0;
   }
 
   /**
@@ -2826,11 +2935,11 @@ export class ActorMesh {
      * delivery semantics and remain outside this slice.
      */
     selfCausedMidRun = false
-  ): boolean {
-    if (!this.inboxStore) return false;
+  ): Promise<boolean> {
+    if (!this.inboxStore) return Promise.resolve(false);
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
-    if (!record || record.status !== "active") return false;
+    if (!record || record.status !== "active") return Promise.resolve(false);
 
     // Mid-run self-caused ready attention: defer delivery until the end of
     // the run. Generalizes the ready-head deferral principle (#632):
@@ -2844,15 +2953,14 @@ export class ActorMesh {
         this.runResponsiveReadyAttention.set(actorId, pending);
       }
       pending.set(obligation.id, obligation);
-      return true;
+      return Promise.resolve(true);
     }
 
     // The after-commit append seam owes this row its ordinary, preemptive
     // wake (#632); an unannotated row is never a joining wake.
-    const entries = this.inboxStore.append([
-      this.responsiveReadyAttentionEntry(actorId, obligation),
-    ]);
-    return entries.length > 0;
+    return this.appendInbox([this.responsiveReadyAttentionEntry(actorId, obligation)]).then(
+      (entries) => entries.length > 0
+    );
   }
 
   /**
@@ -2863,14 +2971,14 @@ export class ActorMesh {
    * `append` is `ON CONFLICT(id) DO NOTHING`, so a transition already delivered
    * is a silent no-op.
    */
-  reconcileResponsiveReadyAttention(obligations: {
+  async reconcileResponsiveReadyAttention(obligations: {
     listResponsiveReadyAttention(): Iterable<{
       id: string;
       ownerId: string;
       intent: string | null;
       readyCount?: number;
     }>;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const obligation of obligations.listResponsiveReadyAttention()) {
@@ -2880,7 +2988,7 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(obligation.ownerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
-        this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
+        await this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
       }
     } catch (err) {
       this.log(
@@ -2896,11 +3004,11 @@ export class ActorMesh {
    * runs — no sequence number is needed, only exact-once delivery of the one
    * (dependent, prerequisite) pair.
    */
-  deliverPrerequisiteCancelledAttention(
+  async deliverPrerequisiteCancelledAttention(
     actorId: string,
     dependentObligationId: string,
     prerequisiteId: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!this.inboxStore) return false;
     actorId = this.resolveThreadId(actorId);
     const record = this.actors.get(actorId);
@@ -2909,7 +3017,7 @@ export class ActorMesh {
       `obligation-prereq-cancelled:${prerequisiteEdgeKey(dependentObligationId, prerequisiteId)}`,
       actorId
     );
-    const entries = this.inboxStore.append([
+    const entries = await this.appendInbox([
       {
         id: entryId,
         actorId,
@@ -2921,9 +3029,8 @@ export class ActorMesh {
         } as unknown as InboxPayload,
       },
     ]);
-    if (entries.length === 0) return false;
-    this.wake(actorId, "prerequisite-cancelled attention");
-    return true;
+    // The after-commit append seam owes the row its wake (#632).
+    return entries.length > 0;
   }
 
   /**
@@ -2932,13 +3039,13 @@ export class ActorMesh {
    * prerequisite is cancelled), so this simply replays that query through the
    * same idempotent delivery path used at the moment of cancellation.
    */
-  reconcileCancelledPrerequisiteAttention(obligations: {
+  async reconcileCancelledPrerequisiteAttention(obligations: {
     listPrerequisiteCancellationAttention(): Iterable<{
       dependentId: string;
       dependentOwnerId: string;
       prerequisiteId: string;
     }>;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const {
@@ -2952,7 +3059,7 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(dependentOwnerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
-        this.deliverPrerequisiteCancelledAttention(actorId, dependentId, prerequisiteId);
+        await this.deliverPrerequisiteCancelledAttention(actorId, dependentId, prerequisiteId);
       }
     } catch (err) {
       this.log(
@@ -2968,17 +3075,17 @@ export class ActorMesh {
    * while a replaced matcher that closes unmerged again is announced again.
    * Human owners see the recorded state on the dashboard instead.
    */
-  deliverCompletionMatcherClosedUnmergedAttention(
+  async deliverCompletionMatcherClosedUnmergedAttention(
     ownerId: string,
     obligationId: string,
     matcherSetAt: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!this.inboxStore) return false;
     if (ownerId.startsWith("system:")) return false;
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    const entries = this.inboxStore.append([
+    const entries = await this.appendInbox([
       {
         id: deduplicatedInboxEntryId(
           `obligation-matcher-closed-unmerged:${obligationId}:${matcherSetAt}`,
@@ -2992,23 +3099,22 @@ export class ActorMesh {
         } as unknown as InboxPayload,
       },
     ]);
-    if (entries.length === 0) return false;
-    this.wake(actorId, "completion-matcher attention");
-    return true;
+    // The after-commit append seam owes the row its wake (#632).
+    return entries.length > 0;
   }
 
   /** Boot recovery for {@link deliverCompletionMatcherClosedUnmergedAttention}. */
-  reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
+  async reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
     listCompletionMatcherClosedUnmergedAttention(): Iterable<{
       obligationId: string;
       ownerId: string;
       matcherSetAt: string;
     }>;
-  }): void {
+  }): Promise<void> {
     if (!this.inboxStore) return;
     try {
       for (const attention of obligations.listCompletionMatcherClosedUnmergedAttention()) {
-        this.deliverCompletionMatcherClosedUnmergedAttention(
+        await this.deliverCompletionMatcherClosedUnmergedAttention(
           attention.ownerId,
           attention.obligationId,
           attention.matcherSetAt
@@ -3396,61 +3502,22 @@ export class ActorMesh {
   }
 
   /**
-   * Grantor authorization for {@link grantCapability}/{@link revokeCapability}.
-   * A `capability-admin` holder may grant/revoke anything grantable within its
-   * own subtree (itself included); a host-global capability is refused before
-   * this runs, for every grantor. Any other grantor may only touch
-   * capabilities in {@link PARENT_GRANTABLE_CAPABILITIES} and only where the
-   * grantee is its DIRECT child (the repository's `parentId` edge). Enforced
-   * HERE — the mesh layer — not just at the tool layer, so the invariant holds
-   * for any future caller. Fail-closed: an unknown grantor holds nothing.
+   * The grant and experiment authority checks' reads, as this mesh sees them
+   * now. The writes decide authority again inside their transaction; this
+   * view only orders a refusal ahead of checks that would otherwise disclose
+   * something to an unauthorized caller.
    */
-  private assertGrantAuthority(
-    grantorId: string,
-    granteeId: string,
-    capability: string,
-    verb: "grant" | "revoke"
-  ): void {
-    const grantee = this.actors.get(granteeId);
-    if (!grantee) {
-      throw new Error(`unknown thread id: ${granteeId}`);
-    }
-    if (this.hasActiveCapability(grantorId, CAPABILITY_ADMIN_CAPABILITY)) {
-      if (!this.isAncestorOf(grantorId, granteeId)) {
-        throw new Error(
-          `${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
-        );
-      }
-      return;
-    }
-    let baseCapability = capability;
-    if (capability.startsWith("chat-write:")) {
-      baseCapability = "chat-write";
-    } else if (capability.startsWith("calendar-read:")) {
-      baseCapability = "calendar-read";
-    } else if (capability.startsWith("calendar-write:")) {
-      baseCapability = "calendar-write";
-    } else if (capability.startsWith("email-send:")) {
-      baseCapability = "email-send";
-    } else if (capability.startsWith("drive-read:")) {
-      baseCapability = "drive-read";
-    }
-    // Secret capabilities are deliberately NOT reduced to their `secret` base
-    // here: a non-root parent may delegate only the exact
-    // `secret:<filename>` names in the allow-list (#542 security review), so a
-    // guessed infrastructure filename never rides through on the prefix.
-    if (!PARENT_GRANTABLE_CAPABILITIES.has(baseCapability)) {
-      throw new Error(
-        `only a ${CAPABILITY_ADMIN_CAPABILITY} holder may ${verb} ${capability}; a parent without it may only ${verb}: ${
-          [...PARENT_GRANTABLE_CAPABILITIES].join(", ") || "none"
-        }`
-      );
-    }
-    if (grantee.parentId !== grantorId) {
-      throw new Error(
-        `without ${CAPABILITY_ADMIN_CAPABILITY}, an actor may only ${verb} ${capability} to/from its direct children; ${granteeId} is not a child of ${grantorId}`
-      );
-    }
+  private grantAuthorityReader(): GrantAuthorityReader {
+    return {
+      actor: (id) => this.actors.get(id),
+      capabilities: (id) => this.grants.activeFor(id),
+    };
+  }
+
+  /** The writer, which every grant and experiment write goes through (#1289 D1). */
+  private requireWriter(): Pick<MeshObligationWriter, "write"> {
+    if (!this.writer) throw new Error("this mesh has no writer configured");
+    return this.writer;
   }
 
   /**
@@ -3465,7 +3532,7 @@ export class ActorMesh {
    * on a live actor's next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
-  grantCapability(actorId: string, capability: string, grantedBy: string): void {
+  async grantCapability(actorId: string, capability: string, grantedBy: string): Promise<void> {
     actorId = this.resolveThreadId(actorId);
     grantedBy = this.resolveThreadId(grantedBy);
     if (!actorId.trim()) throw new Error("actorId is required");
@@ -3546,24 +3613,60 @@ export class ActorMesh {
         `not a grantable capability: ${capability} (grantable: ${[...this.grantable].join(", ") || "none"})`
       );
     }
-    this.assertGrantAuthority(grantedBy, actorId, capability, "grant");
+    // Decided here first so an unauthorized grantor is refused before the
+    // secret check below can tell it whether a secret file exists. The write
+    // decides it again against its own transaction, which is what counts.
+    assertGrantAuthority(this.grantAuthorityReader(), {
+      grantorId: grantedBy,
+      granteeId: actorId,
+      capability,
+      verb: "grant",
+    });
     if (baseCapability === "secret") {
       const secretFilename = capability.slice("secret:".length);
       assertSecretContainment(secretFilename, this.secretsDir);
     }
-    this.grants.grant({ actorId, capability, grantedBy, grantedAt: this.now() });
-    this.recordEvent({
-      kind: "capability_granted",
-      actorId,
-      detail: capability,
-      payload: JSON.stringify({ grantedBy }),
+    await this.requireWriter().write("grants.grant", {
+      grant: { actorId, capability, grantedBy, grantedAt: this.now() },
+      policy: this.capabilityPolicy(),
     });
-    if (this.onCapabilityGranted) {
+  }
+
+  /**
+   * What one committed grant or revocation owes the mesh, delivered by the
+   * writer in commit order (#1289 D1): the audit event, then the live-resource
+   * hook. A revocation's delivery settles when its unmount hook does, so later
+   * deliveries wait behind it. Hook failures are logged, never thrown, so a
+   * hook cannot fail a write that has already committed.
+   */
+  private deliverGrantMutation(effect: GrantMutationEffect): Promise<void> | void {
+    const { actorId, capability } = effect;
+    const describe = (err: unknown) => (err instanceof Error ? err.message : String(err));
+    if (effect.change === "granted") {
+      this.recordEvent({
+        kind: "capability_granted",
+        actorId,
+        detail: capability,
+        payload: JSON.stringify({ grantedBy: effect.by }),
+      });
       try {
-        this.onCapabilityGranted(actorId, capability);
+        this.onCapabilityGranted?.(actorId, capability);
       } catch (err) {
-        this.log(`onCapabilityGranted failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.log(`onCapabilityGranted failed: ${describe(err)}`);
       }
+      return;
+    }
+    this.recordEvent({ kind: "capability_revoked", actorId, detail: capability });
+    if (!this.onCapabilityRevoked) return;
+    let pending: Promise<void> | void;
+    try {
+      pending = this.onCapabilityRevoked(actorId, capability);
+    } catch (err) {
+      this.log(`onCapabilityRevoked failed: ${describe(err)}`);
+      return;
+    }
+    if (pending instanceof Promise) {
+      return pending.catch((err) => this.log(`onCapabilityRevoked failed: ${describe(err)}`));
     }
   }
 
@@ -3574,10 +3677,14 @@ export class ActorMesh {
    * capability is refused here regardless of grantor. Any other `revokedBy`
    * only revokes a parent-grantable capability from a direct child. No-op on
    * the store if not active, but the unmount hook still
-   * fires so a stale mounted endpoint is torn down idempotently. Revocation takes
-   * effect immediately via {@link ActorMeshOptions.onCapabilityRevoked} (the
-   * wiring unmounts the granted endpoint → a 404), not only at the actor's next
-   * reconstruction; a granted secret disappears at the actor's next spawn.
+   * fires so a stale mounted endpoint is torn down idempotently. A mounted
+   * endpoint admits each request against the actor's capabilities, so it
+   * refuses new requests once the revocation commits; the unmount hook
+   * ({@link ActorMeshOptions.onCapabilityRevoked}) then runs in this write's
+   * ordered effect delivery and closes its sessions, possibly after an earlier
+   * delivery settles (#1289 D1). A request already running is not cancelled.
+   * A granted secret disappears at the actor's next spawn. Resolves once the
+   * hook has settled.
    */
   async revokeCapability(actorId: string, capability: string, revokedBy: string): Promise<void> {
     actorId = this.resolveThreadId(actorId);
@@ -3587,16 +3694,13 @@ export class ActorMesh {
         `${capability} is provisioned only by an authenticated operator; actor-facing revocations cannot change it`
       );
     }
-    this.assertGrantAuthority(revokedBy, actorId, capability, "revoke");
-    this.grants.revoke(actorId, capability, this.now());
-    this.recordEvent({ kind: "capability_revoked", actorId, detail: capability });
-    if (this.onCapabilityRevoked) {
-      try {
-        await this.onCapabilityRevoked(actorId, capability);
-      } catch (err) {
-        this.log(`onCapabilityRevoked failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    await this.requireWriter().write("grants.revoke", {
+      actorId,
+      capability,
+      revokedBy,
+      at: this.now(),
+      policy: this.capabilityPolicy(),
+    });
   }
 
   /**
@@ -3605,7 +3709,7 @@ export class ActorMesh {
    * column on `actors`.
    *
    * Authorized by the `experiment-admin` capability over the caller's own
-   * subtree (see {@link assertExperimentAuthority}). Enrollment is strictly post-spawn — the actor must
+   * subtree, decided inside the write. Enrollment is strictly post-spawn — the actor must
    * already exist — and a retired actor is refused, matching
    * {@link setActorModel}: enrolling a thread that is not going to run again
    * records an intent nothing will ever read.
@@ -3617,25 +3721,25 @@ export class ActorMesh {
    * Only a real change records an event. Throws if the experiment is not
    * registered, the actor is unknown or retired, or the caller lacks authority.
    */
-  enrollActorInExperiment(
+  async enrollActorInExperiment(
     actorId: string,
     experiment: string,
     enrolledBy: string
-  ): ExperimentEnrollmentChange {
+  ): Promise<ExperimentEnrollmentChange> {
     actorId = this.resolveThreadId(actorId);
     enrolledBy = this.resolveThreadId(enrolledBy);
     const name = assertKnownExperiment(experiment, this.experimentRegistry);
-    const record = this.assertExperimentAuthority(enrolledBy, actorId, "enroll");
-    if (record.status === "retired") {
-      throw new Error(`Cannot enroll a retired thread: ${actorId}`);
-    }
     const enrollment: ExperimentEnrollment = {
       actorId,
       experiment: name,
       enrolledBy,
       enrolledAt: this.now(),
     };
-    if (!this.experiments.enroll(enrollment)) return { actorId, changed: false };
+    const changed = await this.requireWriter().write("experiments.enroll", {
+      enrollment,
+      policy: this.capabilityPolicy(),
+    });
+    if (!changed) return { actorId, changed: false };
     this.recordEvent({
       kind: "experiment_enrolled",
       actorId,
@@ -3662,15 +3766,20 @@ export class ActorMesh {
    * without requiring manual SQL. The event's `detail` is then the stored
    * name, which no consumer checks against the registry.
    */
-  unenrollActorFromExperiment(
+  async unenrollActorFromExperiment(
     actorId: string,
     experiment: string,
     unenrolledBy: string
-  ): ExperimentEnrollmentChange {
+  ): Promise<ExperimentEnrollmentChange> {
     actorId = this.resolveThreadId(actorId);
     unenrolledBy = this.resolveThreadId(unenrolledBy);
-    this.assertExperimentAuthority(unenrolledBy, actorId, "unenroll");
-    if (!this.experiments.unenroll(actorId, experiment)) return { actorId, changed: false };
+    const changed = await this.requireWriter().write("experiments.unenroll", {
+      actorId,
+      experiment,
+      unenrolledBy,
+      policy: this.capabilityPolicy(),
+    });
+    if (!changed) return { actorId, changed: false };
     this.recordEvent({
       kind: "experiment_unenrolled",
       actorId,
@@ -3709,38 +3818,6 @@ export class ActorMesh {
     if (!actorId) return enrollments;
     const targetId = this.resolveThreadId(actorId);
     return enrollments.filter((enrollment) => enrollment.actorId === targetId);
-  }
-
-  /**
-   * Authority for experiment administration (#394, #549): an `experiment-admin`
-   * holder, over its own subtree (itself included), and only for an actor that
-   * exists. Fail-closed — an unknown caller holds nothing — and enforced HERE
-   * rather than only at the tool layer, so the boundary holds for any future
-   * caller. Returns the target's record, which both callers need next.
-   */
-  private assertExperimentAuthority(
-    callerId: string,
-    actorId: string,
-    verb: "enroll" | "unenroll"
-  ): ActorRecord {
-    const preposition = verb === "enroll" ? "in" : "from";
-    if (!this.hasActiveCapability(callerId, EXPERIMENT_ADMIN_CAPABILITY)) {
-      throw new Error(
-        `only an ${EXPERIMENT_ADMIN_CAPABILITY} holder may ${verb} an actor ${preposition} an experiment`
-      );
-    }
-    const record = this.actors.get(actorId);
-    if (!record) {
-      throw new Error(`unknown thread id: ${actorId}`);
-    }
-    // Holding the capability is not reach: another top-level tree is a legal
-    // shape this holder must not administer. `isAncestorOf` admits the holder itself.
-    if (!this.isAncestorOf(callerId, actorId)) {
-      throw new Error(
-        `${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
-      );
-    }
-    return record;
   }
 
   /** Every grant, active and revoked — for the `list_grants` tool + audit. */
@@ -5772,16 +5849,11 @@ export class ActorMesh {
 
   /** True if `ancestorId` is `id` itself or any ancestor up the ownership tree. */
   isAncestorOf(ancestorId: string, id: string): boolean {
-    ancestorId = this.resolveThreadId(ancestorId);
-    id = this.resolveThreadId(id);
-    let cursor: string | null = id;
-    const seen = new Set<string>();
-    while (cursor && !seen.has(cursor)) {
-      if (cursor === ancestorId) return true;
-      seen.add(cursor);
-      cursor = this.actors.parentOf(cursor) ?? null;
-    }
-    return false;
+    return isAncestorIn(
+      { actor: (actorId) => ({ parentId: this.actors.parentOf(actorId) }) },
+      this.resolveThreadId(ancestorId),
+      this.resolveThreadId(id)
+    );
   }
 
   /**
@@ -5793,6 +5865,8 @@ export class ActorMesh {
     this.unsubscribeInboxAppends = undefined;
     this.unsubscribeInboxHandled?.();
     this.unsubscribeInboxHandled = undefined;
+    this.unsubscribeGrantMutations?.();
+    this.unsubscribeGrantMutations = undefined;
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
     this.activeSuppressions.clear();

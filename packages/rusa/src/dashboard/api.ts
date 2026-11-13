@@ -19,6 +19,7 @@ import {
   uploadAvatar,
 } from "../avatar/avatars.js";
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
+import { committedWriteReport, MeshWriteCommittedError } from "../db/mesh-writer.js";
 import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
 import { DbReadUnavailableError } from "../db/read-pool.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
@@ -621,6 +622,17 @@ function compress(encoding: Encoding, payload: Buffer, onCodecDone: () => void):
       done
     );
   });
+}
+
+/**
+ * A write that committed but failed to deliver an effect (#1289) answers 500
+ * with what committed, never a 400 that reads as "nothing happened". Returns
+ * whether it answered.
+ */
+function sendCommittedWrite(res: ServerResponse, err: unknown): boolean {
+  if (!(err instanceof MeshWriteCommittedError)) return false;
+  sendJson(res, 500, committedWriteReport(err));
+  return true;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -1359,7 +1371,7 @@ async function routeMeshApiRequest(
       }
       const actorId = decodeURIComponent(obligationsAdminMatch[1]);
       readBody(req)
-        .then((bodyStr) => {
+        .then(async (bodyStr) => {
           let parsed: unknown;
           try {
             parsed = JSON.parse(bodyStr);
@@ -1379,7 +1391,7 @@ async function routeMeshApiRequest(
           const principal = requireOperatorPrincipal(req, res, deps);
           if (!principal) return;
           try {
-            const binding = operatorActors.setObligationsAdmin(
+            const binding = await operatorActors.setObligationsAdmin(
               actorId,
               (parsed as Record<string, boolean>).enabled,
               principal
@@ -1686,6 +1698,7 @@ async function routeMeshApiRequest(
               alreadyHandled: result.alreadyHandled,
             });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             const message = err instanceof Error ? err.message : String(err);
             sendJson(res, message === "inbox entry not found" ? 404 : 400, { error: message });
           }
@@ -1871,6 +1884,9 @@ async function routeMeshApiRequest(
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
+            // The obligation's id is generated in the write, so a create that
+            // committed answers it rather than inviting a duplicate (#1289).
+            if (sendCommittedWrite(res, err)) return;
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -1932,6 +1948,7 @@ async function routeMeshApiRequest(
             });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -2003,6 +2020,7 @@ async function routeMeshApiRequest(
                 : {}),
             });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             // No timer here could end the snooze (the standalone dashboard
             // attaches none): the service is unavailable, not the request bad.
             const status =
@@ -2069,6 +2087,7 @@ async function routeMeshApiRequest(
             });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -2124,6 +2143,7 @@ async function routeMeshApiRequest(
             });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -2173,6 +2193,7 @@ async function routeMeshApiRequest(
             });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
         })
@@ -2234,6 +2255,7 @@ async function routeMeshApiRequest(
             });
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
+            if (sendCommittedWrite(res, err)) return;
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
         })

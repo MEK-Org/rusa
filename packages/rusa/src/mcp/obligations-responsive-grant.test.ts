@@ -13,6 +13,8 @@ import {
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
+import { memoryGrantWriter } from "../db/fixtures/memory-grant-writer.js";
 import { obligationStore } from "../db/fixtures/obligation-store.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -55,6 +57,11 @@ function setup() {
     actors,
     rootId: "configured",
     capabilityGrants: grants,
+    writer: memoryGrantWriter({
+      actors,
+      grants,
+      experiments: new InMemoryExperimentEnrollmentStore(),
+    }),
     grantableCapabilities: new Set([
       "understanding-write",
       OBLIGATION_RESPONSIVE_CAPABILITY,
@@ -105,17 +112,17 @@ describe("grantable responsive-obligation authority (#1026)", () => {
     expect(mesh.hasActiveCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY)).toBe(false);
 
     // A parent without capability-admin cannot hand it to its own child…
-    expect(() =>
+    await expect(
       mesh.grantCapability("steward-child", OBLIGATION_RESPONSIVE_CAPABILITY, "steward")
-    ).toThrow(/capability-admin/);
+    ).rejects.toThrow(/capability-admin/);
 
-    mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
+    await mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
     expect(mesh.hasActiveCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY)).toBe(true);
 
     // …and holding it confers no grant authority or other administration.
-    expect(() =>
+    await expect(
       mesh.grantCapability("steward-child", OBLIGATION_RESPONSIVE_CAPABILITY, "steward")
-    ).toThrow(/capability-admin/);
+    ).rejects.toThrow(/capability-admin/);
     expect(mesh.hasActiveCapability("steward", CAPABILITY_ADMIN_CAPABILITY)).toBe(false);
     expect(mesh.hasActiveCapability("steward", ACTOR_ADMIN_CAPABILITY)).toBe(false);
     expect(mesh.activeCapabilitiesFor("steward")).toEqual([OBLIGATION_RESPONSIVE_CAPABILITY]);
@@ -151,7 +158,7 @@ describe("grantable responsive-obligation authority (#1026)", () => {
     ).toContain(OBLIGATION_RESPONSIVE_CAPABILITY);
     expect(db.serialize().equals(beforeGrant)).toBe(true);
 
-    mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
+    await mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
 
     const created = await call(steward, "create_obligation", {
       owner_id: "steward",
@@ -199,7 +206,7 @@ describe("grantable responsive-obligation authority (#1026)", () => {
 
   it("keeps ordinary ownership boundaries for a granted actor", async () => {
     const { db, mesh, repository, workerServer } = setup();
-    mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
+    await mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
     const descendants = repository.create({ ownerId: "steward-child", title: "descendant's" });
     const siblings = repository.create({ ownerId: "sibling", title: "sibling's" });
     const ownBranch = repository.create({ ownerId: "steward", title: "own", responsive: true });
@@ -249,7 +256,7 @@ describe("grantable responsive-obligation authority (#1026)", () => {
 
   it("leaves ungranted actors with the existing restriction and inherited responsiveness", async () => {
     const { db, mesh, repository, workerServer } = setup();
-    mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
+    await mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
     const urgent = repository.create({
       ownerId: "steward-child",
       title: "urgent",

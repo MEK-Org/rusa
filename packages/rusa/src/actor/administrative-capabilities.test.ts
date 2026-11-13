@@ -6,6 +6,7 @@ import {
   CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES,
   CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
   defaultActorBootstrapCapabilities,
+  defaultActorCapabilityPolicy,
   defaultGrantRecipient,
   EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
@@ -100,7 +101,10 @@ describe("in-memory default actor authority", () => {
     const store = new InMemoryCapabilityGrantStore();
     const grant = vi.spyOn(store, "grant");
     const revoke = vi.spyOn(store, "revoke");
-    const effective = withDefaultActorCapabilities(store, () => "default", ["capability-admin"]);
+    const effective = withDefaultActorCapabilities(
+      store,
+      defaultActorCapabilityPolicy(() => "default", ["capability-admin"])
+    );
     expect(effective.activeFor("default")).toEqual(["capability-admin"]);
     expect(effective.activeFor("other")).toEqual([]);
     expect(effective.list()).toEqual([]);
@@ -111,7 +115,10 @@ describe("in-memory default actor authority", () => {
   it("ignores legacy default rows while preserving independent explicit grants and revocations", () => {
     const store = new InMemoryCapabilityGrantStore();
     seedConfiguredActorGrants(store, "former-default");
-    const effective = withDefaultActorCapabilities(store, () => "default", ["capability-admin"]);
+    const effective = withDefaultActorCapabilities(
+      store,
+      defaultActorCapabilityPolicy(() => "default", ["capability-admin"])
+    );
     expect(effective.activeFor("former-default")).toEqual([]);
     effective.grant({
       actorId: "former-default",
@@ -142,15 +149,17 @@ describe("in-memory default actor authority", () => {
     const boot = (id: string, space: string) =>
       withDefaultActorCapabilities(
         store,
-        () => id,
-        defaultActorBootstrapCapabilities({
-          chat: {
-            projectId: "test",
-            subscription: "test",
-            pubsubKeyPath: "/dev/null",
-            gchat: [space],
-          },
-        })
+        defaultActorCapabilityPolicy(
+          () => id,
+          defaultActorBootstrapCapabilities({
+            chat: {
+              projectId: "test",
+              subscription: "test",
+              pubsubKeyPath: "/dev/null",
+              gchat: [space],
+            },
+          })
+        )
       );
     expect(boot("oldest", "spaces/A").activeFor("oldest")).toContain("chat-write:spaces/A");
     const restarted = boot("replacement", "spaces/B");
