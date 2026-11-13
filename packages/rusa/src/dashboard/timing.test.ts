@@ -854,6 +854,47 @@ describe("dashboard timing recorder", () => {
     expect(summary.serverPhases[0]).not.toHaveProperty("tail");
   });
 
+  it("summarizes a read's queue wait, execution and round trip, in the tail too (#1323)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const server = (durationMs: number, substages?: DashboardServerSubstages) =>
+      recorder.recordServer({
+        label: "mesh_obligation_detail",
+        durationMs,
+        status: 200,
+        bytes: 1,
+        phases: { route: durationMs - 2 },
+        ...(substages ? { substages } : {}),
+        request: { method: "GET", terminal: "finished" },
+      });
+    // Queued behind a long read: most of the request is the wait.
+    server(420, { readQueueMs: 380, readExecMs: 25, readTransferMs: 3 });
+    server(30, { readQueueMs: 0, readExecMs: 22, readTransferMs: 2 });
+    // In-process: execution only.
+    server(20, { readExecMs: 15 });
+    while (timingRows().length < 3) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    // Rows carrying the new keys parse; none is dropped as unreadable.
+    expect(summary.window.unreadableSubstages).toBe(0);
+    const [get] = summary.serverPopulations;
+    const cohort = (numerator: number, denominator: number) =>
+      expect.objectContaining({ numerator, denominator });
+    expect(get.finishedSuccess).toMatchObject({
+      substages: {
+        readQueueMs: { maxMs: 380, coverage: cohort(2, 3) },
+        readExecMs: { maxMs: 25, coverage: cohort(3, 3) },
+        readTransferMs: { maxMs: 3, coverage: cohort(2, 3) },
+      },
+      tail: {
+        count: 1,
+        substages: {
+          readQueueMs: { p50Ms: 380, coverage: cohort(1, 1) },
+          readExecMs: { p50Ms: 25, coverage: cohort(1, 1) },
+        },
+      },
+    });
+  });
+
   it("drops only malformed substages and keeps the row in every population (#990)", () => {
     const recorder = new DashboardTimingRecorder(events);
     const row = (substages: unknown, extra: Record<string, unknown> = {}) => ({

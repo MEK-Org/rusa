@@ -38,16 +38,20 @@ export function serveReads(
   port.on("message", (request: WorkerRequest) => {
     const operation = Object.hasOwn(operations, request.op) ? operations[request.op] : undefined;
     let message: WorkerMessage;
+    // The read's own time on this thread, so the pool can tell it apart from
+    // queueing and from the trip across the thread boundary (#1323).
+    const started = performance.now();
     try {
       if (!operation) throw new Error(`unknown read operation: ${request.op}`);
       const value = db.transaction(() => operation(repos, request.input as never))();
-      message = { type: "result", id: request.id, value };
+      message = { type: "result", id: request.id, value, executionMs: performance.now() - started };
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       message = {
         type: "error",
         id: request.id,
         error: { name: error.name, message: error.message },
+        executionMs: performance.now() - started,
       };
     }
     port.postMessage(message);

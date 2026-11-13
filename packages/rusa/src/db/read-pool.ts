@@ -1,7 +1,13 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../observability/logger.js";
-import type { DbReads, ReadInput, ReadOperationName, ReadOutput } from "./read-operations.js";
+import type {
+  DbReads,
+  ReadInput,
+  ReadOperationName,
+  ReadOutput,
+  ReadTiming,
+} from "./read-operations.js";
 import { DbWorkerPool, type WorkerPoolErrors } from "./worker-pool.js";
 
 /**
@@ -93,22 +99,30 @@ export class DbReadPool implements DbReads {
    * database the readers cannot open fails startup rather than the first read.
    */
   static async open(options: DbReadPoolOptions): Promise<DbReadPool> {
-    return new DbReadPool(
-      await DbWorkerPool.open({
-        dbPath: options.dbPath,
-        size: options.size ?? DEFAULT_SIZE,
-        maxQueued: options.maxQueued ?? DEFAULT_MAX_QUEUED,
-        worker: options.worker,
-        errors: READ_POOL_ERRORS,
-        logger: options.logger,
-      })
-    );
+    const size = options.size ?? DEFAULT_SIZE;
+    const maxQueued = options.maxQueued ?? DEFAULT_MAX_QUEUED;
+    const pool = await DbWorkerPool.open({
+      dbPath: options.dbPath,
+      size,
+      maxQueued,
+      worker: options.worker,
+      errors: READ_POOL_ERRORS,
+      logger: options.logger,
+    });
+    // The counterpart of `db_read_pool_unavailable` (#1323): a run that logs
+    // neither line did not try to serve reads off the main thread.
+    options.logger?.info("db_read_pool_ready", { size, maxQueued });
+    return new DbReadPool(pool);
   }
 
   private constructor(private readonly pool: DbWorkerPool) {}
 
-  read<K extends ReadOperationName>(op: K, input: ReadInput<K>): Promise<ReadOutput<K>> {
-    return this.pool.request(op, input) as Promise<ReadOutput<K>>;
+  read<K extends ReadOperationName>(
+    op: K,
+    input: ReadInput<K>,
+    onTiming?: (timing: ReadTiming) => void
+  ): Promise<ReadOutput<K>> {
+    return this.pool.request(op, input, onTiming) as Promise<ReadOutput<K>>;
   }
 
   /**

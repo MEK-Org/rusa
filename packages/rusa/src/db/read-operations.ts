@@ -1,6 +1,7 @@
 import type { Obligation } from "../obligations/obligation.js";
 import type { InboxListOptions, InboxRepository } from "../repositories/inbox-repository.js";
 import type { ObligationRepository } from "./repositories/obligation-repository.js";
+import type { WorkerRequestTiming } from "./worker-pool.js";
 
 /**
  * The repositories a standalone read may use. Every member is a plain SQL read
@@ -11,6 +12,7 @@ export interface ReadRepositories {
   readonly obligations: Pick<
     ObligationRepository,
     | "get"
+    | "getAncestry"
     | "listPage"
     | "getForest"
     | "getTree"
@@ -110,14 +112,16 @@ export const READ_OPERATIONS = {
       limit: input.limit,
       offset: input.blocksOffset,
     });
-    const parent = obligation.parentId ? obligations.get(obligation.parentId) : null;
+    // The whole chain in one read rather than one read per level (#1323).
+    const ancestry = obligations.getAncestry([input.id]);
+    const parent = obligation.parentId ? (ancestry.get(obligation.parentId) ?? null) : null;
     const ancestors: Obligation[] = [];
     const seen = new Set([input.id]);
     let ancestor = parent;
     while (ancestor && !seen.has(ancestor.id)) {
       seen.add(ancestor.id);
       ancestors.unshift(ancestor);
-      ancestor = ancestor.parentId ? obligations.get(ancestor.parentId) : null;
+      ancestor = ancestor.parentId ? (ancestry.get(ancestor.parentId) ?? null) : null;
     }
     const history = obligations.listHistoryPage(input.id, {
       before: input.historyBefore,
@@ -151,9 +155,28 @@ export type ReadOperationName = keyof ReadOperations;
 export type ReadInput<K extends ReadOperationName> = Parameters<ReadOperations[K]>[1];
 export type ReadOutput<K extends ReadOperationName> = ReturnType<ReadOperations[K]>;
 
+/**
+ * Where one standalone read's time went (#1323), in milliseconds. A read pool
+ * reports all three; an in-process read has no queue or crossing, so it reports
+ * only `executionMs`. See {@link WorkerRequestTiming} for each field.
+ */
+export interface ReadTiming {
+  readonly queuedMs?: number;
+  readonly executionMs?: number;
+  readonly transferMs?: number;
+}
+
 /** Asynchronous access to the named standalone reads. */
 export interface DbReads {
-  read<K extends ReadOperationName>(op: K, input: ReadInput<K>): Promise<ReadOutput<K>>;
+  /**
+   * `onTiming`, when given, hears where an answered read's time went just
+   * before the promise settles. A read refused before it ran reports nothing.
+   */
+  read<K extends ReadOperationName>(
+    op: K,
+    input: ReadInput<K>,
+    onTiming?: (timing: ReadTiming) => void
+  ): Promise<ReadOutput<K>>;
 }
 
 /**
@@ -163,30 +186,36 @@ export interface DbReads {
  */
 export function inProcessReads(repos: ReadRepositories): DbReads {
   return {
-    read: async (op, input) =>
-      (READ_OPERATIONS[op] as (r: ReadRepositories, i: typeof input) => ReadOutput<typeof op>)(
-        repos,
-        input
-      ),
+    read: async (op, input, onTiming) => {
+      const started = performance.now();
+      try {
+        return (
+          READ_OPERATIONS[op] as (r: ReadRepositories, i: typeof input) => ReadOutput<typeof op>
+        )(repos, input);
+      } finally {
+        onTiming?.({ executionMs: performance.now() - started });
+      }
+    },
   };
 }
 
 /**
  * The ancestors of a page's rows, each once and none that is itself a row.
- * Every ancestor is read at most once, so the reads stay within the page's
- * distinct ancestry however many rows share it, and a cycle ends the walk.
+ * The page's whole distinct ancestry is one read (#1323), however many rows
+ * share it, and a cycle ends the walk.
  */
 function pageAncestors(
-  obligations: Pick<ObligationRepository, "get">,
+  obligations: Pick<ObligationRepository, "getAncestry">,
   rows: readonly Obligation[]
 ): Obligation[] {
+  const ancestry = obligations.getAncestry(rows.map((row) => row.id));
   const seen = new Set(rows.map((row) => row.id));
   const ancestors: Obligation[] = [];
   for (const row of rows) {
     let parentId = row.parentId;
     while (parentId && !seen.has(parentId)) {
       seen.add(parentId);
-      const parent = obligations.get(parentId);
+      const parent = ancestry.get(parentId);
       if (!parent) break;
       ancestors.push(parent);
       parentId = parent.parentId;
