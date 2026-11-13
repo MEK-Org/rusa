@@ -871,13 +871,15 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     ]);
   });
 
-  it("permits an authorized selected-thread reply in a threaded direct message", async () => {
-    const directMessage = { ...THREADED, spaceType: "DIRECT_MESSAGE" };
-    const { chat, call } = await mount(
-      [T1],
-      [chatEntry("spaces/A/messages/R1", T1)],
-      directMessage
-    );
+  it.each([
+    "DIRECT_MESSAGE",
+    "GROUP_CHAT",
+    "SPACE",
+  ])("permits an authorized selected-thread reply in a threaded %s", async (spaceType) => {
+    const { chat, call } = await mount([T1], [chatEntry("spaces/A/messages/R1", T1)], {
+      ...THREADED,
+      spaceType,
+    });
 
     expect((await call("send_message", send({}))).isError).toBe(false);
     expect(chat.sent).toEqual([
@@ -889,24 +891,20 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     ]);
   });
 
-  it("fails closed outside a supported threaded space, before any upload", async () => {
+  it("does not let space metadata bypass thread-only routing or pre-upload authorization", async () => {
     for (const space of [
       { ...THREADED, spaceType: "GROUP_CHAT" },
       { ...THREADED, spaceThreadingState: "UNTHREADED_MESSAGES" },
-      { ...THREADED, spaceThreadingState: "GROUPED_MESSAGES" },
       { name: "spaces/A" },
-      null, // the space cannot be read
+      null,
     ]) {
-      const { chat, call } = await mount([T1], [], space);
-      const result = await call("send_message", send({ threadName: T1, ...inlineAttachment }));
+      const { chat, call } = await mount([T1], [chatEntry("spaces/A/messages/R2", T2)], space);
+      const result = await call("send_message", send(inlineAttachment));
       expect(result.isError, JSON.stringify(space)).toBe(true);
-      expect(result.text).toMatch(/access denied: (thread-scoped writes need|cannot confirm)/);
+      expect(result.text).toMatch(/T2 is not in allowed threads/);
       expect(chat.sent).toEqual([]);
       expect(chat.uploadedAttachments).toEqual([]);
     }
-    // A whole-space writer's placement never depended on the space's shape.
-    const whole = await mount(["spaces/A"], [], null);
-    expect((await whole.call("send_message", send({ threadName: T1 }))).isError).toBe(false);
   });
 
   it("scopes reactions to messages in the writer's thread", async () => {
