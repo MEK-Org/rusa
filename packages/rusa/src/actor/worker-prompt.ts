@@ -145,7 +145,8 @@ const INBOX_DISCIPLINE_TAIL = `Act on each selected entry, then mark it handled 
 saying what you did. Handled means the notification was dealt with, not that the
 underlying issue or PR is finished; an inbox entry is not a timer for slow work.
 When CI, a build, a review, or another slow dependency still needs checking,
-checkpoint and snooze only a ready obligation you own. For waiting work (such as
+follow your charter’s tracking practice. By default, checkpoint and snooze only
+a ready obligation you own. For waiting work (such as
 an obligation waiting on child reviews or external work), or work unbacked by an
 obligation, schedule a follow-up wake with a future \`deliver_at\` message to
 yourself (replies from actors you messaged still wake you on their own). For a PR
@@ -345,6 +346,28 @@ When you interact with any system outside this mesh — a website, an API, someo
 
 These norms bind even when they cost you the goal you were given. A worse outcome honestly reported beats a better outcome achieved through access you were never meant to have.`;
 
+/** Reporting defaults shared by root, parented and top-level actors (#1315). */
+export const REPORTING_GUIDANCE = `## Recording and communicating work
+Make the information needed to understand and carry forward your work available
+to the appropriate actors. Favor useful outcomes, evidence, decisions, and
+unresolved needs over a transcript of your activity. Choose communication that
+serves its audience: a record makes information available for later use; a
+notification asks someone to attend to it.
+
+Your charter determines what to record or report, where, to whom, and when. It
+may prescribe a different approach, including no persistent record of your runs.
+The reporting and recordkeeping practices below are defaults where your charter
+leaves these choices open.
+
+By default, keep a concise result and supporting evidence with the work, and
+notify the responsible actor when a blocker, material change, decision, or
+completed assignment needs their attention. An adequate record need not also
+become a message. For example, a routine successful check might need only an
+updated work record; a blocked task might need a message to the actor who can
+unblock it; a charter might call for a direct reply with no saved run report.
+These choices govern actor-authored records and messages; automatic system
+result and failure delivery stays unchanged.`;
+
 /**
  * The forward-progress contract that makes a worker carry a multi-step
  * deliverable to completion instead of stalling after one step.
@@ -353,12 +376,12 @@ These norms bind even when they cost you the goal you were given. A worse outcom
  */
 export const FORWARD_PROGRESS_DISCIPLINE = `## Forward progress and reporting
 Push your charter forward end to end within the current run whenever feasible
-(e.g. commit → push → open the PR → report to your parent); don't stop after one
+(e.g. commit → push → open the PR); don't stop after one
 step expecting another automatic work run. Your run settles when you finish your
 turn and return from the provider CLI.
-Keep your parent thread apprised at meaningful milestones, decisions, blockers,
-or proposed completion using \`send_message\`. Mark selected inbox items handled
-as you address them. Failed runs still mechanically notify the parent.`;
+Follow your charter and the reporting defaults above when communicating progress.
+Mark selected inbox items handled as you address them. Failed runs still
+mechanically notify the parent.`;
 
 export interface WorkerPromptContext {
   /** This worker's own thread id. */
@@ -415,18 +438,18 @@ How you operate:
   fromId and sessionId for mesh chat, or external channels
   according to inbox hints). Answering direct questions or status inquiries from
   a human does not need to be reported to your parent.
-- **Report charter progress to your parent.** Keep your parent thread
-  (\`${ctx.parentId}\`) updated on non-trivial milestones, changes in scope,
-  blockers, and proposed completion. Your parent owns your lifecycle and charter
-  scope.
+- **Follow your charter’s reporting choices.** By default, notify your parent
+  (\`${ctx.parentId}\`) of milestones, scope changes, blockers, and proposed
+  completion that need their attention. Your parent owns your lifecycle and
+  charter scope.
 - You may also message the actors in your directory for what their description
   implies (e.g. ask a code-reviewer thread for a review).
 - Do the work your charter describes (real git/gh in the repos you've been
-  granted), then report what you did.
+  granted), and communicate results according to your charter and the defaults below.
 - **You don't decide your own completion** — your parent retires you. When you
-  believe the charter is satisfied, send a message to your parent (\`send_message\`)
-  proposing completion with a concise summary note: that puts you idle until your
-  parent acts.
+  believe the charter is satisfied, make completion available to your parent as
+  your charter directs; by default, send a concise completion proposal using
+  \`send_message\`. Then finish the run; your parent decides retirement.
 - You may spawn your own sub-workers for parallel/sub-tasks using the same
   primitive, and they report to you.`;
 }
@@ -451,13 +474,14 @@ How you operate:
   in the message or inbox item, so reply to them (send_message to the incoming
   fromId and sessionId for mesh chat, or external channels
   according to inbox hints).
-- **Report charter progress to whoever directs you.** With no parent thread, a
-  milestone, blocker or proposed completion goes back to the sender of the work.
+- **Follow your charter’s reporting choices.** By default, notify whoever
+  directs you of milestones, blockers, or proposed completion needing attention.
   Failed runs reach the operator's error chat mechanically.
 - Do the work your charter describes (real git/gh in the repos you've been
-  granted), then report what you did.
+  granted), and communicate results according to your charter and the defaults below.
 - **You don't decide your own completion.** When you believe the charter is
-  satisfied, say so to whoever directs you; the operator retires you.
+  satisfied, communicate completion as your charter directs; by default, notify
+  whoever directs you. The operator retires you.
 - You may spawn your own sub-workers for parallel/sub-tasks using the same
   primitive, and they report to you.`;
 }
@@ -505,6 +529,8 @@ several PRs.${mountNotice}`;
   return `${trackerWritingGuidance(generateHandle(ctx.threadId))}
 
 ${buildWorkerScaffold(ctx)}
+
+${REPORTING_GUIDANCE}
 
 ${FORWARD_PROGRESS_DISCIPLINE}
 

@@ -554,24 +554,6 @@ export function createChatWriteMcpServer(
     [...allowedThreads].some((thread) => gchatThreadSpace(thread) === spaceName);
   const denySpace = (spaceName: string) =>
     new Error(`access denied: space ${spaceName} is not in allowed spaces`);
-  /**
-   * Fail closed for a thread-only writer outside a named, threaded space.
-   * Google supports reply placement (`messageReplyOption`) only in named
-   * spaces, so in a DM, group chat or unthreaded space nothing guarantees a
-   * reply lands in its thread rather than top-level (#1311).
-   */
-  const assertThreadedNamedSpace = async (spaceName: string) => {
-    const space = await chatClient.getSpace(spaceName).catch((error: unknown) => {
-      throw new Error(
-        `access denied: cannot confirm ${spaceName} is a threaded named space: ${error instanceof Error ? error.message : String(error)}`
-      );
-    });
-    if (space.spaceType !== "SPACE" || space.spaceThreadingState !== "THREADED_MESSAGES") {
-      throw new Error(
-        `access denied: thread-scoped writes need a threaded named space; ${spaceName} reports spaceType ${space.spaceType ?? "unknown"}, spaceThreadingState ${space.spaceThreadingState ?? "unknown"}`
-      );
-    }
-  };
 
   const actorHandle = options.actorHandle ?? generateHandle(actorId);
   const signedText = (text: string) =>
@@ -680,7 +662,6 @@ export function createChatWriteMcpServer(
               : `access denied: this writer may only reply within its allowed threads of ${spaceName}, not post top-level; pass threadName (or createThread: true under a selected message heading an allowed thread)`
           );
         }
-        if (!wholeSpace) await assertThreadedNamedSpace(spaceName);
         const normalizedAttachments: ChatSendMessageAttachment[] = [];
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {

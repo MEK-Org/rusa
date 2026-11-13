@@ -45,14 +45,12 @@ message would actually land in, after selected-inbox reply routing (#611),
 not the arguments as written:
 
 - `send_message` succeeds only when the effective thread is one of the
-  writer's threads, and only in a named, threaded space: Google supports
-  reply placement only in named spaces. Before sending, or uploading any
-  inline attachment, the tool reads the space and refuses unless it reports
-  `spaceType: SPACE` and `spaceThreadingState: THREADED_MESSAGES`. A direct
-  message, a group chat, an unthreaded space, or a space that cannot be read
-  is refused. A send with no thread, which would post top-level, is
-  refused. A selected top-level message routes replies top-level, so use
-  `createThread: true` to reply under it when it heads the granted thread.
+  writer's threads. That permission alone governs placement, the same in a
+  named space, a group chat or a direct message; the tool does not read
+  space metadata. The check runs before any inline attachment uploads. A
+  send with no thread, which would post top-level, is refused. A selected
+  top-level message routes replies top-level, so use `createThread: true`
+  to reply under it when it heads the granted thread.
   The send asks Google to reply or fail (`REPLY_MESSAGE_OR_FAIL`), so it
   never falls back to opening a new thread.
 - `react` succeeds only on a message whose `thread.name` is one of the
