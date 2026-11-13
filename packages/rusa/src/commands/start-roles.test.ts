@@ -1786,6 +1786,7 @@ describe("follower model catalog lifecycle (#878)", () => {
       instance: { id: "follower-node-catalog" },
     });
 
+    const priorSignalListeners = new Set(process.listeners("SIGTERM"));
     const started = runStart({
       e2e: {
         connectPeer: !opts.viaPoll,
@@ -1850,10 +1851,21 @@ describe("follower model catalog lifecycle (#878)", () => {
       finishedRun,
       launchArgv,
       flagValue,
-      /** Idempotent, so a test can time it and still release in `finally`. */
+      /**
+       * Idempotent, so a test can time it and still release in `finally`.
+       * Before the handles arrive, startup still owns its scope, so this stops
+       * it through the follower's own signal handler (process.exit is mocked)
+       * and joins it.
+       */
       shutdown: () =>
         (closing ??= (async () => {
-          await handles?.shutdown();
+          if (handles) {
+            await handles.shutdown();
+          } else {
+            const own = process.listeners("SIGTERM").filter((l) => !priorSignalListeners.has(l));
+            await Promise.all(own.map(async (l) => l("SIGTERM")));
+            await started.catch(() => {});
+          }
           await leader.close();
         })()),
     };
