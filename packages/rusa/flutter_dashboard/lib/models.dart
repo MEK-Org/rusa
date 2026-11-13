@@ -93,6 +93,7 @@ class InboxEntryDto {
     this.handledAt,
     this.handledNote,
     this.payload = const {},
+    this.displaySource,
     this.reference,
     this.eventReference,
     this.obligationId,
@@ -106,6 +107,10 @@ class InboxEntryDto {
   final String? handledAt;
   final String? handledNote;
   final Map<String, dynamic> payload;
+
+  /// Presentation-only source label. The durable [source] remains the event's
+  /// routing resource, which can be a thread even for a top-level Chat message.
+  final String? displaySource;
   final ReferenceDto? reference;
 
   /// The comment or review the event is about, nested under [reference] (the
@@ -129,6 +134,7 @@ class InboxEntryDto {
       handledAt: j['handledAt'] as String?,
       handledNote: j['handledNote'] as String?,
       payload: (j['payload'] as Map<String, dynamic>?) ?? const {},
+      displaySource: j['displaySource'] as String?,
       reference: rawReference is Map<String, dynamic>
           ? ReferenceDto.fromJson(rawReference)
           : null,

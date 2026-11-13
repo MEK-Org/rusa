@@ -1,10 +1,8 @@
-// Screenshot harness for #1311: a Google Chat inbox entry's `source` names
-// the message's thread (`gchat:spaces/S/threads/T`) instead of its space
-// (`gchat:spaces/S`). No widget changed; the dashboard prints that string
-// verbatim only where nothing richer renders: the inbox row when the message
-// reference does not resolve, and a Recent Activity row with no reference.
-// Both captures come from this one run, from the same widgets fed each
-// source form. Run:
+// Screenshot harness for #1311: a Google Chat event routes at its thread
+// (`gchat:spaces/S/threads/T`), but the dashboard labels a top-level message
+// with its space (`gchat:spaces/S`). Replies retain their thread label. The
+// fallback inbox and Recent Activity widgets receive their real routing source
+// plus that presentation label. Both captures come from this one run. Run:
 //
 //   flutter test test/chat_thread_source_1311_screenshot_test.dart
 //
@@ -33,6 +31,9 @@ const _messages = [('M1', '$_space/threads/M1'), ('R2', '$_space/threads/T1')];
 String _source(String thread, bool after) =>
     after ? 'gchat:$thread' : 'gchat:$_space';
 
+String _displaySource(String message, String thread, bool after) =>
+    after && message == 'M1' ? 'gchat:$_space' : _source(thread, after);
+
 InboxEntryDto _entry(String message, String thread, bool after) =>
     InboxEntryDto(
       id: 'entry-$message',
@@ -45,6 +46,7 @@ InboxEntryDto _entry(String message, String thread, bool after) =>
         'messageName': '$_space/messages/$message',
         'threadName': thread,
       },
+      displaySource: _displaySource(message, thread, after),
       // The message itself could not be read, so no card renders.
       reference: const ReferenceDto(
         ref: 'gchat:$_space/messages/M',
@@ -67,7 +69,7 @@ FakeApi _api(bool after) => FakeApi()
         time: _at,
         actorId: 'worker',
         sourceKind: 'GCHAT',
-        sourceRef: _source(thread, after),
+        sourceRef: _displaySource(message, thread, after),
         summary: i == 0 ? 'A new top-level message' : 'A reply in a thread',
         handledTime: _at,
         addressedNote: 'Answered in the thread.',
@@ -118,7 +120,7 @@ void main() {
         );
         await _settle(tester);
         for (final entry in entries) {
-          expect(find.text(entry.source), findsWidgets);
+          expect(find.text(entry.displaySource ?? entry.source), findsWidgets);
         }
         await captureBoundary(key, '$_outDir/1311_inbox_row_$suffix.png');
       });
@@ -151,10 +153,12 @@ void main() {
         await _settle(tester);
         await tester.ensureVisible(find.text('Recent Activity'));
         await tester.pump(const Duration(milliseconds: 50));
-        expect(
-          find.textContaining(_source(_messages[1].$2, after)),
-          findsWidgets,
-        );
+        for (final (message, thread) in _messages) {
+          expect(
+            find.textContaining(_displaySource(message, thread, after)),
+            findsWidgets,
+          );
+        }
         await captureBoundary(key, '$_outDir/1311_recent_activity_$suffix.png');
       });
     });

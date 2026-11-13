@@ -319,6 +319,55 @@ describe("handleMeshApiRequest", () => {
   });
 
   describe("GET /api/mesh/recent-activity (#664)", () => {
+    it("labels a routed Chat thread head as its space while retaining a reply's thread (#1311)", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      const space = "spaces/AAAA";
+      const headThread = `${space}/threads/HEAD`;
+      const replyThread = `${space}/threads/THREAD`;
+      inbox.append([
+        {
+          id: "chat-head",
+          actorId: UUID_A,
+          source: `gchat:${headThread}`,
+          payload: {
+            type: "gchat.message",
+            messageName: `${space}/messages/HEAD`,
+            spaceName: space,
+            threadName: headThread,
+          },
+        },
+        {
+          id: "chat-reply",
+          actorId: UUID_A,
+          source: `gchat:${replyThread}`,
+          payload: {
+            type: "gchat.message",
+            messageName: `${space}/messages/REPLY`,
+            spaceName: space,
+            threadName: replyThread,
+          },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["chat-head", "chat-reply"],
+        new Date("2026-11-13T11:24:00.000Z"),
+        "Addressed"
+      );
+
+      const { res } = await call(deps, "GET", "/api/mesh/recent-activity?limit=10");
+      const byId = new Map(
+        (JSON.parse(res.body).items as Array<Record<string, unknown>>).map((item) => [
+          item.id,
+          item,
+        ])
+      );
+
+      // Routing stays thread-scoped; this is only the dashboard fallback label.
+      expect(byId.get("inbox_chat-head")).toMatchObject({ sourceRef: `gchat:${space}` });
+      expect(byId.get("inbox_chat-reply")).toMatchObject({ sourceRef: `gchat:${replyThread}` });
+    });
+
     it("uses only the display lookup for activity association and terminal folding (#990)", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
       obligations.create({ id: "direct", ownerId: UUID_A, title: "Direct history" });
@@ -3740,6 +3789,53 @@ describe("handleMeshApiRequest", () => {
       messageName: "spaces/AAAA123/messages/BBBB",
     });
     expect(entry.eventReference).toBeUndefined();
+  });
+
+  it("GET /api/mesh/inbox keeps top-level Chat routing at the thread but supplies a space label (#1311)", async () => {
+    const space = "spaces/AAAA123";
+    const headThread = `${space}/threads/HEAD`;
+    const replyThread = `${space}/threads/THREAD`;
+    inbox.append([
+      {
+        id: "gchat-thread-head",
+        actorId: UUID_A,
+        source: `gchat:${headThread}`,
+        payload: {
+          type: "gchat.message",
+          messageName: `${space}/messages/HEAD`,
+          spaceName: space,
+          threadName: headThread,
+        },
+      },
+      {
+        id: "gchat-thread-reply",
+        actorId: UUID_A,
+        source: `gchat:${replyThread}`,
+        payload: {
+          type: "gchat.message",
+          messageName: `${space}/messages/REPLY`,
+          spaceName: space,
+          threadName: replyThread,
+        },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const byId = new Map(
+      (JSON.parse(res.body).entries as Array<Record<string, unknown>>).map((entry) => [
+        entry.id,
+        entry,
+      ])
+    );
+
+    expect(byId.get("gchat-thread-head")).toMatchObject({
+      source: `gchat:${headThread}`,
+      displaySource: `gchat:${space}`,
+    });
+    expect(byId.get("gchat-thread-reply")).toMatchObject({
+      source: `gchat:${replyThread}`,
+    });
+    expect(byId.get("gchat-thread-reply")).not.toHaveProperty("displaySource");
   });
 
   it("GET /api/mesh/inbox leaves a malformed or cross-space Google Chat entry unresolved", async () => {
