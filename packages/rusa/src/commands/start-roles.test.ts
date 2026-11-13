@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -15,8 +23,10 @@ import {
 import { type InstanceIdentity, loadConfig } from "../config/index.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
+import { clearProviderModelCatalog, getProviderModelCatalog } from "../providers/model-catalog.js";
 import type { RunOptions } from "../providers/types.js";
-import type { FollowerCommand } from "../remote-instances/follower-hub.js";
+import type { FollowerActorCommand, FollowerCommand } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { createHarness, waitUntil } from "../remote-instances/harness.js";
 import {
@@ -340,8 +350,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const repos = getRepositories("follower");
     const untyped = repos as unknown as Record<string, unknown>;
 
-    // The follower gets its run capabilities only; global control is absent.
-    expect(Object.keys(repos).sort()).toEqual(["actorRuns", "runPrompts"]);
+    // The follower gets its host-local capabilities only; global control is absent.
+    expect(Object.keys(repos).sort()).toEqual(["actorRuns", "modelScrapes", "runPrompts"]);
     expect(untyped.obligations).toBeUndefined();
     expect(untyped.actors).toBeUndefined();
     expect(untyped.principals).toBeUndefined();
@@ -1632,6 +1642,425 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       } finally {
         await leader.close().catch(() => {});
       }
+    }
+  }, 20_000);
+});
+
+/**
+ * An `agy` stand-in on PATH. The follower launches the real Antigravity
+ * adapter, so the only synthetic part is the binary: `agy models` answers
+ * according to `models-mode`, and any other invocation records its argv.
+ * `slow` answers like `ok` after a second, as a cold `agy` start can.
+ */
+type SyntheticAgyModelsMode = "ok" | "slow" | "fail" | "hang";
+
+function installSyntheticAgy(dir: string, modelsMode: SyntheticAgyModelsMode): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "models-mode"), modelsMode);
+  const script = [
+    "#!/bin/sh",
+    'dir="$(dirname "$0")"',
+    'if [ "$1" = "models" ]; then',
+    '  echo models >> "$dir/models-calls"',
+    '  case "$(cat "$dir/models-mode")" in',
+    "    slow) sleep 1 ;;",
+    "  esac",
+    '  case "$(cat "$dir/models-mode")" in',
+    "    ok|slow) printf 'gemini-3.9-carbon-high\\tGemini 3.9 Carbon (High)\\ngemini-3.9-carbon-low\\tGemini 3.9 Carbon (Low)\\n' ;;",
+    '    fail) echo "synthetic agy models failure" >&2; exit 3 ;;',
+    '    hang) echo $$ > "$dir/models-pid"; exec sleep 60 ;;',
+    "  esac",
+    "  exit 0",
+    "fi",
+    'printf "%s\\n" "$@" > "$dir/launch-argv"',
+    `printf '{"event":"result","result":{"status":"SUCCESS","response":"synthetic agy done"}}\\n'`,
+    "",
+  ].join("\n");
+  writeFileSync(join(dir, "agy"), script);
+  chmodSync(join(dir, "agy"), 0o755);
+}
+
+describe("follower model catalog lifecycle (#878)", () => {
+  const originalPath = process.env.PATH;
+
+  afterEach(() => {
+    process.env.PATH = originalPath;
+    clearProviderModelCatalog();
+  });
+
+  /**
+   * Boot a follower through `runStart` against a synthetic leader that admits
+   * one explicit Antigravity selection, with the real provider factory.
+   *
+   * With `viaPoll`, the follower runs its daemon poll loop and the leader
+   * dispatches the actor in its first poll reply, the moment the follower is
+   * registered. Otherwise `runStart` registers before returning the handles.
+   * With `deferStart`, the caller awaits `started` itself and the handles may
+   * never arrive.
+   */
+  async function bootAgyFollower(opts: {
+    modelsMode: SyntheticAgyModelsMode;
+    selected: { model: string; effort?: string };
+    seed?: (home: string) => void;
+    viaPoll?: boolean;
+    deferStart?: boolean;
+  }) {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    const binDir = join(home, "synthetic-bin");
+    installSyntheticAgy(binDir, opts.modelsMode);
+    process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+    opts.seed?.(home);
+
+    const actorId = "actor-catalog-1";
+    const initCommand = (): FollowerActorCommand => ({
+      actorId,
+      message: {
+        type: "init",
+        bootstrap: {
+          id: actorId,
+          cwd: home,
+          modelConfig: [{ provider: "agy", ...opts.selected }],
+        },
+      },
+    });
+
+    const events: SyntheticEvent[] = [];
+    /** For each /register, whether this process already held an agy catalog. */
+    const registrations: { catalogInstalled: boolean }[] = [];
+    let dispatched = false;
+    let handles: { instance: FollowerInstance; shutdown: () => Promise<void> } | undefined;
+    const reply = (actorId: string, requestId: number, value?: unknown) =>
+      queueMicrotask(() =>
+        handles?.instance.dispatch({ actorId, message: { type: "reply", requestId, value } })
+      );
+    const leader = await startSyntheticLeader((path, body, res) => {
+      if (path === "/register") {
+        registrations.push({ catalogInstalled: getProviderModelCatalog("agy") !== undefined });
+        replyJson(res, {
+          session: "synth-sess-catalog",
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          leaderToken: "synth-leader-tok-catalog",
+        });
+        return;
+      }
+      if (path === "/events") {
+        for (const ev of (body.events as SyntheticEvent[] | undefined) ?? []) {
+          events.push(ev);
+          const requestId = ev.message?.requestId;
+          if (ev.message?.type !== "request" || requestId === undefined) continue;
+          const op = ev.message.request?.op;
+          if (op === "beforeRun") reply(ev.actorId, requestId, { allowed: true });
+          else if (op === "admit") {
+            reply(ev.actorId, requestId, {
+              record: {
+                id: ev.actorId,
+                charter: "Catalog test charter",
+                status: "active",
+                createdAt: new Date().toISOString(),
+              },
+              prompt: "Catalog test prompt",
+              selected: { provider: "agy", ...opts.selected },
+            });
+          } else reply(ev.actorId, requestId);
+        }
+        replyJson(res, { ok: true });
+        return;
+      }
+      if (path === "/poll") {
+        if (opts.viaPoll && !dispatched) {
+          dispatched = true;
+          replyJson(res, [initCommand(), { actorId, message: { type: "wake" } }]);
+        } else {
+          setTimeout(() => replyJson(res, []), 50);
+        }
+        return;
+      }
+      replyJson(res, { ok: true });
+    });
+
+    writeConfigFile(home, {
+      sandbox: "container-boundary",
+      providers: { agy: {} },
+      peers: [{ type: "leader", url: leader.url, token: "token-synthetic-catalog" }],
+      instance: { id: "follower-node-catalog" },
+    });
+
+    const priorSignalListeners = new Set(process.listeners("SIGTERM"));
+    const started = runStart({
+      e2e: {
+        connectPeer: !opts.viaPoll,
+        followerPolling: opts.viaPoll,
+        onFollowerReady: (ready) => {
+          handles = ready;
+        },
+      },
+    });
+    if (!opts.deferStart) {
+      await started;
+      if (!handles) throw new Error("follower handles not initialized");
+    }
+    const follower = () => {
+      if (!handles) throw new Error("follower handles not initialized");
+      return handles;
+    };
+
+    const init = () => follower().instance.dispatch(initCommand());
+
+    /** Wait for the actor's finished local run row. */
+    const finishedRun = async (): Promise<ActorRunRow> => {
+      let row: ActorRunRow | undefined;
+      await waitUntil(() => {
+        row = getDb()
+          .prepare("SELECT * FROM actor_runs WHERE actor_id = ? AND outcome != 'running'")
+          .get(actorId) as ActorRunRow | undefined;
+        return row !== undefined;
+      });
+      return row as ActorRunRow;
+    };
+
+    /** Init, wake once, and return the follower's local run row. */
+    const runOnce = async (): Promise<ActorRunRow> => {
+      init();
+      await waitUntil(() =>
+        events.some((e) => e.actorId === actorId && e.message?.type === "ready")
+      );
+      follower().instance.dispatch({ actorId, message: { type: "wake" } });
+      return finishedRun();
+    };
+
+    const launchArgv = (): string[] | undefined => {
+      const file = join(binDir, "launch-argv");
+      return existsSync(file) ? readFileSync(file, "utf8").split("\n") : undefined;
+    };
+    const flagValue = (argv: string[] | undefined, flag: string) => {
+      const index = argv?.indexOf(flag) ?? -1;
+      return index >= 0 ? argv?.[index + 1] : undefined;
+    };
+
+    let closing: Promise<void> | undefined;
+    return {
+      home,
+      binDir,
+      events,
+      registrations,
+      started,
+      ready: () => handles !== undefined,
+      init,
+      runOnce,
+      finishedRun,
+      launchArgv,
+      flagValue,
+      /**
+       * Idempotent, so a test can time it and still release in `finally`.
+       * Before the handles arrive, startup still owns its scope, so this stops
+       * it through the follower's own signal handler (process.exit is mocked)
+       * and joins it.
+       */
+      shutdown: () =>
+        (closing ??= (async () => {
+          if (handles) {
+            await handles.shutdown();
+          } else {
+            const own = process.listeners("SIGTERM").filter((l) => !priorSignalListeners.has(l));
+            await Promise.all(own.map(async (l) => l("SIGTERM")));
+            await started.catch(() => {});
+          }
+          await leader.close();
+        })()),
+    };
+  }
+
+  it("restores a persisted catalog when the startup probe fails", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "fail",
+      selected: { model: "gemini-3.9-carbon", effort: "low" },
+      seed: (home) => {
+        // A previous start on this host recorded a good scrape.
+        const store = new ModelScrapeRepository(initDb(home));
+        const id = store.recordRaw({
+          provider: "agy",
+          scrapedAt: "2026-11-01T00:00:00.000Z",
+          rawOutput: "gemini-3.9-carbon-low\tGemini 3.9 Carbon (Low)",
+        });
+        store.recordParsed(id, [
+          {
+            identifier: "gemini-3.9-carbon-low",
+            displayLabel: "Gemini 3.9 Carbon (Low)",
+            passable: true,
+          },
+        ]);
+        // An earlier leader run on this home recorded a Codex scrape. Nothing
+        // on a follower refreshes it, so restoring it would make Codex pin
+        // validation refuse models released since (review r4567828007).
+        const codexId = store.recordRaw({
+          provider: "codex",
+          scrapedAt: "2026-11-01T00:00:00.000Z",
+          rawOutput: "gpt-old",
+        });
+        store.recordParsed(codexId, [
+          { identifier: "gpt-old", displayLabel: "gpt-old", passable: true },
+        ]);
+        closeDb();
+      },
+    });
+    try {
+      // The probe ran and failed before registration; the restored catalog is
+      // what admits the run.
+      expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
+      // Only the catalog this follower probes is restored.
+      expect(getProviderModelCatalog("codex")).toBeUndefined();
+      const row = await f.runOnce();
+      expect(row.output ?? "").not.toContain("invalid model selection");
+      expect(f.flagValue(f.launchArgv(), "--model")).toBe("gemini-3.9-carbon");
+      expect(f.flagValue(f.launchArgv(), "--effort")).toBe("low");
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  it("refuses a model the probed catalog does not list, launching nothing", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "ok",
+      selected: { model: "gemini-9-unknown", effort: "high" },
+    });
+    try {
+      // runStart's own registration also waited for the startup probe.
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
+      // With a known catalog the shared pin check refuses while building the
+      // provider, and the leader is told which values the catalog accepts.
+      f.init();
+      await waitUntil(() => f.events.some((e) => e.message?.type === "fatal"));
+      const fatal = f.events.find((e) => e.message?.type === "fatal")?.message;
+      expect(fatal?.error).toContain('rejected "gemini-9-unknown"');
+      expect(fatal?.error).toContain('"gemini-3.9-carbon"');
+      expect(f.launchArgv()).toBeUndefined();
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  it("registers a cold, empty follower only after a slow startup probe, so a run dispatched on readiness reaches the CLI", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "slow",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      viaPoll: true,
+    });
+    try {
+      // The leader dispatches init and wake in its first poll reply.
+      const row = await f.finishedRun();
+      expect(row.output ?? "").not.toContain("invalid model selection");
+      expect(row).toMatchObject({ success: 1 });
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
+      expect(f.flagValue(f.launchArgv(), "--model")).toBe("gemini-3.9-carbon");
+      expect(f.flagValue(f.launchArgv(), "--effort")).toBe("high");
+      // The scrape is recorded locally, so the next start can restore it.
+      const latest = new ModelScrapeRepository(getDb()).getLatestParsedForProvider("agy");
+      expect(latest?.parsedModels?.map((m) => m.identifier)).toContain("gemini-3.9-carbon-high");
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  it("still registers after a failed startup probe on an empty store and refuses an explicit selection, launching nothing", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "fail",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      viaPoll: true,
+    });
+    try {
+      const row = await f.finishedRun();
+      // Availability is not tied to agy health: the probe ran, failed, and the
+      // follower registered anyway.
+      expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
+      expect(f.registrations).toEqual([{ catalogInstalled: false }]);
+      expect(row.success).toBe(0);
+      expect(row.output).toContain("agy catalog is empty or missing");
+      // No default model was substituted: the CLI never ran.
+      expect(f.launchArgv()).toBeUndefined();
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  /** The hanging synthetic probe's pid, once it has started, and a liveness check. */
+  async function hangingProbe(binDir: string) {
+    const pidFile = join(binDir, "models-pid");
+    await waitUntil(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "");
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    return {
+      alive: () => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    };
+  }
+
+  const countScrapes = (home: string) => {
+    const db = new Database(join(home, "data", "mesh.db"));
+    try {
+      return db.prepare("SELECT COUNT(*) AS n FROM model_scrapes").get();
+    } finally {
+      db.close();
+    }
+  };
+
+  it("stops an in-flight probe before the database closes on shutdown", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "hang",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      viaPoll: true,
+    });
+    try {
+      const probe = await hangingProbe(f.binDir);
+      expect(probe.alive()).toBe(true);
+      // Registration is still waiting on the probe.
+      expect(f.registrations).toEqual([]);
+      const shutdownStarted = Date.now();
+      await f.shutdown();
+      // Shutdown interrupts the wait rather than sitting out the probe timeout.
+      expect(Date.now() - shutdownStarted).toBeLessThan(5000);
+      expect(f.registrations).toEqual([]);
+      // Killed during shutdown; allow the runtime to reap it.
+      await waitUntil(() => !probe.alive(), 2000);
+      // An aborted probe is not a failed scrape: nothing was written behind the close.
+      expect(countScrapes(f.home)).toEqual({ n: 0 });
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  it("does not register when a signal stops the follower during its startup probe", async () => {
+    const priorListeners = new Set(process.listeners("SIGTERM"));
+    // Without polling, startup registers directly once the probe settles.
+    const f = await bootAgyFollower({
+      modelsMode: "hang",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      deferStart: true,
+    });
+    try {
+      const probe = await hangingProbe(f.binDir);
+      expect(f.registrations).toEqual([]);
+      // Invoke only the follower's signal handler, which closes the scope;
+      // process.exit is mocked here.
+      const onSignal = process.listeners("SIGTERM").filter((l) => !priorListeners.has(l));
+      expect(onSignal).toHaveLength(1);
+      onSignal[0]?.("SIGTERM");
+      await f.started;
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, 5000);
+      expect(process.exit).toHaveBeenCalledWith(0);
+      // The peer disposer ran before the probe was aborted; nothing registered after it.
+      expect(f.registrations).toEqual([]);
+      expect(f.ready()).toBe(false);
+      await waitUntil(() => !probe.alive(), 2000);
+      expect(countScrapes(f.home)).toEqual({ n: 0 });
+    } finally {
+      await f.shutdown();
     }
   }, 20_000);
 });
