@@ -1878,6 +1878,17 @@ describe("follower model catalog lifecycle (#878)", () => {
             passable: true,
           },
         ]);
+        // An earlier leader run on this home recorded a Codex scrape. Nothing
+        // on a follower refreshes it, so restoring it would make Codex pin
+        // validation refuse models released since (review r4567828007).
+        const codexId = store.recordRaw({
+          provider: "codex",
+          scrapedAt: "2026-11-01T00:00:00.000Z",
+          rawOutput: "gpt-old",
+        });
+        store.recordParsed(codexId, [
+          { identifier: "gpt-old", displayLabel: "gpt-old", passable: true },
+        ]);
         closeDb();
       },
     });
@@ -1886,6 +1897,8 @@ describe("follower model catalog lifecycle (#878)", () => {
       // what admits the run.
       expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
       expect(f.registrations).toEqual([{ catalogInstalled: true }]);
+      // Only the catalog this follower probes is restored.
+      expect(getProviderModelCatalog("codex")).toBeUndefined();
       const row = await f.runOnce();
       expect(row.output ?? "").not.toContain("invalid model selection");
       expect(f.flagValue(f.launchArgv(), "--model")).toBe("gemini-3.9-carbon");

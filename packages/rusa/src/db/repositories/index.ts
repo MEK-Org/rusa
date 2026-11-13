@@ -64,7 +64,6 @@ export interface FollowerRepositories {
     | "recordParseError"
     | "getLatestForProvider"
     | "getLatestParsedForProvider"
-    | "listLatestForEachProvider"
   >;
 }
 
@@ -89,7 +88,6 @@ export function createFollowerRepositories(db: Database.Database): FollowerRepos
       recordParseError: (id, error) => scrapes.recordParseError(id, error),
       getLatestForProvider: (provider) => scrapes.getLatestForProvider(provider),
       getLatestParsedForProvider: (provider) => scrapes.getLatestParsedForProvider(provider),
-      listLatestForEachProvider: () => scrapes.listLatestForEachProvider(),
     } satisfies FollowerRepositories["modelScrapes"]),
   });
 }

@@ -58,7 +58,6 @@ describe("follower repository authority (#1019)", () => {
     expect(Reflect.ownKeys(follower.modelScrapes).sort()).toEqual([
       "getLatestForProvider",
       "getLatestParsedForProvider",
-      "listLatestForEachProvider",
       "recordParseError",
       "recordParsed",
       "recordRaw",

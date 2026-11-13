@@ -8,7 +8,7 @@ import { closeDb, getRepositories, initDb } from "../db/index.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
-import { populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import { setProviderModelCatalog } from "../providers/model-catalog.js";
 import { refreshProviderModelCatalog } from "../providers/model-scrape.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
@@ -80,14 +80,17 @@ export interface StartFollowerRelease {
 const MODEL_CATALOG_PROBE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Restore this host's recorded model catalogs, then probe the ones a follower
- * needs at startup and daily, as the leader does for its own.
+ * Restore this host's recorded Antigravity catalog, then probe it at startup
+ * and daily, as the leader does for its own catalogs.
  *
- * Only Antigravity is probed. Its adapter resolves an explicit model and
- * effort against the process-local catalog at launch and refuses when that
- * catalog is empty (#878). Codex and the other adapters pass a nonblank model
- * to their CLI without consulting the catalog again, so a follower has no use
- * for theirs; probing Codex could also start its interactive fallback.
+ * Only Antigravity is restored and probed. Its adapter resolves an explicit
+ * model and effort against the process-local catalog at launch and refuses
+ * when that catalog is empty (#878). Other providers' catalogs stay absent, as
+ * before: provider construction validates a pin against any installed catalog,
+ * so a stale scrape that nothing here refreshes (say, from an earlier leader
+ * run on this home) would refuse models released since, and with no catalog
+ * their CLIs remain the authority. Probing Codex could also start its
+ * interactive fallback.
  *
  * Returns the startup probe, which never rejects. The caller registers with
  * the leader only after it settles, so the first run the leader dispatches
@@ -106,15 +109,16 @@ function startFollowerModelCatalogs(
   resources: ResourceScope,
   log: Logger
 ): Promise<void> {
-  try {
-    populateModelCatalogsFromDb(scrapeStore);
-  } catch (err) {
-    log.warn("model_catalog_restore_failed", { err });
-  }
   const runsAgy = Object.keys(config.providers ?? {}).some(
     (name) => providerCapabilityName(name, config) === "agy"
   );
   if (!runsAgy) return Promise.resolve();
+  try {
+    const restored = scrapeStore.getLatestParsedForProvider("agy")?.parsedModels;
+    if (Array.isArray(restored)) setProviderModelCatalog("agy", restored);
+  } catch (err) {
+    log.warn("model_catalog_restore_failed", { err });
+  }
 
   const abort = new AbortController();
   let inFlight: Promise<void> = Promise.resolve();
