@@ -319,7 +319,9 @@ export class GchatClient implements ChatClient {
     const query: Record<string, string> = {};
     if (opts?.threadName) {
       body.thread = { name: opts.threadName };
-      query.messageReplyOption = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
+      query.messageReplyOption = opts.requireExistingThread
+        ? "REPLY_MESSAGE_OR_FAIL"
+        : "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
     }
     const r = (await this.call("POST", `${spaceName}/messages`, query, body)) as { name: string };
     return { name: r.name };

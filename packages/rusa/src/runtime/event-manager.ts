@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { type EventResource, resourceKey } from "../actor/event-subscriptions.js";
+import { gchatThreadSpace } from "../chat/chat-write-scope.js";
 import {
   checkSuiteCompletionModeFromConfig,
   checkSuiteWakesAnyone,
@@ -380,6 +381,19 @@ export interface EventRoutingKernel extends EventSourceResolver {
 }
 
 /**
+ * The exact sources whose direct subscribers an event at `key` reaches. A
+ * subscription does not bubble, with one exception: a Google Chat thread is
+ * part of its space's conversation, and space subscribers received in-thread
+ * messages while chat events were routed at the space, so they still do now
+ * that a message routes at its thread (#1311).
+ */
+function directSubscriptionKeys(key: EventResource): EventResource[] {
+  if (!key.startsWith("gchat:")) return [key];
+  const space = gchatThreadSpace(key.slice("gchat:".length));
+  return space ? [key, `gchat:${space}`] : [key];
+}
+
+/**
  * Resolves event recipients following hierarchical event-source rules:
  * obligation claims take precedence over explicit subscriptions, live owners
  * govern, allowlisted events bubble up ancestor resources, direct subscribers
@@ -457,10 +471,11 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
     // a landed directive earns.
     const subscriberIds: string[] = [];
     if (!directed) {
-      const subs = this.options.ports.directSubscribersFor(key);
-      for (const sub of subs) {
-        if (this.options.ports.isLive(sub.actorId) && !subscriberIds.includes(sub.actorId)) {
-          subscriberIds.push(sub.actorId);
+      for (const subscribedKey of directSubscriptionKeys(key)) {
+        for (const sub of this.options.ports.directSubscribersFor(subscribedKey)) {
+          if (this.options.ports.isLive(sub.actorId) && !subscriberIds.includes(sub.actorId)) {
+            subscriberIds.push(sub.actorId);
+          }
         }
       }
     }
@@ -723,7 +738,14 @@ export class EventManager {
     const spaceName = message.spaceName.startsWith("spaces/")
       ? message.spaceName
       : `spaces/${message.spaceName}`;
-    const resource = raw.rawResource ?? `gchat:${spaceName}`;
+    // A message in a thread of this space routes at that thread, so an owner
+    // the thread was delegated to outranks the space's owner; with no thread
+    // owner it bubbles to the space as before (#1311). Every Google Chat
+    // message names a thread, a top-level one heading its own new thread.
+    const threadName = message.threadName?.trim();
+    const conversation =
+      threadName && gchatThreadSpace(threadName) === spaceName ? threadName : spaceName;
+    const resource = raw.rawResource ?? `gchat:${conversation}`;
     const payload: InboxPayload = {
       type: "gchat.message",
       messageName: message.name,

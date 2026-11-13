@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { parseChatWriteScope } from "../chat/chat-write-scope.js";
 import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
@@ -3566,6 +3567,14 @@ export class ActorMesh {
     if (capability === "chat-write" || capability === "chat-write:") {
       throw new Error(
         `bare chat-write grant is not allowed; must specify a space (e.g. chat-write:spaces/AAAA)`
+      );
+    }
+    if (
+      baseCapability === "chat-write" &&
+      parseChatWriteScope(capability.slice("chat-write:".length)) === undefined
+    ) {
+      throw new Error(
+        `chat-write grant must name '*', a space (chat-write:spaces/AAAA) or one thread in it (chat-write:spaces/AAAA/threads/BBBB); got ${capability}`
       );
     }
     if (capability === "calendar-read" || capability === "calendar-read:") {

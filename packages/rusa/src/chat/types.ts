@@ -132,6 +132,8 @@ export interface ChatSpace {
   name: string;
   /** `SPACE` | `GROUP_CHAT` | `DIRECT_MESSAGE` | other. */
   spaceType?: string;
+  /** `THREADED_MESSAGES` | `GROUPED_MESSAGES` | `UNTHREADED_MESSAGES` | other. */
+  spaceThreadingState?: string;
   displayName?: string;
 }
 
@@ -173,6 +175,12 @@ export interface ChatSendMessageAttachment {
 export interface ChatSendMessageOptions {
   threadName?: string;
   attachments?: ChatSendMessageAttachment[];
+  /**
+   * Fail instead of starting a new thread when `threadName` does not name an
+   * existing thread. A thread-scoped writer sets it, so a reply to a missing
+   * thread cannot surface as a new top-level message (#1311).
+   */
+  requireExistingThread?: boolean;
 }
 
 export interface ChatUploadAttachmentResult {

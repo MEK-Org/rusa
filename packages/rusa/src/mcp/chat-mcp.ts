@@ -4,6 +4,7 @@ import mime from "mime";
 import { z } from "zod";
 import { generateHandle } from "../actor/handle-generator.js";
 import { isGchatThreadHead } from "../actor/inbox-hints.js";
+import { gchatThreadSpace } from "../chat/chat-write-scope.js";
 import {
   type ChatAttachmentDataRef,
   type ChatClient,
@@ -340,7 +341,14 @@ export function createChatReadMcpServer(
 }
 
 export interface ChatWriteMcpOptions {
+  /** Whole spaces (`spaces/S`) this writer may post anywhere in, or `*` for all. */
   allowedSpaces: string[];
+  /**
+   * Individual threads (`spaces/S/threads/T`) this writer may reply within
+   * when it does not hold the whole space (#1311). Such a writer cannot post
+   * top-level or in any other thread of that space.
+   */
+  allowedThreads?: string[];
   /** Display name for this actor's visible Chat footer. */
   actorHandle?: string;
   /** The exact normalized selection for the provider attempt currently writing. */
@@ -540,6 +548,30 @@ export function createChatWriteMcpServer(
     if (options.allowedSpaces.includes("*")) return true;
     return options.allowedSpaces.includes(spaceName);
   };
+  const allowedThreads = new Set(options.allowedThreads ?? []);
+  /** Whether this writer holds at least one thread of `spaceName` without the whole space. */
+  const holdsThreadIn = (spaceName: string) =>
+    [...allowedThreads].some((thread) => gchatThreadSpace(thread) === spaceName);
+  const denySpace = (spaceName: string) =>
+    new Error(`access denied: space ${spaceName} is not in allowed spaces`);
+  /**
+   * Fail closed for a thread-only writer outside a named, threaded space.
+   * Google supports reply placement (`messageReplyOption`) only in named
+   * spaces, so in a DM, group chat or unthreaded space nothing guarantees a
+   * reply lands in its thread rather than top-level (#1311).
+   */
+  const assertThreadedNamedSpace = async (spaceName: string) => {
+    const space = await chatClient.getSpace(spaceName).catch((error: unknown) => {
+      throw new Error(
+        `access denied: cannot confirm ${spaceName} is a threaded named space: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+    if (space.spaceType !== "SPACE" || space.spaceThreadingState !== "THREADED_MESSAGES") {
+      throw new Error(
+        `access denied: thread-scoped writes need a threaded named space; ${spaceName} reports spaceType ${space.spaceType ?? "unknown"}, spaceThreadingState ${space.spaceThreadingState ?? "unknown"}`
+      );
+    }
+  };
 
   const actorHandle = options.actorHandle ?? generateHandle(actorId);
   const signedText = (text: string) =>
@@ -614,9 +646,41 @@ export function createChatWriteMcpServer(
     },
     async ({ spaceName, text, threadName, createThread, attachments }) => {
       try {
-        if (!isAllowed(spaceName)) {
-          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
+        const wholeSpace = isAllowed(spaceName);
+        if (!wholeSpace && !holdsThreadIn(spaceName)) throw denySpace(spaceName);
+        const callerThread = threadName?.trim() ? threadName.trim() : undefined;
+        if (callerThread !== undefined && gchatThreadSpace(callerThread) !== spaceName) {
+          throw new Error(
+            `threadName must be a thread of spaceName (${spaceName}/threads/THREAD); got ${callerThread}`
+          );
         }
+        // Resolved, and authorized, before any upload: what is checked is the
+        // thread the message would actually land in, after selected-inbox
+        // reply routing, not the arguments as written (#1311).
+        const selectedEntries =
+          typeof options.selectedInboxEntries === "function"
+            ? options.selectedInboxEntries()
+            : options.selectedInboxEntries;
+        const effectiveThreadName = resolveChatReplyThreadName(
+          spaceName,
+          threadName,
+          createThread,
+          selectedEntries,
+          options.logger
+        );
+        if (effectiveThreadName && gchatThreadSpace(effectiveThreadName) !== spaceName) {
+          throw new Error(
+            `access denied: reply thread ${effectiveThreadName} does not belong to ${spaceName}`
+          );
+        }
+        if (!wholeSpace && !(effectiveThreadName && allowedThreads.has(effectiveThreadName))) {
+          throw new Error(
+            effectiveThreadName
+              ? `access denied: thread ${effectiveThreadName} is not in allowed threads`
+              : `access denied: this writer may only reply within its allowed threads of ${spaceName}, not post top-level; pass threadName (or createThread: true under a selected message heading an allowed thread)`
+          );
+        }
+        if (!wholeSpace) await assertThreadedNamedSpace(spaceName);
         const normalizedAttachments: ChatSendMessageAttachment[] = [];
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {
@@ -686,20 +750,11 @@ export function createChatWriteMcpServer(
             }
           }
         }
-        const selectedEntries =
-          typeof options.selectedInboxEntries === "function"
-            ? options.selectedInboxEntries()
-            : options.selectedInboxEntries;
-        const effectiveThreadName = resolveChatReplyThreadName(
-          spaceName,
-          threadName,
-          createThread,
-          selectedEntries,
-          options.logger
-        );
         const res = await chatClient.send(spaceName, signedText(text), {
           ...(effectiveThreadName ? { threadName: effectiveThreadName } : {}),
           ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
+          // A thread-scoped writer must land in the thread, never a new one.
+          ...(wholeSpace ? {} : { requireExistingThread: true }),
         });
         options.onWrite?.(actorId);
         return toolOk(res);
@@ -743,9 +798,9 @@ export function createChatWriteMcpServer(
     },
     async ({ spaceName, filePath, filename, contentBase64, mimeType }) => {
       try {
-        if (!isAllowed(spaceName)) {
-          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
-        }
+        // Uploading posts nothing; a thread-scoped writer needs it to attach
+        // files to replies in its thread, where send_message checks placement.
+        if (!isAllowed(spaceName) && !holdsThreadIn(spaceName)) throw denySpace(spaceName);
         const maxBytes = options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
         let contentBuffer: Buffer;
         let effectiveFilename: string;
@@ -809,7 +864,18 @@ export function createChatWriteMcpServer(
         }
         const spaceName = `spaces/${match[1]}`;
         if (!isAllowed(spaceName)) {
-          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
+          if (!holdsThreadIn(spaceName)) throw denySpace(spaceName);
+          // A thread-scoped writer may react only to a message in its thread,
+          // which the message name alone does not reveal (#1311).
+          if (!/^spaces\/[^/]+\/messages\/[^/]+$/.test(messageName)) {
+            throw new Error(
+              "access denied: messageName must be in format spaces/SPACE/messages/MSG"
+            );
+          }
+          const thread = (await chatClient.getMessage(messageName)).thread?.name;
+          if (!thread || !allowedThreads.has(thread)) {
+            throw new Error(`access denied: message ${messageName} is not in an allowed thread`);
+          }
         }
         await chatClient.react(messageName, emoji);
         options.onWrite?.(actorId);

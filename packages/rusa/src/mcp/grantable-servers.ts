@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { CalendarClientProvider } from "../calendar/calendar-client.js";
+import { chatWriteScopes } from "../chat/chat-write-scope.js";
 import type { ChatClient } from "../chat/types.js";
 import type { CustomMcpServerConfig } from "../config/types.js";
 import type { DriveClient } from "../drive/drive-client.js";
@@ -240,15 +241,16 @@ export function buildGrantableServers(
   ]);
   if (deps.chatClient) {
     map.set(CHAT_WRITE_MCP_NAME, (selfId, params) => {
-      // params are e.g. ["spaces/AAAA", "spaces/BBBB"] from "chat-write:spaces/AAAA" etc.
-      // Or if they were granted "*", we can support that, though typically spaces are passed.
-      const allowedSpaces = params.map((p) =>
-        p === "*" ? "*" : p.startsWith("spaces/") ? p : `spaces/${p}`
-      );
+      // params come from "chat-write:<param>" grants: "*", a space
+      // ("spaces/AAAA", or a legacy bare id) or one thread
+      // ("spaces/AAAA/threads/BBBB", #1311). A whole space covers its threads.
+      const scopes = chatWriteScopes(params);
+      const allowedSpaces = scopes.allSpaces ? ["*"] : [...scopes.spaces];
       if (!deps.chatClient) throw new Error("chatClient is required for chat-write capability");
       const workDir = deps.actorRootFor?.(selfId);
       return createChatWriteMcpServer(selfId, deps.chatClient, {
         allowedSpaces,
+        allowedThreads: [...scopes.threads],
         actorHandle: deps.actorHandleFor?.(selfId),
         getRunSelection: () => deps.getRunSelectionForActor(selfId),
         onWrite: deps.onChatWrite,
