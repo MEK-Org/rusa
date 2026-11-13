@@ -871,9 +871,26 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     ]);
   });
 
-  it("fails closed outside a threaded named space, before any upload", async () => {
+  it("permits an authorized selected-thread reply in a threaded direct message", async () => {
+    const directMessage = { ...THREADED, spaceType: "DIRECT_MESSAGE" };
+    const { chat, call } = await mount(
+      [T1],
+      [chatEntry("spaces/A/messages/R1", T1)],
+      directMessage
+    );
+
+    expect((await call("send_message", send({}))).isError).toBe(false);
+    expect(chat.sent).toEqual([
+      expect.objectContaining({
+        spaceName: "spaces/A",
+        threadName: T1,
+        requireExistingThread: true,
+      }),
+    ]);
+  });
+
+  it("fails closed outside a supported threaded space, before any upload", async () => {
     for (const space of [
-      { ...THREADED, spaceType: "DIRECT_MESSAGE" },
       { ...THREADED, spaceType: "GROUP_CHAT" },
       { ...THREADED, spaceThreadingState: "UNTHREADED_MESSAGES" },
       { ...THREADED, spaceThreadingState: "GROUPED_MESSAGES" },
