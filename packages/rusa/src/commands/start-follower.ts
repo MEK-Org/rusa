@@ -5,8 +5,12 @@ import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
+import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
+import { populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
+import { providerCapabilityName } from "../providers/provider-selection.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
 import {
   FollowerEventAcceptanceFailedError,
@@ -71,6 +75,60 @@ export interface StartFollowerRelease {
   runningSha?: string;
   /** Where updates come from, or why this launch cannot update itself. */
   update: StartFollowerUpdateSource | { unavailable: string };
+}
+
+const MODEL_CATALOG_PROBE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Restore this host's recorded model catalogs, then probe the ones a follower
+ * needs at startup and daily, as the leader does for its own.
+ *
+ * Only Antigravity is probed. Its adapter resolves an explicit model and
+ * effort against the process-local catalog at launch and refuses when that
+ * catalog is empty (#878). Codex and the other adapters pass a nonblank model
+ * to their CLI without consulting the catalog again, so a follower has no use
+ * for theirs; probing Codex could also start its interactive fallback.
+ *
+ * Shutdown stops the interval and aborts and joins an in-flight probe, so no
+ * probe writes to the store after the database disposer, which was acquired
+ * first and so is released after this.
+ */
+function startFollowerModelCatalogs(
+  config: RusaConfig,
+  mcHome: string,
+  scrapeStore: FollowerRepositories["modelScrapes"],
+  resources: ResourceScope,
+  log: Logger
+): void {
+  try {
+    populateModelCatalogsFromDb(scrapeStore);
+  } catch (err) {
+    log.warn("model_catalog_restore_failed", { err });
+  }
+  const runsAgy = Object.keys(config.providers ?? {}).some(
+    (name) => providerCapabilityName(name, config) === "agy"
+  );
+  if (!runsAgy) return;
+
+  const abort = new AbortController();
+  let inFlight: Promise<void> | undefined;
+  const probe = () => {
+    inFlight = refreshConfiguredProviderModelCatalogs({
+      config,
+      workersDir: join(mcHome, "workers"),
+      scrapeStore,
+      signal: abort.signal,
+      providers: ["agy"],
+    }).catch((err) => log.warn("model_catalog_probe_failed", { err }));
+  };
+  const interval = setInterval(probe, MODEL_CATALOG_PROBE_INTERVAL_MS);
+  interval.unref?.();
+  resources.acquire("modelCatalogProbe", async () => {
+    clearInterval(interval);
+    abort.abort();
+    await inFlight;
+  });
+  probe();
 }
 
 // `restarting` is the last status the old process can truthfully emit. Bound its
@@ -200,6 +258,7 @@ export async function composeFollowerStart(
   if (identity.role !== "follower") throw new Error("Follower start requires a leader peer");
   const repos = getRepositories("follower");
   log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
+  startFollowerModelCatalogs(config, mcHome, repos.modelScrapes, resources, log);
 
   // An e2e composition must never reset and rebuild the checkout running it.
   const release: StartFollowerRelease = opts?.e2e
