@@ -132,8 +132,6 @@ export interface ChatSpace {
   name: string;
   /** `SPACE` | `GROUP_CHAT` | `DIRECT_MESSAGE` | other. */
   spaceType?: string;
-  /** `THREADED_MESSAGES` | `GROUPED_MESSAGES` | `UNTHREADED_MESSAGES` | other. */
-  spaceThreadingState?: string;
   displayName?: string;
 }
 
