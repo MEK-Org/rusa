@@ -20,6 +20,7 @@ import {
   gitIdentityGuidance,
   inboxDiscipline,
   OBLIGATION_DISCIPLINE,
+  REPORTING_GUIDANCE,
   trackerWritingGuidance,
   WRITING_FOR_AGENTS_DISCIPLINE,
 } from "./worker-prompt.js";
@@ -71,6 +72,8 @@ export function buildRootPrompt(
   return `${trackerWritingGuidance(actorHandle ?? "rusa")}
 
 ${charter}
+
+${REPORTING_GUIDANCE}
 
 ${DELEGATION_DISCIPLINE}
 
