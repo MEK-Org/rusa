@@ -6,6 +6,7 @@ import { withDefaultActorCapabilities } from "../actor/administrative-capabiliti
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
 import { FakeChatClient } from "../chat/fake.js";
+import type { ChatSpace } from "../chat/types.js";
 import { createSelectedInboxEntriesAccessor } from "../commands/start.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
@@ -771,14 +772,12 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
 
   /**
    * Mount chat-write from grant params exactly as a capability grant does.
-   * Space metadata is unreadable: requested-thread permission alone governs
-   * placement in every space type (#1316), so no write may depend on it.
+   * With no `space`, the space's metadata cannot be read: requested-thread
+   * permission alone governs placement in every space type (#1316).
    */
-  async function mount(params: string[], selected: InboxEntry[] = []) {
+  async function mount(params: string[], selected: InboxEntry[] = [], space?: ChatSpace) {
     const chat = new FakeChatClient();
-    chat.getSpace = async (spaceName) => {
-      throw new Error(`space metadata is unreadable: ${spaceName}`);
-    };
+    if (space) chat.spaces.push(space);
     chat.messages.push(
       { name: "spaces/A/messages/R1", thread: { name: T1 } },
       { name: "spaces/A/messages/R2", thread: { name: T2 } }
@@ -863,6 +862,24 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     expect((await head.call("send_message", send({ createThread: true }))).isError).toBe(false);
     expect(head.chat.sent).toEqual([
       expect.objectContaining({ threadName: T1, requireExistingThread: true }),
+    ]);
+  });
+
+  it.each([
+    ["a direct message", { name: "spaces/A", spaceType: "DIRECT_MESSAGE" }],
+    ["a group chat", { name: "spaces/A", spaceType: "GROUP_CHAT" }],
+    ["a named space", { name: "spaces/A", spaceType: "SPACE" }],
+    ["a space whose metadata cannot be read", undefined],
+  ] as const)("permits an authorized selected-thread reply in %s", async (_label, space) => {
+    const { chat, call } = await mount([T1], [chatEntry("spaces/A/messages/R1", T1)], space);
+
+    expect((await call("send_message", send({}))).isError).toBe(false);
+    expect(chat.sent).toEqual([
+      expect.objectContaining({
+        spaceName: "spaces/A",
+        threadName: T1,
+        requireExistingThread: true,
+      }),
     ]);
   });
 

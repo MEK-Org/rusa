@@ -48,8 +48,9 @@ not the arguments as written:
   writer's threads. That permission alone governs placement, the same in a
   named space, a group chat or a direct message; the tool does not read
   space metadata. The check runs before any inline attachment uploads. A
-  send with no thread, which would post top-level, is refused. A selected top-level message routes replies top-level, so use
-  `createThread: true` to reply under it when it heads the granted thread.
+  send with no thread, which would post top-level, is refused. A selected
+  top-level message routes replies top-level, so use `createThread: true`
+  to reply under it when it heads the granted thread.
   The send asks Google to reply or fail (`REPLY_MESSAGE_OR_FAIL`), so it
   never falls back to opening a new thread.
 - `react` succeeds only on a message whose `thread.name` is one of the
