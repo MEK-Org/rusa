@@ -1859,28 +1859,6 @@ describe("follower model catalog lifecycle (#878)", () => {
     };
   }
 
-  it("probes a cold, empty follower's catalog so an explicit model and effort reach the CLI", async () => {
-    const f = await bootAgyFollower({
-      modelsMode: "ok",
-      selected: { model: "gemini-3.9-carbon", effort: "high" },
-    });
-    try {
-      // Registration waited for the startup probe; no test-side catalog wait.
-      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
-      const row = await f.runOnce();
-      expect(row.output ?? "").not.toContain("invalid model selection");
-      expect(row).toMatchObject({ success: 1 });
-      const argv = f.launchArgv();
-      expect(f.flagValue(argv, "--model")).toBe("gemini-3.9-carbon");
-      expect(f.flagValue(argv, "--effort")).toBe("high");
-      // The scrape is recorded locally, so the next start can restore it.
-      const latest = new ModelScrapeRepository(getDb()).getLatestParsedForProvider("agy");
-      expect(latest?.parsedModels?.map((m) => m.identifier)).toContain("gemini-3.9-carbon-high");
-    } finally {
-      await f.shutdown();
-    }
-  }, 20_000);
-
   it("restores a persisted catalog when the startup probe fails", async () => {
     const f = await bootAgyFollower({
       modelsMode: "fail",
@@ -1917,29 +1895,14 @@ describe("follower model catalog lifecycle (#878)", () => {
     }
   }, 20_000);
 
-  it("refuses an explicit selection with an actionable error, launching nothing, when the probe fails on an empty store", async () => {
-    const f = await bootAgyFollower({
-      modelsMode: "fail",
-      selected: { model: "gemini-3.9-carbon", effort: "high" },
-    });
-    try {
-      expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
-      const row = await f.runOnce();
-      expect(row.success).toBe(0);
-      expect(row.output).toContain("agy catalog is empty or missing");
-      // No default model was substituted: the CLI never ran.
-      expect(f.launchArgv()).toBeUndefined();
-    } finally {
-      await f.shutdown();
-    }
-  }, 20_000);
-
   it("refuses a model the probed catalog does not list, launching nothing", async () => {
     const f = await bootAgyFollower({
       modelsMode: "ok",
       selected: { model: "gemini-9-unknown", effort: "high" },
     });
     try {
+      // runStart's own registration also waited for the startup probe.
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
       // With a known catalog the shared pin check refuses while building the
       // provider, and the leader is told which values the catalog accepts.
       f.init();
@@ -1953,7 +1916,7 @@ describe("follower model catalog lifecycle (#878)", () => {
     }
   }, 20_000);
 
-  it("registers only after a slow startup probe, so a run dispatched on readiness reaches the CLI", async () => {
+  it("registers a cold, empty follower only after a slow startup probe, so a run dispatched on readiness reaches the CLI", async () => {
     const f = await bootAgyFollower({
       modelsMode: "slow",
       selected: { model: "gemini-3.9-carbon", effort: "high" },
@@ -1967,12 +1930,15 @@ describe("follower model catalog lifecycle (#878)", () => {
       expect(f.registrations).toEqual([{ catalogInstalled: true }]);
       expect(f.flagValue(f.launchArgv(), "--model")).toBe("gemini-3.9-carbon");
       expect(f.flagValue(f.launchArgv(), "--effort")).toBe("high");
+      // The scrape is recorded locally, so the next start can restore it.
+      const latest = new ModelScrapeRepository(getDb()).getLatestParsedForProvider("agy");
+      expect(latest?.parsedModels?.map((m) => m.identifier)).toContain("gemini-3.9-carbon-high");
     } finally {
       await f.shutdown();
     }
   }, 20_000);
 
-  it("still registers after a failed startup probe and refuses an explicit selection", async () => {
+  it("still registers after a failed startup probe on an empty store and refuses an explicit selection, launching nothing", async () => {
     const f = await bootAgyFollower({
       modelsMode: "fail",
       selected: { model: "gemini-3.9-carbon", effort: "high" },
@@ -1980,10 +1946,13 @@ describe("follower model catalog lifecycle (#878)", () => {
     });
     try {
       const row = await f.finishedRun();
-      // Availability is not tied to agy health: the follower registered.
+      // Availability is not tied to agy health: the probe ran, failed, and the
+      // follower registered anyway.
+      expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
       expect(f.registrations).toEqual([{ catalogInstalled: false }]);
       expect(row.success).toBe(0);
       expect(row.output).toContain("agy catalog is empty or missing");
+      // No default model was substituted: the CLI never ran.
       expect(f.launchArgv()).toBeUndefined();
     } finally {
       await f.shutdown();

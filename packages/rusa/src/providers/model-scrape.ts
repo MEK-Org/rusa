@@ -651,12 +651,9 @@ export async function refreshConfiguredProviderModelCatalogs(deps: {
     scrapeCodex?: (opts: ModelProbeOptions) => Promise<string>;
     scrapeAgy?: (opts: ModelProbeOptions) => Promise<string>;
   };
-  /** Probe exactly these providers instead of every configured one. */
-  providers?: readonly string[];
 }): Promise<void> {
   const configured = Object.keys(deps.config.providers ?? {});
-  const providersToProbe =
-    deps.providers ?? (configured.length > 0 ? configured : ["kimi", "codex", "claude", "agy"]);
+  const providersToProbe = configured.length > 0 ? configured : ["kimi", "codex", "claude", "agy"];
 
   await Promise.all(
     providersToProbe.map(async (provider) => {

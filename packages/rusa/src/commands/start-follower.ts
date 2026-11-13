@@ -9,7 +9,7 @@ import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
 import { populateModelCatalogsFromDb } from "../providers/model-catalog.js";
-import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
+import { refreshProviderModelCatalog } from "../providers/model-scrape.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
 import {
@@ -119,13 +119,17 @@ function startFollowerModelCatalogs(
   const abort = new AbortController();
   let inFlight: Promise<void> = Promise.resolve();
   const probe = () => {
-    inFlight = refreshConfiguredProviderModelCatalogs({
-      config,
+    // The agy probe records and logs its own failures; the catch is for the
+    // unexpected, so a rejection never escapes the interval or the startup wait.
+    inFlight = refreshProviderModelCatalog({
+      provider: "agy",
       workersDir: join(mcHome, "workers"),
       scrapeStore,
       signal: abort.signal,
-      providers: ["agy"],
-    }).catch((err) => log.warn("model_catalog_probe_failed", { err }));
+    }).then(
+      () => undefined,
+      (err) => log.warn("model_catalog_probe_failed", { err })
+    );
   };
   const interval = setInterval(probe, MODEL_CATALOG_PROBE_INTERVAL_MS);
   interval.unref?.();
