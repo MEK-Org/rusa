@@ -6,7 +6,6 @@ import { withDefaultActorCapabilities } from "../actor/administrative-capabiliti
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
 import { FakeChatClient } from "../chat/fake.js";
-import type { ChatSpace } from "../chat/types.js";
 import { createSelectedInboxEntriesAccessor } from "../commands/start.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
@@ -770,20 +769,16 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     };
   }
 
-  const THREADED: ChatSpace = {
-    name: "spaces/A",
-    spaceType: "SPACE",
-    spaceThreadingState: "THREADED_MESSAGES",
-  };
-
-  /** Mount chat-write from grant params exactly as a capability grant does. */
-  async function mount(
-    params: string[],
-    selected: InboxEntry[] = [],
-    space: ChatSpace | null = THREADED
-  ) {
+  /**
+   * Mount chat-write from grant params exactly as a capability grant does.
+   * Space metadata is unreadable: requested-thread permission alone governs
+   * placement in every space type (#1316), so no write may depend on it.
+   */
+  async function mount(params: string[], selected: InboxEntry[] = []) {
     const chat = new FakeChatClient();
-    if (space) chat.spaces.push(space);
+    chat.getSpace = async (spaceName) => {
+      throw new Error(`space metadata is unreadable: ${spaceName}`);
+    };
     chat.messages.push(
       { name: "spaces/A/messages/R1", thread: { name: T1 } },
       { name: "spaces/A/messages/R2", thread: { name: T2 } }
@@ -869,42 +864,6 @@ describe("thread-scoped chat-write at the tool boundary (#1311)", () => {
     expect(head.chat.sent).toEqual([
       expect.objectContaining({ threadName: T1, requireExistingThread: true }),
     ]);
-  });
-
-  it.each([
-    "DIRECT_MESSAGE",
-    "GROUP_CHAT",
-    "SPACE",
-  ])("permits an authorized selected-thread reply in a threaded %s", async (spaceType) => {
-    const { chat, call } = await mount([T1], [chatEntry("spaces/A/messages/R1", T1)], {
-      ...THREADED,
-      spaceType,
-    });
-
-    expect((await call("send_message", send({}))).isError).toBe(false);
-    expect(chat.sent).toEqual([
-      expect.objectContaining({
-        spaceName: "spaces/A",
-        threadName: T1,
-        requireExistingThread: true,
-      }),
-    ]);
-  });
-
-  it("does not let space metadata bypass thread-only routing or pre-upload authorization", async () => {
-    for (const space of [
-      { ...THREADED, spaceType: "GROUP_CHAT" },
-      { ...THREADED, spaceThreadingState: "UNTHREADED_MESSAGES" },
-      { name: "spaces/A" },
-      null,
-    ]) {
-      const { chat, call } = await mount([T1], [chatEntry("spaces/A/messages/R2", T2)], space);
-      const result = await call("send_message", send(inlineAttachment));
-      expect(result.isError, JSON.stringify(space)).toBe(true);
-      expect(result.text).toMatch(/T2 is not in allowed threads/);
-      expect(chat.sent).toEqual([]);
-      expect(chat.uploadedAttachments).toEqual([]);
-    }
   });
 
   it("scopes reactions to messages in the writer's thread", async () => {
