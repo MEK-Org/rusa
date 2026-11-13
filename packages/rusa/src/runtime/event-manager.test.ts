@@ -568,7 +568,8 @@ describe("EventManager", () => {
 
       const { entries } = await em.handleExternalEvent(rawChat);
       expect(entries.length).toBe(1);
-      expect(entries[0].source).toBe("gchat:spaces/AAA");
+      // In-thread messages route at their thread so a thread delegation (#1311) can win.
+      expect(entries[0].source).toBe("gchat:spaces/AAA/threads/TTT");
       expect(entries[0].payload).toEqual({
         type: "gchat.message",
         messageName: "spaces/AAA/messages/BBB",
@@ -579,6 +580,41 @@ describe("EventManager", () => {
         deliveryRole: "owner",
       });
       expect(entries[0].id).toBe(deduplicatedInboxEntryId("spaces/AAA/messages/BBB", "actor-chat"));
+    });
+
+    it("routes a Chat message at its space when its thread is absent or names another space", async () => {
+      const inbox = new FakeInboxStore();
+      const keys: string[] = [];
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
+        resolveRecipients: (resource) => {
+          keys.push(String(resource));
+          return { directed: false, ownerIds: ["actor-chat"], subscriberIds: [] };
+        },
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+      const chat = (name: string, threadName?: string): RawIntegrationEvent => ({
+        sourceType: "chat",
+        rawPayload: {
+          name,
+          spaceName: "spaces/AAA",
+          ...(threadName === undefined ? {} : { threadName }),
+          senderName: "users/123",
+          createTime: "2026-09-10T12:00:00Z",
+        },
+      });
+
+      const plain = await em.handleExternalEvent(chat("spaces/AAA/messages/M1"));
+      const foreign = await em.handleExternalEvent(
+        chat("spaces/AAA/messages/M2", "spaces/ZZZ/threads/TTT")
+      );
+      const malformed = await em.handleExternalEvent(chat("spaces/AAA/messages/M3", "threads/TTT"));
+
+      expect(plain.entries[0]?.source).toBe("gchat:spaces/AAA");
+      expect(foreign.entries[0]?.source).toBe("gchat:spaces/AAA");
+      expect(malformed.entries[0]?.source).toBe("gchat:spaces/AAA");
+      expect(keys).toEqual(["gchat:spaces/AAA", "gchat:spaces/AAA", "gchat:spaces/AAA"]);
     });
 
     it("persists an unstated timer priority as normal work", async () => {

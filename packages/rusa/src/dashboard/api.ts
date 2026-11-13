@@ -6,6 +6,7 @@ import { resolveContextSelection } from "../actor/context-selection.js";
 import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
+import { isGchatThreadHead } from "../actor/inbox-hints.js";
 import type { OperatorActorControl } from "../actor/operator-actor-control.js";
 import type { PortableBriefStore, PortableContextStore } from "../actor/portable-context-state.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
@@ -18,6 +19,7 @@ import {
   readAvatar,
   uploadAvatar,
 } from "../avatar/avatars.js";
+import { gchatThreadSpace } from "../chat/chat-write-scope.js";
 import type { MeshObligationWriter } from "../db/mesh-write-operations.js";
 import { committedWriteReport, MeshWriteCommittedError } from "../db/mesh-writer.js";
 import { type DbReads, inProcessReads, type ReadOutput } from "../db/read-operations.js";
@@ -342,6 +344,8 @@ function charterPreview(charter: string): string {
 }
 
 type ResolvedInboxEntry = InboxEntry & {
+  /** A presentation-only source label; `source` remains the routing resource. */
+  displaySource?: string;
   reference?: ResolvedReference;
   /**
    * The comment or review the event is about, nested under `reference` (the
@@ -355,6 +359,36 @@ type ResolvedInboxEntry = InboxEntry & {
   obligationId?: string;
 };
 type ResolvedInboxPage = Omit<InboxPage, "entries"> & { entries: ResolvedInboxEntry[] };
+
+/**
+ * A top-level Google Chat message routes at its implicit thread so a later
+ * thread delegation can take precedence, but its fallback dashboard label is
+ * the enclosing space. Replies retain their thread label. This never rewrites
+ * the durable routing source.
+ */
+function dashboardInboxDisplaySource(entry: InboxEntry): string {
+  const { source, payload } = entry;
+  if (payload.type !== "gchat.message" || !source.startsWith("gchat:")) return source;
+  const threadName = source.slice("gchat:".length);
+  const space = gchatThreadSpace(threadName);
+  if (
+    !space ||
+    typeof payload.threadName !== "string" ||
+    payload.threadName.trim() !== threadName ||
+    !isGchatThreadHead(
+      typeof payload.messageName === "string" ? payload.messageName : undefined,
+      payload.threadName
+    )
+  ) {
+    return source;
+  }
+  return `gchat:${space}`;
+}
+
+function withDashboardInboxDisplaySource(entry: InboxEntry): ResolvedInboxEntry {
+  const displaySource = dashboardInboxDisplaySource(entry);
+  return displaySource === entry.source ? entry : { ...entry, displaySource };
+}
 
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
 interface ThreadDto {
@@ -760,7 +794,8 @@ async function resolveInboxPage(
       : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
     page.entries.map(async (entry): Promise<ResolvedInboxEntry | null> => {
-      const { messageId, ...payload } = entry.payload as InboxPayload & {
+      const dashboardEntry = withDashboardInboxDisplaySource(entry);
+      const { messageId, ...payload } = dashboardEntry.payload as InboxPayload & {
         messageId?: unknown;
       };
       if (typeof messageId === "string") {
@@ -781,24 +816,24 @@ async function resolveInboxPage(
           return null;
         }
         return {
-          ...entry,
+          ...dashboardEntry,
           payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
           reference,
         };
       }
-      if (entry.source.startsWith("github:")) {
+      if (dashboardEntry.source.startsWith("github:")) {
         // A comment or review is resolved alongside the issue/PR it arrived
         // through, so the card can show what was said and what it was said on.
-        const eventRef = githubInboxEventReference(entry.source, entry.payload);
+        const eventRef = githubInboxEventReference(dashboardEntry.source, dashboardEntry.payload);
         const [reference, eventReference] = await Promise.all([
-          resolve(entry.source),
+          resolve(dashboardEntry.source),
           eventRef ? resolve(eventRef) : undefined,
         ]);
-        return { ...entry, reference, ...(eventReference ? { eventReference } : {}) };
+        return { ...dashboardEntry, reference, ...(eventReference ? { eventReference } : {}) };
       }
-      const chatMessage = gchatInboxMessageReference(entry.source, entry.payload);
-      if (chatMessage) return { ...entry, reference: await resolve(chatMessage) };
-      return entry;
+      const chatMessage = gchatInboxMessageReference(dashboardEntry.source, dashboardEntry.payload);
+      if (chatMessage) return { ...dashboardEntry, reference: await resolve(chatMessage) };
+      return dashboardEntry;
     })
   );
   return {
@@ -2988,6 +3023,7 @@ async function routeMeshApiRequest(
     const activityEntries: Array<{
       entry: InboxEntry;
       source: string;
+      displaySource: string;
       referenceKey?: string;
       sourceKind: string;
       handledAt: string;
@@ -3006,6 +3042,7 @@ async function routeMeshApiRequest(
       if (!entry.handledAt) continue;
 
       const source = entry.source;
+      const displaySource = dashboardInboxDisplaySource(entry);
       const { messageId } = entry.payload as { messageId?: unknown };
       let referenceKey: string | undefined;
       if (typeof messageId === "string") {
@@ -3074,6 +3111,7 @@ async function routeMeshApiRequest(
       activityEntries.push({
         entry,
         source,
+        displaySource,
         ...(referenceKey ? { referenceKey } : {}),
         sourceKind,
         handledAt,
@@ -3134,7 +3172,7 @@ async function routeMeshApiRequest(
         time: activity.handledAt,
         actorId: activity.entry.actorId,
         sourceKind: activity.sourceKind,
-        sourceRef: activity.source,
+        sourceRef: activity.displaySource,
         ...(activity.referenceKey ? { referenceKey: activity.referenceKey } : {}),
         summary,
         handledTime: activity.handledAt,

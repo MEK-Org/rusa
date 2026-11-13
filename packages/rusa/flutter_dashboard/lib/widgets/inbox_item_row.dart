@@ -117,6 +117,7 @@ class InboxItemRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final displaySource = entry.displaySource ?? entry.source;
     final showMoreCount = moreCount != null && moreCount! > 0;
     final content = entry.contentText;
     final moreLabel = showMoreCount
@@ -179,9 +180,9 @@ class InboxItemRow extends StatelessWidget {
               children: [
                 InboxChip(entry.type),
                 if (entry.isResponsive) const _ResponsiveBadge(),
-                if (entry.source.isNotEmpty)
+                if (displaySource.isNotEmpty)
                   Text(
-                    entry.source,
+                    displaySource,
                     style: const TextStyle(
                       color: MeshColors.textMuted,
                       fontSize: 11,

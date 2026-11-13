@@ -64,6 +64,7 @@ export class FakeChatClient implements ChatClient {
     text: string;
     threadName?: string;
     attachments?: ChatSendMessageAttachment[];
+    requireExistingThread?: boolean;
   }[] = [];
   /** Membership the fake reports from {@link listSpaces}; push to populate it. */
   readonly spaces: ChatSpace[] = [];
@@ -272,6 +273,7 @@ export class FakeChatClient implements ChatClient {
       text,
       threadName: opts?.threadName,
       ...(opts?.attachments ? { attachments: opts.attachments } : {}),
+      ...(opts?.requireExistingThread ? { requireExistingThread: true } : {}),
     });
     const msgName = `${spaceName}/messages/fake-${this.sent.length}`;
     const attachmentsList: ChatAttachment[] = (opts?.attachments ?? []).map((att) => {

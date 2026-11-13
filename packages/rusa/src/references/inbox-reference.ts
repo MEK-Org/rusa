@@ -6,10 +6,10 @@ import { parseReference } from "./reference.js";
  * The `gchat:spaces/S/messages/M` reference a Google Chat inbox entry is
  * about, or undefined when its payload names no message in its source space.
  *
- * A chat event's `source` is the containing space (routing granularity), so
- * resolving that would show the wrong entity; the message itself is the
- * payload's `messageName`, which is Google's resource name and so already
- * the reference path.
+ * A chat event's `source` is the containing space or thread (routing
+ * granularity, #1311), so resolving that would show the wrong entity; the
+ * message itself is the payload's `messageName`, which is Google's resource
+ * name and so already the reference path.
  */
 export function gchatInboxMessageReference(
   source: string,
@@ -22,17 +22,20 @@ export function gchatInboxMessageReference(
     const reference = parseReference(`gchat:${payload.messageName}`);
     const sourceReference = parseReference(source);
     const [messageCollection, messageSpace, messageKind] = reference.segments;
-    const [sourceCollection, sourceSpace] = sourceReference.segments;
+    const [sourceCollection, sourceSpace, sourceKind] = sourceReference.segments;
     // This is the exact Google message resource form, not the cache's broader
     // internal entity classifier. The source must be the message's containing
-    // space: an inbox payload cannot use this rendering path to name a message
-    // in a different space.
+    // space or a thread of it: an inbox payload cannot use this rendering path
+    // to name a message in a different space.
+    const sourceIsSpaceOrThread =
+      sourceReference.segments.length === 2 ||
+      (sourceReference.segments.length === 4 && sourceKind === "threads");
     return reference.scheme === "gchat" &&
       reference.segments.length === 4 &&
       messageCollection === "spaces" &&
       messageKind === "messages" &&
       sourceReference.scheme === "gchat" &&
-      sourceReference.segments.length === 2 &&
+      sourceIsSpaceOrThread &&
       sourceCollection === "spaces" &&
       messageSpace === sourceSpace
       ? reference.key
