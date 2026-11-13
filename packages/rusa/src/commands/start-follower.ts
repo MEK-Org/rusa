@@ -89,6 +89,12 @@ const MODEL_CATALOG_PROBE_INTERVAL_MS = 24 * 60 * 60 * 1000;
  * to their CLI without consulting the catalog again, so a follower has no use
  * for theirs; probing Codex could also start its interactive fallback.
  *
+ * Returns the startup probe, which never rejects. The caller registers with
+ * the leader only after it settles, so the first run the leader dispatches
+ * already sees the catalog. A failed or timed-out probe settles too: the
+ * follower still registers, and an explicit selection then gets the adapter's
+ * empty-catalog refusal. The wait is the probe's own timeout.
+ *
  * Shutdown stops the interval and aborts and joins an in-flight probe, so no
  * probe writes to the store after the database disposer, which was acquired
  * first and so is released after this.
@@ -99,7 +105,7 @@ function startFollowerModelCatalogs(
   scrapeStore: FollowerRepositories["modelScrapes"],
   resources: ResourceScope,
   log: Logger
-): void {
+): Promise<void> {
   try {
     populateModelCatalogsFromDb(scrapeStore);
   } catch (err) {
@@ -108,10 +114,10 @@ function startFollowerModelCatalogs(
   const runsAgy = Object.keys(config.providers ?? {}).some(
     (name) => providerCapabilityName(name, config) === "agy"
   );
-  if (!runsAgy) return;
+  if (!runsAgy) return Promise.resolve();
 
   const abort = new AbortController();
-  let inFlight: Promise<void> | undefined;
+  let inFlight: Promise<void> = Promise.resolve();
   const probe = () => {
     inFlight = refreshConfiguredProviderModelCatalogs({
       config,
@@ -129,6 +135,7 @@ function startFollowerModelCatalogs(
     await inFlight;
   });
   probe();
+  return inFlight;
 }
 
 // `restarting` is the last status the old process can truthfully emit. Bound its
@@ -258,7 +265,13 @@ export async function composeFollowerStart(
   if (identity.role !== "follower") throw new Error("Follower start requires a leader peer");
   const repos = getRepositories("follower");
   log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
-  startFollowerModelCatalogs(config, mcHome, repos.modelScrapes, resources, log);
+  const startupCatalogs = startFollowerModelCatalogs(
+    config,
+    mcHome,
+    repos.modelScrapes,
+    resources,
+    log
+  );
 
   // An e2e composition must never reset and rebuild the checkout running it.
   const release: StartFollowerRelease = opts?.e2e
@@ -596,6 +609,15 @@ export async function composeFollowerStart(
 
   const startPolling = () => {
     polling = (async () => {
+      // Register only once the startup probe has settled. Shutdown releases
+      // this peer before the probe resource, so stop waiting on its abort.
+      await Promise.race([
+        startupCatalogs,
+        new Promise<void>((resolve) => {
+          if (stopPolling.signal.aborted) resolve();
+          else stopPolling.signal.addEventListener("abort", () => resolve(), { once: true });
+        }),
+      ]);
       let backoffMs = 500;
       while (!stopped) {
         if (!session) {
@@ -643,6 +665,7 @@ export async function composeFollowerStart(
 
   if (opts?.e2e?.onFollowerReady) {
     if (opts.e2e.connectPeer !== false) {
+      await startupCatalogs;
       const ok = await registerWithLeader();
       if (!ok) {
         throw new Error(`Follower e2e registration with leader ${leaderUrl.origin} failed`);

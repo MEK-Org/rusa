@@ -26,7 +26,7 @@ import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
 import { clearProviderModelCatalog, getProviderModelCatalog } from "../providers/model-catalog.js";
 import type { RunOptions } from "../providers/types.js";
-import type { FollowerCommand } from "../remote-instances/follower-hub.js";
+import type { FollowerActorCommand, FollowerCommand } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { createHarness, waitUntil } from "../remote-instances/harness.js";
 import {
@@ -1650,8 +1650,11 @@ describe("shared startup, role authority, and local database (#1019)", () => {
  * An `agy` stand-in on PATH. The follower launches the real Antigravity
  * adapter, so the only synthetic part is the binary: `agy models` answers
  * according to `models-mode`, and any other invocation records its argv.
+ * `slow` answers like `ok` after a second, as a cold `agy` start can.
  */
-function installSyntheticAgy(dir: string, modelsMode: "ok" | "fail" | "hang"): void {
+type SyntheticAgyModelsMode = "ok" | "slow" | "fail" | "hang";
+
+function installSyntheticAgy(dir: string, modelsMode: SyntheticAgyModelsMode): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "models-mode"), modelsMode);
   const script = [
@@ -1660,7 +1663,10 @@ function installSyntheticAgy(dir: string, modelsMode: "ok" | "fail" | "hang"): v
     'if [ "$1" = "models" ]; then',
     '  echo models >> "$dir/models-calls"',
     '  case "$(cat "$dir/models-mode")" in',
-    "    ok) printf 'gemini-3.9-carbon-high\\tGemini 3.9 Carbon (High)\\ngemini-3.9-carbon-low\\tGemini 3.9 Carbon (Low)\\n' ;;",
+    "    slow) sleep 1 ;;",
+    "  esac",
+    '  case "$(cat "$dir/models-mode")" in',
+    "    ok|slow) printf 'gemini-3.9-carbon-high\\tGemini 3.9 Carbon (High)\\ngemini-3.9-carbon-low\\tGemini 3.9 Carbon (Low)\\n' ;;",
     '    fail) echo "synthetic agy models failure" >&2; exit 3 ;;',
     '    hang) echo $$ > "$dir/models-pid"; exec sleep 60 ;;',
     "  esac",
@@ -1685,11 +1691,16 @@ describe("follower model catalog lifecycle (#878)", () => {
   /**
    * Boot a follower through `runStart` against a synthetic leader that admits
    * one explicit Antigravity selection, with the real provider factory.
+   *
+   * With `viaPoll`, the follower runs its daemon poll loop and the leader
+   * dispatches the actor in its first poll reply, the moment the follower is
+   * registered. Otherwise `runStart` registers before returning the handles.
    */
   async function bootAgyFollower(opts: {
-    modelsMode: "ok" | "fail" | "hang";
+    modelsMode: SyntheticAgyModelsMode;
     selected: { model: string; effort?: string };
     seed?: (home: string) => void;
+    viaPoll?: boolean;
   }) {
     const home = makeTempHome();
     process.env.RUSA_HOME = home;
@@ -1698,7 +1709,23 @@ describe("follower model catalog lifecycle (#878)", () => {
     process.env.PATH = `${binDir}:${originalPath ?? ""}`;
     opts.seed?.(home);
 
+    const actorId = "actor-catalog-1";
+    const initCommand = (): FollowerActorCommand => ({
+      actorId,
+      message: {
+        type: "init",
+        bootstrap: {
+          id: actorId,
+          cwd: home,
+          modelConfig: [{ provider: "agy", ...opts.selected }],
+        },
+      },
+    });
+
     const events: SyntheticEvent[] = [];
+    /** For each /register, whether this process already held an agy catalog. */
+    const registrations: { catalogInstalled: boolean }[] = [];
+    let dispatched = false;
     let handles: { instance: FollowerInstance; shutdown: () => Promise<void> } | undefined;
     const reply = (actorId: string, requestId: number, value?: unknown) =>
       queueMicrotask(() =>
@@ -1706,6 +1733,7 @@ describe("follower model catalog lifecycle (#878)", () => {
       );
     const leader = await startSyntheticLeader((path, body, res) => {
       if (path === "/register") {
+        registrations.push({ catalogInstalled: getProviderModelCatalog("agy") !== undefined });
         replyJson(res, {
           session: "synth-sess-catalog",
           protocolVersion: INSTANCE_PROTOCOL_VERSION,
@@ -1736,6 +1764,15 @@ describe("follower model catalog lifecycle (#878)", () => {
         replyJson(res, { ok: true });
         return;
       }
+      if (path === "/poll") {
+        if (opts.viaPoll && !dispatched) {
+          dispatched = true;
+          replyJson(res, [initCommand(), { actorId, message: { type: "wake" } }]);
+        } else {
+          setTimeout(() => replyJson(res, []), 50);
+        }
+        return;
+      }
       replyJson(res, { ok: true });
     });
 
@@ -1748,7 +1785,8 @@ describe("follower model catalog lifecycle (#878)", () => {
 
     await runStart({
       e2e: {
-        connectPeer: true,
+        connectPeer: !opts.viaPoll,
+        followerPolling: opts.viaPoll,
         onFollowerReady: (ready) => {
           handles = ready;
         },
@@ -1757,27 +1795,10 @@ describe("follower model catalog lifecycle (#878)", () => {
     if (!handles) throw new Error("follower handles not initialized");
     const follower = handles;
 
-    const actorId = "actor-catalog-1";
-    const init = () =>
-      follower.instance.dispatch({
-        actorId,
-        message: {
-          type: "init",
-          bootstrap: {
-            id: actorId,
-            cwd: home,
-            modelConfig: [{ provider: "agy", ...opts.selected }],
-          },
-        },
-      });
+    const init = () => follower.instance.dispatch(initCommand());
 
-    /** Init, wake once, and return the follower's local run row. */
-    const runOnce = async (): Promise<ActorRunRow> => {
-      init();
-      await waitUntil(() =>
-        events.some((e) => e.actorId === actorId && e.message?.type === "ready")
-      );
-      follower.instance.dispatch({ actorId, message: { type: "wake" } });
+    /** Wait for the actor's finished local run row. */
+    const finishedRun = async (): Promise<ActorRunRow> => {
       let row: ActorRunRow | undefined;
       await waitUntil(() => {
         row = getDb()
@@ -1786,6 +1807,16 @@ describe("follower model catalog lifecycle (#878)", () => {
         return row !== undefined;
       });
       return row as ActorRunRow;
+    };
+
+    /** Init, wake once, and return the follower's local run row. */
+    const runOnce = async (): Promise<ActorRunRow> => {
+      init();
+      await waitUntil(() =>
+        events.some((e) => e.actorId === actorId && e.message?.type === "ready")
+      );
+      follower.instance.dispatch({ actorId, message: { type: "wake" } });
+      return finishedRun();
     };
 
     const launchArgv = (): string[] | undefined => {
@@ -1801,8 +1832,10 @@ describe("follower model catalog lifecycle (#878)", () => {
       home,
       binDir,
       events,
+      registrations,
       init,
       runOnce,
+      finishedRun,
       launchArgv,
       flagValue,
       shutdown: async () => {
@@ -1818,7 +1851,8 @@ describe("follower model catalog lifecycle (#878)", () => {
       selected: { model: "gemini-3.9-carbon", effort: "high" },
     });
     try {
-      await waitUntil(() => getProviderModelCatalog("agy") !== undefined);
+      // Registration waited for the startup probe; no test-side catalog wait.
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
       const row = await f.runOnce();
       expect(row.output ?? "").not.toContain("invalid model selection");
       expect(row).toMatchObject({ success: 1 });
@@ -1856,8 +1890,10 @@ describe("follower model catalog lifecycle (#878)", () => {
       },
     });
     try {
-      // The probe ran and failed; the restored catalog is what admits the run.
-      await waitUntil(() => existsSync(join(f.binDir, "models-calls")));
+      // The probe ran and failed before registration; the restored catalog is
+      // what admits the run.
+      expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
       const row = await f.runOnce();
       expect(row.output ?? "").not.toContain("invalid model selection");
       expect(f.flagValue(f.launchArgv(), "--model")).toBe("gemini-3.9-carbon");
@@ -1873,7 +1909,7 @@ describe("follower model catalog lifecycle (#878)", () => {
       selected: { model: "gemini-3.9-carbon", effort: "high" },
     });
     try {
-      await waitUntil(() => existsSync(join(f.binDir, "models-calls")));
+      expect(existsSync(join(f.binDir, "models-calls"))).toBe(true);
       const row = await f.runOnce();
       expect(row.success).toBe(0);
       expect(row.output).toContain("agy catalog is empty or missing");
@@ -1890,7 +1926,6 @@ describe("follower model catalog lifecycle (#878)", () => {
       selected: { model: "gemini-9-unknown", effort: "high" },
     });
     try {
-      await waitUntil(() => getProviderModelCatalog("agy") !== undefined);
       // With a known catalog the shared pin check refuses while building the
       // provider, and the leader is told which values the catalog accepts.
       f.init();
@@ -1904,10 +1939,48 @@ describe("follower model catalog lifecycle (#878)", () => {
     }
   }, 20_000);
 
+  it("registers only after a slow startup probe, so a run dispatched on readiness reaches the CLI", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "slow",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      viaPoll: true,
+    });
+    try {
+      // The leader dispatches init and wake in its first poll reply.
+      const row = await f.finishedRun();
+      expect(row.output ?? "").not.toContain("invalid model selection");
+      expect(row).toMatchObject({ success: 1 });
+      expect(f.registrations).toEqual([{ catalogInstalled: true }]);
+      expect(f.flagValue(f.launchArgv(), "--model")).toBe("gemini-3.9-carbon");
+      expect(f.flagValue(f.launchArgv(), "--effort")).toBe("high");
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
+  it("still registers after a failed startup probe and refuses an explicit selection", async () => {
+    const f = await bootAgyFollower({
+      modelsMode: "fail",
+      selected: { model: "gemini-3.9-carbon", effort: "high" },
+      viaPoll: true,
+    });
+    try {
+      const row = await f.finishedRun();
+      // Availability is not tied to agy health: the follower registered.
+      expect(f.registrations).toEqual([{ catalogInstalled: false }]);
+      expect(row.success).toBe(0);
+      expect(row.output).toContain("agy catalog is empty or missing");
+      expect(f.launchArgv()).toBeUndefined();
+    } finally {
+      await f.shutdown();
+    }
+  }, 20_000);
+
   it("stops an in-flight probe before the database closes on shutdown", async () => {
     const f = await bootAgyFollower({
       modelsMode: "hang",
       selected: { model: "gemini-3.9-carbon", effort: "high" },
+      viaPoll: true,
     });
     const pidFile = join(f.binDir, "models-pid");
     await waitUntil(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "");
@@ -1921,7 +1994,13 @@ describe("follower model catalog lifecycle (#878)", () => {
       }
     };
     expect(alive()).toBe(true);
+    // Registration is still waiting on the probe.
+    expect(f.registrations).toEqual([]);
+    const shutdownStarted = Date.now();
     await f.shutdown();
+    // Shutdown interrupts the wait rather than sitting out the probe timeout.
+    expect(Date.now() - shutdownStarted).toBeLessThan(5000);
+    expect(f.registrations).toEqual([]);
     // Killed during shutdown; allow the runtime to reap it.
     await waitUntil(() => !alive(), 2000);
     // An aborted probe is not a failed scrape: nothing was written behind the close.
