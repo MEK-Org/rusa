@@ -40,7 +40,7 @@ import {
 
 /**
  * The host-local execution capabilities a follower instance writes and reads
- * (#1019): its own run accounting and retained prompts. Global coordination
+ * (#1019): its own run accounting, retained prompts and model scrapes. Global coordination
  * state (actors, obligations, inbox, principals, grants) belongs to the leader
  * and is absent here, not guarded: each member is a frozen object of bound
  * methods, so neither a repository instance nor its database handle is
@@ -52,11 +52,25 @@ export interface FollowerRepositories {
     "start" | "complete" | "abandon" | "abandonOpen" | "listRecentCompleted"
   >;
   readonly runPrompts: Pick<RunPromptRepository, "recordForActor">;
+  /**
+   * This host's own model scrapes. Antigravity resolves an explicit selection
+   * against the process-local catalog at launch, so a follower restores and
+   * refreshes that catalog itself (#878).
+   */
+  readonly modelScrapes: Pick<
+    ModelScrapeRepository,
+    | "recordRaw"
+    | "recordParsed"
+    | "recordParseError"
+    | "getLatestForProvider"
+    | "getLatestParsedForProvider"
+  >;
 }
 
 export function createFollowerRepositories(db: Database.Database): FollowerRepositories {
   const runs = new ActorRunRepository(db);
   const prompts = new RunPromptRepository(db);
+  const scrapes = new ModelScrapeRepository(db);
   return Object.freeze({
     actorRuns: Object.freeze({
       start: (opts) => runs.start(opts),
@@ -68,6 +82,13 @@ export function createFollowerRepositories(db: Database.Database): FollowerRepos
     runPrompts: Object.freeze({
       recordForActor: (actorId, runId, prompt) => prompts.recordForActor(actorId, runId, prompt),
     } satisfies FollowerRepositories["runPrompts"]),
+    modelScrapes: Object.freeze({
+      recordRaw: (opts) => scrapes.recordRaw(opts),
+      recordParsed: (id, models) => scrapes.recordParsed(id, models),
+      recordParseError: (id, error) => scrapes.recordParseError(id, error),
+      getLatestForProvider: (provider) => scrapes.getLatestForProvider(provider),
+      getLatestParsedForProvider: (provider) => scrapes.getLatestParsedForProvider(provider),
+    } satisfies FollowerRepositories["modelScrapes"]),
   });
 }
 

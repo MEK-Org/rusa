@@ -7,6 +7,7 @@ import { closeDb, getDb, getRepositories, initDb } from "../index.js";
 import { runMigrations } from "../migrations/runner.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { createFollowerRepositories, Repositories } from "./index.js";
+import { ModelScrapeRepository } from "./model-scrape-repository.js";
 
 const migrated = () => {
   const db = new Database(":memory:");
@@ -40,7 +41,7 @@ describe("follower repository authority (#1019)", () => {
     const db = migrated();
     const follower = createFollowerRepositories(db);
 
-    expect(Object.keys(follower).sort()).toEqual(["actorRuns", "runPrompts"]);
+    expect(Object.keys(follower).sort()).toEqual(["actorRuns", "modelScrapes", "runPrompts"]);
     expect(Object.getPrototypeOf(follower)).toBe(Object.prototype);
     expect(Object.isFrozen(follower)).toBe(true);
     expect(Object.isFrozen(follower.actorRuns)).toBe(true);
@@ -53,18 +54,27 @@ describe("follower repository authority (#1019)", () => {
       "start",
     ]);
     expect(Reflect.ownKeys(follower.runPrompts)).toEqual(["recordForActor"]);
+    expect(Object.isFrozen(follower.modelScrapes)).toBe(true);
+    expect(Reflect.ownKeys(follower.modelScrapes).sort()).toEqual([
+      "getLatestForProvider",
+      "getLatestParsedForProvider",
+      "recordParseError",
+      "recordParsed",
+      "recordRaw",
+    ]);
 
     // Negative authority: the global aggregate's members and the old raw escape
     // hatches are absent, and nothing reachable is a repository or the database.
     const untyped = follower as unknown as Record<string, unknown>;
     for (const name of Reflect.ownKeys(new Repositories(db)).map(String))
-      if (name !== "actorRuns" && name !== "runPrompts")
+      if (name !== "actorRuns" && name !== "runPrompts" && name !== "modelScrapes")
         expect(untyped[name], name).toBeUndefined();
     for (const name of ["db", "role", "rawObligations", "rawSqliteInbox", "portableContext"])
       expect(untyped[name], name).toBeUndefined();
     for (const value of reachable(follower)) {
       expect(value).not.toBeInstanceOf(Database);
       expect(value).not.toBeInstanceOf(ActorRunRepository);
+      expect(value).not.toBeInstanceOf(ModelScrapeRepository);
     }
     expect(() => Object.assign(untyped, { obligations: {} })).toThrow(TypeError);
     expect(() => Object.assign(follower.actorRuns, { getById: () => undefined })).toThrow(
@@ -109,7 +119,7 @@ describe("follower repository authority (#1019)", () => {
     try {
       initDb(dir);
       const follower = getRepositories("follower");
-      expect(Object.keys(follower).sort()).toEqual(["actorRuns", "runPrompts"]);
+      expect(Object.keys(follower).sort()).toEqual(["actorRuns", "modelScrapes", "runPrompts"]);
       expect(getRepositories("follower")).toBe(follower);
       expect(() => getRepositories("leader")).toThrow(
         /already initialized for role "follower", cannot access as "leader"/

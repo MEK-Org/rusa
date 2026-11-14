@@ -5,8 +5,12 @@ import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
+import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
+import { setProviderModelCatalog } from "../providers/model-catalog.js";
+import { refreshProviderModelCatalog } from "../providers/model-scrape.js";
+import { providerCapabilityName } from "../providers/provider-selection.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
 import {
   FollowerEventAcceptanceFailedError,
@@ -71,6 +75,75 @@ export interface StartFollowerRelease {
   runningSha?: string;
   /** Where updates come from, or why this launch cannot update itself. */
   update: StartFollowerUpdateSource | { unavailable: string };
+}
+
+const MODEL_CATALOG_PROBE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Restore this host's recorded Antigravity catalog, then probe it at startup
+ * and daily, as the leader does for its own catalogs.
+ *
+ * Only Antigravity is restored and probed. Its adapter resolves an explicit
+ * model and effort against the process-local catalog at launch and refuses
+ * when that catalog is empty (#878). Other providers' catalogs stay absent, as
+ * before: provider construction validates a pin against any installed catalog,
+ * so a stale scrape that nothing here refreshes (say, from an earlier leader
+ * run on this home) would refuse models released since, and with no catalog
+ * their CLIs remain the authority. Probing Codex could also start its
+ * interactive fallback.
+ *
+ * Returns the startup probe, which never rejects. The caller registers with
+ * the leader only after it settles, so the first run the leader dispatches
+ * already sees the catalog. A failed or timed-out probe settles too: the
+ * follower still registers, and an explicit selection then gets the adapter's
+ * empty-catalog refusal. The wait is the probe's own timeout.
+ *
+ * Shutdown stops the interval and aborts and joins an in-flight probe, so no
+ * probe writes to the store after the database disposer, which was acquired
+ * first and so is released after this.
+ */
+function startFollowerModelCatalogs(
+  config: RusaConfig,
+  mcHome: string,
+  scrapeStore: FollowerRepositories["modelScrapes"],
+  resources: ResourceScope,
+  log: Logger
+): Promise<void> {
+  const runsAgy = Object.keys(config.providers ?? {}).some(
+    (name) => providerCapabilityName(name, config) === "agy"
+  );
+  if (!runsAgy) return Promise.resolve();
+  try {
+    const restored = scrapeStore.getLatestParsedForProvider("agy")?.parsedModels;
+    if (Array.isArray(restored)) setProviderModelCatalog("agy", restored);
+  } catch (err) {
+    log.warn("model_catalog_restore_failed", { err });
+  }
+
+  const abort = new AbortController();
+  let inFlight: Promise<void> = Promise.resolve();
+  const probe = () => {
+    // The agy probe records and logs its own failures; the catch is for the
+    // unexpected, so a rejection never escapes the interval or the startup wait.
+    inFlight = refreshProviderModelCatalog({
+      provider: "agy",
+      workersDir: join(mcHome, "workers"),
+      scrapeStore,
+      signal: abort.signal,
+    }).then(
+      () => undefined,
+      (err) => log.warn("model_catalog_probe_failed", { err })
+    );
+  };
+  const interval = setInterval(probe, MODEL_CATALOG_PROBE_INTERVAL_MS);
+  interval.unref?.();
+  resources.acquire("modelCatalogProbe", async () => {
+    clearInterval(interval);
+    abort.abort();
+    await inFlight;
+  });
+  probe();
+  return inFlight;
 }
 
 // `restarting` is the last status the old process can truthfully emit. Bound its
@@ -200,6 +273,13 @@ export async function composeFollowerStart(
   if (identity.role !== "follower") throw new Error("Follower start requires a leader peer");
   const repos = getRepositories("follower");
   log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
+  const startupCatalogs = startFollowerModelCatalogs(
+    config,
+    mcHome,
+    repos.modelScrapes,
+    resources,
+    log
+  );
 
   // An e2e composition must never reset and rebuild the checkout running it.
   const release: StartFollowerRelease = opts?.e2e
@@ -535,8 +615,21 @@ export async function composeFollowerStart(
     await flush();
   };
 
+  // Register only once the startup probe has settled. Shutdown releases this
+  // peer before the probe resource, so stop waiting when polling stops; callers
+  // check `stopped` before registering.
+  const startupCatalogsOrStop = () =>
+    Promise.race([
+      startupCatalogs,
+      new Promise<void>((resolve) => {
+        if (stopPolling.signal.aborted) resolve();
+        else stopPolling.signal.addEventListener("abort", () => resolve(), { once: true });
+      }),
+    ]);
+
   const startPolling = () => {
     polling = (async () => {
+      await startupCatalogsOrStop();
       let backoffMs = 500;
       while (!stopped) {
         if (!session) {
@@ -584,6 +677,13 @@ export async function composeFollowerStart(
 
   if (opts?.e2e?.onFollowerReady) {
     if (opts.e2e.connectPeer !== false) {
+      await startupCatalogsOrStop();
+      if (stopped) {
+        // A signal closed the scope during the startup probe. The peer
+        // disposer has already run, so a session registered now would leak.
+        log.info("follower_stopped_before_registration", { leader: leaderUrl.origin });
+        return;
+      }
       const ok = await registerWithLeader();
       if (!ok) {
         throw new Error(`Follower e2e registration with leader ${leaderUrl.origin} failed`);
