@@ -547,6 +547,10 @@ export class FollowerHub {
       delete headers.origin;
       const upstream = proxyRequest(target, { method: req.method, headers }, (incoming) => {
         res.writeHead(incoming.statusCode ?? 502, incoming.headers);
+        // writeHead only buffers the head until the first body write. An
+        // event stream can flush its headers and then stay idle, so send them
+        // now rather than holding the client until the first event (#1327).
+        res.flushHeaders();
         incoming.pipe(res);
       });
       upstream.on("error", () => {

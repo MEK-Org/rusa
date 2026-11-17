@@ -410,6 +410,44 @@ describe("leader follower gateway", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+  it("delivers an idle upstream stream's status and headers before any body (#1327)", async () => {
+    const h = await setup();
+    await h.register("mac");
+    h.hub.createHost("mac", "a");
+    let upstreamClosed!: Promise<unknown>;
+    const server = createServer((_req, res) => {
+      upstreamClosed = once(res, "close");
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.flushHeaders();
+      // Idle: no event, no end, until the downstream client goes away.
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No address");
+    const controller = new AbortController();
+    try {
+      const [tool] = h.hub.toolUrls("mac", "a", [
+        { name: "mesh", url: `http://127.0.0.1:${address.port}/mcp/stream` },
+      ]);
+      let timer: NodeJS.Timeout | undefined;
+      const response = await Promise.race([
+        fetch(tool.url, { headers: { accept: "text/event-stream" }, signal: controller.signal }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("proxied headers not delivered")), 2_000);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+      // Cancelling the downstream stream still tears down the upstream request.
+      controller.abort();
+      await upstreamClosed;
+    } finally {
+      controller.abort();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
   it("revokes a capability the moment it leaves the actor's snapshot, not at exit", async () => {
     const h = await setup();
     await h.register("mac");
