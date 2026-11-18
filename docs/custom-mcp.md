@@ -70,7 +70,8 @@ reports that as unavailable, like any other failed call.
 `gg-mcp-*` is the wire contract: deploy a service that accepts these headers
 with this Rusa change. Rusa does not send `rusa-mcp-*` compatibility headers.
 Until the paired service has this contract, it may refuse discovery or calls;
-Rusa does not negotiate the older headers and reports such failures as unavailable.
+Rusa does not negotiate the older headers; the refusal and unavailable behavior
+is described below.
 Updating Rusa alone neither establishes service availability nor performs
 activation; coordinate the paired-service rollout and live acceptance separately.
 
