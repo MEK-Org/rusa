@@ -56,7 +56,10 @@ let mode:
 interface Call {
   method: string | undefined;
   tool: string | undefined;
+  user: string | undefined;
   scope: string | undefined;
+  legacyUser: string | undefined;
+  legacyScope: string | undefined;
   protocolVersion: string | undefined;
 }
 let calls: Call[];
@@ -81,10 +84,10 @@ const gate = (headers: http.IncomingHttpHeaders) =>
         if (token !== credential) {
           throw new OAuthError(OAuthErrorCode.InvalidToken, "private rejection detail");
         }
-        if (headers["rusa-mcp-user-id"] !== "configured-user") {
+        if (headers["gg-mcp-user-id"] !== "configured-user") {
           throw new OAuthError(OAuthErrorCode.InsufficientScope, "private rejection detail");
         }
-        const scope = headers["rusa-mcp-scope"];
+        const scope = headers["gg-mcp-scope"];
         if (scope !== "read" && scope !== "write") {
           throw new OAuthError(OAuthErrorCode.InsufficientScope, "private rejection detail");
         }
@@ -136,10 +139,10 @@ async function startService(): Promise<void> {
                   text: JSON.stringify({
                     contextId,
                     visits: ++visits,
-                    userId: headers?.get("rusa-mcp-user-id"),
-                    scope: headers?.get("rusa-mcp-scope"),
+                    userId: headers?.get("gg-mcp-user-id"),
+                    scope: headers?.get("gg-mcp-scope"),
                     args,
-                    actorId: headers?.get("rusa-mcp-actor-id") ?? null,
+                    actorId: headers?.get("gg-mcp-actor-id") ?? null,
                   }),
                 },
               ],
@@ -164,12 +167,16 @@ async function startService(): Promise<void> {
     } catch {
       // A non-JSON body is recorded with no method.
     }
-    const scope = req.headers["rusa-mcp-scope"] as string | undefined;
+    const user = req.headers["gg-mcp-user-id"] as string | undefined;
+    const scope = req.headers["gg-mcp-scope"] as string | undefined;
     const tool = message.params?.name;
     calls.push({
       method: message.method,
       tool,
+      user,
       scope,
+      legacyUser: req.headers["rusa-mcp-user-id"] as string | undefined,
+      legacyScope: req.headers["rusa-mcp-scope"] as string | undefined,
       protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
     });
     const headers = new Headers();
@@ -325,6 +332,19 @@ describe("configured host MCP service", () => {
       "read",
       "write",
     ]);
+    expect(
+      calls
+        .filter((c) => c.method === "server/discover")
+        .map(({ user, scope, legacyUser, legacyScope }) => ({
+          user,
+          scope,
+          legacyUser,
+          legacyScope,
+        }))
+    ).toEqual([
+      { user: "configured-user", scope: "read", legacyUser: undefined, legacyScope: undefined },
+      { user: "configured-user", scope: "write", legacyUser: undefined, legacyScope: undefined },
+    ]);
     const first = await call(reader, "read_goal", { id: "a/b ?&=#" });
     expect(first).toMatchObject({
       userId: "configured-user",
@@ -337,10 +357,10 @@ describe("configured host MCP service", () => {
       contextId: first.contextId,
     });
     expect((await call(writer, "read_goal")).scope).toBe("read");
-    expect(toolCalls().map((c) => [c.tool, c.scope])).toEqual([
-      ["read_goal", "read"],
-      ["write_goal", "write"],
-      ["read_goal", "read"],
+    expect(toolCalls().map((c) => [c.tool, c.user, c.scope, c.legacyUser, c.legacyScope])).toEqual([
+      ["read_goal", "configured-user", "read", undefined, undefined],
+      ["write_goal", "configured-user", "write", undefined, undefined],
+      ["read_goal", "configured-user", "read", undefined, undefined],
     ]);
     // Each exchange is its own stateless connection: a version probe, then
     // the one request. Nothing else is sent and no session is kept.
