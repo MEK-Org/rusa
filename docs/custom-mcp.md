@@ -55,7 +55,7 @@ The service is an ordinary MCP server speaking the official protocol revision
 Every request is a plain JSON-RPC request answered with plain JSON on the same
 exchange (no session, SSE stream or `mcp-session-id`); `Host` is `localhost`.
 All requests carry `Authorization: Bearer <host-token>`,
-`rusa-mcp-user-id: <configured-user>` and `rusa-mcp-scope: read|write`. Each
+`gg-mcp-user-id: <configured-user>` and `gg-mcp-scope: read|write`. Each
 Rusa exchange opens its own connection: a `server/discover` probe for the
 pinned revision followed by the one request. Discovery carries the actor's
 current effective scope; each tool call carries only the scope its configured
@@ -66,6 +66,14 @@ calls. Classification drift between the upstream listing and configured tools is
 reported in the service log at first discovery. A tool called at a scope that does not list it is therefore unknown to
 the service, which answers the ordinary JSON-RPC tool-not-found error; Rusa
 reports that as unavailable, like any other failed call.
+
+`gg-mcp-*` is the wire contract: deploy a service that accepts these headers
+with this Rusa change. Rusa does not send `rusa-mcp-*` compatibility headers.
+Until the paired service has this contract, it may refuse discovery or calls;
+Rusa does not negotiate the older headers; the refusal and unavailable behavior
+is described below.
+Updating Rusa alone neither establishes service availability nor performs
+activation; coordinate the paired-service rollout and live acceptance separately.
 
 The service refuses an invalid token with HTTP 401 `invalid_token`, and a
 configured user it does not act for or a scope header it does not recognise

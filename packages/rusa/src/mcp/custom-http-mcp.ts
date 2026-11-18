@@ -247,8 +247,8 @@ export function createCustomHttpMcpServer(options: CustomHttpMcpOptions): McpSer
       requestInit: {
         headers: {
           authorization: `Bearer ${token}`,
-          "rusa-mcp-user-id": configured.config.userId,
-          "rusa-mcp-scope": required,
+          "gg-mcp-user-id": configured.config.userId,
+          "gg-mcp-scope": required,
         },
       },
       // A scope refusal is the service's verdict on this configured user;

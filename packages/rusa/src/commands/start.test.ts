@@ -3089,8 +3089,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const body = Buffer.concat(chunks).toString("utf8");
       requests.push({
         auth: req.headers.authorization,
-        user: req.headers["rusa-mcp-user-id"],
-        scope: req.headers["rusa-mcp-scope"],
+        user: req.headers["gg-mcp-user-id"],
+        scope: req.headers["gg-mcp-scope"],
         method: (JSON.parse(body) as { method?: string }).method,
       });
       const headers = new Headers();
