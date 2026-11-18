@@ -58,8 +58,7 @@ interface Call {
   tool: string | undefined;
   user: string | undefined;
   scope: string | undefined;
-  legacyUser: string | undefined;
-  legacyScope: string | undefined;
+  hasLegacyHeaders: boolean;
   protocolVersion: string | undefined;
 }
 let calls: Call[];
@@ -175,8 +174,9 @@ async function startService(): Promise<void> {
       tool,
       user,
       scope,
-      legacyUser: req.headers["rusa-mcp-user-id"] as string | undefined,
-      legacyScope: req.headers["rusa-mcp-scope"] as string | undefined,
+      hasLegacyHeaders:
+        req.headers["rusa-mcp-user-id"] !== undefined ||
+        req.headers["rusa-mcp-scope"] !== undefined,
       protocolVersion: req.headers["mcp-protocol-version"] as string | undefined,
     });
     const headers = new Headers();
@@ -312,6 +312,9 @@ afterEach(async () => {
   expect(new Set(calls.map((c) => c.protocolVersion))).toEqual(
     new Set(calls.length === 0 ? [] : [CUSTOM_MCP_PROTOCOL_VERSION])
   );
+  // The replacement is a wire-contract cutover: no exchange may emit either
+  // deprecated header, irrespective of its MCP method.
+  expect(calls.every((c) => !c.hasLegacyHeaders)).toBe(true);
   grants.clear();
   vi.restoreAllMocks();
   rmSync(dir, { recursive: true, force: true });
@@ -335,15 +338,13 @@ describe("configured host MCP service", () => {
     expect(
       calls
         .filter((c) => c.method === "server/discover")
-        .map(({ user, scope, legacyUser, legacyScope }) => ({
+        .map(({ user, scope }) => ({
           user,
           scope,
-          legacyUser,
-          legacyScope,
         }))
     ).toEqual([
-      { user: "configured-user", scope: "read", legacyUser: undefined, legacyScope: undefined },
-      { user: "configured-user", scope: "write", legacyUser: undefined, legacyScope: undefined },
+      { user: "configured-user", scope: "read" },
+      { user: "configured-user", scope: "write" },
     ]);
     const first = await call(reader, "read_goal", { id: "a/b ?&=#" });
     expect(first).toMatchObject({
@@ -357,10 +358,10 @@ describe("configured host MCP service", () => {
       contextId: first.contextId,
     });
     expect((await call(writer, "read_goal")).scope).toBe("read");
-    expect(toolCalls().map((c) => [c.tool, c.user, c.scope, c.legacyUser, c.legacyScope])).toEqual([
-      ["read_goal", "configured-user", "read", undefined, undefined],
-      ["write_goal", "configured-user", "write", undefined, undefined],
-      ["read_goal", "configured-user", "read", undefined, undefined],
+    expect(toolCalls().map((c) => [c.tool, c.user, c.scope])).toEqual([
+      ["read_goal", "configured-user", "read"],
+      ["write_goal", "configured-user", "write"],
+      ["read_goal", "configured-user", "read"],
     ]);
     // Each exchange is its own stateless connection: a version probe, then
     // the one request. Nothing else is sent and no session is kept.
