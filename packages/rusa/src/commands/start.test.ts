@@ -69,6 +69,7 @@ import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import { AUXILIARY_KIMI_CLI_CAPABILITY } from "../providers/sandbox.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
@@ -11836,6 +11837,25 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "pnpm-install",
         "brief",
       ]);
+    });
+
+    it("allows a capability admin to grant auxiliary Kimi CLI access without mounting an MCP server", async () => {
+      const { mesh, root } = await boot();
+      if (!root) throw new Error("configured actor missing");
+      const childId = mesh.spawn({
+        charter: "auxiliary Kimi reader",
+        parentId: root.id,
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+
+      await mesh.grantCapability(childId, AUXILIARY_KIMI_CLI_CAPABILITY, root.id);
+      expect(mesh.activeCapabilitiesFor(childId)).toEqual([AUXILIARY_KIMI_CLI_CAPABILITY]);
+      expect(mcpServersOf(workerOf(mesh, childId)).map((server) => server.name)).not.toContain(
+        AUXILIARY_KIMI_CLI_CAPABILITY
+      );
+
+      await mesh.revokeCapability(childId, AUXILIARY_KIMI_CLI_CAPABILITY, root.id);
+      expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
     });
 
     it("restores configured Chat and Slack write automatically on a staging-shaped upgrade", async () => {

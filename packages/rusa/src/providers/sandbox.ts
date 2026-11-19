@@ -36,6 +36,13 @@ import { CODEX_REFRESH_URL_ENV } from "./codex-auth-broker.js";
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
 /**
+ * An explicit per-actor grant that lets a non-Kimi provider use the installed
+ * Kimi CLI as an auxiliary tool. The grant projects Kimi's narrowly scoped
+ * sandbox home; it never changes the provider selected for the actor run.
+ */
+export const AUXILIARY_KIMI_CLI_CAPABILITY = "kimi-cli";
+
+/**
  * Host-side diagnostics from the sandbox layer. The layer is built per spawn
  * by the providers, which carry no logger, so the composition root installs
  * the service logger with {@link setSandboxLogger} (its secret scrubbing then
@@ -684,6 +691,67 @@ export function addWritableDirBindIfRealDir(args: string[], source: string, targ
 }
 
 /**
+ * Whether config still authorizes the installed Kimi CLI. A durable grant alone
+ * is deliberately insufficient: an operator removing every Kimi provider
+ * configuration must withdraw this auxiliary projection at the next spawn.
+ */
+function isKimiCliConfigured(): boolean {
+  try {
+    return Object.entries(loadConfig().providers).some(
+      ([name, provider]) => (provider.cliCommand?.trim() || name) === "kimi"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reads the durable grant at the spawn boundary, matching secret-grant
+ * behavior: a failed read is denial, never an accidental credential bind.
+ */
+function hasAuxiliaryKimiCliGrant(mcHome: string | undefined, actorDir: string): boolean {
+  if (!mcHome || !isKimiCliConfigured()) return false;
+  try {
+    const db = new Database(join(mcHome, "data", "mesh.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return new DbCapabilityGrantStore(db)
+        .activeFor(basename(actorDir))
+        .includes(AUXILIARY_KIMI_CLI_CAPABILITY);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Projects the installed Kimi CLI's state into one sandbox. The mutable
+ * credential/OAuth directories remain canonical so the CLI's own cross-process
+ * refresh lock covers every grantee, while sessions stay per actor.
+ */
+function addKimiHome(args: string[], actorDir: string): void {
+  const kimiCodeDir = join(getHostHomeDir(), ".kimi-code");
+  args.push("--setenv", "KIMI_CODE_HOME", "/tmp/kimi-home");
+  args.push("--dir", "/tmp/kimi-home");
+  addReadonlyBindIfExists(args, join(kimiCodeDir, "config.toml"), "/tmp/kimi-home/config.toml");
+  addWritableDirBindIfRealDir(args, join(kimiCodeDir, "credentials"), "/tmp/kimi-home/credentials");
+  addWritableDirBindIfRealDir(args, join(kimiCodeDir, "oauth"), "/tmp/kimi-home/oauth");
+
+  const kimiSessionsStore = kimiSessionStoreDir(actorDir);
+  mkdirSync(join(kimiSessionsStore, "sessions"), { recursive: true, mode: 0o700 });
+  const kimiIndexPath = join(kimiSessionsStore, "session_index.jsonl");
+  if (!existsSync(kimiIndexPath)) {
+    writeFileSync(kimiIndexPath, "", { mode: 0o600 });
+  }
+  args.push("--bind", join(kimiSessionsStore, "sessions"), "/tmp/kimi-home/sessions");
+  args.push("--bind", kimiIndexPath, "/tmp/kimi-home/session_index.jsonl");
+}
+
+/**
  * `--dir` every ancestor of `target` so a later `--bind`/`--ro-bind` onto a
  * shadowed (freshly `--tmpfs`'d) tree has somewhere to mount — bwrap does NOT
  * auto-vivify a bind target's parent directories under a fresh tmpfs. Exported
@@ -1044,62 +1112,12 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--bind", sessionsStore, SANDBOX_CODEX_SESSIONS_PATH);
   }
 
-  if (o.authMode === "kimi") {
-    const kimiCodeDir = join(getHostHomeDir(), ".kimi-code");
-    // Redirect kimi-code's data dir to the sandbox's writable /tmp so session writes are
-    // isolated per-worker (mirrors the CODEX_HOME=/tmp pattern for codex workers). The
-    // sessions half of that pattern — persisting the store across invocations — is wired
-    // below via the per-actor bind ; the rest of /tmp/kimi-home is per-invocation.
-    args.push("--setenv", "KIMI_CODE_HOME", "/tmp/kimi-home");
-    args.push("--dir", "/tmp/kimi-home");
-    // config.toml is static — bind read-only from the host ~/.kimi-code.
-    addReadonlyBindIfExists(args, join(kimiCodeDir, "config.toml"), "/tmp/kimi-home/config.toml");
-    // credentials/: the installed kimi CLI writes credentials/kimi-code.json via a same-dir
-    // tmp-file + fsync + rename on every refresh (a read-only bind fails that rename with
-    // EROFS), so this needs a real directory bind, not a single-file one — a file bind can't
-    // be renamed over. Bind the REAL host dir instead of a per-actor copy: kimi's refresh
-    // token rotates on use (see oauth/ below), so a copy's rewrite would leave the copy
-    // holding the live token and the host holding the one that rotation just burned — the
-    // next run (or a sibling actor) would start from a dead token. A directory bind means the
-    // rewrite's rename lands in the real host dir and every actor shares one live credential.
-    addWritableDirBindIfRealDir(
-      args,
-      join(kimiCodeDir, "credentials"),
-      "/tmp/kimi-home/credentials"
-    );
-    // oauth/: not a legacy token file — per the installed CLI's own OAuth manager (readable in
-    // its bundled build output), refreshing takes a cross-process advisory lock at
-    // `${KIMI_CODE_HOME}/oauth/kimi-code` (via `proper-lockfile`, mkdir-based) before rotating
-    // the refresh token, guarding exactly the race this issue is about; the CLI's own comment
-    // is explicit that skipping the lock would mean "racing refresh_token rotation". That lock
-    // needs a writable parent directory (proper-lockfile creates a sibling `kimi-code.lock`
-    // entry next to the target), so this is a directory bind too, not a file bind. Binding the
-    // real host oauth/ dir — instead of each actor getting its own copy and thus its own private
-    // lock namespace — is what actually restores the CLI's built-in single-refresh-owner
-    // protection across concurrent actors; rusa does not need a lock of its own on top of it.
-    addWritableDirBindIfRealDir(args, join(kimiCodeDir, "oauth"), "/tmp/kimi-home/oauth");
-    // Cross-invocation session continuity (ISSUE_NUM + follow-up): kimi keeps its session
-    // transcripts under KIMI_CODE_HOME/sessions AND a sibling KIMI_CODE_HOME/session_index.jsonl
-    // that maps a session id to its workdir bucket. /tmp/kimi-home is a per-invocation sandbox
-    // tmpfs, so both vanished with the prior invocation's bwrap and every `kimi -r <id>` resume
-    // failed "Session not found". ISSUE_NUM persisted sessions/ alone, but the `-r` id->bucket lookup
-    // reads the sibling index FIRST, so resume still failed until the index is persisted too
-    // (isolated by solid-rusa's Layer 2 real-`-r` E2E). Persist BOTH in a per-actor host-/tmp
-    // dir laid out like KIMI_CODE_HOME's session slice and bind each into place — same
-    // memory-not-secret discipline as codex's rollout store (see {@link kimiSessionStoreDir}):
-    // NOT tempPaths, survive across runs/retire/redeploy — like credentials/ and oauth/ above,
-    // but for session continuity rather than auth (separate paths, unaffected by each other).
-    // Must come AFTER the initial `--tmpfs /tmp` and the `--dir /tmp/kimi-home` above, or they
-    // would be shadowed.
-    const kimiSessionsStore = kimiSessionStoreDir(o.actorDir);
-    mkdirSync(join(kimiSessionsStore, "sessions"), { recursive: true, mode: 0o700 });
-    const kimiIndexPath = join(kimiSessionsStore, "session_index.jsonl");
-    if (!existsSync(kimiIndexPath)) {
-      // bind source must exist; an empty index is kimi's fresh-start state (it appends).
-      writeFileSync(kimiIndexPath, "", { mode: 0o600 });
-    }
-    args.push("--bind", join(kimiSessionsStore, "sessions"), "/tmp/kimi-home/sessions");
-    args.push("--bind", kimiIndexPath, "/tmp/kimi-home/session_index.jsonl");
+  if (o.authMode === "kimi" || hasAuxiliaryKimiCliGrant(mcHome, realActorDir)) {
+    // Kimi itself always receives its existing home. Other providers require
+    // both configured Kimi support and the durable auxiliary capability above.
+    // Keep this separate from the auth-mode/MCP branch: that branch must remain
+    // tied to the actual provider selected for this run.
+    addKimiHome(args, realActorDir);
   }
 
   const hostFlutterRoot = resolveHostFlutterRoot();

@@ -351,6 +351,74 @@ describe("sandbox bwrap args", () => {
     expect(tempPaths).not.toContain(storeIndex);
   });
 
+  it("gives a non-Kimi provider the shared Kimi home only when Kimi is configured and its actor holds the auxiliary grant", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-kimi-aux-home-"));
+    tempDirs.push(home);
+    const mcHome = join(home, ".rusa");
+    const actorId = "codex-kimi-reader";
+    const actorDir = join(mcHome, "workers", actorId);
+    mkdirSync(actorDir, { recursive: true });
+    mkdirSync(join(home, ".kimi-code", "credentials"), { recursive: true });
+    mkdirSync(join(home, ".kimi-code", "oauth"), { recursive: true });
+    writeFileSync(join(home, ".kimi-code", "config.toml"), "default_model = 'kimi-for-coding'\n");
+    process.env.HOME = home;
+    mockLoadConfig.mockReturnValue({
+      github: { account: "test" },
+      providers: { kimi: { cliCommand: "kimi" } },
+      webhook: { port: 9742, secret: "secret" },
+      gitBridge: false,
+    });
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs, SANDBOX_KIMI_MCP_CONFIG_PATH } = await import("./sandbox.js");
+    const denied = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    expect(denied).not.toContain("KIMI_CODE_HOME");
+    expect(denied).not.toContain("/tmp/kimi-home/credentials");
+    expect(denied).toContain("/tmp/config.toml");
+    expect(denied).not.toContain(SANDBOX_KIMI_MCP_CONFIG_PATH);
+
+    const dataDir = join(mcHome, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const db = new Database(join(dataDir, "mesh.db"));
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'test actor', NULL, '2026-11-19T00:00:00Z')"
+    ).run();
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-11-19T00:00:00Z')"
+    ).run(actorId);
+    db.prepare(
+      `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+       VALUES (?, 'kimi-cli', 'root', '2026-11-19T00:00:00Z', NULL)`
+    ).run(actorId);
+    db.close();
+
+    const granted = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    expectSetenv(granted, "KIMI_CODE_HOME", "/tmp/kimi-home");
+    expect(granted).toContain("/tmp/kimi-home/credentials");
+    expect(granted).toContain("/tmp/kimi-home/oauth");
+    expect(granted).toContain("/tmp/kimi-home/sessions");
+    // The actor remains a Codex provider: its MCP config has not been redirected to Kimi.
+    expect(granted).toContain("/tmp/config.toml");
+    expect(granted).not.toContain(SANDBOX_KIMI_MCP_CONFIG_PATH);
+
+    mockLoadConfig.mockReturnValue({
+      github: { account: "test" },
+      providers: {},
+      webhook: { port: 9742, secret: "secret" },
+      gitBridge: false,
+    });
+    const configDenied = buildActorBwrapArgs(actorDir, "codex").args;
+    expect(configDenied).not.toContain("KIMI_CODE_HOME");
+    expect(configDenied).not.toContain("/tmp/kimi-home/credentials");
+  });
+
   it("pins the per-invocation mcp config over the real ~/.gemini paths for antigravity", async () => {
     const home = mkdtempSync(join(tmpdir(), "mc-gemini-home-"));
     tempDirs.push(home);

@@ -3,8 +3,24 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildActorBwrapArgs, kimiSessionStoreDir, teardownFlutterOverlay } from "./sandbox.js";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import {
+  AUXILIARY_KIMI_CLI_CAPABILITY,
+  buildActorBwrapArgs,
+  codexRolloutStoreDir,
+  kimiSessionStoreDir,
+  teardownFlutterOverlay,
+} from "./sandbox.js";
+
+vi.mock("../config/loader.js", () => ({
+  loadConfig: () => ({
+    github: { account: "test" },
+    providers: { kimi: { cliCommand: "kimi" } },
+    webhook: { port: 9742, secret: "synthetic" },
+  }),
+}));
 
 const execFileAsync = promisify(execFile);
 
@@ -18,6 +34,32 @@ function probeBwrapCapable(): boolean {
 }
 
 const BWRAP_CAPABLE = probeBwrapCapable();
+
+function grantAuxiliaryKimiCli(mcHome: string, actorIds: string[]): void {
+  const dataDir = join(mcHome, "data");
+  mkdirSync(dataDir, { recursive: true });
+  const db = new Database(join(dataDir, "mesh.db"));
+  try {
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'test actor', NULL, '2026-11-19T00:00:00Z')"
+    ).run();
+    const insertActor = db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-11-19T00:00:00Z')"
+    );
+    const grant = db.prepare(
+      `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+       VALUES (?, ?, 'root', '2026-11-19T00:00:00Z', NULL)`
+    );
+    for (const actorId of actorIds) {
+      insertActor.run(actorId);
+      grant.run(actorId, AUXILIARY_KIMI_CLI_CAPABILITY);
+    }
+  } finally {
+    db.close();
+  }
+}
 
 describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () => {
   const originalHome = process.env.HOME;
@@ -152,6 +194,69 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
       rmSync(kimiSessionStoreDir(actorDirB), { recursive: true, force: true });
       teardownFlutterOverlay(actorDirB);
       rmSync(actorDirB, { recursive: true, force: true });
+    }
+  });
+
+  it("projects shared Kimi auth but isolated sessions into two auxiliary Codex sandboxes", async () => {
+    const mcHome = join(fixtureHome, ".rusa");
+    const workersDir = join(mcHome, "workers");
+    const actorIdA = "aux-kimi-reader-a";
+    const actorIdB = "aux-kimi-reader-b";
+    const actorDirA = join(workersDir, actorIdA);
+    const actorDirB = join(workersDir, actorIdB);
+    mkdirSync(actorDirA, { recursive: true });
+    mkdirSync(actorDirB, { recursive: true });
+    grantAuxiliaryKimiCli(mcHome, [actorIdA, actorIdB]);
+
+    const argsA = buildActorBwrapArgs(actorDirA, "codex").args;
+    const argsB = buildActorBwrapArgs(actorDirB, "codex").args;
+    const lockPath = "/tmp/kimi-home/oauth/kimi-code.lock";
+    const commandFor = (label: string, otherLabel: string) =>
+      `for i in $(seq 1 200); do
+         if mkdir ${lockPath} 2>/dev/null; then
+           printf '%s\\n' '${label}' >> /tmp/kimi-home/oauth/winners
+           rmdir ${lockPath}
+           break
+         fi
+         sleep 0.01
+       done
+       printf '%s' '${label}' > /tmp/kimi-home/credentials/kimi-code.json
+       printf '%s' '${label}' > /tmp/kimi-home/sessions/${label}
+       test ! -e /tmp/kimi-home/sessions/${otherLabel}`;
+    try {
+      await expect(
+        Promise.all([
+          execFileAsync(
+            "bwrap",
+            [...argsA, "--", "/bin/sh", "-c", commandFor(actorIdA, actorIdB)],
+            { encoding: "utf8" }
+          ),
+          execFileAsync(
+            "bwrap",
+            [...argsB, "--", "/bin/sh", "-c", commandFor(actorIdB, actorIdA)],
+            { encoding: "utf8" }
+          ),
+        ])
+      ).resolves.toBeDefined();
+
+      const winners = readFileSync(join(hostOauthDir, "winners"), "utf8").trim().split("\n");
+      expect(winners.sort()).toEqual([actorIdA, actorIdB]);
+      expect(existsSync(join(hostOauthDir, "kimi-code.lock"))).toBe(false);
+      expect(readFileSync(join(hostCredsDir, "kimi-code.json"), "utf8")).toMatch(
+        /aux-kimi-reader-[ab]/
+      );
+      expect(readFileSync(join(kimiSessionStoreDir(actorDirA), "sessions", actorIdA), "utf8")).toBe(
+        actorIdA
+      );
+      expect(readFileSync(join(kimiSessionStoreDir(actorDirB), "sessions", actorIdB), "utf8")).toBe(
+        actorIdB
+      );
+    } finally {
+      for (const dir of [actorDirA, actorDirB]) {
+        rmSync(kimiSessionStoreDir(dir), { recursive: true, force: true });
+        rmSync(codexRolloutStoreDir(dir), { recursive: true, force: true });
+        teardownFlutterOverlay(dir);
+      }
     }
   });
 });
