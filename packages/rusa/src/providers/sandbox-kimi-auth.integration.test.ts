@@ -312,17 +312,17 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
 
     const { args } = buildActorBwrapArgs(auxiliaryActorDir, "codex");
     try {
-      execFileSync(
-        "bwrap",
-        [
-          ...args,
-          "--",
-          "/bin/sh",
-          "-c",
-          'test ! -e "$HOME/.kimi-code/mcp.json" && test ! -e "$HOME/.kimi-code/credentials/google-creds/drive-token.json" && test ! -e /tmp/kimi-home/credentials/google-creds/drive-token.json && test -e /tmp/kimi-home/credentials/kimi-code.json && ! touch "$HOME/.kimi-code/ignored-kimi-home-write" && test ! -e "$HOME/.kimi-code/ignored-kimi-home-write"',
-        ],
-        { stdio: "pipe" }
-      );
+      const command = [
+        'test ! -e "$HOME/.kimi-code/mcp.json" || { echo "symlink mcp visible" >&2; exit 1; }',
+        'test ! -e "$HOME/.kimi-code/credentials/google-creds/drive-token.json" || { echo "symlink Google token visible" >&2; exit 1; }',
+        'test ! -e "$HOME/kimi-code-real/mcp.json" || { echo "resolved mcp visible" >&2; exit 1; }',
+        'test ! -e "$HOME/kimi-code-real/sessions/host-session" || { echo "resolved session visible" >&2; exit 1; }',
+        'test ! -e /tmp/kimi-home/credentials/google-creds/drive-token.json || { echo "projected Google token visible" >&2; exit 1; }',
+        'test -e /tmp/kimi-home/credentials/kimi-code.json || { echo "projected Kimi credential hidden" >&2; exit 1; }',
+        '! touch "$HOME/.kimi-code/ignored-kimi-home-write" || { echo "symlink write succeeded" >&2; exit 1; }',
+        '! touch "$HOME/kimi-code-real/ignored-resolved-kimi-home-write" || { echo "resolved write succeeded" >&2; exit 1; }',
+      ].join("\n");
+      execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", command], { stdio: "pipe" });
     } finally {
       rmSync(kimiSessionStoreDir(auxiliaryActorDir), { recursive: true, force: true });
       rmSync(codexRolloutStoreDir(auxiliaryActorDir), { recursive: true, force: true });

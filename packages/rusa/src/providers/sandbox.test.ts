@@ -441,6 +441,10 @@ describe("sandbox bwrap args", () => {
     }
     expect(googleShadow).toBeGreaterThan(auxiliaryShadow);
     expect(granted.slice(googleShadow - 2, googleShadow)).toEqual(["--dir", googleCredentialsDir]);
+    const auxiliaryRemount = granted.findIndex(
+      (arg, index) => arg === "--remount-ro" && granted[index + 1] === hostKimiHome
+    );
+    expect(auxiliaryRemount).toBeGreaterThan(googleShadow);
 
     const nativeKimi = buildActorBwrapArgs(actorDir, "kimi").args;
     expect(
