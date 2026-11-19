@@ -431,7 +431,6 @@ describe("sandbox bwrap args", () => {
       (arg, index) => arg === "--tmpfs" && granted[index + 1] === hostKimiHome
     );
     expect(auxiliaryShadow).toBeGreaterThan(-1);
-    expect(granted[auxiliaryShadow + 2]).not.toBe("--remount-ro");
     // A configured Google credential path beneath the isolated Kimi home is
     // shadowed later, so the nested mount remains constructible in real bwrap.
     let googleShadow = -1;

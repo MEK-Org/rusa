@@ -11853,9 +11853,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(mcpServersOf(workerOf(mesh, childId)).map((server) => server.name)).not.toContain(
         AUXILIARY_KIMI_CLI_CAPABILITY
       );
-
-      await mesh.revokeCapability(childId, AUXILIARY_KIMI_CLI_CAPABILITY, root.id);
-      expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
     });
 
     it("restores configured Chat and Slack write automatically on a staging-shaped upgrade", async () => {

@@ -1,5 +1,14 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -282,7 +291,7 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
     }
   });
 
-  it("keeps a nested Google credential shadow mountable after the auxiliary Kimi host-home shadow", () => {
+  it("keeps a nested Google credential shadow mountable under a symlinked auxiliary Kimi home", () => {
     const mcHome = join(fixtureHome, ".rusa");
     const actorId = "aux-kimi-google-shadow";
     const auxiliaryActorDir = join(mcHome, "workers", actorId);
@@ -297,6 +306,9 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
       webhook: { port: 9742, secret: "synthetic" },
       chat: { gchatConfigDir: googleCredentialsDir },
     });
+    const realKimiDir = join(fixtureHome, "kimi-code-real");
+    renameSync(join(fixtureHome, ".kimi-code"), realKimiDir);
+    symlinkSync(realKimiDir, join(fixtureHome, ".kimi-code"));
 
     const { args } = buildActorBwrapArgs(auxiliaryActorDir, "codex");
     try {
@@ -307,7 +319,7 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
           "--",
           "/bin/sh",
           "-c",
-          'test ! -e "$HOME/.kimi-code/mcp.json" && test ! -e "$HOME/.kimi-code/credentials/google-creds/drive-token.json"',
+          'test ! -e "$HOME/.kimi-code/mcp.json" && test ! -e "$HOME/.kimi-code/credentials/google-creds/drive-token.json" && test ! -e /tmp/kimi-home/credentials/google-creds/drive-token.json && test -e /tmp/kimi-home/credentials/kimi-code.json && ! touch "$HOME/.kimi-code/ignored-kimi-home-write" && test ! -e "$HOME/.kimi-code/ignored-kimi-home-write"',
         ],
         { stdio: "pipe" }
       );

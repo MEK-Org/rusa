@@ -723,14 +723,25 @@ function isKimiCliConfigured(): boolean {
  * Kimi home can be shadowed only after the allow-listed projections are mounted
  * for an auxiliary grantee: `KIMI_CODE_HOME` is a CLI convention, not a
  * sufficient containment boundary for a process that could otherwise read the
- * host path directly. Native Kimi keeps its existing host-home topology.
+ * host path directly. Native Kimi keeps its existing host-home topology. The
+ * returned paths must be made read-only only after later nested credential
+ * shadows have created their mountpoints.
  */
-function addKimiHome(args: string[], actorDir: string, shadowHostKimiHome = false): void {
+function addKimiHome(
+  args: string[],
+  actorDir: string,
+  shadowHostKimiHome = false
+): readonly string[] {
   const kimiCodeDir = join(getHostHomeDir(), ".kimi-code");
   args.push("--setenv", "KIMI_CODE_HOME", "/tmp/kimi-home");
   args.push("--dir", "/tmp/kimi-home");
   addReadonlyBindIfExists(args, join(kimiCodeDir, "config.toml"), "/tmp/kimi-home/config.toml");
+  // Kimi refresh replaces its credential file with a same-directory temporary
+  // file plus rename; a file or read-only bind fails that operation with EROFS.
+  // Bind the canonical directory so every grantee observes the rotated token.
   addWritableDirBindIfRealDir(args, join(kimiCodeDir, "credentials"), "/tmp/kimi-home/credentials");
+  // The installed CLI's cross-process refresh lock also lives beside its OAuth
+  // state, so this canonical directory preserves one lock namespace for all grantees.
   addWritableDirBindIfRealDir(args, join(kimiCodeDir, "oauth"), "/tmp/kimi-home/oauth");
 
   const kimiSessionsStore = kimiSessionStoreDir(actorDir);
@@ -739,9 +750,12 @@ function addKimiHome(args: string[], actorDir: string, shadowHostKimiHome = fals
   if (!existsSync(kimiIndexPath)) {
     writeFileSync(kimiIndexPath, "", { mode: 0o600 });
   }
+  // These must follow the initial `/tmp` tmpfs and `/tmp/kimi-home` directory,
+  // or those earlier mounts would hide the actor-isolated session state.
   args.push("--bind", join(kimiSessionsStore, "sessions"), "/tmp/kimi-home/sessions");
   args.push("--bind", kimiIndexPath, "/tmp/kimi-home/session_index.jsonl");
 
+  const shadowedHostKimiHomes: string[] = [];
   if (shadowHostKimiHome) {
     // These source paths have now been projected to the limited sandbox home.
     // Shadow the host view afterwards so an auxiliary tool cannot bypass
@@ -750,9 +764,13 @@ function addKimiHome(args: string[], actorDir: string, shadowHostKimiHome = fals
     // Keep this tmpfs writable: injectGoogleCredentialShadow runs later and may
     // need to create a nested shadow under this isolated tree.
     for (const dir of new Set([kimiCodeDir, realpathIfExists(kimiCodeDir)])) {
-      if (existsSync(dir)) args.push("--tmpfs", dir);
+      if (existsSync(dir)) {
+        args.push("--tmpfs", dir);
+        shadowedHostKimiHomes.push(dir);
+      }
     }
   }
+  return shadowedHostKimiHomes;
 }
 
 /**
@@ -1124,15 +1142,15 @@ function buildMeshActorBwrapArgs(o: {
 
   const hasAuxiliaryKimiCliGrant =
     o.authMode !== "kimi" &&
-    isWorkerActor &&
     activeGrants.includes(AUXILIARY_KIMI_CLI_CAPABILITY) &&
     isKimiCliConfigured();
+  let auxiliaryKimiHostHomeShadows: readonly string[] = [];
   if (o.authMode === "kimi" || hasAuxiliaryKimiCliGrant) {
     // Kimi itself always receives its existing home. Other providers require
     // both configured Kimi support and the durable auxiliary capability above.
     // Keep this separate from the auth-mode/MCP branch: that branch must remain
     // tied to the actual provider selected for this run.
-    addKimiHome(args, realActorDir, hasAuxiliaryKimiCliGrant);
+    auxiliaryKimiHostHomeShadows = addKimiHome(args, realActorDir, hasAuxiliaryKimiCliGrant);
   }
 
   const hostFlutterRoot = resolveHostFlutterRoot();
@@ -1191,6 +1209,13 @@ function buildMeshActorBwrapArgs(o: {
     // visibility of the real `~/.config/gchat` dir. Last, so no later mount can
     // bind a credential dir back in (#1013).
     injectGoogleCredentialShadow(args);
+  }
+  // A nested Google shadow may sit below the isolated Kimi host-home tmpfs, so
+  // it must be mounted first. Remount the remaining host-home tree read-only
+  // afterwards: an auxiliary process that ignores KIMI_CODE_HOME now fails
+  // loudly instead of silently writing into a disposable shadow.
+  for (const dir of auxiliaryKimiHostHomeShadows) {
+    args.push("--remount-ro", dir);
   }
 
   return { args, tempPaths };
