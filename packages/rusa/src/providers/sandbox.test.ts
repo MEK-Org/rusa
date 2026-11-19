@@ -364,7 +364,7 @@ describe("sandbox bwrap args", () => {
     process.env.HOME = home;
     mockLoadConfig.mockReturnValue({
       github: { account: "test" },
-      providers: { kimi: { cliCommand: "kimi" } },
+      providers: { auxiliaryKimi: { cliCommand: "kimi" } },
       webhook: { port: 9742, secret: "secret" },
       gitBridge: false,
     });
@@ -375,7 +375,13 @@ describe("sandbox bwrap args", () => {
       throw new Error(`Unexpected command: ${command}`);
     });
 
-    const { buildActorBwrapArgs, SANDBOX_KIMI_MCP_CONFIG_PATH } = await import("./sandbox.js");
+    const {
+      buildActorBwrapArgs,
+      codexRolloutStoreDir,
+      kimiSessionStoreDir,
+      SANDBOX_KIMI_MCP_CONFIG_PATH,
+    } = await import("./sandbox.js");
+    tempDirs.push(codexRolloutStoreDir(actorDir), kimiSessionStoreDir(actorDir));
     const denied = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
     expect(denied).not.toContain("KIMI_CODE_HOME");
     expect(denied).not.toContain("/tmp/kimi-home/credentials");

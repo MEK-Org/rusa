@@ -32,6 +32,7 @@ import {
   ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
 import { CODEX_REFRESH_URL_ENV } from "./codex-auth-broker.js";
+import { providerCapabilityName } from "./provider-selection.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
@@ -697,8 +698,9 @@ export function addWritableDirBindIfRealDir(args: string[], source: string, targ
  */
 function isKimiCliConfigured(): boolean {
   try {
-    return Object.entries(loadConfig().providers).some(
-      ([name, provider]) => (provider.cliCommand?.trim() || name) === "kimi"
+    const config = loadConfig();
+    return Object.keys(config.providers).some(
+      (providerName) => providerCapabilityName(providerName, config) === "kimi"
     );
   } catch {
     return false;
