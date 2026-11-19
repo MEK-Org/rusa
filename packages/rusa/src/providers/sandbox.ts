@@ -759,15 +759,15 @@ function addKimiHome(
   if (shadowHostKimiHome) {
     // These source paths have now been projected to the limited sandbox home.
     // Shadow the host view afterwards so an auxiliary tool cannot bypass
-    // KIMI_CODE_HOME and read host sessions or mcp.json directly. Cover both a
-    // configured spelling and its resolved target, as with the Codex auth mask.
+    // KIMI_CODE_HOME and read host sessions or mcp.json directly. Mounting a
+    // tmpfs at the resolved target covers every spelling; bwrap cannot mount a
+    // tmpfs directly over a visible symlink.
     // Keep this tmpfs writable: injectGoogleCredentialShadow runs later and may
     // need to create a nested shadow under this isolated tree.
-    for (const dir of new Set([kimiCodeDir, realpathIfExists(kimiCodeDir)])) {
-      if (existsSync(dir)) {
-        args.push("--tmpfs", dir);
-        shadowedHostKimiHomes.push(dir);
-      }
+    const resolvedKimiCodeDir = realpathIfExists(kimiCodeDir);
+    if (existsSync(resolvedKimiCodeDir)) {
+      args.push("--tmpfs", resolvedKimiCodeDir);
+      shadowedHostKimiHomes.push(resolvedKimiCodeDir);
     }
   }
   return shadowedHostKimiHomes;

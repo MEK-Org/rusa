@@ -82,7 +82,9 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
   let hostOauthDir: string;
 
   beforeEach(() => {
-    fixtureHome = mkdtempSync(join(tmpdir(), "kimi-auth-home-"));
+    // Keep this outside host /tmp: bwrap's baseline --tmpfs /tmp would otherwise
+    // make the auxiliary host-home-shadow assertions pass without that shadow.
+    fixtureHome = mkdtempSync(join(process.cwd(), "kimi-auth-home-"));
     process.env.HOME = fixtureHome;
     hostCredsDir = join(fixtureHome, ".kimi-code", "credentials");
     hostOauthDir = join(fixtureHome, ".kimi-code", "oauth");
