@@ -357,9 +357,12 @@ describe("sandbox bwrap args", () => {
     const mcHome = join(home, ".rusa");
     const actorId = "codex-kimi-reader";
     const actorDir = join(mcHome, "workers", actorId);
+    const googleCredentialsDir = join(home, ".kimi-code", "credentials", "google-creds");
     mkdirSync(actorDir, { recursive: true });
     mkdirSync(join(home, ".kimi-code", "credentials"), { recursive: true });
     mkdirSync(join(home, ".kimi-code", "oauth"), { recursive: true });
+    mkdirSync(googleCredentialsDir, { recursive: true });
+    writeFileSync(join(googleCredentialsDir, "drive-token.json"), '{"refresh_token":"synthetic"}');
     writeFileSync(join(home, ".kimi-code", "config.toml"), "default_model = 'kimi-for-coding'\n");
     process.env.HOME = home;
     mockLoadConfig.mockReturnValue({
@@ -367,6 +370,7 @@ describe("sandbox bwrap args", () => {
       providers: { auxiliaryKimi: { cliCommand: "kimi" } },
       webhook: { port: 9742, secret: "secret" },
       gitBridge: false,
+      chat: { gchatConfigDir: googleCredentialsDir },
     });
     execSyncMock.mockImplementation((command: string) => {
       if (command === "pnpm store path") return "/tmp/pnpm-store\n";
@@ -421,12 +425,35 @@ describe("sandbox bwrap args", () => {
     // The actor remains a Codex provider: its MCP config has not been redirected to Kimi.
     expect(granted).toContain("/tmp/config.toml");
     expect(granted).not.toContain(SANDBOX_KIMI_MCP_CONFIG_PATH);
+    // The new auxiliary view cannot bypass KIMI_CODE_HOME to read host-only state.
+    const hostKimiHome = join(home, ".kimi-code");
+    const auxiliaryShadow = granted.findIndex(
+      (arg, index) => arg === "--tmpfs" && granted[index + 1] === hostKimiHome
+    );
+    expect(auxiliaryShadow).toBeGreaterThan(-1);
+    expect(granted[auxiliaryShadow + 2]).not.toBe("--remount-ro");
+    // A configured Google credential path beneath the isolated Kimi home is
+    // shadowed later, so the nested mount remains constructible in real bwrap.
+    let googleShadow = -1;
+    for (let index = 0; index < granted.length - 1; index += 1) {
+      if (granted[index] === "--tmpfs" && granted[index + 1] === googleCredentialsDir) {
+        googleShadow = index;
+      }
+    }
+    expect(googleShadow).toBeGreaterThan(auxiliaryShadow);
+    expect(granted.slice(googleShadow - 2, googleShadow)).toEqual(["--dir", googleCredentialsDir]);
+
+    const nativeKimi = buildActorBwrapArgs(actorDir, "kimi").args;
+    expect(
+      nativeKimi.some((arg, index) => arg === "--tmpfs" && nativeKimi[index + 1] === hostKimiHome)
+    ).toBe(false);
 
     mockLoadConfig.mockReturnValue({
       github: { account: "test" },
       providers: {},
       webhook: { port: 9742, secret: "secret" },
       gitBridge: false,
+      chat: { gchatConfigDir: googleCredentialsDir },
     });
     const configDenied = buildActorBwrapArgs(actorDir, "codex").args;
     expect(configDenied).not.toContain("KIMI_CODE_HOME");
@@ -437,6 +464,7 @@ describe("sandbox bwrap args", () => {
       providers: { auxiliaryKimi: { cliCommand: "kimi" } },
       webhook: { port: 9742, secret: "secret" },
       gitBridge: false,
+      chat: { gchatConfigDir: googleCredentialsDir },
     });
     const e2eRootDir = join(mcHome, e2eRootActorId);
     mkdirSync(e2eRootDir, { recursive: true });

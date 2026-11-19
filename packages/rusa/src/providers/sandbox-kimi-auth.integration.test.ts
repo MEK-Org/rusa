@@ -14,12 +14,16 @@ import {
   teardownFlutterOverlay,
 } from "./sandbox.js";
 
-vi.mock("../config/loader.js", () => ({
-  loadConfig: () => ({
+const loadConfigMock = vi.hoisted(() =>
+  vi.fn<() => unknown>(() => ({
     github: { account: "test" },
     providers: { kimi: { cliCommand: "kimi" } },
     webhook: { port: 9742, secret: "synthetic" },
-  }),
+  }))
+);
+
+vi.mock("../config/loader.js", () => ({
+  loadConfig: loadConfigMock,
 }));
 
 const execFileAsync = promisify(execFile);
@@ -90,6 +94,12 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
   });
 
   afterEach(() => {
+    loadConfigMock.mockReset();
+    loadConfigMock.mockReturnValue({
+      github: { account: "test" },
+      providers: { kimi: { cliCommand: "kimi" } },
+      webhook: { port: 9742, secret: "synthetic" },
+    });
     rmSync(kimiSessionStoreDir(actorDir), { recursive: true, force: true });
     teardownFlutterOverlay(actorDir);
     rmSync(actorDir, { recursive: true, force: true });
@@ -269,6 +279,42 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
         rmSync(codexRolloutStoreDir(dir), { recursive: true, force: true });
         teardownFlutterOverlay(dir);
       }
+    }
+  });
+
+  it("keeps a nested Google credential shadow mountable after the auxiliary Kimi host-home shadow", () => {
+    const mcHome = join(fixtureHome, ".rusa");
+    const actorId = "aux-kimi-google-shadow";
+    const auxiliaryActorDir = join(mcHome, "workers", actorId);
+    const googleCredentialsDir = join(hostCredsDir, "google-creds");
+    mkdirSync(auxiliaryActorDir, { recursive: true });
+    mkdirSync(googleCredentialsDir, { recursive: true });
+    writeFileSync(join(googleCredentialsDir, "drive-token.json"), '{"refresh_token":"synthetic"}');
+    grantAuxiliaryKimiCli(mcHome, [actorId]);
+    loadConfigMock.mockReturnValue({
+      github: { account: "test" },
+      providers: { kimi: { cliCommand: "kimi" } },
+      webhook: { port: 9742, secret: "synthetic" },
+      chat: { gchatConfigDir: googleCredentialsDir },
+    });
+
+    const { args } = buildActorBwrapArgs(auxiliaryActorDir, "codex");
+    try {
+      execFileSync(
+        "bwrap",
+        [
+          ...args,
+          "--",
+          "/bin/sh",
+          "-c",
+          'test ! -e "$HOME/.kimi-code/mcp.json" && test ! -e "$HOME/.kimi-code/credentials/google-creds/drive-token.json"',
+        ],
+        { stdio: "pipe" }
+      );
+    } finally {
+      rmSync(kimiSessionStoreDir(auxiliaryActorDir), { recursive: true, force: true });
+      rmSync(codexRolloutStoreDir(auxiliaryActorDir), { recursive: true, force: true });
+      teardownFlutterOverlay(auxiliaryActorDir);
     }
   });
 });
