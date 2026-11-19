@@ -295,6 +295,7 @@ import {
   resolveProvider,
 } from "../providers/registry.js";
 import {
+  AUXILIARY_KIMI_CLI_CAPABILITY,
   assertBwrapAvailable,
   setSandboxLogger,
   teardownFlutterOverlay,
@@ -438,6 +439,7 @@ const WORKER_MCP_NAMES = [
 /** Grantable capabilities that mount no MCP server of their own. */
 const NON_SERVER_CAPABILITIES = [
   SECRET_CAPABILITY_BASE,
+  AUXILIARY_KIMI_CLI_CAPABILITY,
   COMPUTER_USE_CAPABILITY,
   OBLIGATION_RESPONSIVE_CAPABILITY,
   OBLIGATIONS_ADMIN_CAPABILITY,
