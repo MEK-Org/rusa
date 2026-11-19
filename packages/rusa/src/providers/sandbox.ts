@@ -557,10 +557,10 @@ function injectGoogleCredentialShadow(args: string[]): void {
  * mounts in argument order), so the grantee reads the key at the same well-known
  * path as on the host (e.g. `$RUSA_HOME/secrets/gemini-api-key`). Secret grants
  * do not export environment variables into the actor's process tree; a command
- * that needs an environment variable takes it per-command from the file. Grants
- * are read straight from the `capability_grants` table in `$RUSA_HOME/data/mesh.db`
- * through a short-lived readonly connection (the sandbox layer never imports the
- * mesh — same discipline as `loadConfig()` in {@link injectWorkerGithubCredential}),
+ * that needs an environment variable takes it per-command from the file. The
+ * worker's spawn reads the `capability_grants` table in `$RUSA_HOME/data/mesh.db`
+ * once through a short-lived readonly connection (the sandbox layer never imports
+ * the mesh — same discipline as `loadConfig()` in {@link injectWorkerGithubCredential}),
  * keyed by the actor id (= the worker dir's basename, see start.ts
  * `join(workersDir, actorId)`). Evaluated per-spawn, so grant/revoke takes effect
  * on the actor's next run. Fail-closed to MASKED: any open/read error means "no
@@ -577,7 +577,36 @@ export function deriveSecretEnvVar(filename: string): string {
   return filename.toUpperCase().replace(/-/g, "_");
 }
 
-function injectSecretsMasking(args: string[], mcHome: string, actorId: string): void {
+/**
+ * Reads all durable grants once at the real-worker spawn boundary. A failed
+ * read is denial for every capability consumer in this sandbox build.
+ */
+function readActiveCapabilityGrants(mcHome: string, actorId: string): string[] {
+  try {
+    // Path must match db/index.ts's initDb layout (`<mcHome>/data/mesh.db`).
+    // Opened fresh per spawn, readonly, and closed immediately — this never
+    // holds the mesh's own connection, which may belong to a different
+    // `mcHome` in the same process (e.g. under test).
+    const db = new Database(join(mcHome, "data", "mesh.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return new DbCapabilityGrantStore(db).activeFor(actorId);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+function injectSecretsMasking(
+  args: string[],
+  mcHome: string,
+  actorId: string,
+  activeGrants: readonly string[]
+): void {
   const secretsDir = join(mcHome, SECRETS_DIRNAME);
   // The tmpfs mount point must exist under the ro-bound `/` — create it (0700)
   // so the mask holds even on a host that has no secrets yet (same discipline as
@@ -595,26 +624,6 @@ function injectSecretsMasking(args: string[], mcHome: string, actorId: string): 
     }
   } catch {
     // If we can't read the dir, just proceed (tmpfs mask is already in place).
-  }
-
-  let activeGrants: string[] = [];
-  try {
-    // Path must match db/index.ts's initDb layout (`<mcHome>/data/mesh.db`).
-    // Opened fresh per spawn, readonly, and closed immediately — this never
-    // holds the mesh's own connection, which may belong to a different
-    // `mcHome` in the same process (e.g. under test).
-    const db = new Database(join(mcHome, "data", "mesh.db"), {
-      readonly: true,
-      fileMustExist: true,
-    });
-    try {
-      activeGrants = new DbCapabilityGrantStore(db).activeFor(actorId);
-    } finally {
-      db.close();
-    }
-  } catch {
-    // Fail-closed: no database yet, or an unreadable/corrupt one, means "no
-    // grant" (the secrets dir stays fully masked), never a leaked secret.
   }
 
   const secretGrants = activeGrants
@@ -708,32 +717,12 @@ function isKimiCliConfigured(): boolean {
 }
 
 /**
- * Reads the durable grant at the spawn boundary, matching secret-grant
- * behavior: a failed read is denial, never an accidental credential bind.
- */
-function hasAuxiliaryKimiCliGrant(mcHome: string | undefined, actorDir: string): boolean {
-  if (!mcHome || !isKimiCliConfigured()) return false;
-  try {
-    const db = new Database(join(mcHome, "data", "mesh.db"), {
-      readonly: true,
-      fileMustExist: true,
-    });
-    try {
-      return new DbCapabilityGrantStore(db)
-        .activeFor(basename(actorDir))
-        .includes(AUXILIARY_KIMI_CLI_CAPABILITY);
-    } finally {
-      db.close();
-    }
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Projects the installed Kimi CLI's state into one sandbox. The mutable
  * credential/OAuth directories remain canonical so the CLI's own cross-process
- * refresh lock covers every grantee, while sessions stay per actor.
+ * refresh lock covers every grantee, while sessions stay per actor. The host
+ * Kimi home is shadowed only after the allow-listed projections are mounted:
+ * `KIMI_CODE_HOME` is a CLI convention, not a sufficient containment boundary
+ * for a process that could otherwise read the host path directly.
  */
 function addKimiHome(args: string[], actorDir: string): void {
   const kimiCodeDir = join(getHostHomeDir(), ".kimi-code");
@@ -751,6 +740,14 @@ function addKimiHome(args: string[], actorDir: string): void {
   }
   args.push("--bind", join(kimiSessionsStore, "sessions"), "/tmp/kimi-home/sessions");
   args.push("--bind", kimiIndexPath, "/tmp/kimi-home/session_index.jsonl");
+
+  // These source paths have now been projected to the limited sandbox home.
+  // Shadow the host view afterwards so an auxiliary tool cannot bypass
+  // KIMI_CODE_HOME and read host sessions or mcp.json directly. Cover both a
+  // configured spelling and its resolved target, as with the Codex auth mask.
+  for (const dir of new Set([kimiCodeDir, realpathIfExists(kimiCodeDir)])) {
+    if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
+  }
 }
 
 /**
@@ -978,6 +975,12 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--setenv", "RUSA_HOME", mcHome);
   }
 
+  // Capability grants are worker-scoped. Read them once so all consumers see
+  // the same fail-closed snapshot for this spawn; the E2E root double must not
+  // gain a worker-only auxiliary projection.
+  const activeGrants =
+    mcHome && isWorkerActor ? readActiveCapabilityGrants(mcHome, basename(realActorDir)) : [];
+
   let ghWrapperDir: string | undefined;
   // GitHub credential split (ISSUE_NUM/ISSUE_NUM-adjacent): real workers only — this
   // guard is deliberately narrower than the `mcHome` one above so root (never
@@ -988,7 +991,7 @@ function buildMeshActorBwrapArgs(o: {
     // Host-secrets masking : same real-workers-only guard as the gh
     // credential split above — root (unsandboxed in production) and the E2E
     // root-agent test double keep host visibility.
-    injectSecretsMasking(args, mcHome, basename(realActorDir));
+    injectSecretsMasking(args, mcHome, basename(realActorDir), activeGrants);
   }
 
   // Write scope: the actor's own directory, re-bound in place over the ro view.
@@ -1114,7 +1117,12 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--bind", sessionsStore, SANDBOX_CODEX_SESSIONS_PATH);
   }
 
-  if (o.authMode === "kimi" || hasAuxiliaryKimiCliGrant(mcHome, realActorDir)) {
+  const hasAuxiliaryKimiCliGrant =
+    o.authMode !== "kimi" &&
+    isWorkerActor &&
+    activeGrants.includes(AUXILIARY_KIMI_CLI_CAPABILITY) &&
+    isKimiCliConfigured();
+  if (o.authMode === "kimi" || hasAuxiliaryKimiCliGrant) {
     // Kimi itself always receives its existing home. Other providers require
     // both configured Kimi support and the durable auxiliary capability above.
     // Keep this separate from the auth-mode/MCP branch: that branch must remain

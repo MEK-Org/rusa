@@ -403,6 +403,14 @@ describe("sandbox bwrap args", () => {
       `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
        VALUES (?, 'kimi-cli', 'root', '2026-11-19T00:00:00Z', NULL)`
     ).run(actorId);
+    const e2eRootActorId = "root-agent";
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-11-19T00:00:00Z')"
+    ).run(e2eRootActorId);
+    db.prepare(
+      `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+       VALUES (?, 'kimi-cli', 'root', '2026-11-19T00:00:00Z', NULL)`
+    ).run(e2eRootActorId);
     db.close();
 
     const granted = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
@@ -423,6 +431,20 @@ describe("sandbox bwrap args", () => {
     const configDenied = buildActorBwrapArgs(actorDir, "codex").args;
     expect(configDenied).not.toContain("KIMI_CODE_HOME");
     expect(configDenied).not.toContain("/tmp/kimi-home/credentials");
+
+    mockLoadConfig.mockReturnValue({
+      github: { account: "test" },
+      providers: { auxiliaryKimi: { cliCommand: "kimi" } },
+      webhook: { port: 9742, secret: "secret" },
+      gitBridge: false,
+    });
+    const e2eRootDir = join(mcHome, e2eRootActorId);
+    mkdirSync(e2eRootDir, { recursive: true });
+    const e2eRootArgs = buildActorBwrapArgs(e2eRootDir, "codex", undefined, true).args;
+    // The sandboxed root test double shares no worker-only capability path,
+    // even if a fixture creates a matching durable grant.
+    expect(e2eRootArgs).not.toContain("KIMI_CODE_HOME");
+    expect(e2eRootArgs).not.toContain("/tmp/kimi-home/credentials");
   });
 
   it("pins the per-invocation mcp config over the real ~/.gemini paths for antigravity", async () => {

@@ -75,6 +75,12 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
     hostOauthDir = join(fixtureHome, ".kimi-code", "oauth");
     mkdirSync(hostCredsDir, { recursive: true });
     mkdirSync(hostOauthDir, { recursive: true });
+    // These are deliberately outside the narrow KIMI_CODE_HOME projection.
+    // The auxiliary regression proves a sandbox cannot bypass that projection
+    // through the host's read-only root mount.
+    mkdirSync(join(fixtureHome, ".kimi-code", "sessions"), { recursive: true });
+    writeFileSync(join(fixtureHome, ".kimi-code", "sessions", "host-session"), "host-only");
+    writeFileSync(join(fixtureHome, ".kimi-code", "mcp.json"), '{"host":true}');
     // Synthetic fixtures only — structurally like kimi's real files, no real secrets.
     writeFileSync(join(hostCredsDir, "kimi-code.json"), '{"accessToken":"synthetic-before"}', {
       mode: 0o600,
@@ -211,31 +217,33 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
     const argsA = buildActorBwrapArgs(actorDirA, "codex").args;
     const argsB = buildActorBwrapArgs(actorDirB, "codex").args;
     const lockPath = "/tmp/kimi-home/oauth/kimi-code.lock";
-    const commandFor = (label: string, otherLabel: string) =>
-      `for i in $(seq 1 200); do
+    const commandFor = (label: string) =>
+      `acquired=0
+       for i in $(seq 1 200); do
          if mkdir ${lockPath} 2>/dev/null; then
            printf '%s\\n' '${label}' >> /tmp/kimi-home/oauth/winners
+           printf '%s' '${label}' > /tmp/kimi-home/credentials/kimi-code.json.tmp.${label}
+           mv /tmp/kimi-home/credentials/kimi-code.json.tmp.${label} /tmp/kimi-home/credentials/kimi-code.json
            rmdir ${lockPath}
+           acquired=1
            break
          fi
          sleep 0.01
        done
-       printf '%s' '${label}' > /tmp/kimi-home/credentials/kimi-code.json
+       test "$acquired" -eq 1
        printf '%s' '${label}' > /tmp/kimi-home/sessions/${label}
-       test ! -e /tmp/kimi-home/sessions/${otherLabel}`;
+       test ! -e "$HOME/.kimi-code/sessions/host-session"
+       test ! -e "$HOME/.kimi-code/mcp.json"
+       test ! -e /tmp/kimi-home/mcp.json`;
     try {
       await expect(
         Promise.all([
-          execFileAsync(
-            "bwrap",
-            [...argsA, "--", "/bin/sh", "-c", commandFor(actorIdA, actorIdB)],
-            { encoding: "utf8" }
-          ),
-          execFileAsync(
-            "bwrap",
-            [...argsB, "--", "/bin/sh", "-c", commandFor(actorIdB, actorIdA)],
-            { encoding: "utf8" }
-          ),
+          execFileAsync("bwrap", [...argsA, "--", "/bin/sh", "-c", commandFor(actorIdA)], {
+            encoding: "utf8",
+          }),
+          execFileAsync("bwrap", [...argsB, "--", "/bin/sh", "-c", commandFor(actorIdB)], {
+            encoding: "utf8",
+          }),
         ])
       ).resolves.toBeDefined();
 
@@ -251,6 +259,10 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
       expect(readFileSync(join(kimiSessionStoreDir(actorDirB), "sessions", actorIdB), "utf8")).toBe(
         actorIdB
       );
+      // Assert after both writes complete: an inline sibling check can pass
+      // before the other sandbox has reached its own session write.
+      expect(existsSync(join(kimiSessionStoreDir(actorDirA), "sessions", actorIdB))).toBe(false);
+      expect(existsSync(join(kimiSessionStoreDir(actorDirB), "sessions", actorIdA))).toBe(false);
     } finally {
       for (const dir of [actorDirA, actorDirB]) {
         rmSync(kimiSessionStoreDir(dir), { recursive: true, force: true });
