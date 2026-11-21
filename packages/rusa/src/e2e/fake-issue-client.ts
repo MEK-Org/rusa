@@ -20,6 +20,8 @@ import {
   type PullRequestDetails,
   type PullRequestReviewDetails,
   type ReactionContent,
+  type UpdatedPullRequest,
+  type UpdatePullRequestOptions,
 } from "../gitops/issue-client.js";
 import type { LocalTracker, ReviewState } from "./local-tracker.js";
 
@@ -75,6 +77,26 @@ export class FakeIssueClient implements IssueClient {
       author: this.botAccount,
     });
     return { number: pr.number, htmlUrl: pr.htmlUrl, wasCreated: pr.wasCreated, draft: pr.draft };
+  }
+
+  async updatePullRequest(opts: UpdatePullRequestOptions): Promise<UpdatedPullRequest> {
+    if (
+      opts.title === undefined &&
+      opts.body === undefined &&
+      opts.base === undefined &&
+      opts.draft === undefined
+    ) {
+      throw new Error("update_pull_request requires at least one change");
+    }
+    const existing = this.tracker.getPr(opts.prNumber);
+    if (!existing) throw new Error(`PR #${opts.prNumber} not found in local tracker`);
+    const pr = this.tracker.updatePr(opts.prNumber, {
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+      ...(opts.body !== undefined ? { body: opts.body } : {}),
+      ...(opts.base !== undefined ? { base: opts.base } : {}),
+      ...(opts.draft !== undefined ? { draft: opts.draft } : {}),
+    });
+    return { htmlUrl: pr.htmlUrl, draft: pr.draft };
   }
 
   async getOpenPullRequestsByAuthor(_repo: string, author: string): Promise<OpenPullRequest[]> {
