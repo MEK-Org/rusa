@@ -114,6 +114,7 @@ export function createTrackerMcpServer(
       description:
         "Create a PR for the given head branch, or update the existing PR if one already exists for that branch. " +
         "Returns the PR URL, followed by a 'draft:' line whenever the PR is a draft after the call.\n\n" +
+        "To edit selected fields on one known existing PR without rewriting omitted fields, use update_pull_request.\n\n" +
         GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
@@ -182,6 +183,56 @@ export function createTrackerMcpServer(
         // its state on a second line rather than a suffix, so the first line
         // stays a whole URL that an actor can quote or paste unchanged.
         return toolOk(pr.draft ? `${pr.htmlUrl}\ndraft: not yet ready for review` : pr.htmlUrl);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "update_pull_request",
+    {
+      title: "Partially edit a pull request",
+      description:
+        "Edit selected metadata on an existing pull request. Supply at least one of title, body, base, or draft; omitted fields are preserved. " +
+        "A supplied body replaces the entire existing body and is re-stamped with your authenticated identity. " +
+        "Returns the PR URL and its observed draft or ready-for-review state.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
+      inputSchema: z
+        .strictObject({
+          repo: z.string().describe("Repository in owner/name format"),
+          prNumber: z.number().int().describe("Existing pull request number"),
+          title: z.string().optional().describe("Replacement title; omit to preserve it"),
+          body: z.string().optional().describe("Full replacement body; omit to preserve it"),
+          base: z.string().optional().describe("Replacement base branch; omit to preserve it"),
+          draft: z
+            .boolean()
+            .optional()
+            .describe(
+              "Draft state; omit to preserve it, true converts to draft, false marks ready"
+            ),
+        })
+        .refine(
+          (args) =>
+            args.title !== undefined ||
+            args.body !== undefined ||
+            args.base !== undefined ||
+            args.draft !== undefined,
+          { message: "provide at least one of title, body, base, or draft" }
+        ),
+    },
+    async ({ repo, prNumber, title, body, base, draft }) => {
+      try {
+        const result = await issueClient.updatePullRequest({
+          repo,
+          prNumber,
+          ...(title !== undefined ? { title } : {}),
+          ...(body !== undefined ? { body: restampAuthor(body, repo, prNumber) } : {}),
+          ...(base !== undefined ? { base } : {}),
+          ...(draft !== undefined ? { draft } : {}),
+        });
+        options.onWrite?.();
+        return toolOk(`${result.htmlUrl}\nstate: ${result.draft ? "draft" : "ready for review"}`);
       } catch (err) {
         return toolError(err);
       }

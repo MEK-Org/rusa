@@ -47,6 +47,22 @@ export interface CreatePROptions {
   draft?: boolean;
 }
 
+/** A partial edit to one existing pull request. */
+export interface UpdatePullRequestOptions {
+  /** Repository in owner/name format. */
+  repo: string;
+  /** Existing pull request number. */
+  prNumber: number;
+  /** Replacement title. Omit to preserve it. */
+  title?: string;
+  /** Replacement body. Omit to preserve it. */
+  body?: string;
+  /** Replacement base branch. Omit to preserve it. */
+  base?: string;
+  /** Requested draft state. Omit to preserve it. */
+  draft?: boolean;
+}
+
 export interface CreateIssueOptions {
   /** Repository in owner/name format */
   repo: string;
@@ -72,6 +88,12 @@ export interface CreatedPullRequest {
    */
   wasCreated: boolean;
   /** Whether the pull request is a draft after this call. */
+  draft: boolean;
+}
+
+/** The URL and draft state GitHub reported after a partial PR edit. */
+export interface UpdatedPullRequest {
+  htmlUrl: string;
   draft: boolean;
 }
 
@@ -292,6 +314,8 @@ export interface IssueClient {
    * existing PR.
    */
   createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest>;
+  /** Partially edit one existing pull request without replacing omitted fields. */
+  updatePullRequest(opts: UpdatePullRequestOptions): Promise<UpdatedPullRequest>;
   /** Query every open pull request created by a specific author. */
   getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]>;
   /**
@@ -634,6 +658,60 @@ export class GitHubIssueClient implements IssueClient {
     return pr;
   }
 
+  async updatePullRequest(opts: UpdatePullRequestOptions): Promise<UpdatedPullRequest> {
+    const hasMetadataEdit =
+      opts.title !== undefined || opts.body !== undefined || opts.base !== undefined;
+    if (!hasMetadataEdit && opts.draft === undefined) {
+      throw new Error("update_pull_request requires at least one change");
+    }
+
+    // Read exactly the state required for the optional draft transition before
+    // any write. A missing node id therefore refuses cleanly instead of
+    // leaving metadata updated with no possible draft transition.
+    const current = await this.api<{
+      html_url: string;
+      draft?: boolean;
+      node_id?: string;
+    }>("GET", `/repos/${opts.repo}/pulls/${opts.prNumber}`);
+    const observedBefore = current.draft === true;
+    const transitionTo =
+      opts.draft !== undefined && opts.draft !== observedBefore ? opts.draft : undefined;
+    if (transitionTo !== undefined && !current.node_id) {
+      throw new Error(
+        `pull request #${opts.prNumber} has no node id; cannot change its draft state`
+      );
+    }
+
+    let htmlUrl = current.html_url;
+    let draft = observedBefore;
+    if (hasMetadataEdit) {
+      const updated = await this.api<{ html_url?: string; draft?: boolean }>(
+        "PATCH",
+        `/repos/${opts.repo}/pulls/${opts.prNumber}`,
+        {
+          ...(opts.title !== undefined ? { title: opts.title } : {}),
+          ...(opts.body !== undefined ? { body: opts.body } : {}),
+          ...(opts.base !== undefined ? { base: opts.base } : {}),
+        }
+      );
+      htmlUrl = updated.html_url ?? htmlUrl;
+      draft = updated.draft ?? draft;
+    }
+
+    if (opts.draft !== undefined && opts.draft !== draft && current.node_id) {
+      try {
+        draft = await this.setPullRequestDraft(current.node_id, opts.draft);
+      } catch (err) {
+        const metadata = hasMetadataEdit ? "metadata was updated" : "no metadata was changed";
+        throw new Error(
+          `pull request ${htmlUrl} ${metadata}, but its draft transition to ${opts.draft ? "draft" : "ready for review"} could not be confirmed: ${err instanceof Error ? err.message : String(err)}. Re-run the same call to retry the transition.`
+        );
+      }
+    }
+
+    return { htmlUrl, draft };
+  }
+
   async createIssue(opts: CreateIssueOptions): Promise<CreatedIssue> {
     const issue = await this.api<{ number: number; html_url: string }>(
       "POST",
@@ -677,12 +755,19 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   /** Flip an open PR between draft and ready for review (GraphQL-only on GitHub). */
-  private async setPullRequestDraft(pullRequestId: string, draft: boolean): Promise<void> {
+  private async setPullRequestDraft(pullRequestId: string, draft: boolean): Promise<boolean> {
     const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
-    await this.graphql(
+    const data = await this.graphql<{
+      [key: string]: { pullRequest?: { isDraft?: boolean } } | undefined;
+    }>(
       `mutation($pullRequestId: ID!) { ${mutation}(input: { pullRequestId: $pullRequestId }) { pullRequest { isDraft } } }`,
       { pullRequestId }
     );
+    const observed = data[mutation]?.pullRequest?.isDraft;
+    if (typeof observed !== "boolean") {
+      throw new Error("draft transition response omitted its observed draft state");
+    }
+    return observed;
   }
 
   async getParentIssueNumber(repo: string, issueNumber: number): Promise<number | null> {
@@ -1641,6 +1726,10 @@ export class GitBridgeIssueClient implements IssueClient {
       wasCreated: false,
       draft: false,
     };
+  }
+
+  updatePullRequest(opts: UpdatePullRequestOptions): Promise<UpdatedPullRequest> {
+    return this.delegate.updatePullRequest(opts);
   }
 
   createIssue(opts: CreateIssueOptions): Promise<CreatedIssue> {

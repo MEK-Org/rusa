@@ -60,6 +60,34 @@ describe("FakeIssueClient", () => {
     expect(details.headRef).toBe("mc/issue-1");
   });
 
+  it("partially updates an existing PR without changing omitted metadata", async () => {
+    const { client } = setup();
+    await client.createPullRequest({
+      repo: REPO,
+      head: "mc/issue-1",
+      title: "v1",
+      body: "b1",
+      base: "main",
+    });
+
+    const result = await client.updatePullRequest({
+      repo: REPO,
+      prNumber: 1,
+      title: "v2",
+      draft: true,
+    });
+
+    expect(result).toEqual({
+      htmlUrl: "http://localhost:8084/rusa-e2e/scratch/pull/1",
+      draft: true,
+    });
+    await expect(client.getPullRequestDetails(REPO, 1)).resolves.toMatchObject({
+      title: "v2",
+      body: "b1",
+      baseRef: "main",
+    });
+  });
+
   it("lists the bot's open PRs matching author case-insensitively", async () => {
     const { client } = setup();
     await client.createPullRequest({
