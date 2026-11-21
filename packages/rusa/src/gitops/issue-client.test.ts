@@ -251,10 +251,9 @@ describe("GitHubIssueClient", () => {
     const PR_URL = "https://github.com/test-org/test-repo/pull/12";
     const PR_READ = `GET /repos/${REPO}/pulls/12`;
 
-    it("patches only supplied metadata and preserves the observed draft state", async () => {
+    it("patches only supplied metadata without a pre-flight GET when draft is omitted", async () => {
       const requests = installFetch({
-        [PR_READ]: { json: { html_url: PR_URL, draft: true, node_id: "PR_node12" } },
-        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: { html_url: PR_URL, draft: true } },
       });
 
       const pr = await new GitHubIssueClient().updatePullRequest({
@@ -265,10 +264,28 @@ describe("GitHubIssueClient", () => {
 
       expect(pr).toEqual({ htmlUrl: PR_URL, draft: true });
       expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
-        PR_READ,
         `PATCH /repos/${REPO}/pulls/12`,
       ]);
-      expect(requests[1].body).toEqual({ title: "Clearer title" });
+      expect(requests[0].body).toEqual({ title: "Clearer title" });
+    });
+
+    it("falls back to GET when a metadata-only PATCH response omits draft or html_url", async () => {
+      const requests = installFetch({
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        [PR_READ]: { json: { html_url: PR_URL, draft: true } },
+      });
+
+      const pr = await new GitHubIssueClient().updatePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        title: "Clearer title",
+      });
+
+      expect(pr).toEqual({ htmlUrl: PR_URL, draft: true });
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+        `PATCH /repos/${REPO}/pulls/12`,
+        PR_READ,
+      ]);
     });
 
     it("changes draft state without writing title or body for a draft-only edit", async () => {
@@ -386,6 +403,25 @@ describe("GitHubIssueClient", () => {
         })
       ).rejects.toThrow("no node id");
       expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([PR_READ]);
+    });
+
+    it("throws a retryable error when GraphQL returns an isDraft state disagreeing with requested draft", async () => {
+      installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: true, node_id: "PR_node12" } },
+        "POST /graphql": {
+          json: { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: true } } } },
+        },
+      });
+
+      await expect(
+        new GitHubIssueClient().updatePullRequest({
+          repo: REPO,
+          prNumber: 12,
+          draft: false,
+        })
+      ).rejects.toThrow(
+        /#12 had no metadata changes, and could not be marked ready for review.*remained draft.*Re-running/s
+      );
     });
   });
 

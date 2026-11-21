@@ -90,13 +90,11 @@ export class FakeIssueClient implements IssueClient {
     }
     const existing = this.tracker.getPr(opts.prNumber);
     if (!existing) throw new Error(`PR #${opts.prNumber} not found in local tracker`);
-    const pr = this.tracker.upsertPrByHead({
-      headRef: existing.headRef,
-      title: opts.title ?? existing.title,
-      body: opts.body ?? existing.body,
+    const pr = this.tracker.updatePr(opts.prNumber, {
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+      ...(opts.body !== undefined ? { body: opts.body } : {}),
       ...(opts.base !== undefined ? { base: opts.base } : {}),
       ...(opts.draft !== undefined ? { draft: opts.draft } : {}),
-      author: this.botAccount,
     });
     return { htmlUrl: pr.htmlUrl, draft: pr.draft };
   }

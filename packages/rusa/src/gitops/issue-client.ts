@@ -638,10 +638,29 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async updatePullRequest(opts: UpdatePullRequestOptions): Promise<UpdatedPullRequest> {
-    const hasMetadataEdit =
-      opts.title !== undefined || opts.body !== undefined || opts.base !== undefined;
+    const patch = this.buildPullRequestPatchBody(opts);
+    const hasMetadataEdit = Object.keys(patch).length > 0;
     if (!hasMetadataEdit && opts.draft === undefined) {
       throw new Error("update_pull_request requires at least one change");
+    }
+
+    if (opts.draft === undefined) {
+      const updated = await this.api<{ html_url?: string; draft?: boolean }>(
+        "PATCH",
+        `/repos/${opts.repo}/pulls/${opts.prNumber}`,
+        patch
+      );
+      if (typeof updated?.html_url === "string" && typeof updated?.draft === "boolean") {
+        return { htmlUrl: updated.html_url, draft: updated.draft };
+      }
+      const current = await this.api<{ html_url: string; draft?: boolean }>(
+        "GET",
+        `/repos/${opts.repo}/pulls/${opts.prNumber}`
+      );
+      return {
+        htmlUrl: updated?.html_url ?? current.html_url,
+        draft: updated?.draft ?? current.draft === true,
+      };
     }
 
     const current = await this.api<{
@@ -655,11 +674,21 @@ export class GitHubIssueClient implements IssueClient {
       htmlUrl: current.html_url,
       currentDraft: current.draft === true,
       nodeId: current.node_id,
-      title: opts.title,
-      body: opts.body,
-      base: opts.base,
+      ...patch,
       draft: opts.draft,
     });
+  }
+
+  private buildPullRequestPatchBody(opts: { title?: string; body?: string; base?: string }): {
+    title?: string;
+    body?: string;
+    base?: string;
+  } {
+    return {
+      ...(opts.title !== undefined ? { title: opts.title } : {}),
+      ...(opts.body !== undefined ? { body: opts.body } : {}),
+      ...(opts.base !== undefined ? { base: opts.base } : {}),
+    };
   }
 
   private async applyPullRequestUpdate(opts: {
@@ -673,8 +702,8 @@ export class GitHubIssueClient implements IssueClient {
     base?: string;
     draft?: boolean;
   }): Promise<UpdatedPullRequest> {
-    const hasMetadataEdit =
-      opts.title !== undefined || opts.body !== undefined || opts.base !== undefined;
+    const patch = this.buildPullRequestPatchBody(opts);
+    const hasMetadataEdit = Object.keys(patch).length > 0;
     // Draft state is not a PATCH field: GitHub only flips it through two
     // GraphQL mutations keyed by node id. Resolve everything the transition
     // needs before the PATCH so a missing id fails with nothing applied.
@@ -692,11 +721,7 @@ export class GitHubIssueClient implements IssueClient {
       const updated = await this.api<{ html_url?: string; draft?: boolean }>(
         "PATCH",
         `/repos/${opts.repo}/pulls/${opts.prNumber}`,
-        {
-          ...(opts.title !== undefined ? { title: opts.title } : {}),
-          ...(opts.body !== undefined ? { body: opts.body } : {}),
-          ...(opts.base !== undefined ? { base: opts.base } : {}),
-        }
+        patch
       );
       htmlUrl = updated.html_url ?? htmlUrl;
       draft = updated.draft ?? draft;
@@ -774,7 +799,13 @@ export class GitHubIssueClient implements IssueClient {
       `mutation($pullRequestId: ID!) { ${mutation}(input: { pullRequestId: $pullRequestId }) { pullRequest { isDraft } } }`,
       { pullRequestId }
     );
-    return data[mutation]?.pullRequest?.isDraft ?? draft;
+    const observed = data[mutation]?.pullRequest?.isDraft;
+    if (typeof observed === "boolean" && observed !== draft) {
+      throw new Error(
+        `pull request remained ${observed ? "draft" : "ready for review"} after ${mutation}`
+      );
+    }
+    return observed ?? draft;
   }
 
   async getParentIssueNumber(repo: string, issueNumber: number): Promise<number | null> {
