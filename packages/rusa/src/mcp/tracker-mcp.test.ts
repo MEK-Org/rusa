@@ -9,6 +9,7 @@ import type {
   CreatePrReviewCommentOptions,
   CreatePullRequestReviewOptions,
   IssueClient,
+  UpdatePullRequestOptions,
 } from "../gitops/issue-client.js";
 import { parseAuthor, stampAuthor, verifyAuthorStamp } from "./stamp.js";
 import { createTrackerMcpServer, GITHUB_IMAGE_LINK_INSTRUCTION } from "./tracker-mcp.js";
@@ -25,6 +26,10 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
     createPullRequest: async (opts: CreatePROptions) => {
       calls.push({ method: "createPullRequest", args: [opts] });
       return { number: 1, htmlUrl: "https://example.test/pr/1", wasCreated: true, draft: false };
+    },
+    updatePullRequest: async (opts: UpdatePullRequestOptions) => {
+      calls.push({ method: "updatePullRequest", args: [opts] });
+      return { htmlUrl: `https://example.test/pr/${opts.prNumber}`, draft: opts.draft ?? false };
     },
     createPrReviewComment: async (opts: CreatePrReviewCommentOptions) => {
       calls.push({ method: "createPrReviewComment", args: [opts] });
@@ -221,6 +226,7 @@ describe("tracker MCP server", () => {
         "set_parent",
         "unstack",
         "update_body",
+        "update_pull_request",
       ].sort()
     );
   });
@@ -906,6 +912,73 @@ describe("tracker MCP server", () => {
     expect(parseAuthor(newBody)).toBe("test-actor-editor");
   });
 
+  it("partially updates a PR without forwarding omitted fields", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const onWrite = vi.fn();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-editor", backend, {
+        instanceId: "test-instance",
+        onWrite,
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "update_pull_request",
+      arguments: { repo: "owner/repo", prNumber: 55, title: "Clearer title" },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toBe("https://example.test/pr/55\nstate: ready for review");
+    expect(calls).toContainEqual({
+      method: "updatePullRequest",
+      args: [{ repo: "owner/repo", prNumber: 55, title: "Clearer title" }],
+    });
+    expect(onWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-stamps a supplied full PR body but leaves a draft-only change bodyless", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-editor", backend, { instanceId: "test-instance" })
+    );
+    const oldStamp = stampAuthor("actor-original", "owner/repo", 55, "orig-instance");
+
+    await client.callTool({
+      name: "update_pull_request",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 55,
+        body: `Replacement body\n\n${oldStamp}`,
+      },
+    });
+    await client.callTool({
+      name: "update_pull_request",
+      arguments: { repo: "owner/repo", prNumber: 55, draft: true },
+    });
+
+    const bodyEdit = calls[0].args[0] as UpdatePullRequestOptions;
+    expect(bodyEdit.body).not.toContain("actor-original");
+    expect(bodyEdit.body).toContain("<!-- mesh:author:v2 test-actor-editor test-instance");
+    expect(calls[1]).toEqual({
+      method: "updatePullRequest",
+      args: [{ repo: "owner/repo", prNumber: 55, draft: true }],
+    });
+  });
+
+  it("rejects an empty partial PR edit before the client is called", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(createTrackerMcpServer("test-actor-editor", backend));
+
+    const res = (await client.callTool({
+      name: "update_pull_request",
+      arguments: { repo: "owner/repo", prNumber: 55 },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("provide at least one");
+    expect(calls).toHaveLength(0);
+  });
+
   it("routes bodiless write tools (add_label, remove_label, close_issue, reopen_issue)", async () => {
     const { client: backend, calls } = recordingIssueClient();
     const client = await connect(createTrackerMcpServer("test-actor-1", backend));
@@ -1352,6 +1425,7 @@ describe("tracker MCP server", () => {
         "post_review",
         "create_pr_review_comment",
         "update_body",
+        "update_pull_request",
       ]);
 
       const toolsWithGuidance = tools

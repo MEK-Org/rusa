@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -20,10 +20,19 @@ import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repositor
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
-import { type FollowerActorCommand, type FollowerEvent, FollowerHub } from "./follower-hub.js";
+import {
+  type FollowerActorCommand,
+  type FollowerCommand,
+  type FollowerEvent,
+  FollowerHub,
+} from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { registerFollowerRegistrationRecovery } from "./follower-registration-recovery.js";
-import { INSTANCE_PROTOCOL_VERSION, type ProviderFactory } from "./protocol.js";
+import {
+  INSTANCE_PROTOCOL_VERSION,
+  type ProviderFactory,
+  WORKSPACE_SWEEP_CAPABILITY,
+} from "./protocol.js";
 import { RemoteInstance } from "./remote-instance.js";
 
 const homes: string[] = [];
@@ -663,5 +672,339 @@ describe("follower registration recovery", () => {
       expect.arrayContaining(["remote_state_stale_timeout", "remote_preempt_requested"])
     );
     expect(records.map((record) => record.event)).not.toContain("remote_wake_dropped");
+  });
+
+  it("sweeps retired follower workspaces on registration while keeping unknown, reserved, and active dirs (#1338)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-follower-sweep-register-"));
+    const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-sweep-scratch-"));
+    homes.push(home, scratchDir);
+    const token = randomBytes(32).toString("hex");
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const log = testLogger(records);
+    const hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    const origin = await hub.listen("127.0.0.1", 0);
+
+    const actors = new InMemoryActorRepository();
+    const retiredId = "9f8e7d6c-1111-4222-8333-555566667777";
+    const activeId = "a1b2c3d4-1111-4222-8333-555566667777";
+    const unknownId = "deadbeef-1111-4222-8333-555566667777";
+    actors.upsert({
+      id: "root",
+      parentId: null,
+      charter: "root",
+      executionConfig: { unsandboxed: true },
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+    actors.upsert({
+      id: retiredId,
+      parentId: "root",
+      charter: "retired worker",
+      executionConfig: { executionTarget: "sweep-follower" },
+      status: "retired",
+      createdAt: new Date().toISOString(),
+    });
+    actors.upsert({
+      id: activeId,
+      parentId: "root",
+      charter: "active worker",
+      executionConfig: { executionTarget: "sweep-follower" },
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+
+    const mesh = {
+      dispatch: async () => false,
+      get: () => undefined,
+      rehydrate: () => {},
+    } as unknown as Parameters<typeof registerFollowerRegistrationRecovery>[0]["mesh"];
+    cleanups.push(registerFollowerRegistrationRecovery({ actors, hub, log, mesh }));
+
+    const follower = new FollowerInstance(home, false, () => {}, undefined, { scratchDir });
+    followers.push(follower);
+    // Retired actor workspace + scratch (should be swept).
+    mkdirSync(join(home, "workers", retiredId), { recursive: true });
+    mkdirSync(join(scratchDir, `worker-${retiredId.slice(0, 8)}`), { recursive: true });
+    // Active actor workspace + scratch (must stay).
+    mkdirSync(join(home, "workers", activeId), { recursive: true });
+    mkdirSync(join(scratchDir, `worker-${activeId.slice(0, 8)}`), { recursive: true });
+    // Unknown & reserved dirs (must stay).
+    mkdirSync(join(home, "workers", unknownId), { recursive: true });
+    mkdirSync(join(home, "workers", "root"), { recursive: true });
+    mkdirSync(join(home, "workers", "quota-probe-codex"), { recursive: true });
+    mkdirSync(join(home, "workers", "model-probe-claude"), { recursive: true });
+    mkdirSync(join(scratchDir, `worker-${unknownId.slice(0, 8)}`), { recursive: true });
+    mkdirSync(join(scratchDir, "hand-named-clone"), { recursive: true });
+
+    const regRes = await fetch(`${origin}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "sweep-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation: "gen-1",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
+      }),
+    });
+    expect(regRes.status).toBe(200);
+    const reg = (await regRes.json()) as { session: string; workspaceSweep?: unknown };
+    expect(reg.workspaceSweep).toEqual(WORKSPACE_SWEEP_CAPABILITY);
+
+    const pollRes = await fetch(`${origin}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "sweep-follower", session: reg.session }),
+    });
+    expect(pollRes.status).toBe(200);
+    const commands = (await pollRes.json()) as FollowerCommand[];
+    const sweepCommands = commands.filter(
+      (cmd) => !("actorId" in cmd) && cmd.type === "workspaceSweep"
+    );
+    expect(sweepCommands).toHaveLength(1);
+    for (const cmd of commands) {
+      if (!("actorId" in cmd) && cmd.type === "workspaceSweep") {
+        follower.sweepWorkspaces(cmd.actors);
+      }
+    }
+
+    expect(existsSync(join(home, "workers", retiredId))).toBe(false);
+    expect(existsSync(join(scratchDir, `worker-${retiredId.slice(0, 8)}`))).toBe(false);
+    expect(existsSync(join(home, "workers", activeId))).toBe(true);
+    expect(existsSync(join(scratchDir, `worker-${activeId.slice(0, 8)}`))).toBe(true);
+    expect(existsSync(join(home, "workers", unknownId))).toBe(true);
+    expect(existsSync(join(home, "workers", "root"))).toBe(true);
+    expect(existsSync(join(home, "workers", "quota-probe-codex"))).toBe(true);
+    expect(existsSync(join(home, "workers", "model-probe-claude"))).toBe(true);
+    expect(existsSync(join(scratchDir, `worker-${unknownId.slice(0, 8)}`))).toBe(true);
+    expect(existsSync(join(scratchDir, "hand-named-clone"))).toBe(true);
+
+    // Same-generation reconnect also receives workspaceSweep, and a capability
+    // newly offered on reconnect is recorded before onRegister runs.
+    const lateRetiredId = "b2c3d4e5-1111-4222-8333-555566667777";
+    actors.upsert({
+      id: lateRetiredId,
+      parentId: "root",
+      charter: "retired between reconnects",
+      executionConfig: { executionTarget: "sweep-follower" },
+      status: "retired",
+      createdAt: new Date().toISOString(),
+    });
+    mkdirSync(join(home, "workers", lateRetiredId), { recursive: true });
+
+    const reconnectRes = await fetch(`${origin}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "sweep-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation: "gen-1",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
+      }),
+    });
+    expect(reconnectRes.status).toBe(200);
+    const reconnectReg = (await reconnectRes.json()) as {
+      session: string;
+      workspaceSweep?: unknown;
+    };
+    expect(reconnectReg.workspaceSweep).toEqual(WORKSPACE_SWEEP_CAPABILITY);
+
+    const reconnectPoll = await fetch(`${origin}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "sweep-follower", session: reconnectReg.session }),
+    });
+    expect(reconnectPoll.status).toBe(200);
+    const reconnectCommands = (await reconnectPoll.json()) as FollowerCommand[];
+    const reconnectSweep = reconnectCommands.find(
+      (cmd) => !("actorId" in cmd) && cmd.type === "workspaceSweep"
+    );
+    expect(reconnectSweep).toBeDefined();
+    if (
+      reconnectSweep &&
+      !("actorId" in reconnectSweep) &&
+      reconnectSweep.type === "workspaceSweep"
+    ) {
+      follower.sweepWorkspaces(reconnectSweep.actors);
+    }
+    expect(existsSync(join(home, "workers", lateRetiredId))).toBe(false);
+  });
+
+  it("sends no workspaceSweep on registration when the registry is empty or unreadable, or when un-negotiated", async () => {
+    const token = randomBytes(32).toString("hex");
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const log = testLogger(records);
+    const hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    const origin = await hub.listen("127.0.0.1", 0);
+
+    let mode: "empty" | "throw" | "populated" = "empty";
+    const actors = {
+      get: () => undefined,
+      list: () => {
+        if (mode === "throw") throw new Error("registry unreadable");
+        if (mode === "empty") return [];
+        return [
+          {
+            id: "9f8e7d6c-1111-4222-8333-555566667777",
+            parentId: "root",
+            charter: "retired",
+            status: "retired" as const,
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ];
+      },
+    };
+    const mesh = {
+      dispatch: async () => false,
+      get: () => undefined,
+      rehydrate: () => {},
+    } as unknown as Parameters<typeof registerFollowerRegistrationRecovery>[0]["mesh"];
+    cleanups.push(registerFollowerRegistrationRecovery({ actors, hub, log, mesh }));
+
+    const registerAndCheckNoSweep = async (id: string, offerSweep: boolean): Promise<void> => {
+      const regRes = await fetch(`${origin}/register`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          id,
+          platform: process.platform,
+          pid: process.pid,
+          generation: `${id}-gen-1`,
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          ...(offerSweep ? { workspaceSweep: WORKSPACE_SWEEP_CAPABILITY } : {}),
+        }),
+      });
+      expect(regRes.status).toBe(200);
+      const reg = (await regRes.json()) as { session: string };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 50);
+      const pollRes = await fetch(`${origin}/poll`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ id, session: reg.session }),
+        signal: controller.signal,
+      }).catch(() => undefined);
+      clearTimeout(timer);
+      if (pollRes) {
+        const commands = (await pollRes.json()) as FollowerCommand[];
+        expect(commands.some((cmd) => !("actorId" in cmd) && cmd.type === "workspaceSweep")).toBe(
+          false
+        );
+      }
+    };
+
+    mode = "empty";
+    await registerAndCheckNoSweep("f-empty", true);
+
+    mode = "throw";
+    await registerAndCheckNoSweep("f-unreadable", true);
+    expect(records.some((r) => r.event === "follower_register_registry_read_failed")).toBe(true);
+
+    mode = "populated";
+    await registerAndCheckNoSweep("f-legacy", false);
+  });
+
+  it("wires hub onActorExit through registration recovery to send workspaceSweep on /events exit (#1338)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-follower-exit-e2e-"));
+    const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-exit-scratch-"));
+    homes.push(home, scratchDir);
+    const token = randomBytes(32).toString("hex");
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const log = testLogger(records);
+    const hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    const origin = await hub.listen("127.0.0.1", 0);
+
+    const actors = new InMemoryActorRepository();
+    const actorId = "c3d4e5f6-1111-4222-8333-555566667777";
+    actors.upsert({
+      id: actorId,
+      parentId: "root",
+      charter: "retired follower worker",
+      executionConfig: { executionTarget: "exit-follower" },
+      status: "retired",
+      createdAt: new Date().toISOString(),
+    });
+    const mesh = {
+      dispatch: async () => false,
+      get: () => undefined,
+      rehydrate: () => {},
+    } as unknown as Parameters<typeof registerFollowerRegistrationRecovery>[0]["mesh"];
+    cleanups.push(registerFollowerRegistrationRecovery({ actors, hub, log, mesh }));
+
+    const regRes = await fetch(`${origin}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "exit-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation: "gen-exit",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
+      }),
+    });
+    expect(regRes.status).toBe(200);
+    const reg = (await regRes.json()) as { session: string };
+
+    // Drain registration sweep first.
+    const initialPoll = (await (
+      await fetch(`${origin}/poll`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ id: "exit-follower", session: reg.session }),
+      })
+    ).json()) as FollowerCommand[];
+    expect(initialPoll.some((cmd) => !("actorId" in cmd) && cmd.type === "workspaceSweep")).toBe(
+      true
+    );
+
+    const follower = new FollowerInstance(home, false, () => {}, undefined, { scratchDir });
+    followers.push(follower);
+    mkdirSync(join(home, "workers", actorId), { recursive: true });
+    mkdirSync(join(scratchDir, `worker-${actorId.slice(0, 8)}`), { recursive: true });
+
+    hub.createHost("exit-follower", actorId);
+    expect(hub.hasActorHost("exit-follower", actorId)).toBe(true);
+
+    const eventsRes = await fetch(`${origin}/events`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "exit-follower",
+        session: reg.session,
+        batchId: randomUUID(),
+        events: [
+          {
+            eventId: randomUUID(),
+            actorId,
+            message: { type: "exit", code: 0, signal: null },
+          },
+        ],
+      }),
+    });
+    expect(eventsRes.status).toBe(200);
+    expect(hub.hasActorHost("exit-follower", actorId)).toBe(false);
+
+    const pollAfterExit = (await (
+      await fetch(`${origin}/poll`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ id: "exit-follower", session: reg.session }),
+      })
+    ).json()) as FollowerCommand[];
+    const exitSweeps = pollAfterExit.filter(
+      (cmd): cmd is Extract<FollowerCommand, { type: "workspaceSweep" }> =>
+        !("actorId" in cmd) && cmd.type === "workspaceSweep"
+    );
+    expect(exitSweeps).toHaveLength(1);
+    follower.sweepWorkspaces(exitSweeps[0]?.actors ?? []);
+    expect(existsSync(join(home, "workers", actorId))).toBe(false);
+    expect(existsSync(join(scratchDir, `worker-${actorId.slice(0, 8)}`))).toBe(false);
   });
 });

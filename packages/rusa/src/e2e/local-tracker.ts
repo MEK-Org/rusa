@@ -322,6 +322,20 @@ export class LocalTracker {
     return pr;
   }
 
+  /** Partially update an existing PR by number without emitting intake events. */
+  updatePr(
+    prNumber: number,
+    opts: { title?: string; body?: string; base?: string; draft?: boolean }
+  ): TrackerPr {
+    const pr = this.requirePr(prNumber);
+    if (opts.title !== undefined) pr.title = opts.title;
+    if (opts.body !== undefined) pr.body = opts.body;
+    if (opts.base !== undefined) pr.base = opts.base;
+    if (opts.draft !== undefined) pr.draft = opts.draft;
+    pr.updatedAt = new Date().toISOString();
+    return { ...pr, wasCreated: false };
+  }
+
   getPr(prNumber: number): TrackerPr | undefined {
     return this.prs.get(prNumber);
   }

@@ -199,4 +199,90 @@ describe("createStartRetireCleanups", () => {
 
     expect(existsSync(workdir)).toBe(false);
   });
+
+  it("sweeps follower workspaces on retire when no live host blocks it, skips while a host is live, and keeps leader workdir cleanup idempotent (#1338)", () => {
+    const actorId = "follower-actor-1";
+    const localWorkdir = join(workersDir, actorId);
+    mkdirSync(localWorkdir, { recursive: true });
+    const swept: Array<{ followerId: string; actors: Array<{ id: string; retired: boolean }> }> =
+      [];
+    let listMode: "normal" | "empty" | "throw" = "normal";
+    let hostLive = false;
+    const registry = new InMemoryActorRepository();
+    registry.upsert({
+      id: actorId,
+      charter: "follower worker",
+      parentId: "root",
+      executionConfig: { executionTarget: "mac-follower" },
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const mesh = new ActorMesh({
+      actors: registry,
+      createActor: () => {
+        throw new Error("not used");
+      },
+      retireCleanups: createStartRetireCleanups(
+        workersDir,
+        { async cancel() {} },
+        undefined,
+        undefined,
+        {
+          sweep: (followerId, actors) => swept.push({ followerId, actors: [...actors] }),
+          listActors: () => {
+            if (listMode === "throw") throw new Error("unreadable");
+            if (listMode === "empty") return [];
+            return [{ id: actorId, retired: registry.get(actorId)?.status === "retired" }];
+          },
+          hasLiveHost: () => hostLive,
+        }
+      ),
+    });
+
+    mesh.retire(actorId);
+    expect(swept).toEqual([
+      { followerId: "mac-follower", actors: [{ id: actorId, retired: true }] },
+    ]);
+    // Any empty leader-side workersDir entry created by createActor/onRevive is also cleaned.
+    expect(existsSync(localWorkdir)).toBe(false);
+
+    // When the follower still holds a live host channel (waiting on `exit`),
+    // createStartRetireCleanups skips without deferring, so a later `run_abandoned`
+    // after `exit` clears `hosts` does not emit a duplicate sweep.
+    const waitingExitActor = "follower-actor-live-host";
+    registry.upsert({
+      id: waitingExitActor,
+      charter: "follower worker",
+      parentId: "root",
+      executionConfig: { executionTarget: "mac-follower" },
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    hostLive = true;
+    mesh.recordEvent({ kind: "run_queued", actorId: waitingExitActor });
+    mesh.retire(waitingExitActor, { force: true });
+    expect(swept).toHaveLength(1);
+    hostLive = false;
+    mesh.recordEvent({ kind: "run_abandoned", actorId: waitingExitActor });
+    expect(swept).toHaveLength(1);
+
+    // Empty or throwing registry sends nothing.
+    const emptyActor = "follower-actor-empty";
+    const throwActor = "follower-actor-throw";
+    for (const id of [emptyActor, throwActor]) {
+      registry.upsert({
+        id,
+        charter: "follower worker",
+        parentId: "root",
+        executionConfig: { executionTarget: "mac-follower" },
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    listMode = "empty";
+    mesh.retire(emptyActor);
+    listMode = "throw";
+    mesh.retire(throwActor);
+    expect(swept).toHaveLength(1);
+  });
 });

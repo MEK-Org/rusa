@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -217,6 +217,38 @@ describe("workspace sweep", () => {
     const orphans = orphanedWorkspaces({ workersDir, scratchDir, actors: REGISTRY });
 
     expect(orphans).toEqual([join(workersDir, RETIRED)]);
+  });
+
+  it("sweeps workersDir alone when scratchDir is omitted", () => {
+    dir(workersDir, RETIRED);
+    dir(workersDir, LIVE);
+
+    const removed = sweepOrphanedWorkspaces({ workersDir, actors: REGISTRY });
+
+    expect(removed).toEqual([join(workersDir, RETIRED)]);
+    expect(existsSync(join(workersDir, RETIRED))).toBe(false);
+    expect(existsSync(join(workersDir, LIVE))).toBe(true);
+  });
+
+  it("runs teardownFlutterOverlay before removing a workersDir entry", () => {
+    const actorDir = dir(workersDir, RETIRED);
+    const flutterMnt = dir(actorDir, ".flutter_mnt");
+    const fakeBin = mkdtempSync(join(tmpdir(), "rusa-fusermount-"));
+    const logFile = join(fakeBin, "fusermount3.log");
+    writeFileSync(join(fakeBin, "fusermount3"), `#!/bin/sh\necho "$*" >> "${logFile}"\nexit 0\n`, {
+      mode: 0o755,
+    });
+    const prevPath = process.env.PATH ?? "";
+    process.env.PATH = `${fakeBin}:${prevPath}`;
+    try {
+      const removed = sweepOrphanedWorkspaces({ workersDir, scratchDir, actors: REGISTRY });
+      expect(removed).toEqual([actorDir]);
+      expect(existsSync(actorDir)).toBe(false);
+      expect(readFileSync(logFile, "utf8").trim()).toBe(`-u -z ${flutterMnt}`);
+    } finally {
+      process.env.PATH = prevPath;
+      rmSync(fakeBin, { recursive: true, force: true });
+    }
   });
 
   describe("isReservedWorkerDirectory", () => {

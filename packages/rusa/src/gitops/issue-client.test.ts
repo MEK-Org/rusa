@@ -247,6 +247,184 @@ describe("GitHubIssueClient", () => {
     expect(reviewers?.body).toEqual({ reviewers: ["operator"] });
   });
 
+  describe("partial pull request edits", () => {
+    const PR_URL = "https://github.com/test-org/test-repo/pull/12";
+    const PR_READ = `GET /repos/${REPO}/pulls/12`;
+
+    it("patches only supplied metadata without a pre-flight GET when draft is omitted", async () => {
+      const requests = installFetch({
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: { html_url: PR_URL, draft: true } },
+      });
+
+      const pr = await new GitHubIssueClient().updatePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        title: "Clearer title",
+      });
+
+      expect(pr).toEqual({ htmlUrl: PR_URL, draft: true });
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+        `PATCH /repos/${REPO}/pulls/12`,
+      ]);
+      expect(requests[0].body).toEqual({ title: "Clearer title" });
+    });
+
+    it("falls back to GET when a metadata-only PATCH response omits draft or html_url", async () => {
+      const requests = installFetch({
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        [PR_READ]: { json: { html_url: PR_URL, draft: true } },
+      });
+
+      const pr = await new GitHubIssueClient().updatePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        title: "Clearer title",
+      });
+
+      expect(pr).toEqual({ htmlUrl: PR_URL, draft: true });
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+        `PATCH /repos/${REPO}/pulls/12`,
+        PR_READ,
+      ]);
+    });
+
+    it("changes draft state without writing title or body for a draft-only edit", async () => {
+      const requests = installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: false, node_id: "PR_node12" } },
+        "POST /graphql": {
+          json: { data: { convertPullRequestToDraft: { pullRequest: { isDraft: true } } } },
+        },
+      });
+
+      const pr = await new GitHubIssueClient().updatePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        draft: true,
+      });
+
+      expect(pr).toEqual({ htmlUrl: PR_URL, draft: true });
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([PR_READ, "POST /graphql"]);
+      expect(requests.some((r) => r.method === "PATCH")).toBe(false);
+    });
+
+    it("marks a draft PR ready for review without writing metadata", async () => {
+      const requests = installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: true, node_id: "PR_node12" } },
+        "POST /graphql": {
+          json: { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } },
+        },
+      });
+
+      const pr = await new GitHubIssueClient().updatePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        draft: false,
+      });
+
+      expect(pr).toEqual({ htmlUrl: PR_URL, draft: false });
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([PR_READ, "POST /graphql"]);
+      const mutation = requests[1].body as { query: string; variables: Record<string, unknown> };
+      expect(mutation.query).toContain("markPullRequestReadyForReview");
+      expect(mutation.variables).toEqual({ pullRequestId: "PR_node12" });
+    });
+
+    it("makes no writes when the requested draft state already matches the observed state", async () => {
+      for (const draft of [true, false]) {
+        const requests = installFetch({
+          [PR_READ]: { json: { html_url: PR_URL, draft, node_id: "PR_node12" } },
+        });
+
+        const pr = await new GitHubIssueClient().updatePullRequest({
+          repo: REPO,
+          prNumber: 12,
+          draft,
+        });
+
+        expect(pr).toEqual({ htmlUrl: PR_URL, draft });
+        expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([PR_READ]);
+      }
+    });
+
+    it("reports a metadata success when its following draft transition fails", async () => {
+      const requests = installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: true, node_id: "PR_node12" } },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        "POST /graphql": { json: { errors: [{ message: "not permitted" }] } },
+      });
+
+      await expect(
+        new GitHubIssueClient().updatePullRequest({
+          repo: REPO,
+          prNumber: 12,
+          body: "Replacement body",
+          draft: false,
+        })
+      ).rejects.toThrow(
+        /#12 was updated but could not be marked ready for review.*pull\/12.*GraphQL error: not permitted.*Re-running/s
+      );
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+        PR_READ,
+        `PATCH /repos/${REPO}/pulls/12`,
+        "POST /graphql",
+      ]);
+      expect(requests[1].body).toEqual({ body: "Replacement body" });
+    });
+
+    it("reports no metadata change when a draft-only transition fails", async () => {
+      const requests = installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: false, node_id: "PR_node12" } },
+        "POST /graphql": { json: { errors: [{ message: "not permitted" }] } },
+      });
+
+      await expect(
+        new GitHubIssueClient().updatePullRequest({
+          repo: REPO,
+          prNumber: 12,
+          draft: true,
+        })
+      ).rejects.toThrow(
+        /#12 had no metadata changes, and could not be converted to draft.*pull\/12.*GraphQL error: not permitted.*Re-running/s
+      );
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([PR_READ, "POST /graphql"]);
+    });
+
+    it("refuses an unavailable draft transition before writing metadata", async () => {
+      const requests = installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: false } },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+      });
+
+      await expect(
+        new GitHubIssueClient().updatePullRequest({
+          repo: REPO,
+          prNumber: 12,
+          title: "Would have changed",
+          draft: true,
+        })
+      ).rejects.toThrow("no node id");
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([PR_READ]);
+    });
+
+    it("throws a retryable error when GraphQL returns an isDraft state disagreeing with requested draft", async () => {
+      installFetch({
+        [PR_READ]: { json: { html_url: PR_URL, draft: true, node_id: "PR_node12" } },
+        "POST /graphql": {
+          json: { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: true } } } },
+        },
+      });
+
+      await expect(
+        new GitHubIssueClient().updatePullRequest({
+          repo: REPO,
+          prNumber: 12,
+          draft: false,
+        })
+      ).rejects.toThrow(
+        /#12 had no metadata changes, and could not be marked ready for review.*remained draft.*Re-running/s
+      );
+    });
+  });
+
   describe("draft pull requests", () => {
     const HEAD_LOOKUP = `GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`;
     const PR_URL = "https://github.com/test-org/test-repo/pull/12";
@@ -407,6 +585,26 @@ describe("GitHubIssueClient", () => {
       ).rejects.toThrow("no node id");
       // Nothing was half-applied: the lookup is the only request made.
       expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([HEAD_LOOKUP]);
+    });
+
+    it("falls back to the requested draft state when a GraphQL transition response omits isDraft", async () => {
+      installFetch({
+        [HEAD_LOOKUP]: {
+          json: [{ number: 12, html_url: PR_URL, draft: true, node_id: "PR_node12" }],
+        },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        "POST /graphql": { json: { data: {} } },
+      });
+
+      const pr = await new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Ready",
+        body: "Body.",
+        draft: false,
+      });
+
+      expect(pr.draft).toBe(false);
     });
 
     it("falls back to the requested draft state when the create response omits it", async () => {

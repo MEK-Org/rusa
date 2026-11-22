@@ -2,6 +2,7 @@ import type { ActorOptions, PromptBuild, RunAbandon } from "../actor/actor.js";
 import type { ActorRuntimeState } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import type { ActorRunMode, RunNudge } from "../actor/trigger-runner.js";
+import type { ActorLiveness } from "../actor/workspace-sweep.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
 
@@ -43,6 +44,23 @@ export interface BoundedExecutionCapability {
   version: 1;
 }
 export const BOUNDED_EXECUTION_CAPABILITY: BoundedExecutionCapability = { version: 1 };
+
+/**
+ * Negotiated workspace sweep (#1338). A follower that sweeps retired actors'
+ * working and provider-scratch directories offers it on `/register`; the
+ * leader echoes it only if it understands it, and only then sends
+ * `workspaceSweep` commands. Additive and does not change the protocol
+ * version: a follower without it receives no `workspaceSweep` command.
+ */
+export interface WorkspaceSweepCapability {
+  version: 1;
+}
+export const WORKSPACE_SWEEP_CAPABILITY: WorkspaceSweepCapability = { version: 1 };
+
+export interface FollowerWorkspaceSweepCommand {
+  type: "workspaceSweep";
+  actors: ActorLiveness[];
+}
 
 /** One fragment of an event transfer, posted to `/events/transfer`. */
 export interface EventTransferFragment {

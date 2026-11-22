@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
+import type { ActorLiveness } from "../actor/workspace-sweep.js";
 import type { ActorChannel } from "./actor-channel.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import type {
@@ -258,6 +259,8 @@ export class RemoteInstance {
   private readonly fileOps = new Map<string, PendingFileOp>();
   /** Set when this generation offered bounded execution and the hub echoed it (#1020). */
   boundedExecution = false;
+  /** Set when this generation offered workspace sweep and the hub echoed it (#1338). */
+  workspaceSweep = false;
   private readonly materialReads = new Map<string, PendingMaterialRead>();
 
   constructor(
@@ -324,6 +327,20 @@ export class RemoteInstance {
 
   enqueueUpdate(update: FollowerUpdateCommand): void {
     this.enqueueCommand(update);
+  }
+
+  /**
+   * Ask a capable follower to sweep retired actors' workspaces (#1338).
+   * Returns false when this generation did not negotiate `workspaceSweep` or
+   * when `actors` is empty (an empty/unreadable registry sweeps nothing).
+   */
+  sweepWorkspaces(actors: readonly ActorLiveness[]): boolean {
+    if (!this.workspaceSweep || actors.length === 0) return false;
+    this.enqueueCommand({
+      type: "workspaceSweep",
+      actors: actors.map(({ id, retired }) => ({ id, retired })),
+    });
+    return true;
   }
 
   isUpdateInProgress(): boolean {

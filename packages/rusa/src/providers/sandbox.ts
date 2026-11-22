@@ -32,8 +32,16 @@ import {
   ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
 import { CODEX_REFRESH_URL_ENV } from "./codex-auth-broker.js";
+import { providerCapabilityName } from "./provider-selection.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
+
+/**
+ * An explicit per-actor grant that lets a non-Kimi provider use the installed
+ * Kimi CLI as an auxiliary tool. The grant projects Kimi's narrowly scoped
+ * sandbox home; it never changes the provider selected for the actor run.
+ */
+export const AUXILIARY_KIMI_CLI_CAPABILITY = "kimi-cli";
 
 /**
  * Host-side diagnostics from the sandbox layer. The layer is built per spawn
@@ -549,10 +557,10 @@ function injectGoogleCredentialShadow(args: string[]): void {
  * mounts in argument order), so the grantee reads the key at the same well-known
  * path as on the host (e.g. `$RUSA_HOME/secrets/gemini-api-key`). Secret grants
  * do not export environment variables into the actor's process tree; a command
- * that needs an environment variable takes it per-command from the file. Grants
- * are read straight from the `capability_grants` table in `$RUSA_HOME/data/mesh.db`
- * through a short-lived readonly connection (the sandbox layer never imports the
- * mesh — same discipline as `loadConfig()` in {@link injectWorkerGithubCredential}),
+ * that needs an environment variable takes it per-command from the file. The
+ * worker's spawn reads the `capability_grants` table in `$RUSA_HOME/data/mesh.db`
+ * once through a short-lived readonly connection (the sandbox layer never imports
+ * the mesh — same discipline as `loadConfig()` in {@link injectWorkerGithubCredential}),
  * keyed by the actor id (= the worker dir's basename, see start.ts
  * `join(workersDir, actorId)`). Evaluated per-spawn, so grant/revoke takes effect
  * on the actor's next run. Fail-closed to MASKED: any open/read error means "no
@@ -569,7 +577,36 @@ export function deriveSecretEnvVar(filename: string): string {
   return filename.toUpperCase().replace(/-/g, "_");
 }
 
-function injectSecretsMasking(args: string[], mcHome: string, actorId: string): void {
+/**
+ * Reads all durable grants once at the real-worker spawn boundary. A failed
+ * read is denial for every capability consumer in this sandbox build.
+ */
+function readActiveCapabilityGrants(mcHome: string, actorId: string): string[] {
+  try {
+    // Path must match db/index.ts's initDb layout (`<mcHome>/data/mesh.db`).
+    // Opened fresh per spawn, readonly, and closed immediately — this never
+    // holds the mesh's own connection, which may belong to a different
+    // `mcHome` in the same process (e.g. under test).
+    const db = new Database(join(mcHome, "data", "mesh.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return new DbCapabilityGrantStore(db).activeFor(actorId);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+function injectSecretsMasking(
+  args: string[],
+  mcHome: string,
+  actorId: string,
+  activeGrants: readonly string[]
+): void {
   const secretsDir = join(mcHome, SECRETS_DIRNAME);
   // The tmpfs mount point must exist under the ro-bound `/` — create it (0700)
   // so the mask holds even on a host that has no secrets yet (same discipline as
@@ -587,26 +624,6 @@ function injectSecretsMasking(args: string[], mcHome: string, actorId: string): 
     }
   } catch {
     // If we can't read the dir, just proceed (tmpfs mask is already in place).
-  }
-
-  let activeGrants: string[] = [];
-  try {
-    // Path must match db/index.ts's initDb layout (`<mcHome>/data/mesh.db`).
-    // Opened fresh per spawn, readonly, and closed immediately — this never
-    // holds the mesh's own connection, which may belong to a different
-    // `mcHome` in the same process (e.g. under test).
-    const db = new Database(join(mcHome, "data", "mesh.db"), {
-      readonly: true,
-      fileMustExist: true,
-    });
-    try {
-      activeGrants = new DbCapabilityGrantStore(db).activeFor(actorId);
-    } finally {
-      db.close();
-    }
-  } catch {
-    // Fail-closed: no database yet, or an unreadable/corrupt one, means "no
-    // grant" (the secrets dir stays fully masked), never a leaked secret.
   }
 
   const secretGrants = activeGrants
@@ -681,6 +698,79 @@ export function addWritableDirBindIfRealDir(args: string[], source: string, targ
   }
   if (!st.isDirectory()) return; // not a real directory (plain file or symlink) — skip
   args.push("--bind", source, target);
+}
+
+/**
+ * Whether config still authorizes the installed Kimi CLI. A durable grant alone
+ * is deliberately insufficient: an operator removing every Kimi provider
+ * configuration must withdraw this auxiliary projection at the next spawn.
+ */
+function isKimiCliConfigured(): boolean {
+  try {
+    const config = loadConfig();
+    return Object.keys(config.providers).some(
+      (providerName) => providerCapabilityName(providerName, config) === "kimi"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Projects the installed Kimi CLI's state into one sandbox. The mutable
+ * credential/OAuth directories remain canonical so the CLI's own cross-process
+ * refresh lock covers every grantee, while sessions stay per actor. The host
+ * Kimi home can be shadowed only after the allow-listed projections are mounted
+ * for an auxiliary grantee: `KIMI_CODE_HOME` is a CLI convention, not a
+ * sufficient containment boundary for a process that could otherwise read the
+ * host path directly. Native Kimi keeps its existing host-home topology. The
+ * returned paths must be made read-only only after later nested credential
+ * shadows have created their mountpoints.
+ */
+function addKimiHome(
+  args: string[],
+  actorDir: string,
+  shadowHostKimiHome = false
+): readonly string[] {
+  const kimiCodeDir = join(getHostHomeDir(), ".kimi-code");
+  args.push("--setenv", "KIMI_CODE_HOME", "/tmp/kimi-home");
+  args.push("--dir", "/tmp/kimi-home");
+  addReadonlyBindIfExists(args, join(kimiCodeDir, "config.toml"), "/tmp/kimi-home/config.toml");
+  // Kimi refresh replaces its credential file with a same-directory temporary
+  // file plus rename; a file or read-only bind fails that operation with EROFS.
+  // Bind the canonical directory so every grantee observes the rotated token.
+  addWritableDirBindIfRealDir(args, join(kimiCodeDir, "credentials"), "/tmp/kimi-home/credentials");
+  // The installed CLI's cross-process refresh lock also lives beside its OAuth
+  // state, so this canonical directory preserves one lock namespace for all grantees.
+  addWritableDirBindIfRealDir(args, join(kimiCodeDir, "oauth"), "/tmp/kimi-home/oauth");
+
+  const kimiSessionsStore = kimiSessionStoreDir(actorDir);
+  mkdirSync(join(kimiSessionsStore, "sessions"), { recursive: true, mode: 0o700 });
+  const kimiIndexPath = join(kimiSessionsStore, "session_index.jsonl");
+  if (!existsSync(kimiIndexPath)) {
+    writeFileSync(kimiIndexPath, "", { mode: 0o600 });
+  }
+  // These must follow the initial `/tmp` tmpfs and `/tmp/kimi-home` directory,
+  // or those earlier mounts would hide the actor-isolated session state.
+  args.push("--bind", join(kimiSessionsStore, "sessions"), "/tmp/kimi-home/sessions");
+  args.push("--bind", kimiIndexPath, "/tmp/kimi-home/session_index.jsonl");
+
+  const shadowedHostKimiHomes: string[] = [];
+  if (shadowHostKimiHome) {
+    // These source paths have now been projected to the limited sandbox home.
+    // Shadow the host view afterwards so an auxiliary tool cannot bypass
+    // KIMI_CODE_HOME and read host sessions or mcp.json directly. Mounting a
+    // tmpfs at the resolved target covers every spelling; bwrap cannot mount a
+    // tmpfs directly over a visible symlink.
+    // Keep this tmpfs writable: injectGoogleCredentialShadow runs later and may
+    // need to create a nested shadow under this isolated tree.
+    const resolvedKimiCodeDir = realpathIfExists(kimiCodeDir);
+    if (existsSync(resolvedKimiCodeDir)) {
+      args.push("--tmpfs", resolvedKimiCodeDir);
+      shadowedHostKimiHomes.push(resolvedKimiCodeDir);
+    }
+  }
+  return shadowedHostKimiHomes;
 }
 
 /**
@@ -908,6 +998,12 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--setenv", "RUSA_HOME", mcHome);
   }
 
+  // Capability grants are worker-scoped. Read them once so all consumers see
+  // the same fail-closed snapshot for this spawn; the E2E root double must not
+  // gain a worker-only auxiliary projection.
+  const activeGrants =
+    mcHome && isWorkerActor ? readActiveCapabilityGrants(mcHome, basename(realActorDir)) : [];
+
   let ghWrapperDir: string | undefined;
   // GitHub credential split (ISSUE_NUM/ISSUE_NUM-adjacent): real workers only — this
   // guard is deliberately narrower than the `mcHome` one above so root (never
@@ -918,7 +1014,7 @@ function buildMeshActorBwrapArgs(o: {
     // Host-secrets masking : same real-workers-only guard as the gh
     // credential split above — root (unsandboxed in production) and the E2E
     // root-agent test double keep host visibility.
-    injectSecretsMasking(args, mcHome, basename(realActorDir));
+    injectSecretsMasking(args, mcHome, basename(realActorDir), activeGrants);
   }
 
   // Write scope: the actor's own directory, re-bound in place over the ro view.
@@ -1044,62 +1140,17 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--bind", sessionsStore, SANDBOX_CODEX_SESSIONS_PATH);
   }
 
-  if (o.authMode === "kimi") {
-    const kimiCodeDir = join(getHostHomeDir(), ".kimi-code");
-    // Redirect kimi-code's data dir to the sandbox's writable /tmp so session writes are
-    // isolated per-worker (mirrors the CODEX_HOME=/tmp pattern for codex workers). The
-    // sessions half of that pattern — persisting the store across invocations — is wired
-    // below via the per-actor bind ; the rest of /tmp/kimi-home is per-invocation.
-    args.push("--setenv", "KIMI_CODE_HOME", "/tmp/kimi-home");
-    args.push("--dir", "/tmp/kimi-home");
-    // config.toml is static — bind read-only from the host ~/.kimi-code.
-    addReadonlyBindIfExists(args, join(kimiCodeDir, "config.toml"), "/tmp/kimi-home/config.toml");
-    // credentials/: the installed kimi CLI writes credentials/kimi-code.json via a same-dir
-    // tmp-file + fsync + rename on every refresh (a read-only bind fails that rename with
-    // EROFS), so this needs a real directory bind, not a single-file one — a file bind can't
-    // be renamed over. Bind the REAL host dir instead of a per-actor copy: kimi's refresh
-    // token rotates on use (see oauth/ below), so a copy's rewrite would leave the copy
-    // holding the live token and the host holding the one that rotation just burned — the
-    // next run (or a sibling actor) would start from a dead token. A directory bind means the
-    // rewrite's rename lands in the real host dir and every actor shares one live credential.
-    addWritableDirBindIfRealDir(
-      args,
-      join(kimiCodeDir, "credentials"),
-      "/tmp/kimi-home/credentials"
-    );
-    // oauth/: not a legacy token file — per the installed CLI's own OAuth manager (readable in
-    // its bundled build output), refreshing takes a cross-process advisory lock at
-    // `${KIMI_CODE_HOME}/oauth/kimi-code` (via `proper-lockfile`, mkdir-based) before rotating
-    // the refresh token, guarding exactly the race this issue is about; the CLI's own comment
-    // is explicit that skipping the lock would mean "racing refresh_token rotation". That lock
-    // needs a writable parent directory (proper-lockfile creates a sibling `kimi-code.lock`
-    // entry next to the target), so this is a directory bind too, not a file bind. Binding the
-    // real host oauth/ dir — instead of each actor getting its own copy and thus its own private
-    // lock namespace — is what actually restores the CLI's built-in single-refresh-owner
-    // protection across concurrent actors; rusa does not need a lock of its own on top of it.
-    addWritableDirBindIfRealDir(args, join(kimiCodeDir, "oauth"), "/tmp/kimi-home/oauth");
-    // Cross-invocation session continuity (ISSUE_NUM + follow-up): kimi keeps its session
-    // transcripts under KIMI_CODE_HOME/sessions AND a sibling KIMI_CODE_HOME/session_index.jsonl
-    // that maps a session id to its workdir bucket. /tmp/kimi-home is a per-invocation sandbox
-    // tmpfs, so both vanished with the prior invocation's bwrap and every `kimi -r <id>` resume
-    // failed "Session not found". ISSUE_NUM persisted sessions/ alone, but the `-r` id->bucket lookup
-    // reads the sibling index FIRST, so resume still failed until the index is persisted too
-    // (isolated by solid-rusa's Layer 2 real-`-r` E2E). Persist BOTH in a per-actor host-/tmp
-    // dir laid out like KIMI_CODE_HOME's session slice and bind each into place — same
-    // memory-not-secret discipline as codex's rollout store (see {@link kimiSessionStoreDir}):
-    // NOT tempPaths, survive across runs/retire/redeploy — like credentials/ and oauth/ above,
-    // but for session continuity rather than auth (separate paths, unaffected by each other).
-    // Must come AFTER the initial `--tmpfs /tmp` and the `--dir /tmp/kimi-home` above, or they
-    // would be shadowed.
-    const kimiSessionsStore = kimiSessionStoreDir(o.actorDir);
-    mkdirSync(join(kimiSessionsStore, "sessions"), { recursive: true, mode: 0o700 });
-    const kimiIndexPath = join(kimiSessionsStore, "session_index.jsonl");
-    if (!existsSync(kimiIndexPath)) {
-      // bind source must exist; an empty index is kimi's fresh-start state (it appends).
-      writeFileSync(kimiIndexPath, "", { mode: 0o600 });
-    }
-    args.push("--bind", join(kimiSessionsStore, "sessions"), "/tmp/kimi-home/sessions");
-    args.push("--bind", kimiIndexPath, "/tmp/kimi-home/session_index.jsonl");
+  const hasAuxiliaryKimiCliGrant =
+    o.authMode !== "kimi" &&
+    activeGrants.includes(AUXILIARY_KIMI_CLI_CAPABILITY) &&
+    isKimiCliConfigured();
+  let auxiliaryKimiHostHomeShadows: readonly string[] = [];
+  if (o.authMode === "kimi" || hasAuxiliaryKimiCliGrant) {
+    // Kimi itself always receives its existing home. Other providers require
+    // both configured Kimi support and the durable auxiliary capability above.
+    // Keep this separate from the auth-mode/MCP branch: that branch must remain
+    // tied to the actual provider selected for this run.
+    auxiliaryKimiHostHomeShadows = addKimiHome(args, realActorDir, hasAuxiliaryKimiCliGrant);
   }
 
   const hostFlutterRoot = resolveHostFlutterRoot();
@@ -1158,6 +1209,13 @@ function buildMeshActorBwrapArgs(o: {
     // visibility of the real `~/.config/gchat` dir. Last, so no later mount can
     // bind a credential dir back in (#1013).
     injectGoogleCredentialShadow(args);
+  }
+  // A nested Google shadow may sit below the isolated Kimi host-home tmpfs, so
+  // it must be mounted first. Remount the remaining host-home tree read-only
+  // afterwards: an auxiliary process that ignores KIMI_CODE_HOME now fails
+  // loudly instead of silently writing into a disposable shadow.
+  for (const dir of auxiliaryKimiHostHomeShadows) {
+    args.push("--remount-ro", dir);
   }
 
   return { args, tempPaths };

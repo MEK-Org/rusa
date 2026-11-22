@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import type {
@@ -15,6 +16,7 @@ import { InMemoryExperimentEnrollmentStore } from "../actor/experiments.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
+import { createStartRetireCleanups } from "../commands/start.js";
 import { createInProcessMeshWriter } from "../db/mesh-write-operations.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
@@ -30,6 +32,7 @@ import type { RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./fixture-provider.js";
 import type { FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
+import { sweepRetiredFollowerActorOnExit } from "./follower-registration-recovery.js";
 import type { ActorEvent, ProviderFactory } from "./protocol.js";
 import { RemoteInstance } from "./remote-instance.js";
 
@@ -70,6 +73,14 @@ export function createHarness(options: {
   material?: RunMaterialOptions;
   /** Further leader-side lifecycle listeners, one set per actor. */
   lifecycle?: (actorId: string) => ActorLifecycleListener;
+  /** Provider CLI scratch area on the synthetic follower; omitted unless tested. */
+  scratchDir?: string;
+  /** Whether the synthetic follower negotiated `workspaceSweep` (#1338). Defaults to true. */
+  workspaceSweep?: boolean;
+  /** Opt-in follower placement + retire workdir sweep wiring for #1338 tests. */
+  followerPlacement?: boolean;
+  /** Actor ID generator override for tests that need UUID-shaped IDs. */
+  idgen?: () => string;
 }) {
   const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();
@@ -77,6 +88,7 @@ export function createHarness(options: {
   const newRemote = () => {
     const instance = new RemoteInstance("test-follower", process.platform, process.pid);
     instance.boundedExecution = options.material?.enabled() === true;
+    instance.workspaceSweep = options.workspaceSweep ?? true;
     return instance;
   };
   let remote = newRemote();
@@ -88,10 +100,29 @@ export function createHarness(options: {
     false,
     (event) => {
       followerEvents.push(structuredClone(event));
-      queueMicrotask(() => remote.receive(structuredClone(event)));
+      queueMicrotask(() => {
+        const cloned = structuredClone(event);
+        remote.receive(cloned);
+        if (
+          options.followerPlacement &&
+          cloned.actorId !== "$instance" &&
+          cloned.message.type === "exit"
+        ) {
+          sweepRetiredFollowerActorOnExit({
+            followerId: remote.id,
+            actorId: cloned.actorId,
+            actors,
+            sweepWorkspaces: (_followerId, list) => remote.sweepWorkspaces(list),
+          });
+        }
+      });
     },
     options.providerFactory ?? createProvider,
-    { repositories: options.repositories, material: options.material }
+    {
+      repositories: options.repositories,
+      material: options.material,
+      scratchDir: options.scratchDir,
+    }
   );
   // Exercise the same instance commands without opening a port in unit tests.
   const wire = (instance: RemoteInstance) => {
@@ -99,6 +130,8 @@ export function createHarness(options: {
       for (const command of instance.commands.splice(0))
         if ("actorId" in command) {
           queueMicrotask(() => follower.dispatch(structuredClone(command)));
+        } else if (command.type === "workspaceSweep") {
+          queueMicrotask(() => follower.sweepWorkspaces(structuredClone(command.actors)));
         } else {
           // This in-process fixture shares the leader checkout. Running an update
           // here could reset the test source tree, so surface an explicit failed
@@ -177,8 +210,27 @@ export function createHarness(options: {
     experimentEnrollments,
     grantableCapabilities: new Set([COMPUTER_USE_CAPABILITY]),
     events: (event) => meshEvents.push(event),
-    idgen: () => `instance-worker-${++sequence}`,
+    idgen: options.idgen ?? (() => `instance-worker-${++sequence}`),
     writer,
+    ...(options.followerPlacement
+      ? {
+          supportsExecutionTarget: (target: string) => target === "test-follower",
+          retireCleanups: createStartRetireCleanups(
+            join(options.cwd, "leader-workers"),
+            { cancel: async () => {} },
+            undefined,
+            undefined,
+            {
+              sweep: (_followerId, list) => remote.sweepWorkspaces(list),
+              listActors: () =>
+                actors
+                  .list()
+                  .map((record) => ({ id: record.id, retired: record.status === "retired" })),
+              hasLiveHost: (_followerId, actorId) => remote.hosts.has(actorId),
+            }
+          ),
+        }
+      : {}),
     ...(options.obligationClosure
       ? {
           obligations: {
@@ -367,7 +419,12 @@ export function createHarness(options: {
         model: "scripted",
       }
     ) => {
-      const id = mesh.spawn({ charter, parentId: "root", modelConfig });
+      const id = mesh.spawn({
+        charter,
+        parentId: "root",
+        modelConfig,
+        ...(options.followerPlacement ? { executionTarget: "test-follower" } : {}),
+      });
       mesh.sendMessage(id, "Begin your charter", "root");
       return id;
     },

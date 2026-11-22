@@ -157,8 +157,9 @@ export interface VerificationResult {
  *
  * `issues.edited` / `pull_request.edited` ARE included, because a re-write makes the editor
  * the body's author . The old exclusion rested on "the sender is the editor, but the
- * stamp is the original author's" — update_body now strips before it stamps, so the single
- * surviving stamp IS the editor's by construction. This is not the freshness-window
+ * stamp is the original author's" — the body-editing write paths (`update_body`,
+ * `update_pull_request`, and `create_pull_request` upserts) strip before they stamp, so
+ * the single surviving stamp IS the editor's by construction. This is not the freshness-window
  * discriminator that was ruled out: nothing here infers WHO edited, it reads a stamp the
  * write path guaranteed.
  *
@@ -172,11 +173,11 @@ export interface VerificationResult {
  * Hence the `changes.body` gate. A native webhook proves a body edit by sending that key;
  * anything that cannot prove it falls through to null and is delivered.
  *
- * That guarantee is exactly as wide as update_body, which is why comment edits stay
- * excluded:
+ * That guarantee covers issue and PR body writes (`update_body`, `update_pull_request`,
+ * and `create_pull_request` upserts), which is why comment edits stay excluded:
  * - `issue_comment.edited` / `pull_request_review_comment.edited` → null. There is no
- *   comment-edit tool on the mesh write path (update_body takes an issueNumber and replaces
- *   an issue/PR body), so an edited comment still carries the ORIGINAL commenter's stamp
+ *   comment-edit tool on the mesh write path (`update_body` and `update_pull_request`
+ *   replace an issue/PR body), so an edited comment still carries the ORIGINAL commenter's stamp
  *   with nothing to re-stamp it. Including them would suppress the event for whoever wrote
  *   the comment rather than whoever edited it — silent deafness, the failure this whole
  *   table exists to avoid. Add them only alongside a re-stamping comment-edit write path.
@@ -207,8 +208,9 @@ export function authorStampBodyForWebhookPayload(
   if (event === "pull_request_review" && action === "submitted") return bodyOf("review");
   if (event === "issues" && action === "opened") return bodyOf("issue");
   if (event === "pull_request" && action === "opened") return bodyOf("pull_request");
-  // Body edits to issues/PRs only — update_body re-stamps these, so the stamp is the
-  // editor's. Comment edits have no re-stamping write path; see the doc comment above.
+  // Body edits to issues/PRs only — update_body, update_pull_request, and create_pull_request
+  // upserts re-stamp these, so the stamp is the editor's. Comment edits have no re-stamping
+  // write path; see the doc comment above.
   if (event === "issues" && action === "edited") return bodyWasEdited() ? bodyOf("issue") : null;
   if (event === "pull_request" && action === "edited")
     return bodyWasEdited() ? bodyOf("pull_request") : null;

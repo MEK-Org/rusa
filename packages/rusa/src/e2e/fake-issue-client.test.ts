@@ -60,6 +60,64 @@ describe("FakeIssueClient", () => {
     expect(details.headRef).toBe("mc/issue-1");
   });
 
+  it("partially updates an existing PR without changing omitted metadata", async () => {
+    const { client } = setup();
+    await client.createPullRequest({
+      repo: REPO,
+      head: "mc/issue-1",
+      title: "v1",
+      body: "b1",
+      base: "main",
+    });
+
+    const result = await client.updatePullRequest({
+      repo: REPO,
+      prNumber: 1,
+      title: "v2",
+      draft: true,
+    });
+
+    expect(result).toEqual({
+      htmlUrl: "http://localhost:8084/rusa-e2e/scratch/pull/1",
+      draft: true,
+    });
+    await expect(client.getPullRequestDetails(REPO, 1)).resolves.toMatchObject({
+      title: "v2",
+      body: "b1",
+      baseRef: "main",
+    });
+  });
+
+  it("mutates the PR identified by prNumber even when closed or sharing a headRef", async () => {
+    const { tracker, client } = setup();
+    const closedPr = await client.createPullRequest({
+      repo: REPO,
+      head: "mc/issue-1",
+      title: "closed v1",
+      body: "closed b1",
+      base: "main",
+    });
+    await tracker.closePr(closedPr.number);
+    const openPr = await client.createPullRequest({
+      repo: REPO,
+      head: "mc/issue-1",
+      title: "open v1",
+      body: "open b1",
+      base: "main",
+    });
+
+    const updated = await client.updatePullRequest({
+      repo: REPO,
+      prNumber: closedPr.number,
+      title: "closed v2",
+    });
+
+    expect(updated.htmlUrl).toBe(closedPr.htmlUrl);
+    expect(tracker.listPrs()).toHaveLength(2);
+    expect(tracker.getPr(closedPr.number)?.title).toBe("closed v2");
+    expect(tracker.getPr(openPr.number)?.title).toBe("open v1");
+  });
+
   it("lists the bot's open PRs matching author case-insensitively", async () => {
     const { client } = setup();
     await client.createPullRequest({
