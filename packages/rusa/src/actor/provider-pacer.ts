@@ -399,15 +399,17 @@ export interface PoolLaneCandidate<C> {
   weeklyQuota?: WeeklyQuotaObservation;
   /**
    * Whether the quota controller is asking for no throttle on this candidate
-   * lane (#1351): every governing bucket on the provider lane and any
-   * applicable model lanes has a fresh reading with `error <= 0`. Optional:
-   * when omitted, {@link selectPoolLane} falls back to
-   * `Math.round(pacer.governingInterval) === 0`.
+   * lane (#1351): every current bucket on the provider lane and any
+   * applicable model lanes has a fresh reading with `error <= 0`. Optional.
+   * {@link selectPoolLane} counts a lane unthrottled when this is `true` **or**
+   * `Math.round(pacer.governingInterval) === 0`, so an omitted, missing or
+   * stale (`false`) reading leaves a lane whose pacer has reached 0 ms
+   * unthrottled and ranks every other lane by its governing throttle.
    */
   controllerUnthrottled?: boolean;
 }
 
-/** The provider-wide weekly reading used only to break an immediate-lane tie. */
+/** The provider-wide weekly reading used only to break an equally-throttled tie. */
 interface WeeklyQuotaObservation {
   /** Percentage of the weekly quota still available, from 0 through 100. */
   percentLeft: number;
@@ -457,19 +459,25 @@ function weeklyQuotaHeadroom(
  *    wins (#895).
  * 3. Trustworthy weekly quota headroom only breaks ties between **equally
  *    throttled** lanes, and only when **every** lane in the tie has a
- *    trustworthy reading; a single fresh reading never outranks declared
- *    order over lanes with stale or missing evidence. It never outranks
+ *    trustworthy reading; one lane's reading never outranks declared order
+ *    over lanes with missing or untrustworthy evidence. It never outranks
  *    declared order among unthrottled lanes. Tied headroom falls back to
  *    declared order.
  *
  * For normal requests, {@link ProviderPacer.quote} still gates availability:
  * when only one lane is available now (or all lanes must wait), the earliest
  * quote wins; when multiple lanes are available now, the rule above decides.
+ * The quote rule means a preferred lane that is still waiting out its last
+ * start's interval does not hold normal work: a lane available now wins over
+ * one that is not, whatever their declared order.
+ *
  * For responsive requests (`opts.responsive`), pacing never disqualifies a
  * lane and the reservation bypasses the wait, so unthrottled lanes win in
  * declared order ahead of throttled lanes, and among throttled lanes the
  * shortest governing throttle ranks first, with weekly headroom breaking ties
- * between equally throttled lanes. Lanes at absolute zero are expected to have
+ * between equally throttled lanes. Without unanimous headroom evidence, an
+ * equally-throttled responsive tie goes to the earliest quote, as normal
+ * admission would pick (#655). Lanes at absolute zero are expected to have
  * been excluded by the caller.
  *
  * Callers must reserve the winning lane (via `submit`) synchronously, with no
@@ -488,22 +496,25 @@ export function selectPoolLane<C>(
 
     // All candidates are throttled: shortest governing throttle wins (#895),
     // and weekly headroom breaks the tie only when every tied lane has a
-    // trustworthy reading; otherwise declared order stands.
+    // trustworthy reading. Otherwise the tie goes to the lane normal admission
+    // would pick among those tied lanes, the earliest quote with declared
+    // order breaking equal quotes (unchanged from #655), so responsive and
+    // normal priority differ only in bypassing the wait.
     const shortest = withShortestGoverningInterval(candidates);
-    return headroomTieWinner(shortest, now) ?? selectByQuote(shortest, now);
+    return headroomTieWinner(shortest, now) ?? earliestQuote(shortest, now).best;
   }
   return selectByQuote(candidates, now);
 }
 
 /**
- * Earliest quote first; among lanes available now, unthrottled lanes win in
- * declared order, otherwise the shortest governing throttle ranks the tie and
- * weekly headroom decides only when every tied lane has a trustworthy reading.
+ * The candidate with the earliest quote (declared order breaks equal quotes),
+ * and every candidate available now. A quote is never earlier than `now`, so
+ * the first available candidate is also the earliest.
  */
-function selectByQuote<C>(
+function earliestQuote<C>(
   candidates: readonly PoolLaneCandidate<C>[],
   now: number
-): PoolLaneCandidate<C> | undefined {
+): { best: PoolLaneCandidate<C> | undefined; immediatelyAvailable: PoolLaneCandidate<C>[] } {
   let best: PoolLaneCandidate<C> | undefined;
   let bestQuote = Number.POSITIVE_INFINITY;
   const immediatelyAvailable: PoolLaneCandidate<C>[] = [];
@@ -515,6 +526,19 @@ function selectByQuote<C>(
     }
     if (quote <= now) immediatelyAvailable.push(candidate);
   }
+  return { best, immediatelyAvailable };
+}
+
+/**
+ * Earliest quote first; among lanes available now, unthrottled lanes win in
+ * declared order, otherwise the shortest governing throttle ranks the tie and
+ * weekly headroom decides only when every tied lane has a trustworthy reading.
+ */
+function selectByQuote<C>(
+  candidates: readonly PoolLaneCandidate<C>[],
+  now: number
+): PoolLaneCandidate<C> | undefined {
+  const { best, immediatelyAvailable } = earliestQuote(candidates, now);
   if (!best || immediatelyAvailable.length < 2) return best;
 
   const unthrottled = immediatelyAvailable.filter(isCandidateUnthrottled);
@@ -528,8 +552,8 @@ function selectByQuote<C>(
  * The headroom winner across an equally-throttled tie, or `undefined` when
  * headroom must not be consulted at all (#1351): weekly headroom decides a
  * tie only when **every** lane in the tie has a trustworthy reading, so one
- * lane's fresh observation never outranks declared order over lanes whose
- * evidence is stale or missing. Tied headroom keeps the first declared.
+ * lane's observation never outranks declared order over lanes whose
+ * evidence is missing or untrustworthy. Tied headroom keeps the first declared.
  */
 function headroomTieWinner<C>(
   tie: readonly PoolLaneCandidate<C>[],
@@ -604,11 +628,13 @@ export interface SubmitPoolGateOptions<C>
  * lanes as a single composed {@link RunStartHandle}. A normal request paces
  * through the winning lane's `ProviderPacer`, chosen by {@link selectPoolLane}
  * among non-halted candidates. Responsive priority excludes coordinator-known
- * exhausted lanes through this same selection path, ranks survivors by quota
- * headroom rather than pacing heat, and then skips pacing once its selected
- * lane has been reserved (#655).
+ * exhausted lanes through this same selection path, ranks survivors by the
+ * responsive rule of {@link selectPoolLane} (first-declared unthrottled lane,
+ * else shortest governing throttle with unanimous weekly headroom breaking
+ * ties, #1351), and then skips pacing once its selected lane has been
+ * reserved (#655).
  *
- * `promote()` re-runs the normal selection rule before bypassing pacing. When
+ * `promote()` re-runs that responsive selection before bypassing pacing. When
  * the newly selected lane differs, the stale reservation is cancelled; a
  * `generation` counter on the outer handle ignores the stale lane's
  * now-asynchronous cancellation rejection so it can never clobber the freshly
@@ -1022,7 +1048,9 @@ export class UnifiedAdmissionQueue<C> {
    * delay left. Requiring an idle lane keeps at most one claimed-but-unstarted
    * actor per lane, so work waiting on mesh concurrency stays in this list
    * (reorderable, cancellable) rather than draining into per-lane FIFOs.
-   * `selectPoolLane` keeps the weekly-headroom tie-break among idle lanes.
+   * `selectPoolLane` ranks idle lanes: the first-declared unthrottled lane,
+   * else the shortest governing throttle with unanimous weekly headroom
+   * breaking ties (#1351).
    *
    * This is greedy, as requested in #633: when several lanes are idle in one
    * pass, an earlier actor may take the lane a later, narrower actor needed

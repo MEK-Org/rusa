@@ -661,33 +661,64 @@ export function weeklyAdmissionObservation(status: PublishedThrottleProviderStat
 }
 
 function laneBucketsControllerUnthrottled(
-  lane: Pick<PublishedThrottleProviderStatus, "buckets" | "freshness">
+  lane: Pick<
+    PublishedThrottleProviderStatus,
+    "buckets" | "expired" | "freshness" | "governingBucketKey" | "updatedAt"
+  >,
+  nowMs: number
 ): boolean {
+  if (lane.expired) return false;
   if (lane.freshness.stale || lane.freshness.hardStale) return false;
-  if (!Array.isArray(lane.buckets) || lane.buckets.length === 0) return false;
-  return lane.buckets.every(
+  if (!Array.isArray(lane.buckets)) return false;
+  // The same bucket scope the controller elects its governing bucket from and
+  // freshness ages the lane by (§5.5): kinds in the newest scrape, or the
+  // governing bucket. A kind the provider has stopped emitting keeps its last
+  // reasoned row in `buckets` until retention purges it; it does not decide
+  // whether the controller is throttling the lane now.
+  const current = lane.buckets.filter(
     (bucket) =>
-      typeof bucket.error === "number" && Number.isFinite(bucket.error) && bucket.error <= 0
+      bucket.observedAt === lane.updatedAt ||
+      (lane.governingBucketKey != null && bucket.key === lane.governingBucketKey)
   );
+  if (current.length === 0) return false;
+  // Published freshness is frozen when the coordinator serializes a status,
+  // and a client keeps its last-good status through cold or unavailable
+  // reads, so re-age each current bucket against the wall clock with the
+  // published soft-stale threshold (as `closedGoverningWindow` does).
+  const staleAfterMs =
+    lane.freshness.staleAfterMs ?? freshnessThresholds(lane.freshness.mode).staleAfterMs;
+  return current.every((bucket) => {
+    const observedMs = Date.parse(bucket.observedAt);
+    return (
+      Number.isFinite(observedMs) &&
+      nowMs - observedMs <= staleAfterMs &&
+      typeof bucket.error === "number" &&
+      Number.isFinite(bucket.error) &&
+      bucket.error <= 0
+    );
+  });
 }
 
 /**
  * Whether the quota controller is asking for no throttle on this candidate
  * lane (#1351): true only when the provider lane and every applicable model
- * lane are fresh, have at least one bucket, and every bucket has `error <= 0`
- * (on or under pace). Returns `undefined` when no published status exists.
+ * lane are unexpired, fresh by both their published flags and the wall clock
+ * at `nowMs`, have at least one current bucket (newest scrape or governing),
+ * and every current bucket has `error <= 0` (on or under pace). Returns
+ * `undefined` when no published status exists.
  */
 export function laneControllerUnthrottled(
   status: PublishedThrottleProviderStatus | undefined,
-  model: string | undefined
+  model: string | undefined,
+  nowMs: number
 ): boolean | undefined {
   if (!status) return undefined;
-  if (!laneBucketsControllerUnthrottled(status)) return false;
+  if (!laneBucketsControllerUnthrottled(status, nowMs)) return false;
   if (!model) return true;
   const lanes: unknown[] = Array.isArray(status.modelLanes) ? status.modelLanes : [];
   for (const lane of lanes) {
     if (!isPublishedModelLane(lane) || !modelListCovers(lane.models, model)) continue;
-    if (!laneBucketsControllerUnthrottled(lane)) return false;
+    if (!laneBucketsControllerUnthrottled(lane, nowMs)) return false;
   }
   return true;
 }

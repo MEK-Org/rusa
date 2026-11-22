@@ -733,11 +733,15 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         };
       };
 
-      expect(laneControllerUnthrottled(undefined, undefined)).toBeUndefined();
-      expect(laneControllerUnthrottled(makeLane(-10), undefined)).toBe(true);
-      expect(laneControllerUnthrottled(makeLane(0), undefined)).toBe(true);
-      expect(laneControllerUnthrottled(makeLane(5), undefined)).toBe(false);
-      expect(laneControllerUnthrottled(makeLane(-10, true), undefined)).toBe(false);
+      expect(laneControllerUnthrottled(undefined, undefined, nowMs)).toBeUndefined();
+      expect(laneControllerUnthrottled(makeLane(-10), undefined, nowMs)).toBe(true);
+      expect(laneControllerUnthrottled(makeLane(0), undefined, nowMs)).toBe(true);
+      expect(laneControllerUnthrottled(makeLane(5), undefined, nowMs)).toBe(false);
+      expect(laneControllerUnthrottled(makeLane(-10, true), undefined, nowMs)).toBe(false);
+      // An exhausted lane is never "unthrottled", even on a retained on-pace error.
+      expect(laneControllerUnthrottled({ ...makeLane(-10), expired: true }, undefined, nowMs)).toBe(
+        false
+      );
 
       // Provider unthrottled, applicable model lane throttled -> false; other model -> true.
       const withModelLane = {
@@ -749,8 +753,75 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
           },
         ],
       };
-      expect(laneControllerUnthrottled(withModelLane, "claude-fable-5-1")).toBe(false);
-      expect(laneControllerUnthrottled(withModelLane, "claude-sonnet-4-6")).toBe(true);
+      expect(laneControllerUnthrottled(withModelLane, "claude-fable-5-1", nowMs)).toBe(false);
+      expect(laneControllerUnthrottled(withModelLane, "claude-sonnet-4-6", nowMs)).toBe(true);
+    });
+
+    it("re-ages a retained status against the wall clock before counting a lane unthrottled (#1351)", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const observedAt = new Date(nowMs).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const base = weeklyStatus("claude", 60, observedAt, resetAtIso);
+      const lane = {
+        ...base,
+        freshness: { ...base.freshness, mode: "scrape" as const, staleAfterMs: 45 * 60 * 1_000 },
+        buckets: [{ ...base.buckets[0], error: -10 }],
+      };
+      // The published flags were frozen fresh; the wall clock decides once the
+      // status is retained past soft-stale through a cold or unavailable read.
+      expect(laneControllerUnthrottled(lane, undefined, nowMs + 45 * 60 * 1_000)).toBe(true);
+      expect(laneControllerUnthrottled(lane, undefined, nowMs + 45 * 60 * 1_000 + 1)).toBe(false);
+    });
+
+    it("judges only current buckets (newest scrape or governing) for controllerUnthrottled (#1351)", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const newest = new Date(nowMs).toISOString();
+      const earlier = new Date(nowMs - 10 * 60 * 1_000).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const bucket = (key: string, error: number, observedAt: string) => ({
+        key,
+        percentLeft: 60,
+        timeRemainingPct: 50,
+        error,
+        derivative: 0,
+        requiredIntervalSeconds: 12,
+        resetAtIso,
+        observedAt,
+      });
+      const lane = {
+        ...providerStatus(12, "claude"),
+        updatedAt: newest,
+        buckets: [
+          bucket("claude:weekly", -10, newest),
+          // A kind the provider stopped emitting: its last reasoned row was
+          // ahead of pace, but it is neither in the newest scrape nor governing.
+          bucket("claude:opus-weekly", 5, earlier),
+        ],
+      };
+      expect(laneControllerUnthrottled(lane, undefined, nowMs)).toBe(true);
+
+      // The same row as the governing bucket still decides.
+      expect(
+        laneControllerUnthrottled(
+          { ...lane, governingBucketKey: "claude:opus-weekly" },
+          undefined,
+          nowMs
+        )
+      ).toBe(false);
+      // In the newest scrape it decides too.
+      expect(
+        laneControllerUnthrottled(
+          {
+            ...lane,
+            buckets: [
+              bucket("claude:weekly", -10, newest),
+              bucket("claude:opus-weekly", 5, newest),
+            ],
+          },
+          undefined,
+          nowMs
+        )
+      ).toBe(false);
     });
 
     // These outcomes are decided by selectPoolLane at the merge base (the

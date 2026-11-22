@@ -1199,18 +1199,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(live.opts.isE2eRoot).toBe(false);
   });
 
-  it("#367 selects greater weekly headroom through the live runStart provider gate when lanes are equally throttled, and retains the pick through a cold response", async () => {
+  it("#367 selects greater weekly headroom through the live runStart provider gate when lanes are equally throttled, retains the pick through a cold response, and ranks an on-pace lane unthrottled (#1351)", async () => {
     const socketPath = join(homeDir, "coordinator.sock");
     const observedAt = new Date().toISOString();
     const resetAtIso = new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000).toISOString();
-    const weeklyBucket = (provider: string, percentLeft: number) => ({
+    const weeklyBucket = (provider: string, percentLeft: number, error?: number) => ({
       key: `${provider}:weekly`,
       percentLeft,
       timeRemainingPct: 50,
       // error = timeRemainingPct - percentLeft: both lanes burn ahead of pace
       // (error > 0), so #1351 ranks them as equally throttled and weekly
-      // headroom decides the tie.
-      error: 50 - percentLeft,
+      // headroom decides the tie. The last phase overrides it to on pace.
+      error: error ?? 50 - percentLeft,
       derivative: 0,
       requiredIntervalSeconds: 300,
       observedAt,
@@ -1220,7 +1220,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // governing throttle for the gates below, so each proves what it claims:
     // the warm gate that the live weekly projection decides the tie, the cold
     // gate that the retained last-good status keeps the pick.
-    const throttleStatus = (provider: string, percentLeft: number, intervalSeconds = 60) => ({
+    const throttleStatus = (
+      provider: string,
+      percentLeft: number,
+      intervalSeconds = 60,
+      error?: number
+    ) => ({
       provider,
       intervalSeconds,
       uncappedIntervalSeconds: intervalSeconds,
@@ -1229,7 +1234,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expired: false,
       exhaustedUntil: null,
       updatedAt: observedAt,
-      buckets: [weeklyBucket(provider, percentLeft)],
+      buckets: [weeklyBucket(provider, percentLeft, error)],
       freshness: {
         ageMs: 0,
         buckets: { [`${provider}:weekly`]: 0 },
@@ -1244,6 +1249,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       serverTime: observedAt,
     };
     let codexCold = false;
+    let claudeOnPace = false;
     const coordinator = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://localhost");
       res.setHeader("content-type", "application/json");
@@ -1258,7 +1264,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
           providers: {
             // A changed claude interval lets the test observe that the production
             // client completed this cold collection, not just that the server sent it.
-            claude: throttleStatus("claude", 20, codexCold ? 120 : 60),
+            claude: claudeOnPace
+              ? throttleStatus("claude", 20, 90, -5)
+              : throttleStatus("claude", 20, codexCold ? 120 : 60),
             // A cold lane is a 200 not_ready entry in the collection (§5.5, #480).
             codex: codexCold
               ? { error: { code: "not_ready", message: "cold", retryable: true } }
@@ -1342,6 +1350,27 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
       await expect(coldGate.result).resolves.toBe("codex");
       expect(afterCold).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+
+      // Claude's controller now asks for no throttle (error <= 0) while its
+      // published interval is still decaying (90 s), longer than codex's
+      // retained 60 s. Only the live controllerUnthrottled wiring ranks claude
+      // unthrottled; on governing throttle alone codex would keep winning.
+      claudeOnPace = true;
+      await vi.waitFor(() => expect(coordinatorAppliedInterval?.("claude")).toBe(90), {
+        timeout: 5_000,
+      });
+      const onPace = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);
+      const onPaceGate = mesh.gateRun(
+        onPace,
+        [
+          { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+          { provider: "codex", model: "gpt-5.6", effort: "high" },
+        ],
+        true,
+        rootId
+      );
+      await expect(onPaceGate.result).resolves.toBe("claude");
+      expect(onPace).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
     } finally {
       await shutdownFn?.();
       shutdownFn = undefined;

@@ -10072,7 +10072,7 @@ describe("ActorMesh", () => {
   // first-declared lane the controller is not throttling, so promotion may
   // move a queued run to an earlier-declared unthrottled lane; what survives
   // is a single immediate run with the responsive selection recorded.
-  describe("responsive promotion retains normal pool selection (#347)", () => {
+  describe("responsive promotion reselects by the responsive lane rule (#347, #1351)", () => {
     it("promotes a queued run on its first-declared unthrottled lane, with exactly one immediate run", async () => {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];

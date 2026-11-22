@@ -466,9 +466,11 @@ describe("ProviderPacer", () => {
     it("starts the responsive headroom winner without waiting out its pace (#655)", async () => {
       const mesh = new ConcurrencyLimiter(1);
       const now = Date.now();
-      const hot = laneFor("hot");
-      hot.pacer.deferUntil(now + 3_600_000);
-      const cool = laneFor("cool");
+      // Equally throttled, so weekly headroom decides the tie (#1351); the
+      // winner is the later-quoting lane, which responsive starts at once.
+      const coolLow = laneFor("cool-low-headroom", 60_000);
+      const hotHigh = laneFor("hot-high-headroom", 60_000);
+      hotHigh.pacer.deferUntil(now + 3_600_000);
       const resetAtIso = new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString();
       const observedAt = new Date(now).toISOString();
       const started: string[] = [];
@@ -478,8 +480,8 @@ describe("ProviderPacer", () => {
           return config;
         },
         [
-          { ...hot, weeklyQuota: { percentLeft: 80, observedAt, resetAtIso } },
-          { ...cool, weeklyQuota: { percentLeft: 20, observedAt, resetAtIso } },
+          { ...coolLow, weeklyQuota: { percentLeft: 20, observedAt, resetAtIso } },
+          { ...hotHigh, weeklyQuota: { percentLeft: 80, observedAt, resetAtIso } },
         ],
         {
           responsive: true,
@@ -487,8 +489,8 @@ describe("ProviderPacer", () => {
         }
       );
       await vi.advanceTimersByTimeAsync(0);
-      await expect(handle.result).resolves.toBe("hot");
-      expect(started).toEqual(["hot"]);
+      await expect(handle.result).resolves.toBe("hot-high-headroom");
+      expect(started).toEqual(["hot-high-headroom"]);
     });
 
     it("responsive requests choose the same earliest available healthy candidate as normal admission while bypassing pacing", async () => {
@@ -539,8 +541,9 @@ describe("ProviderPacer", () => {
     it("falls back to declared order when weekly headroom evidence is unknown or the window has rolled over", () => {
       const now = Date.now();
       const resetAtIso = new Date(now + 24 * 60 * 60 * 1000).toISOString();
-      const a = laneFor("a");
-      const b = laneFor("b");
+      // Equally throttled, so these reach the headroom tie-break (#1351).
+      const a = laneFor("a", 60_000);
+      const b = laneFor("b", 60_000);
       // Unknown evidence on one lane: not every tied lane has a trustworthy
       // reading, so declared order stands even though b's older reading counts.
       const winnerUnknown = selectPoolLane(
@@ -559,10 +562,15 @@ describe("ProviderPacer", () => {
       );
       expect(winnerUnknown?.config).toBe("a");
 
-      // A reading whose reset has passed is untrustworthy.
+      // A reading whose reset has passed is untrustworthy, so a's lower but
+      // valid reading does not lose to it; the tie falls back to declared order.
+      const aLow = {
+        ...a,
+        weeklyQuota: { percentLeft: 10, observedAt: new Date(now).toISOString(), resetAtIso },
+      };
       const winnerRolledOver = selectPoolLane(
         [
-          { ...a },
+          aLow,
           {
             ...b,
             weeklyQuota: {
@@ -575,15 +583,39 @@ describe("ProviderPacer", () => {
         now
       );
       expect(winnerRolledOver?.config).toBe("a");
+      expect(
+        selectPoolLane(
+          [
+            aLow,
+            {
+              ...b,
+              weeklyQuota: {
+                percentLeft: 99,
+                observedAt: new Date(now).toISOString(),
+                resetAtIso: new Date(now - 60_000).toISOString(),
+              },
+            },
+          ],
+          now,
+          { responsive: true }
+        )?.config
+      ).toBe("a");
     });
 
     it("falls back to declared order when weekly headroom is invalid", () => {
       const now = Date.now();
-      const a = laneFor("a");
-      const b = laneFor("b");
+      const a = laneFor("a", 60_000);
+      const b = laneFor("b", 60_000);
       const winner = selectPoolLane(
         [
-          { ...a },
+          {
+            ...a,
+            weeklyQuota: {
+              percentLeft: 10,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
           {
             ...b,
             weeklyQuota: {
@@ -618,23 +650,6 @@ describe("ProviderPacer", () => {
       // or missing evidence, on either path.
       expect(selectPoolLane(candidates, now)?.config).toBe("a");
       expect(selectPoolLane(candidates, now, { responsive: true })?.config).toBe("a");
-    });
-
-    it("falls back to declared order when trustworthy weekly headroom is tied", () => {
-      const now = Date.now();
-      const a = laneFor("a");
-      const b = laneFor("b");
-      const resetAtIso = new Date(now + 24 * 60 * 60 * 1000).toISOString();
-      const observedAt = new Date(now).toISOString();
-      const winner = selectPoolLane(
-        [
-          { ...a, weeklyQuota: { percentLeft: 30, observedAt, resetAtIso } },
-          { ...b, weeklyQuota: { percentLeft: 30, observedAt, resetAtIso } },
-        ],
-        now
-      );
-
-      expect(winner?.config).toBe("a");
     });
 
     it("breaks quote ties by declaration order", async () => {
@@ -1487,7 +1502,8 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
       "first-declared"
     );
 
-    // With trustworthy weekly evidence, the lane with more headroom wins regardless of order.
+    // Both lanes are unthrottled, so weekly headroom never outranks declared
+    // order (#1351), whichever lane has more of it.
     const decayingMoreHeadroom = { ...decaying, weeklyQuota: weekly(80) };
     const exactZeroLessHeadroom = { ...exactZero, weeklyQuota: weekly(30) };
     expect(selectPoolLane([decayingMoreHeadroom, exactZeroLessHeadroom], now)?.config).toBe(
@@ -1507,27 +1523,6 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
       selectPoolLane([decayingLessHeadroom, exactZeroMoreHeadroom], now, { responsive: true })
         ?.config
     ).toBe("first-declared");
-  });
-
-  it("prefers first-declared among unthrottled lanes even when second-declared has more weekly headroom (#1351)", () => {
-    const now = Date.now();
-    const first = {
-      config: "first-declared",
-      lane: "first-declared",
-      pacer: new ProviderPacer(0, clock),
-      weeklyQuota: weekly(30),
-    };
-    const second = {
-      config: "second-declared",
-      lane: "second-declared",
-      pacer: new ProviderPacer(0, clock),
-      weeklyQuota: weekly(80),
-    };
-
-    expect(selectPoolLane([first, second], now)?.config).toBe("first-declared");
-    expect(selectPoolLane([first, second], now, { responsive: true })?.config).toBe(
-      "first-declared"
-    );
   });
 
   it("treats a decaying lane with controllerUnthrottled=true as unthrottled (#1351)", () => {
@@ -1572,6 +1567,31 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     expect(
       selectPoolLane([throttledFirst, decayingSecond], now, { responsive: true })?.config
     ).toBe("decaying-second");
+  });
+
+  it("does not hold normal work on an on-pace preferred lane that is still cooling down (#1351)", () => {
+    const now = Date.now();
+    const decayingFirst = {
+      config: "decaying-first",
+      lane: "decaying-first",
+      pacer: new ProviderPacer(12_000, clock),
+      controllerUnthrottled: true,
+    };
+    const zeroSecond = {
+      config: "zero-second",
+      lane: "zero-second",
+      pacer: new ProviderPacer(0, clock),
+    };
+    // Both idle: the on-pace first-declared lane wins despite its residual interval.
+    expect(selectPoolLane([decayingFirst, zeroSecond], now)?.config).toBe("decaying-first");
+
+    // While it waits out that interval after a start, a normal run spills to
+    // the lane available now rather than waiting; responsive keeps declared order.
+    decayingFirst.pacer.deferUntil(now + 12_000);
+    expect(selectPoolLane([decayingFirst, zeroSecond], now)?.config).toBe("zero-second");
+    expect(selectPoolLane([decayingFirst, zeroSecond], now, { responsive: true })?.config).toBe(
+      "decaying-first"
+    );
   });
 
   it("breaks ties between equally throttled lanes by weekly headroom, falling back to declared order (#1351)", () => {
@@ -1629,31 +1649,6 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     expect(selectPoolLane([first, second], now)?.config).toBe("second-declared-fresh");
     expect(selectPoolLane([first, second], now, { responsive: true })?.config).toBe(
       "second-declared-fresh"
-    );
-  });
-
-  it("ignores a weekly reading whose reset has passed (#1351)", () => {
-    const now = Date.now();
-    const first = {
-      config: "first-declared",
-      lane: "first",
-      pacer: new ProviderPacer(60_000, clock),
-      weeklyQuota: weekly(10),
-    };
-    const second = {
-      config: "second-declared-rolled-over",
-      lane: "second",
-      pacer: new ProviderPacer(60_000, clock),
-      weeklyQuota: {
-        percentLeft: 90,
-        observedAt: new Date(now).toISOString(),
-        resetAtIso: new Date(now - 60_000).toISOString(),
-      },
-    };
-
-    expect(selectPoolLane([first, second], now)?.config).toBe("first-declared");
-    expect(selectPoolLane([first, second], now, { responsive: true })?.config).toBe(
-      "first-declared"
     );
   });
 
