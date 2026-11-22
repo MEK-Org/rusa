@@ -20,7 +20,7 @@
  */
 
 import { existsSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 
 /**
@@ -126,15 +126,10 @@ export function isReservedWorkerDirectory(name: string): boolean {
   return name === "root" || name.startsWith("quota-probe-") || name.startsWith("model-probe-");
 }
 
-/**
- * Absolute paths of the workspaces of actors that have retired.
- *
- * `root`, `quota-probe-<provider>` and `model-probe-<provider>` share the
- * workers directory and are not actors that retire; the provider's area holds
- * directories that were never a workspace at all. None of them resolves to a
- * retired actor, so none is ever a candidate.
- */
-export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
+function collectOrphanedWorkspaces(opts: WorkspaceSweepOptions): {
+  workerPaths: string[];
+  scratchPaths: string[];
+} {
   const live = liveActorPrefixes(opts.actors);
   const retiredIds = new Set<string>();
   const retiredPrefixes = new Set<string>();
@@ -145,13 +140,14 @@ export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
     }
   }
 
-  const orphans: string[] = [];
+  const workerPaths: string[] = [];
+  const scratchPaths: string[] = [];
 
   // rusa names its own worker directories with the whole actor id, so nothing
   // here is ever ambiguous and only an exact retired record sweeps one. The
   // provider's short spellings are not this directory's problem.
   for (const name of subdirectories(opts.workersDir)) {
-    if (retiredIds.has(name)) orphans.push(join(opts.workersDir, name));
+    if (retiredIds.has(name)) workerPaths.push(join(opts.workersDir, name));
   }
 
   // The provider's area is where all three spellings appear, so what a name
@@ -169,11 +165,24 @@ export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
         named.kind === "id"
           ? retiredIds.has(named.id)
           : retiredPrefixes.has(named.prefix) && !live.has(named.prefix);
-      if (sweepable) orphans.push(join(opts.scratchDir, name));
+      if (sweepable) scratchPaths.push(join(opts.scratchDir, name));
     }
   }
 
-  return orphans;
+  return { workerPaths, scratchPaths };
+}
+
+/**
+ * Absolute paths of the workspaces of actors that have retired.
+ *
+ * `root`, `quota-probe-<provider>` and `model-probe-<provider>` share the
+ * workers directory and are not actors that retire; the provider's area holds
+ * directories that were never a workspace at all. None of them resolves to a
+ * retired actor, so none is ever a candidate.
+ */
+export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
+  const { workerPaths, scratchPaths } = collectOrphanedWorkspaces(opts);
+  return [...workerPaths, ...scratchPaths];
 }
 
 /**
@@ -230,12 +239,10 @@ export function sweepOrphanedWorkspaces(
   opts: WorkspaceSweepOptions & { log?: (message: string) => void }
 ): string[] {
   const removed: string[] = [];
-  const workersParent = dirname(join(opts.workersDir, "_"));
-  for (const path of orphanedWorkspaces(opts)) {
+  const { workerPaths, scratchPaths } = collectOrphanedWorkspaces(opts);
+  const removePath = (path: string, teardownOverlay: boolean): void => {
     try {
-      if (dirname(path) === workersParent) {
-        teardownFlutterOverlay(path);
-      }
+      if (teardownOverlay) teardownFlutterOverlay(path);
       rmSync(path, { recursive: true, force: true });
       removed.push(path);
     } catch (err) {
@@ -243,6 +250,8 @@ export function sweepOrphanedWorkspaces(
         `[start] could not remove orphaned workspace ${path}: ${err instanceof Error ? err.message : String(err)}`
       );
     }
-  }
+  };
+  for (const path of workerPaths) removePath(path, true);
+  for (const path of scratchPaths) removePath(path, false);
   return removed;
 }

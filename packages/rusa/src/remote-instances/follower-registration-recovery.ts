@@ -20,14 +20,12 @@ type ReattachableActor = MeshActor & { attachHost?: (host: unknown) => void };
 export function sweepRetiredFollowerActorOnExit(deps: {
   followerId: string;
   actorId: string;
-  actors: Pick<ActorRepository, "list"> & Partial<Pick<ActorRepository, "get">>;
+  actors: Pick<ActorRepository, "list" | "get">;
   sweepWorkspaces: (followerId: string, actors: readonly ActorLiveness[]) => void;
   onError?: (err: unknown) => void;
 }): boolean {
   try {
-    const record = deps.actors.get
-      ? deps.actors.get(deps.actorId)
-      : deps.actors.list().find((entry) => entry.id === deps.actorId);
+    const record = deps.actors.get(deps.actorId);
     if (
       !record ||
       record.status !== "retired" ||
@@ -36,7 +34,6 @@ export function sweepRetiredFollowerActorOnExit(deps: {
       return false;
     }
     const allActors = deps.actors.list();
-    if (allActors.length === 0) return false;
     deps.sweepWorkspaces(
       deps.followerId,
       allActors.map((entry) => ({ id: entry.id, retired: entry.status === "retired" }))
@@ -49,12 +46,16 @@ export function sweepRetiredFollowerActorOnExit(deps: {
 }
 
 export interface FollowerRegistrationRecoveryDeps {
-  actors: Pick<ActorRepository, "list"> & Partial<Pick<ActorRepository, "get">>;
+  actors: Pick<ActorRepository, "list" | "get">;
   hub: Pick<
     FollowerHub,
-    "onRegister" | "onPlacementReleased" | "rebindHost" | "stopActor" | "sweepWorkspaces"
-  > &
-    Partial<Pick<FollowerHub, "onActorExit">>;
+    | "onRegister"
+    | "onActorExit"
+    | "onPlacementReleased"
+    | "rebindHost"
+    | "stopActor"
+    | "sweepWorkspaces"
+  >;
   log: Pick<Logger, "warn">;
   mesh: Pick<ActorMesh, "dispatch" | "get" | "rehydrate">;
 }
@@ -131,28 +132,25 @@ export function registerFollowerRegistrationRecovery({
       }
       void dispatch();
     }
-    if (allActors.length > 0) {
-      hub.sweepWorkspaces(
-        follower.id,
-        allActors.map((record) => ({ id: record.id, retired: record.status === "retired" }))
-      );
-    }
+    hub.sweepWorkspaces(
+      follower.id,
+      allActors.map((record) => ({ id: record.id, retired: record.status === "retired" }))
+    );
   });
-  const unregisterExit =
-    hub.onActorExit?.((follower, actorId) => {
-      sweepRetiredFollowerActorOnExit({
-        followerId: follower.id,
-        actorId,
-        actors,
-        sweepWorkspaces: (id, list) => hub.sweepWorkspaces(id, list),
-        onError: (err) =>
-          log.warn("follower_exit_sweep_registry_read_failed", {
-            followerId: follower.id,
-            actorId,
-            err,
-          }),
-      });
-    }) ?? (() => {});
+  const unregisterExit = hub.onActorExit((follower, actorId) => {
+    sweepRetiredFollowerActorOnExit({
+      followerId: follower.id,
+      actorId,
+      actors,
+      sweepWorkspaces: (id, list) => hub.sweepWorkspaces(id, list),
+      onError: (err) =>
+        log.warn("follower_exit_sweep_registry_read_failed", {
+          followerId: follower.id,
+          actorId,
+          err,
+        }),
+    });
+  });
   return () => {
     unregisterExit();
     unregisterRegister();

@@ -208,23 +208,25 @@ export class FollowerInstance {
   sweepWorkspaces(actors: readonly ActorLiveness[]): string[] {
     if (this.stopped) return [];
     if (!this.reconciled) {
-      throw new Error("Follower instance is not reconciled with leader; workspace sweep refused");
+      this.log?.(
+        "[follower] workspace sweep skipped: follower instance is not reconciled with leader"
+      );
+      return [];
     }
     if (!Array.isArray(actors) || actors.length === 0) return [];
-    const normalized: ActorLiveness[] = [];
-    for (const entry of actors) {
-      if (
+    const valid = actors.every(
+      (entry) =>
         entry &&
         typeof entry === "object" &&
         typeof entry.id === "string" &&
         entry.id.length > 0 &&
         typeof entry.retired === "boolean"
-      ) {
-        normalized.push({ id: entry.id, retired: entry.retired });
-      }
+    );
+    if (!valid) {
+      this.log?.("[follower] workspace sweep refused: malformed actor liveness entry");
+      return [];
     }
-    if (normalized.length === 0) return [];
-    return this.runWorkspaceSweep(normalized);
+    return this.runWorkspaceSweep(actors);
   }
 
   private runWorkspaceSweep(actors: readonly ActorLiveness[]): string[] {

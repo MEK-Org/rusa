@@ -844,6 +844,7 @@ describe("follower registration recovery", () => {
 
     let mode: "empty" | "throw" | "populated" = "empty";
     const actors = {
+      get: () => undefined,
       list: () => {
         if (mode === "throw") throw new Error("registry unreadable");
         if (mode === "empty") return [];
@@ -906,5 +907,104 @@ describe("follower registration recovery", () => {
 
     mode = "populated";
     await registerAndCheckNoSweep("f-legacy", false);
+  });
+
+  it("wires hub onActorExit through registration recovery to send workspaceSweep on /events exit (#1338)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-follower-exit-e2e-"));
+    const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-exit-scratch-"));
+    homes.push(home, scratchDir);
+    const token = randomBytes(32).toString("hex");
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const log = testLogger(records);
+    const hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    const origin = await hub.listen("127.0.0.1", 0);
+
+    const actors = new InMemoryActorRepository();
+    const actorId = "c3d4e5f6-1111-4222-8333-555566667777";
+    actors.upsert({
+      id: actorId,
+      parentId: "root",
+      charter: "retired follower worker",
+      executionConfig: { executionTarget: "exit-follower" },
+      status: "retired",
+      createdAt: new Date().toISOString(),
+    });
+    const mesh = {
+      dispatch: async () => false,
+      get: () => undefined,
+      rehydrate: () => {},
+    } as unknown as Parameters<typeof registerFollowerRegistrationRecovery>[0]["mesh"];
+    cleanups.push(registerFollowerRegistrationRecovery({ actors, hub, log, mesh }));
+
+    const regRes = await fetch(`${origin}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "exit-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation: "gen-exit",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
+      }),
+    });
+    expect(regRes.status).toBe(200);
+    const reg = (await regRes.json()) as { session: string };
+
+    // Drain registration sweep first.
+    const initialPoll = (await (
+      await fetch(`${origin}/poll`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ id: "exit-follower", session: reg.session }),
+      })
+    ).json()) as FollowerCommand[];
+    expect(initialPoll.some((cmd) => !("actorId" in cmd) && cmd.type === "workspaceSweep")).toBe(
+      true
+    );
+
+    const follower = new FollowerInstance(home, false, () => {}, undefined, { scratchDir });
+    followers.push(follower);
+    mkdirSync(join(home, "workers", actorId), { recursive: true });
+    mkdirSync(join(scratchDir, `worker-${actorId.slice(0, 8)}`), { recursive: true });
+
+    hub.createHost("exit-follower", actorId);
+    expect(hub.hasActorHost("exit-follower", actorId)).toBe(true);
+
+    const eventsRes = await fetch(`${origin}/events`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "exit-follower",
+        session: reg.session,
+        batchId: randomUUID(),
+        events: [
+          {
+            eventId: randomUUID(),
+            actorId,
+            message: { type: "exit", code: 0, signal: null },
+          },
+        ],
+      }),
+    });
+    expect(eventsRes.status).toBe(200);
+    expect(hub.hasActorHost("exit-follower", actorId)).toBe(false);
+
+    const pollAfterExit = (await (
+      await fetch(`${origin}/poll`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ id: "exit-follower", session: reg.session }),
+      })
+    ).json()) as FollowerCommand[];
+    const exitSweeps = pollAfterExit.filter(
+      (cmd): cmd is Extract<FollowerCommand, { type: "workspaceSweep" }> =>
+        !("actorId" in cmd) && cmd.type === "workspaceSweep"
+    );
+    expect(exitSweeps).toHaveLength(1);
+    follower.sweepWorkspaces(exitSweeps[0]?.actors ?? []);
+    expect(existsSync(join(home, "workers", actorId))).toBe(false);
+    expect(existsSync(join(scratchDir, `worker-${actorId.slice(0, 8)}`))).toBe(false);
   });
 });

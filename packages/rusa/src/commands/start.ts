@@ -687,7 +687,7 @@ export function createStartRetireCleanups(
   followerSweep?: {
     sweep: (followerId: string, actors: readonly ActorLiveness[]) => void;
     listActors: () => readonly ActorLiveness[];
-    hasLiveHost?: (followerId: string, actorId: string) => boolean;
+    hasLiveHost: (followerId: string, actorId: string) => boolean;
   }
 ): RetireCleanup[] {
   return [
@@ -703,10 +703,11 @@ export function createStartRetireCleanups(
       name: "worker workdir",
       deferUntilRunEnd: true,
       run: (record) => {
-        if (record.executionConfig?.executionTarget) return;
         // Re-check immediately before deleting the source tree. The first
         // retirement cleanup normally stopped the unit already; this guard
         // makes the ordering fail closed if that stop threw transiently.
+        // Kept idempotent even for follower-placed actors because createActor
+        // and onRevive still ensure `<leader workersDir>/<id>`.
         e2eInstance?.stopForActorRetirement(record.id);
         teardownFlutterOverlay(join(workersDir, record.id));
         rmSync(join(workersDir, record.id), { recursive: true, force: true });
@@ -741,15 +742,16 @@ export function createStartRetireCleanups(
       ? [
           {
             name: "follower workspaces",
-            deferUntilRunEnd: true,
             run: (record: ActorRecord) => {
               const target = record.executionConfig?.executionTarget;
               if (!target) return;
               // While the follower still holds a host channel for this actor,
-              // its `exit` event (emitted right after `actors.delete(id)`) has
-              // not landed yet; let the exit listener trigger the sweep so
-              // the retired id is guaranteed out of `actors` first (#1338).
-              if (followerSweep.hasLiveHost?.(target, record.id)) return;
+              // `ActorHandle.close()` has sent `stop` and `onActorExit` will
+              // sweep after `{ type: "exit" }` removes it from `this.actors`
+              // (#1338). Running synchronously here (not `deferUntilRunEnd`)
+              // skips without deferring, so `[abandoned, exit]` in the same
+              // batch never triggers a duplicate sweep after `exit` clears the host.
+              if (followerSweep.hasLiveHost(target, record.id)) return;
               let list: readonly ActorLiveness[];
               try {
                 list = followerSweep.listActors();

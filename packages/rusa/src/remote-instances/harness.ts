@@ -77,6 +77,8 @@ export function createHarness(options: {
   scratchDir?: string;
   /** Whether the synthetic follower negotiated `workspaceSweep` (#1338). Defaults to true. */
   workspaceSweep?: boolean;
+  /** Opt-in follower placement + retire workdir sweep wiring for #1338 tests. */
+  followerPlacement?: boolean;
   /** Actor ID generator override for tests that need UUID-shaped IDs. */
   idgen?: () => string;
 }) {
@@ -101,7 +103,11 @@ export function createHarness(options: {
       queueMicrotask(() => {
         const cloned = structuredClone(event);
         remote.receive(cloned);
-        if (cloned.actorId !== "$instance" && cloned.message.type === "exit") {
+        if (
+          options.followerPlacement &&
+          cloned.actorId !== "$instance" &&
+          cloned.message.type === "exit"
+        ) {
           sweepRetiredFollowerActorOnExit({
             followerId: remote.id,
             actorId: cloned.actorId,
@@ -206,19 +212,25 @@ export function createHarness(options: {
     events: (event) => meshEvents.push(event),
     idgen: options.idgen ?? (() => `instance-worker-${++sequence}`),
     writer,
-    supportsExecutionTarget: (target) => target === "test-follower",
-    retireCleanups: createStartRetireCleanups(
-      join(options.cwd, "leader-workers"),
-      { cancel: async () => {} },
-      undefined,
-      undefined,
-      {
-        sweep: (_followerId, list) => remote.sweepWorkspaces(list),
-        listActors: () =>
-          actors.list().map((record) => ({ id: record.id, retired: record.status === "retired" })),
-        hasLiveHost: (_followerId, actorId) => remote.hosts.has(actorId),
-      }
-    ),
+    ...(options.followerPlacement
+      ? {
+          supportsExecutionTarget: (target: string) => target === "test-follower",
+          retireCleanups: createStartRetireCleanups(
+            join(options.cwd, "leader-workers"),
+            { cancel: async () => {} },
+            undefined,
+            undefined,
+            {
+              sweep: (_followerId, list) => remote.sweepWorkspaces(list),
+              listActors: () =>
+                actors
+                  .list()
+                  .map((record) => ({ id: record.id, retired: record.status === "retired" })),
+              hasLiveHost: (_followerId, actorId) => remote.hosts.has(actorId),
+            }
+          ),
+        }
+      : {}),
     ...(options.obligationClosure
       ? {
           obligations: {
@@ -411,7 +423,7 @@ export function createHarness(options: {
         charter,
         parentId: "root",
         modelConfig,
-        executionTarget: "test-follower",
+        ...(options.followerPlacement ? { executionTarget: "test-follower" } : {}),
       });
       mesh.sendMessage(id, "Begin your charter", "root");
       return id;

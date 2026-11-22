@@ -37,6 +37,7 @@ function setup(
     maxConcurrent?: number;
     obligationClosure?: boolean;
     lifecycle?: (actorId: string) => ActorLifecycleListener;
+    followerPlacement?: boolean;
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -52,6 +53,7 @@ function setup(
     maxConcurrent: options.maxConcurrent,
     obligationClosure: options.obligationClosure,
     lifecycle: options.lifecycle,
+    followerPlacement: options.followerPlacement,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -3143,7 +3145,7 @@ describe("follower file operations (#1013)", () => {
 
 describe("follower workdir retirement cleanup (#1338)", () => {
   it("removes the follower-placed actor working directory on retirement", async () => {
-    const h = setup();
+    const h = setup({ followerPlacement: true });
     const actorId = h.spawn("Retire and clean follower workdir");
     await waitUntil(
       () =>
@@ -3176,6 +3178,7 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     const h = createHarness({
       cwd,
       scratchDir,
+      followerPlacement: true,
       idgen: () => randomUUID(),
       providerFactory,
     });
@@ -3235,6 +3238,7 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     const h = createHarness({
       cwd,
       scratchDir,
+      followerPlacement: true,
       idgen: () => randomUUID(),
       providerFactory,
     });
@@ -3275,6 +3279,7 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     const h = createHarness({
       cwd: mkdtempSync(join(tmpdir(), "rusa-follower-live-home-")),
       scratchDir,
+      followerPlacement: true,
       idgen: () => randomUUID(),
       providerFactory: release.factory,
     });
@@ -3304,7 +3309,7 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     expect(existsSync(scratch)).toBe(true);
   });
 
-  it("sweeps nothing when the liveness list is empty", () => {
+  it("skips workspaceSweep without throwing when unreconciled and sweeps nothing when the liveness list is empty", () => {
     const home = mkdtempSync(join(tmpdir(), "rusa-follower-empty-sweep-"));
     const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-empty-scratch-"));
     dirs.push(home, scratchDir);
@@ -3312,8 +3317,26 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     mkdirSync(join(home, "workers", orphanId), { recursive: true });
     mkdirSync(join(scratchDir, `worker-${orphanId.slice(0, 8)}`), { recursive: true });
 
+    const logs: string[] = [];
+    const unreconciled = new FollowerInstance(home, false, () => {}, undefined, {
+      requireReconciliation: true,
+      scratchDir,
+      log: (msg) => logs.push(msg),
+    });
+    expect(unreconciled.sweepWorkspaces([{ id: orphanId, retired: true }])).toEqual([]);
+    expect(logs).toHaveLength(1);
+    expect(existsSync(join(home, "workers", orphanId))).toBe(true);
+    unreconciled.close();
+
     const follower = new FollowerInstance(home, false, () => {}, undefined, { scratchDir });
     expect(follower.sweepWorkspaces([])).toEqual([]);
+    // Fail closed if any entry is malformed rather than sweeping with a partial list.
+    expect(
+      follower.sweepWorkspaces([
+        { id: orphanId, retired: true },
+        { id: "", retired: false },
+      ])
+    ).toEqual([]);
     expect(existsSync(join(home, "workers", orphanId))).toBe(true);
     expect(existsSync(join(scratchDir, `worker-${orphanId.slice(0, 8)}`))).toBe(true);
     follower.close();
@@ -3322,7 +3345,7 @@ describe("follower workdir retirement cleanup (#1338)", () => {
   it("does not send workspaceSweep to an un-negotiated follower on retirement", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unnegotiated-"));
     dirs.push(cwd);
-    const h = createHarness({ cwd, workspaceSweep: false });
+    const h = createHarness({ cwd, followerPlacement: true, workspaceSweep: false });
     instances.push(h);
 
     const actorId = h.spawn("Un-negotiated follower retire");

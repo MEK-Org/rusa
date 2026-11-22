@@ -200,7 +200,7 @@ describe("createStartRetireCleanups", () => {
     expect(existsSync(workdir)).toBe(false);
   });
 
-  it("defers follower workspace sweep until run_end when no live host blocks it, and skips while a host is live (#1338)", () => {
+  it("sweeps follower workspaces on retire when no live host blocks it, skips while a host is live, and keeps leader workdir cleanup idempotent (#1338)", () => {
     const actorId = "follower-actor-1";
     const localWorkdir = join(workersDir, actorId);
     mkdirSync(localWorkdir, { recursive: true });
@@ -239,19 +239,16 @@ describe("createStartRetireCleanups", () => {
       ),
     });
 
-    mesh.recordEvent({ kind: "run_queued", actorId });
     mesh.retire(actorId);
-    expect(swept).toEqual([]);
-
-    mesh.recordEvent({ kind: "run_end", actorId, success: true });
     expect(swept).toEqual([
       { followerId: "mac-follower", actors: [{ id: actorId, retired: true }] },
     ]);
-    // Leader-local directory is left untouched for follower-placed actors.
-    expect(existsSync(localWorkdir)).toBe(true);
+    // Any empty leader-side workersDir entry created by createActor/onRevive is also cleaned.
+    expect(existsSync(localWorkdir)).toBe(false);
 
     // When the follower still holds a live host channel (waiting on `exit`),
-    // createStartRetireCleanups skips sending a premature sweep.
+    // createStartRetireCleanups skips without deferring, so a later `run_abandoned`
+    // after `exit` clears `hosts` does not emit a duplicate sweep.
     const waitingExitActor = "follower-actor-live-host";
     registry.upsert({
       id: waitingExitActor,
@@ -262,9 +259,12 @@ describe("createStartRetireCleanups", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
     hostLive = true;
-    mesh.retire(waitingExitActor);
+    mesh.recordEvent({ kind: "run_queued", actorId: waitingExitActor });
+    mesh.retire(waitingExitActor, { force: true });
     expect(swept).toHaveLength(1);
     hostLive = false;
+    mesh.recordEvent({ kind: "run_abandoned", actorId: waitingExitActor });
+    expect(swept).toHaveLength(1);
 
     // Empty or throwing registry sends nothing.
     const emptyActor = "follower-actor-empty";
