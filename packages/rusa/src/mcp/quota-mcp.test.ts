@@ -3259,10 +3259,11 @@ describe("quota MCP server", () => {
         workersDir: "/tmp/workers",
       }) as unknown as { getTtlMs: (provider: string) => number };
 
-      // #690: routine provider readings target ~30 minutes across all
-      // providers; the fast 5-minute QuotaCollectionLoop tick handles
-      // controller evaluation and manual observation ingestion instead.
-      expect(service.getTtlMs("claude")).toBe(30 * 60 * 1000);
+      // #690: routine provider readings target ~30 minutes; the fast
+      // 5-minute QuotaCollectionLoop tick handles controller evaluation and
+      // manual observation ingestion instead. #1352: Claude alone sits between
+      // the 20- and 25-minute ticks.
+      expect(service.getTtlMs("claude")).toBe(22.5 * 60 * 1000);
       expect(service.getTtlMs("agy")).toBe(30 * 60 * 1000);
       expect(service.getTtlMs("codex")).toBe(30 * 60 * 1000);
       expect(service.getTtlMs("kimi")).toBe(30 * 60 * 1000);
@@ -3336,6 +3337,58 @@ describe("quota MCP server", () => {
       nowMs = Date.parse("2026-07-14T09:45:00.000Z");
       await service.getQuota("claude");
       expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
+    });
+
+    describe("Claude probe cadence on the 300 s collection tick (#1352)", () => {
+      const TICK_MS = 300_000;
+      const TICK_0_MS = Date.parse("2026-07-14T09:15:00.000Z");
+
+      // Calls getQuotaProbeOutcome("claude") once per tick, the way
+      // QuotaCollectionLoop does on its setInterval grid, starting the call
+      // offsetMs(tick) into the tick (the wait on providers ahead of Claude
+      // and on the scrape permit). Returns the ticks and times that probed.
+      async function probeStarts(ticks: number, offsetMs: (tick: number) => number) {
+        let nowMs = TICK_0_MS;
+        const service = new QuotaService({
+          config: mockConfig,
+          workersDir: "/tmp/workers",
+          resolveProvider: mockResolveProvider,
+          now: () => nowMs,
+        });
+        const starts: Array<{ tick: number; atMs: number }> = [];
+        for (let tick = 0; tick < ticks; tick++) {
+          nowMs = TICK_0_MS + tick * TICK_MS + offsetMs(tick);
+          const outcome = await service.getQuotaProbeOutcome("claude");
+          if (outcome.didProbe) starts.push({ tick, atMs: nowMs });
+        }
+        return starts;
+      }
+
+      function gapsMs(starts: Array<{ atMs: number }>): number[] {
+        return starts.slice(1).map((start, i) => start.atMs - starts[i].atMs);
+      }
+
+      it("probes on the 25-minute tick when the previous call started a little later into its tick", async () => {
+        // The first probe starts 2 s into its tick; later ticks start the call
+        // on the boundary, so the elapsed time at the 25-minute tick is 2 s
+        // short of 25 minutes.
+        const starts = await probeStarts(16, (tick) => (tick === 0 ? 2_000 : 0));
+
+        expect(starts.map((start) => start.tick)).toEqual([0, 5, 10, 15]);
+        expect(gapsMs(starts)).toEqual([25 * 60_000 - 2_000, 25 * 60_000, 25 * 60_000]);
+        expect(mockClaudeProvider.run).toHaveBeenCalledTimes(4);
+      });
+
+      it("probes on the 25-minute tick when the previous call started a little earlier into its tick", async () => {
+        // The first probe starts on the boundary; later ticks start the call
+        // 2 s in. The probe still fires on the 25-minute tick, and the gap is
+        // that tick's own 2 s lateness past 25 minutes, not a sixth tick.
+        const starts = await probeStarts(16, (tick) => (tick === 0 ? 0 : 2_000));
+
+        expect(starts.map((start) => start.tick)).toEqual([0, 5, 10, 15]);
+        expect(gapsMs(starts)).toEqual([25 * 60_000 + 2_000, 25 * 60_000, 25 * 60_000]);
+        expect(mockClaudeProvider.run).toHaveBeenCalledTimes(4);
+      });
     });
 
     describe("getQuotaCached (non-blocking request path, issue #10)", () => {

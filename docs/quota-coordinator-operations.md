@@ -417,8 +417,9 @@ The response remains truthfully `hardStale`; this is a pacing decision, not a
 freshness disguise. They are not retired as they are for a single missing model
 window. On the first applied coordinator status where the governing window has
 reset, its retained accepted reading predates that reset, and that reading has
-passed the soft-stale threshold (probe TTL plus three ticks from observation,
-per #794 timing amendment), each `rusa start` process raises one responsive
+passed the soft-stale threshold (the default 30-minute probe TTL plus three
+ticks from observation, per #794 timing amendment; Claude's shorter TTL from
+#1352 leaves it in place), each `rusa start` process raises one responsive
 `system.quota_governing_window_closed` alarm to root on `system:events` (#794),
 naming the provider, window, reset and last reading and asking root to check the
 scrapes. A healthy fresh reading at reset stays quiet; an already stale reading

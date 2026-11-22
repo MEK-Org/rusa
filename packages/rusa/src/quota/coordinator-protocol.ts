@@ -20,11 +20,22 @@ export const COORDINATOR_PROTOCOL_MAJOR = 1;
 export const COORDINATOR_PROTOCOL_MINOR = 6;
 /** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
 export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
+/**
+ * Claude's probe TTL (#1352): consecutive Claude probe starts at most five
+ * 300 s collection ticks (25 minutes) apart. The TTL is a floor and the probe
+ * fires on the first tick at or past it, so 25 minutes exactly would sit on a
+ * tick boundary, where a call starting a little earlier into its tick than the
+ * previous one misses that tick and waits for the 30-minute one. Halfway
+ * between the 20- and 25-minute ticks leaves 150 s of in-tick jitter either way.
+ */
+export const CLAUDE_QUOTA_PROBE_TTL_MS = 22.5 * 60 * 1000;
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 /**
- * Scrape-mode soft stale: three missed ticks past the moment a probe refresh
- * is due, so a healthy lane reading one full TTL old is still fresh. Clamped
- * to the scrape hard stale so the pair stays ordered for long ticks.
+ * Scrape-mode soft stale: three missed ticks past the moment a default-TTL
+ * probe refresh is due, so a healthy lane reading one full TTL old is still
+ * fresh. Clamped to the scrape hard stale so the pair stays ordered for long
+ * ticks. It is one threshold for every provider; Claude's shorter TTL leaves it
+ * in place, so a Claude reading has more margin under it (#1352).
  */
 export function scrapeStaleAfterMs(tickSeconds: number): number {
   return Math.min(QUOTA_PROBE_TTL_MS + 3 * tickSeconds * 1000, DEFAULT_HARD_STALE_AFTER_MS);

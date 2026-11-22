@@ -1293,7 +1293,7 @@ A whole provider lane whose readings stop or fail keeps its last reasoned interv
 through a hard-stale scrape, including across governing window reset (#794).
 The response remains truthfully hard-stale. The first status an instance applies
 after reset where the reading predates the reset and has passed the soft-stale
-threshold (probe TTL plus three ticks from observation) raises one root alarm per
+threshold (the default 30-minute probe TTL plus three ticks from observation) raises one root alarm per
 distinct closed window (#794); a healthy fresh reading at reset stays quiet. The
 alarm leaves the already-published interval unchanged and the lane is not retired.
 The service, not a client, is the only place that can distinguish

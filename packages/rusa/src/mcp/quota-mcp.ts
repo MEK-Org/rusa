@@ -27,7 +27,11 @@ import {
 import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
-import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
+import {
+  CLAUDE_QUOTA_PROBE_TTL_MS,
+  QUOTA_PROBE_TTL_MS,
+  type QuotaFreshness,
+} from "../quota/coordinator-protocol.js";
 import {
   configuredModelRefs,
   keepWindowLaneModels,
@@ -1514,17 +1518,18 @@ export class QuotaService {
     }
   }
 
-  private getTtlMs(): number {
+  private getTtlMs(provider: "claude" | "codex" | "agy" | "kimi"): number {
     if (this.deps.ttlMs !== undefined) {
       return this.deps.ttlMs;
     }
-    // #690: routine provider readings target ~30 minutes across all providers,
-    // so expensive interactive scrapes are not churned while QuotaCollectionLoop
-    // keeps ticking every 5m for manual observation ingestion and metric publication.
-    // (Controller evaluation on scrape lanes advances when a fresh 30m probe lands;
+    // #690: routine provider readings target ~30 minutes, so expensive
+    // interactive scrapes are not churned while QuotaCollectionLoop keeps
+    // ticking every 5m for manual observation ingestion and metric publication.
+    // (Controller evaluation on scrape lanes advances when a fresh probe lands;
     // manual lanes advance as operator observations arrive).
+    // #1352: Claude alone is read on the 25-minute tick.
     // Codex must not go lower until its placeholder handling lands.
-    return QUOTA_PROBE_TTL_MS;
+    return provider === "claude" ? CLAUDE_QUOTA_PROBE_TTL_MS : QUOTA_PROBE_TTL_MS;
   }
 
   /**
@@ -1548,7 +1553,7 @@ export class QuotaService {
     }
     const now = (this.deps.now ?? Date.now)();
     const cached = this.cache.get(provider);
-    const ttl = this.getTtlMs();
+    const ttl = this.getTtlMs(provider);
     if (cached && now - cached.timestamp < ttl) {
       return { state: cached.state, didProbe: false };
     }
@@ -1574,7 +1579,7 @@ export class QuotaService {
     }
     if (state.status !== "unknown" || !cached || cached.state.status === "unknown") {
       // Schedule the next probe from this probe's start, not its completion:
-      // a slow CLI must not silently add a collection tick to the 30m cadence.
+      // a slow CLI must not silently add a collection tick to the probe cadence.
       this.cache.set(provider, { state, timestamp: inFlight.startedAt });
     }
     return {
@@ -1620,7 +1625,7 @@ export class QuotaService {
       };
     }
     const cached = this.cache.get(provider);
-    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs();
+    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs(provider);
     if (!isFresh) {
       // Stale or cold → refresh in the background; do not await the probe.
       // Probe startup is deferred off the synchronous request call stack via
