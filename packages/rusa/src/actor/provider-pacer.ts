@@ -418,13 +418,14 @@ interface WeeklyQuotaObservation {
 }
 
 const WEEKLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-// This matches the longest existing quota-service cache lifetime (Codex).
-// Older readings remain useful for dashboard history, but not for admission.
-const MAX_WEEKLY_QUOTA_AGE_MS = 30 * 60 * 1000;
 
 /**
  * Return a candidate's weekly headroom relative to the remaining weekly
  * window, or `undefined` unless the quota evidence is safe to compare.
+ * There is deliberately no age cut-off (#1351): weekly quota moves slowly
+ * against a seven-day window, a rolled-over window fails the reset checks
+ * below, and headroom only breaks ties between equally throttled lanes, so
+ * an older valid reading cannot move work off a preferred lane.
  */
 function weeklyQuotaHeadroom(
   observation: WeeklyQuotaObservation | undefined,
@@ -436,7 +437,7 @@ function weeklyQuotaHeadroom(
   const observedAt = Date.parse(observation.observedAt);
   const resetAt = Date.parse(observation.resetAtIso);
   if (!Number.isFinite(observedAt) || !Number.isFinite(resetAt)) return undefined;
-  if (observedAt > now || now - observedAt > MAX_WEEKLY_QUOTA_AGE_MS) return undefined;
+  if (observedAt > now) return undefined;
   if (resetAt <= now || resetAt > now + WEEKLY_WINDOW_MS) return undefined;
 
   const windowRemainingPct = ((resetAt - now) / WEEKLY_WINDOW_MS) * 100;

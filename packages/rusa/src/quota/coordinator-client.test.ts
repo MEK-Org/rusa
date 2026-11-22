@@ -753,10 +753,10 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(laneControllerUnthrottled(withModelLane, "claude-sonnet-4-6")).toBe(true);
     });
 
-    // These four outcomes are decided by selectPoolLane at the merge base (the
-    // 30-minute age guard and its finite/tied checks); they document #349
-    // semantics surviving the coordinator adapter, not cache retention.
-    it("retains declared order for missing, stale, invalid, and tied buckets", () => {
+    // These outcomes are decided by selectPoolLane at the merge base (the
+    // validity checks in weeklyQuotaHeadroom); they document #349 semantics
+    // surviving the coordinator adapter, not cache retention.
+    it("retains declared order for missing, rolled-over, invalid, and tied buckets, and counts an older valid reading", () => {
       const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
       const fresh = new Date(nowMs).toISOString();
       const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
@@ -771,22 +771,27 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       apply("codex", providerStatus(300, "codex"));
       expect(selectFromClient(client, nowMs)).toBe("claude"); // missing
 
-      apply(
-        "codex",
-        weeklyStatus("codex", 90, new Date(nowMs - 30 * 60 * 1_000 - 1).toISOString(), resetAtIso)
-      );
-      expect(selectFromClient(client, nowMs)).toBe("claude"); // stale
+      apply("codex", weeklyStatus("codex", 90, fresh, new Date(nowMs - 60_000).toISOString()));
+      expect(selectFromClient(client, nowMs)).toBe("claude"); // reset passed
 
       apply("codex", weeklyStatus("codex", Number.NaN, fresh, resetAtIso));
       expect(selectFromClient(client, nowMs)).toBe("claude"); // invalid
 
       apply("codex", weeklyStatus("codex", 40, fresh, resetAtIso));
       expect(selectFromClient(client, nowMs)).toBe("claude"); // tied
+
+      // No age cut-off (#1351): a reading older than 30 minutes with a valid
+      // future reset still counts, and headroom decides the tie.
+      apply(
+        "codex",
+        weeklyStatus("codex", 90, new Date(nowMs - 30 * 60 * 1_000 - 1).toISOString(), resetAtIso)
+      );
+      expect(selectFromClient(client, nowMs)).toBe("codex"); // older but valid
     });
 
-    it("retains a fresh winning cache through cold, unavailable, and incompatible responses, then falls back once it is stale", async () => {
+    it("retains a fresh winning cache through cold, unavailable, and incompatible responses, then falls back once the weekly window rolls over", async () => {
       const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
-      const staleNowMs = nowMs + 30 * 60 * 1_000 + 1;
+      const rolledOverMs = nowMs + 5 * 24 * 60 * 60 * 1_000;
 
       const coldClient = warmedClient(nowMs);
       expect(
@@ -797,14 +802,14 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       ).toBe(false);
       expect(coldClient.getLastPublishedStatus("codex")).toBeDefined();
       expect(selectFromClient(coldClient, nowMs)).toBe("codex");
-      expect(selectFromClient(coldClient, staleNowMs)).toBe("claude");
+      expect(selectFromClient(coldClient, rolledOverMs)).toBe("claude");
 
       const unavailableClient = warmedClient(nowMs);
       await expect(unavailableClient.getThrottle()).resolves.toBeNull();
       expect(unavailableClient.getHealth()).toEqual({ quota_client_service_connected: 0 });
       expect(unavailableClient.getLastPublishedStatus("codex")).toBeDefined();
       expect(selectFromClient(unavailableClient, nowMs)).toBe("codex");
-      expect(selectFromClient(unavailableClient, staleNowMs)).toBe("claude");
+      expect(selectFromClient(unavailableClient, rolledOverMs)).toBe("claude");
 
       const incompatibleClient = warmedClient(nowMs);
       expect(
@@ -816,7 +821,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(incompatibleClient.getHealth()).toEqual({ quota_client_service_connected: 0 });
       expect(incompatibleClient.getLastPublishedStatus("codex")).toBeDefined();
       expect(selectFromClient(incompatibleClient, nowMs)).toBe("codex");
-      expect(selectFromClient(incompatibleClient, staleNowMs)).toBe("claude");
+      expect(selectFromClient(incompatibleClient, rolledOverMs)).toBe("claude");
     });
   });
 
