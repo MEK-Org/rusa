@@ -331,4 +331,40 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
       teardownFlutterOverlay(auxiliaryActorDir);
     }
   });
+
+  it("lets an auxiliary grantee invoke a ~/.local/bin/kimi symlink targeting ~/.kimi-code/bin/kimi while keeping host state hidden", () => {
+    const mcHome = join(fixtureHome, ".rusa");
+    const actorId = "aux-kimi-launcher";
+    const auxiliaryActorDir = join(mcHome, "workers", actorId);
+    const hostKimiBin = join(fixtureHome, ".kimi-code", "bin");
+    const localBin = join(fixtureHome, ".local", "bin");
+    mkdirSync(auxiliaryActorDir, { recursive: true });
+    mkdirSync(hostKimiBin, { recursive: true });
+    mkdirSync(localBin, { recursive: true });
+    writeFileSync(
+      join(hostKimiBin, "kimi"),
+      '#!/bin/sh\nprintf "stub-kimi-ok:%s\\n" "$KIMI_CODE_HOME"\n',
+      { mode: 0o755 }
+    );
+    symlinkSync(join(hostKimiBin, "kimi"), join(localBin, "kimi"));
+    grantAuxiliaryKimiCli(mcHome, [actorId]);
+
+    const { args } = buildActorBwrapArgs(auxiliaryActorDir, "codex");
+    try {
+      const command = [
+        'out=$("$HOME/.local/bin/kimi")',
+        'test "$out" = "stub-kimi-ok:/tmp/kimi-home" || { echo "unexpected launcher output: $out" >&2; exit 1; }',
+        '! touch "$HOME/.kimi-code/bin/write-test" 2>/dev/null || { echo "bin dir was writable" >&2; exit 1; }',
+        'test ! -e "$HOME/.kimi-code/sessions/host-session" || { echo "host session visible" >&2; exit 1; }',
+        'test ! -e "$HOME/.kimi-code/mcp.json" || { echo "host mcp.json visible" >&2; exit 1; }',
+        'test ! -e "$HOME/.kimi-code/credentials/kimi-code.json" || { echo "host credentials visible" >&2; exit 1; }',
+        'test ! -e "$HOME/.kimi-code/oauth/kimi-code" || { echo "host oauth visible" >&2; exit 1; }',
+      ].join("\n");
+      execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", command], { stdio: "pipe" });
+    } finally {
+      rmSync(kimiSessionStoreDir(auxiliaryActorDir), { recursive: true, force: true });
+      rmSync(codexRolloutStoreDir(auxiliaryActorDir), { recursive: true, force: true });
+      teardownFlutterOverlay(auxiliaryActorDir);
+    }
+  });
 });
