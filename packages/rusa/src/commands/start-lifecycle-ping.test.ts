@@ -199,4 +199,72 @@ describe("createStartRetireCleanups", () => {
 
     expect(existsSync(workdir)).toBe(false);
   });
+
+  it("defers follower workspace sweep until run_end for follower-placed actors and skips empty/unreadable registries", () => {
+    const actorId = "follower-actor-1";
+    const localWorkdir = join(workersDir, actorId);
+    mkdirSync(localWorkdir, { recursive: true });
+    const swept: Array<{ followerId: string; actors: Array<{ id: string; retired: boolean }> }> =
+      [];
+    let listMode: "normal" | "empty" | "throw" = "normal";
+    const registry = new InMemoryActorRepository();
+    registry.upsert({
+      id: actorId,
+      charter: "follower worker",
+      parentId: "root",
+      executionConfig: { executionTarget: "mac-follower" },
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const mesh = new ActorMesh({
+      actors: registry,
+      createActor: () => {
+        throw new Error("not used");
+      },
+      retireCleanups: createStartRetireCleanups(
+        workersDir,
+        { async cancel() {} },
+        undefined,
+        undefined,
+        {
+          sweep: (followerId, actors) => swept.push({ followerId, actors: [...actors] }),
+          listActors: () => {
+            if (listMode === "throw") throw new Error("unreadable");
+            if (listMode === "empty") return [];
+            return [{ id: actorId, retired: registry.get(actorId)?.status === "retired" }];
+          },
+        }
+      ),
+    });
+
+    mesh.recordEvent({ kind: "run_queued", actorId });
+    mesh.retire(actorId);
+    expect(swept).toEqual([]);
+
+    mesh.recordEvent({ kind: "run_end", actorId, success: true });
+    expect(swept).toEqual([
+      { followerId: "mac-follower", actors: [{ id: actorId, retired: true }] },
+    ]);
+    // Leader-local directory is left untouched for follower-placed actors.
+    expect(existsSync(localWorkdir)).toBe(true);
+
+    // Empty or throwing registry sends nothing.
+    const emptyActor = "follower-actor-empty";
+    const throwActor = "follower-actor-throw";
+    for (const id of [emptyActor, throwActor]) {
+      registry.upsert({
+        id,
+        charter: "follower worker",
+        parentId: "root",
+        executionConfig: { executionTarget: "mac-follower" },
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    listMode = "empty";
+    mesh.retire(emptyActor);
+    listMode = "throw";
+    mesh.retire(throwActor);
+    expect(swept).toHaveLength(1);
+  });
 });

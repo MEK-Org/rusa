@@ -1,4 +1,5 @@
 import type { ActorMesh, MeshActor } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import type { Logger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { FollowerHub } from "./follower-hub.js";
@@ -8,7 +9,10 @@ type ReattachableActor = MeshActor & { attachHost?: (host: unknown) => void };
 
 export interface FollowerRegistrationRecoveryDeps {
   actors: Pick<ActorRepository, "list">;
-  hub: Pick<FollowerHub, "onRegister" | "onPlacementReleased" | "rebindHost" | "stopActor">;
+  hub: Pick<
+    FollowerHub,
+    "onRegister" | "onPlacementReleased" | "rebindHost" | "stopActor" | "sweepWorkspaces"
+  >;
   log: Pick<Logger, "warn">;
   mesh: Pick<ActorMesh, "dispatch" | "get" | "rehydrate">;
 }
@@ -44,7 +48,14 @@ export function registerFollowerRegistrationRecovery({
     }
   });
   const unregisterRegister = hub.onRegister((follower: RemoteInstance) => {
-    for (const record of actors.list()) {
+    let allActors: ActorRecord[];
+    try {
+      allActors = actors.list();
+    } catch (err) {
+      log.warn("follower_register_registry_read_failed", { followerId: follower.id, err });
+      return;
+    }
+    for (const record of allActors) {
       if (record.executionConfig?.executionTarget !== follower.id) continue;
       if (record.status !== "active") {
         hub.stopActor(follower.id, record.id);
@@ -77,6 +88,12 @@ export function registerFollowerRegistrationRecovery({
         continue;
       }
       void dispatch();
+    }
+    if (allActors.length > 0) {
+      hub.sweepWorkspaces(
+        follower.id,
+        allActors.map((record) => ({ id: record.id, retired: record.status === "retired" }))
+      );
     }
   });
   return () => {

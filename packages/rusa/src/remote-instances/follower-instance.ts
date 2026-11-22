@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../actor/computer-use-lock.js";
+import { type ActorLiveness, sweepOrphanedWorkspaces } from "../actor/workspace-sweep.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
 import { createActorRuntime, type RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
@@ -29,6 +30,10 @@ export interface FollowerInstanceOptions {
   fileOps?: FollowerFileOps;
   /** Without it, runs are never bound here and every `materialRead` is refused (#1020). */
   material?: RunMaterialOptions;
+  /** Provider CLI scratch area on this host; omitted when scratch sweep is not configured. */
+  scratchDir?: string;
+  /** Diagnostic sink for workspace sweep removal errors. */
+  log?: (message: string) => void;
 }
 
 /** Execution half of an instance: many ordinary Actors, one Node process. */
@@ -42,6 +47,9 @@ export class FollowerInstance {
   private readonly computerUseLock = new ComputerUseLock();
   private readonly fileOps?: FollowerFileOps;
   private readonly material?: RunMaterialOptions;
+  private readonly scratchDir?: string;
+  private readonly log?: (message: string) => void;
+  private pendingRetireSweepActors?: readonly ActorLiveness[];
 
   constructor(
     private readonly home: string,
@@ -56,6 +64,8 @@ export class FollowerInstance {
     this.providerOptions = options?.providerOptions;
     this.fileOps = options?.fileOps;
     this.material = options?.material;
+    this.scratchDir = options?.scratchDir;
+    this.log = options?.log;
   }
 
   get isReconciled(): boolean {
@@ -93,6 +103,11 @@ export class FollowerInstance {
     // Existing actors may finish normally during an update, but no new actor
     // is admitted once the follower has begun its bounded quiescence window.
     if (this.draining) return;
+    if (this.pendingRetireSweepActors) {
+      this.pendingRetireSweepActors = this.pendingRetireSweepActors.map((entry) =>
+        entry.id === actorId ? { id: entry.id, retired: false } : entry
+      );
+    }
     const cwd = join(this.home, "workers", actorId);
     mkdirSync(cwd, { recursive: true });
     let actor = this.actors.get(actorId);
@@ -106,6 +121,16 @@ export class FollowerInstance {
         (event) => this.emit({ eventId: randomUUID(), actorId, message: event }),
         () => {
           this.actors.delete(actorId);
+          if (
+            !this.stopped &&
+            this.pendingRetireSweepActors?.some((entry) => entry.id === actorId && entry.retired)
+          ) {
+            const snapshot = this.pendingRetireSweepActors;
+            this.runWorkspaceSweep(snapshot);
+            if (!snapshot.some((entry) => entry.retired && this.actors.has(entry.id))) {
+              this.pendingRetireSweepActors = undefined;
+            }
+          }
           this.emit({
             eventId: randomUUID(),
             actorId,
@@ -187,6 +212,58 @@ export class FollowerInstance {
       eventId: randomUUID(),
       actorId,
       message: { type: "materialReadResult", requestId, result },
+    });
+  }
+
+  /**
+   * Sweep retired actors' working and scratch directories on this follower (#1338).
+   * An actor with a live runtime in `this.actors` is never swept even when the
+   * incoming list marks it retired; if a retired actor is still closing, its
+   * cleanup runs right after `onClosed` removes it from `this.actors`.
+   */
+  sweepWorkspaces(actors: readonly ActorLiveness[]): string[] {
+    if (this.stopped) return [];
+    if (!this.reconciled) {
+      throw new Error("Follower instance is not reconciled with leader; workspace sweep refused");
+    }
+    if (!Array.isArray(actors) || actors.length === 0) return [];
+    const normalized: ActorLiveness[] = [];
+    for (const entry of actors) {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.id === "string" &&
+        entry.id.length > 0 &&
+        typeof entry.retired === "boolean"
+      ) {
+        normalized.push({ id: entry.id, retired: entry.retired });
+      }
+    }
+    if (normalized.length === 0) return [];
+
+    const hasDeferredRetired = normalized.some(
+      (entry) => entry.retired && this.actors.has(entry.id)
+    );
+    this.pendingRetireSweepActors = hasDeferredRetired ? normalized : undefined;
+
+    return this.runWorkspaceSweep(normalized);
+  }
+
+  private runWorkspaceSweep(actors: readonly ActorLiveness[]): string[] {
+    const liveIds = new Set(this.actors.keys());
+    const effective: ActorLiveness[] = actors.map((entry) =>
+      liveIds.has(entry.id) ? { id: entry.id, retired: false } : entry
+    );
+    for (const id of liveIds) {
+      if (!effective.some((entry) => entry.id === id)) {
+        effective.push({ id, retired: false });
+      }
+    }
+    return sweepOrphanedWorkspaces({
+      workersDir: join(this.home, "workers"),
+      scratchDir: this.scratchDir,
+      actors: effective,
+      log: this.log,
     });
   }
 

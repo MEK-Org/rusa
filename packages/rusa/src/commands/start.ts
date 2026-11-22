@@ -683,7 +683,11 @@ export function createStartRetireCleanups(
   workersDir: string,
   osScheduler: Pick<ActorWakeScheduler, "cancel">,
   e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">,
-  scratch?: { dir: string; listActors: () => readonly ActorLiveness[] }
+  scratch?: { dir: string; listActors: () => readonly ActorLiveness[] },
+  followerSweep?: {
+    sweep: (followerId: string, actors: readonly ActorLiveness[]) => void;
+    listActors: () => readonly ActorLiveness[];
+  }
 ): RetireCleanup[] {
   return [
     ...(e2eInstance
@@ -698,6 +702,7 @@ export function createStartRetireCleanups(
       name: "worker workdir",
       deferUntilRunEnd: true,
       run: (record) => {
+        if (record.executionConfig?.executionTarget) return;
         // Re-check immediately before deleting the source tree. The first
         // retirement cleanup normally stopped the unit already; this guard
         // makes the ordering fail closed if that stop threw transiently.
@@ -717,6 +722,7 @@ export function createStartRetireCleanups(
             name: "provider scratch workdir",
             deferUntilRunEnd: true,
             run: (record: ActorRecord) => {
+              if (record.executionConfig?.executionTarget) return;
               // Every spelling this actor's workspace may carry that no live
               // actor also answers to: the provider has named this directory
               // differently over time, and two of the three name an actor only
@@ -726,6 +732,26 @@ export function createStartRetireCleanups(
               for (const name of removableWorkspaceNames(record.id, scratch.listActors())) {
                 rmSync(join(scratch.dir, name), { recursive: true, force: true });
               }
+            },
+          },
+        ]
+      : []),
+    ...(followerSweep
+      ? [
+          {
+            name: "follower workspaces",
+            deferUntilRunEnd: true,
+            run: (record: ActorRecord) => {
+              const target = record.executionConfig?.executionTarget;
+              if (!target) return;
+              let list: readonly ActorLiveness[];
+              try {
+                list = followerSweep.listActors();
+              } catch {
+                return;
+              }
+              if (list.length === 0) return;
+              followerSweep.sweep(target, list);
             },
           },
         ]
@@ -3408,10 +3434,21 @@ async function composeStart(
       return notifyingParent ? deliverable : undefined;
     },
     log: emitMeshRoutingLog,
-    retireCleanups: createStartRetireCleanups(workersDir, osScheduler, e2eInstance, {
-      dir: antigravityScratchDir(),
-      listActors: actorLiveness,
-    }),
+    retireCleanups: createStartRetireCleanups(
+      workersDir,
+      osScheduler,
+      e2eInstance,
+      {
+        dir: antigravityScratchDir(),
+        listActors: actorLiveness,
+      },
+      followerHub
+        ? {
+            sweep: (followerId, list) => followerHub.sweepWorkspaces(followerId, list),
+            listActors: actorLiveness,
+          }
+        : undefined
+    ),
     lifecycleListeners: [
       {
         onRetire: ({ actorId }) => {
