@@ -550,8 +550,8 @@ export class E2EInstanceManager {
         args.push("--dir", socketDirectory);
         args.push("--ro-bind", realpathIfExists(socketDirectory), socketDirectory);
       }
-      // Carry exactly the LLM keys the nested instance always received — the
-      // parent-grantable allow-list (#542) — never the whole secrets directory:
+      // Carry only the LLM API keys the e2e test instance needs in its sandbox,
+      // never the whole secrets directory:
       // webhook secrets and service passwords stay on the host. Each key passes
       // the same containment check a grant does, and the bind source is the
       // canonical path that check resolved. A key that is missing is simply not

@@ -17,7 +17,7 @@
 //
 // Without --apply, runs on a temporary copy and only reports.
 
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
@@ -101,15 +101,32 @@ async function main() {
 
   let targetPath = args.database;
   let tempDir;
+  let backupPath;
   if (!args.apply) {
     tempDir = await mkdtemp(join(tmpdir(), "rusa-backfill-1346-"));
     targetPath = join(tempDir, "mesh.db");
-    await copyFile(args.database, targetPath);
+    const sourceDb = new Database(args.database, { fileMustExist: true, readonly: true });
+    try {
+      sourceDb.pragma("busy_timeout = 30000");
+      await sourceDb.backup(targetPath);
+    } finally {
+      sourceDb.close();
+    }
+  } else {
+    backupPath = `${args.database}.pre-1346-backfill-${Date.now()}.bak`;
+    const sourceDb = new Database(args.database, { fileMustExist: true });
+    try {
+      sourceDb.pragma("busy_timeout = 30000");
+      await sourceDb.backup(backupPath);
+    } finally {
+      sourceDb.close();
+    }
   }
 
   try {
-    const db = new Database(targetPath);
+    const db = new Database(targetPath, { fileMustExist: true });
     try {
+      db.pragma("busy_timeout = 30000");
       const columns = db.prepare("PRAGMA table_info(capability_grants)").all();
       if (!columns.some((col) => col.name === "delegable")) {
         throw new Error(
@@ -124,6 +141,7 @@ async function main() {
           {
             mode: args.apply ? "apply" : "dry-run",
             database: args.database,
+            ...(backupPath ? { backupPath } : {}),
             updated,
             before,
             after,

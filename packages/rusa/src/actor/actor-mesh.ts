@@ -3671,7 +3671,10 @@ export class ActorMesh {
         kind: "capability_granted",
         actorId,
         detail: capability,
-        payload: JSON.stringify({ grantedBy: effect.by }),
+        payload: JSON.stringify({
+          grantedBy: effect.by,
+          ...(effect.delegable ? { delegable: effect.delegable } : {}),
+        }),
       });
       try {
         this.onCapabilityGranted?.(actorId, capability);
@@ -3699,7 +3702,7 @@ export class ActorMesh {
    * grantor authorization as {@link grantCapability}: a `capability-admin`
    * holder revokes most capabilities in its subtree; an operator-provisioned
    * capability is refused here regardless of grantor. Any other `revokedBy`
-   * only revokes a parent-grantable capability from a direct child. No-op on
+   * only revokes an active grant it made (`grantedBy === revokedBy`). No-op on
    * the store if not active, but the unmount hook still
    * fires so a stale mounted endpoint is torn down idempotently. A mounted
    * endpoint admits each request against the actor's capabilities, so it

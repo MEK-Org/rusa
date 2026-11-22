@@ -60,7 +60,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "secret:gemini-api-key",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/lacks capability-admin and holds no delegable grant covering secret:gemini-api-key/);
   });
 
   it("refuses delegation when the grantor does not hold the capability (old parent-grantable list removed)", () => {
@@ -72,7 +72,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "secret:gemini-api-key",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/lacks capability-admin and holds no delegable grant covering secret:gemini-api-key/);
   });
 
   it("allows descendants-flagged grant to whole subtree (child and grandchild), refuses outside subtree", () => {
@@ -105,7 +105,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "secret:gemini-api-key",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/may only delegate secret:gemini-api-key within its own subtree/);
 
     expect(() =>
       assertGrantAuthority(reader, {
@@ -114,7 +114,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "secret:gemini-api-key",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/may only delegate secret:gemini-api-key within its own subtree/);
   });
 
   it("allows anyone-flagged grant to any existing actor, including another tree", () => {
@@ -154,7 +154,9 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         verb: "grant",
         delegable: "anyone",
       })
-    ).toThrow();
+    ).toThrow(
+      /cannot grant secret:gemini-api-key with delegable="anyone": its own reach is "descendants"/
+    );
 
     expect(() =>
       assertGrantAuthority(reader, {
@@ -221,7 +223,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: CAPABILITY_ADMIN_CAPABILITY,
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/may only grant capabilities in its own subtree/);
 
     expect(() =>
       assertGrantAuthority(reader, {
@@ -230,7 +232,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: ACTOR_ADMIN_CAPABILITY,
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/may only grant capabilities in its own subtree/);
   });
 
   it("ruling 2: whole-space chat-write without flag cannot grant threads; with descendants flag can grant space or thread in subtree", () => {
@@ -242,7 +244,9 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "chat-write:spaces/S1/threads/T1",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(
+      /lacks capability-admin and holds no delegable grant covering chat-write:spaces\/S1\/threads\/T1/
+    );
 
     const flagged = makeReader(tree, [
       grantRow("parent", "chat-write:spaces/S1", "root", "descendants"),
@@ -272,7 +276,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "chat-write:spaces/S1/threads/T1",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(/may only delegate chat-write:spaces\/S1\/threads\/T1 within its own subtree/);
   });
 
   it("ruling 3: delegator may revoke what it granted, refuses revoking another grantor's row; admin revokes any row in subtree", () => {
@@ -301,7 +305,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "secret:gemini-api-key",
         verb: "revoke",
       })
-    ).toThrow();
+    ).toThrow(/cannot revoke secret:gemini-api-key from grandchild: it was granted by root/);
 
     // Admin can revoke what parent granted inside admin's subtree
     expect(() =>
@@ -341,7 +345,9 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         capability: "secret:gemini-api-key",
         verb: "grant",
       })
-    ).toThrow();
+    ).toThrow(
+      /cannot overwrite active grant of secret:gemini-api-key on grandchild granted by root/
+    );
 
     // Admin can replace any row in its subtree
     expect(() =>
@@ -353,5 +359,82 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         delegable: "anyone",
       })
     ).not.toThrow();
+  });
+
+  it('refuses a non-root capability-admin from minting delegable="anyone" unless it already holds anyone reach', () => {
+    const reader = makeReader(tree, [
+      grantRow("parent", CAPABILITY_ADMIN_CAPABILITY, "root"),
+      grantRow("parent", "secret:gemini-api-key", "root", "descendants"),
+      grantRow("parent", "understanding-write", "root", "anyone"),
+    ]);
+
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "parent",
+        granteeId: "child",
+        capability: "secret:gemini-api-key",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).toThrow(/cannot grant secret:gemini-api-key with delegable="anyone"/);
+
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "parent",
+        granteeId: "parent",
+        capability: "secret:gemini-api-key",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).toThrow(/cannot grant secret:gemini-api-key with delegable="anyone"/);
+
+    // Non-root admin can still grant delegable="descendants" in its subtree
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "parent",
+        granteeId: "child",
+        capability: "secret:gemini-api-key",
+        verb: "grant",
+        delegable: "descendants",
+      })
+    ).not.toThrow();
+
+    // Non-root admin that already holds "anyone" reach may pass "anyone"
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "parent",
+        granteeId: "child",
+        capability: "understanding-write",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).not.toThrow();
+  });
+
+  it("refuses non-admin self-delegation for both descendants and anyone reach", () => {
+    const reader = makeReader(tree, [
+      grantRow("parent", "chat-write:spaces/S1", "root", "descendants"),
+      grantRow("sibling", "chat-write:spaces/S1", "root", "anyone"),
+    ]);
+
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "parent",
+        granteeId: "parent",
+        capability: "chat-write:spaces/S1/threads/T1",
+        verb: "grant",
+        delegable: "descendants",
+      })
+    ).toThrow(/cannot delegate .* to itself/);
+
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "sibling",
+        granteeId: "sibling",
+        capability: "chat-write:spaces/S1/threads/T1",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).toThrow(/cannot delegate .* to itself/);
   });
 });

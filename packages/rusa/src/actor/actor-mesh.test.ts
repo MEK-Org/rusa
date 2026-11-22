@@ -6584,7 +6584,7 @@ describe("ActorMesh", () => {
       mesh.grantCapability(grandchild, "secret:gemini-api-key", parent)
     ).resolves.not.toThrow();
     await expect(mesh.grantCapability(parent, "secret:gemini-api-key", parent)).rejects.toThrow(
-      /own subtree|cannot overwrite/
+      /cannot delegate secret:gemini-api-key to itself/
     );
     await expect(
       mesh.grantCapability("ghost-grantee", "secret:gemini-api-key", parent)
@@ -6593,7 +6593,7 @@ describe("ActorMesh", () => {
     expect(mesh.activeCapabilitiesFor(grandchild)).toEqual(["secret:gemini-api-key"]);
     // A non-descendant revoke is rejected (a parent can't strip a grant it did not make).
     await expect(mesh.revokeCapability(sibling, "secret:gemini-api-key", parent)).rejects.toThrow(
-      /capability-admin|did not grant/
+      /only a capability-admin holder or the grantor of an active grant may revoke/
     );
     await expect(
       mesh.revokeCapability("ghost-grantee", "secret:gemini-api-key", parent)
@@ -6701,7 +6701,7 @@ describe("ActorMesh", () => {
       // Nor may the parent strip such a grant that root made.
       await mesh.grantCapability(child, "secret:webhook-secret", "root");
       await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
-        /cannot revoke/
+        /cannot revoke secret:webhook-secret from .*: it was granted by root/
       );
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
 
@@ -6818,11 +6818,11 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent });
 
     await expect(mesh.grantCapability(child, "understanding-write", parent)).rejects.toThrow(
-      /lacks capability-admin/
+      /lacks capability-admin and holds no delegable grant covering understanding-write/
     );
     expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
     await expect(mesh.revokeCapability(child, "understanding-write", parent)).rejects.toThrow(
-      /capability-admin/
+      /only a capability-admin holder or the grantor of an active grant may revoke/
     );
   });
 
@@ -6880,16 +6880,22 @@ describe("ActorMesh", () => {
     // A sandboxed parentless record (ab-rig-holder shape) is refused grant & revoke authority
     await expect(
       mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")
-    ).rejects.toThrow(/lacks capability-admin/);
+    ).rejects.toThrow(
+      /lacks capability-admin and holds no delegable grant covering understanding-write/
+    );
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "ab-rig-holder")
-    ).rejects.toThrow(/capability-admin/);
+    ).rejects.toThrow(
+      /only a capability-admin holder or the grantor of an active grant may revoke/
+    );
 
     // So is a parentless record that runs unsandboxed, as root does: neither
     // topology nor running unsandboxed confers authority
     await expect(
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
-    ).rejects.toThrow(/lacks capability-admin/);
+    ).rejects.toThrow(
+      /lacks capability-admin and holds no delegable grant covering understanding-write/
+    );
   });
 
   it("scopes a capability-admin holder's authority to its own subtree; a second parentless root holds none until granted (#549)", async () => {

@@ -599,6 +599,7 @@ export const MESH_WRITE_OPERATIONS = {
       actorId: grant.actorId,
       capability: grant.capability,
       by: grant.grantedBy,
+      ...(grant.delegable ? { delegable: grant.delegable } : {}),
     });
   },
 

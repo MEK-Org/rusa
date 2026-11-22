@@ -117,6 +117,15 @@ export function assertGrantAuthority(
   }
   const isAdmin = reader.capabilities(grantorId).includes(CAPABILITY_ADMIN_CAPABILITY);
   if (isAdmin && isAncestorIn(reader, grantorId, granteeId)) {
+    if (verb === "grant" && delegable === "anyone") {
+      const grantor = reader.actor(grantorId);
+      const isRoot = grantor !== undefined && (grantor.parentId ?? null) === null;
+      if (!isRoot && delegableReachFor(reader, grantorId, capability) !== "anyone") {
+        throw new Error(
+          `${grantorId} cannot grant ${capability} with delegable="anyone": non-root ${CAPABILITY_ADMIN_CAPABILITY} holders are subtree-bound unless they already hold "anyone" reach`
+        );
+      }
+    }
     return;
   }
 
@@ -150,6 +159,9 @@ export function assertGrantAuthority(
     throw new Error(
       `${grantorId} lacks ${CAPABILITY_ADMIN_CAPABILITY} and holds no delegable grant covering ${capability}`
     );
+  }
+  if (granteeId === grantorId) {
+    throw new Error(`${grantorId} cannot delegate ${capability} to itself`);
   }
   if (reach === "descendants" && !isAncestorIn(reader, grantorId, granteeId)) {
     throw new Error(

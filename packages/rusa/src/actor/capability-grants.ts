@@ -86,6 +86,8 @@ export interface GrantMutationEffect {
   readonly capability: string;
   /** The grantor or revoker. */
   readonly by: string;
+  /** Optional delegation reach recorded on a grant mutation (#1346). */
+  readonly delegable?: DelegationReach;
 }
 
 export type GrantMutationListener = (effect: GrantMutationEffect) => Promise<void> | void;

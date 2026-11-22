@@ -55,6 +55,25 @@ describe("DbCapabilityGrantStore (DB-specific)", () => {
     expect(() => store.grant(grant({ actorId: "no-such-actor" }))).toThrow();
   });
 
+  it("round-trips delegable reach and clears it on re-grant without delegable", () => {
+    store.grant(grant({ delegable: "descendants" }));
+    expect(store.list()[0]?.delegable).toBe("descendants");
+
+    store.grant(grant({ delegable: "anyone" }));
+    expect(store.list()[0]?.delegable).toBe("anyone");
+
+    store.grant(grant());
+    expect(store.list()[0]?.delegable).toBeUndefined();
+  });
+
+  it("ignores unrecognized delegable values in SQLite rows via isDelegationReach", () => {
+    store.grant(grant({ delegable: "descendants" }));
+    db.prepare("UPDATE capability_grants SET delegable = 'invalid-reach' WHERE actor_id = ?").run(
+      IU
+    );
+    expect(store.list()[0]?.delegable).toBeUndefined();
+  });
+
   it("cannot hold two rows for the same (actor_id, capability) even via a raw insert", () => {
     store.grant(grant());
     expect(() =>
