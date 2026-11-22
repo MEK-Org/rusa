@@ -2108,7 +2108,7 @@ export function createAgentExecMcpServer(
       {
         title: "List capability grants (capability-admin)",
         description:
-          "List every capability grant (active and revoked) held by an actor in your own subtree — the audit/inspection view of who holds what. Requires the capability-admin capability.",
+          "List every capability grant (active and revoked, including any delegable reach flag) held by an actor in your own subtree — the audit/inspection view of who holds what. Requires the capability-admin capability.",
         inputSchema: {},
       },
       async () => {

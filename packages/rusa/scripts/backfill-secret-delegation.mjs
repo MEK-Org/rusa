@@ -92,6 +92,16 @@ function applyBackfill(db) {
   return tx().changes;
 }
 
+async function backupDatabase(sourcePath, destinationPath) {
+  const sourceDb = new Database(sourcePath, { fileMustExist: true });
+  try {
+    sourceDb.pragma("busy_timeout = 30000");
+    await sourceDb.backup(destinationPath);
+  } finally {
+    sourceDb.close();
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (args.help) {
@@ -105,22 +115,10 @@ async function main() {
   if (!args.apply) {
     tempDir = await mkdtemp(join(tmpdir(), "rusa-backfill-1346-"));
     targetPath = join(tempDir, "mesh.db");
-    const sourceDb = new Database(args.database, { fileMustExist: true, readonly: true });
-    try {
-      sourceDb.pragma("busy_timeout = 30000");
-      await sourceDb.backup(targetPath);
-    } finally {
-      sourceDb.close();
-    }
+    await backupDatabase(args.database, targetPath);
   } else {
     backupPath = `${args.database}.pre-1346-backfill-${Date.now()}.bak`;
-    const sourceDb = new Database(args.database, { fileMustExist: true });
-    try {
-      sourceDb.pragma("busy_timeout = 30000");
-      await sourceDb.backup(backupPath);
-    } finally {
-      sourceDb.close();
-    }
+    await backupDatabase(args.database, backupPath);
   }
 
   try {
@@ -141,7 +139,12 @@ async function main() {
           {
             mode: args.apply ? "apply" : "dry-run",
             database: args.database,
-            ...(backupPath ? { backupPath } : {}),
+            ...(backupPath
+              ? {
+                  backupPath,
+                  backupCleanupNote: `Remove ${backupPath} once the backfill is verified.`,
+                }
+              : {}),
             updated,
             before,
             after,

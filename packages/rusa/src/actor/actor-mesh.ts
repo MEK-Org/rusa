@@ -3513,7 +3513,6 @@ export class ActorMesh {
     const policy = this.capabilityPolicy();
     return {
       actor: (id) => this.actors.get(id),
-      capabilities: (id) => this.grants.activeFor(id),
       activeGrants: (id) => effectiveActiveGrants(this.grants.list(), id, policy),
     };
   }
@@ -3525,15 +3524,16 @@ export class ActorMesh {
   }
 
   /**
-   * Grant an extra `capability` to a specific actor by id (ISSUE_NUM, phase 1a).
+   * Grant an extra `capability` to a specific actor by id.
    * We enforce the allow-list so the primitive can never hand out a capability
-   * the wiring didn't mark grantable, plus grantor authorization: a
+   * the wiring didn't mark grantable, plus grantor authorization (#1346): a
    * `capability-admin` holder may grant most grantable capabilities in its
    * subtree; an operator-provisioned capability is refused here regardless of
-   * grantor. Any other grantor may only grant a {@link PARENT_GRANTABLE_CAPABILITIES}
-   * capability, and only to its direct children. Idempotent per (actorId,
-   * capability). MCP-server grants take effect
-   * on a live actor's next run; secrets are rebound by its next sandboxed run.
+   * grantor. Any other grantor (or an admin acting outside its subtree) may
+   * delegate a capability only if it holds a covering active grant with a
+   * `delegable` reach (`"descendants"` or `"anyone"`). Idempotent per
+   * (actorId, capability). MCP-server grants take effect on a live actor's
+   * next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
   async grantCapability(

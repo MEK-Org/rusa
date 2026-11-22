@@ -4,7 +4,6 @@ import {
   type CapabilityGrantStore,
   type CapabilityPolicy,
   effectiveActiveGrants,
-  effectiveCapabilities,
   GRANT_MUTATION_EFFECT,
   type GrantMutationEffect,
 } from "../actor/capability-grants.js";
@@ -171,7 +170,6 @@ function grantAuthorityReader(
 ): GrantAuthorityReader {
   return {
     actor: (id) => repos.actors.get(id),
-    capabilities: (id) => effectiveCapabilities(repos.grants.list(), id, policy),
     activeGrants: (id) => effectiveActiveGrants(repos.grants.list(), id, policy),
   };
 }

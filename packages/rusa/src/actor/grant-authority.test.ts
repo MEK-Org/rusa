@@ -9,7 +9,6 @@ import {
   type CapabilityGrant,
   type DelegationReach,
   effectiveActiveGrants,
-  effectiveCapabilities,
 } from "./capability-grants.js";
 import { assertGrantAuthority, type GrantAuthorityReader } from "./grant-authority.js";
 
@@ -20,7 +19,6 @@ function makeReader(
 ): GrantAuthorityReader {
   return {
     actor: (id) => actors[id],
-    capabilities: (id) => effectiveCapabilities(grants, id, policy),
     activeGrants: (id) => effectiveActiveGrants(grants, id, policy),
   };
 }
@@ -356,17 +354,62 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
         granteeId: "child",
         capability: "secret:gemini-api-key",
         verb: "grant",
-        delegable: "anyone",
+        delegable: "descendants",
       })
     ).not.toThrow();
   });
 
-  it('refuses a non-root capability-admin from minting delegable="anyone" unless it already holds anyone reach', () => {
-    const reader = makeReader(tree, [
-      grantRow("parent", CAPABILITY_ADMIN_CAPABILITY, "root"),
-      grantRow("parent", "secret:gemini-api-key", "root", "descendants"),
-      grantRow("parent", "understanding-write", "root", "anyone"),
-    ]);
+  it('requires "anyone" reach for any capability-admin (root or parentless non-root) to mint delegable="anyone"', () => {
+    const policy = defaultActorCapabilityPolicy(
+      () => "root",
+      defaultActorBootstrapCapabilities({
+        chat: { projectId: "p", subscription: "s", pubsubKeyPath: "/k" },
+      })
+    )();
+    const reader = makeReader(
+      tree,
+      [
+        grantRow("parent", CAPABILITY_ADMIN_CAPABILITY, "root"),
+        grantRow("parent", "secret:gemini-api-key", "root", "descendants"),
+        grantRow("parent", "understanding-write", "root", "anyone"),
+        grantRow("otherRoot", CAPABILITY_ADMIN_CAPABILITY, "operator"),
+        grantRow("otherRoot", "secret:gemini-api-key", "operator", "descendants"),
+      ],
+      policy
+    );
+
+    // (a) Default actor may mint "anyone" on a policy communication capability
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "root",
+        granteeId: "child",
+        capability: "chat-write:spaces/S1",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).not.toThrow();
+
+    // (b) Default actor with capability-admin is refused "anyone" on a secret row
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "root",
+        granteeId: "child",
+        capability: "secret:gemini-api-key",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).toThrow(/cannot grant secret:gemini-api-key with delegable="anyone"/);
+
+    // (c) Parentless non-default capability-admin is refused "anyone" (#549 cross-tree isolation)
+    expect(() =>
+      assertGrantAuthority(reader, {
+        grantorId: "otherRoot",
+        granteeId: "otherChild",
+        capability: "secret:gemini-api-key",
+        verb: "grant",
+        delegable: "anyone",
+      })
+    ).toThrow(/cannot grant secret:gemini-api-key with delegable="anyone"/);
 
     expect(() =>
       assertGrantAuthority(reader, {
@@ -388,7 +431,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
       })
     ).toThrow(/cannot grant secret:gemini-api-key with delegable="anyone"/);
 
-    // Non-root admin can still grant delegable="descendants" in its subtree
+    // Subtree admin can still grant delegable="descendants" in its subtree
     expect(() =>
       assertGrantAuthority(reader, {
         grantorId: "parent",
@@ -399,7 +442,7 @@ describe("assertGrantAuthority (#1346 grant delegation flag)", () => {
       })
     ).not.toThrow();
 
-    // Non-root admin that already holds "anyone" reach may pass "anyone"
+    // Admin that already holds "anyone" reach may pass "anyone"
     expect(() =>
       assertGrantAuthority(reader, {
         grantorId: "parent",

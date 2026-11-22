@@ -6379,8 +6379,8 @@ describe("ActorMesh", () => {
     expect(mounted).toEqual([["iu-thread", "understanding-write", ["understanding-write"]]]);
   });
 
-  // ── Grantor authorization : root grants anything grantable; a non-root
-  // parent grants/revokes only PARENT_GRANTABLE secrets, only to direct children.
+  // ── Grantor authorization (#1346): capability-admin grants/revokes within its
+  // subtree; non-admin delegation follows the grant row's `delegable` flag.
 
   it("root grants any grantable capability to any actor (unchanged), audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
@@ -6551,6 +6551,13 @@ describe("ActorMesh", () => {
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
     await mesh.grantCapability(parent, "secret:gemini-api-key", "root", "descendants");
+    expect(
+      events.find((e) => e.kind === "capability_granted" && e.actorId === parent)
+    ).toMatchObject({
+      actorId: parent,
+      detail: "secret:gemini-api-key",
+      payload: JSON.stringify({ grantedBy: "root", delegable: "descendants" }),
+    });
 
     await mesh.grantCapability(child, "secret:gemini-api-key", parent);
     expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:gemini-api-key"]);
@@ -6560,6 +6567,16 @@ describe("ActorMesh", () => {
       actorId: child,
       detail: "secret:gemini-api-key",
       payload: JSON.stringify({ grantedBy: parent }),
+    });
+
+    // Re-granting without `delegable` clears the flag in the emitted event too.
+    await mesh.grantCapability(parent, "secret:gemini-api-key", "root");
+    expect(
+      events.filter((e) => e.kind === "capability_granted" && e.actorId === parent).at(-1)
+    ).toMatchObject({
+      actorId: parent,
+      detail: "secret:gemini-api-key",
+      payload: JSON.stringify({ grantedBy: "root" }),
     });
 
     // ...and revokes it again.

@@ -18,9 +18,7 @@ import type { ActiveGrantRecord, DelegationReach } from "./capability-grants.js"
 export interface GrantAuthorityReader {
   /** The actor's durable record, or undefined when it has none. */
   actor(id: string): { readonly parentId?: string | null; readonly status?: string } | undefined;
-  /** The capabilities the actor holds now. */
-  capabilities(id: string): readonly string[];
-  /** Active grant records held by the actor now (durable rows + policy-derived delegable entries). */
+  /** Active grant records held by the actor now (durable rows + policy-derived entries). */
   activeGrants(id: string): readonly ActiveGrantRecord[];
 }
 
@@ -87,8 +85,10 @@ function activeDurableGrant(
 /**
  * Grantor authority for a grant or revocation (#1346):
  * - A `capability-admin` holder may grant or revoke any grantable capability
- *   within its own subtree (itself included), set any delegation reach, and
- *   replace any existing row in its subtree.
+ *   within its own subtree (itself included), set `delegable: "descendants"`,
+ *   and replace any existing row in its subtree. Setting `delegable: "anyone"`
+ *   requires already holding `"anyone"` delegation reach over that capability
+ *   (no root exemption; administrative authority stays subtree-bound).
  * - Otherwise (non-admin, or an admin acting outside its subtree):
  *   - **grant:** the grantor must hold a delegable covering grant (exact match,
  *     or Chat space containment), the grantee must be within that grant's reach
@@ -115,16 +115,18 @@ export function assertGrantAuthority(
   if (!grantee) {
     throw new Error(`unknown thread id: ${granteeId}`);
   }
-  const isAdmin = reader.capabilities(grantorId).includes(CAPABILITY_ADMIN_CAPABILITY);
+  const isAdmin = reader
+    .activeGrants(grantorId)
+    .some((grant) => grant.capability === CAPABILITY_ADMIN_CAPABILITY);
   if (isAdmin && isAncestorIn(reader, grantorId, granteeId)) {
-    if (verb === "grant" && delegable === "anyone") {
-      const grantor = reader.actor(grantorId);
-      const isRoot = grantor !== undefined && (grantor.parentId ?? null) === null;
-      if (!isRoot && delegableReachFor(reader, grantorId, capability) !== "anyone") {
-        throw new Error(
-          `${grantorId} cannot grant ${capability} with delegable="anyone": non-root ${CAPABILITY_ADMIN_CAPABILITY} holders are subtree-bound unless they already hold "anyone" reach`
-        );
-      }
+    if (
+      verb === "grant" &&
+      delegable === "anyone" &&
+      delegableReachFor(reader, grantorId, capability) !== "anyone"
+    ) {
+      throw new Error(
+        `${grantorId} cannot grant ${capability} with delegable="anyone": ${CAPABILITY_ADMIN_CAPABILITY} is subtree-bound unless the grantor already holds "anyone" reach`
+      );
     }
     return;
   }
@@ -187,7 +189,7 @@ export function assertGrantAuthority(
  * already resolved. Returns the target's record.
  */
 export function assertExperimentAuthority(
-  reader: Pick<GrantAuthorityReader, "actor" | "capabilities">,
+  reader: GrantAuthorityReader,
   query: {
     readonly callerId: string;
     readonly actorId: string;
@@ -196,7 +198,9 @@ export function assertExperimentAuthority(
 ): NonNullable<ReturnType<GrantAuthorityReader["actor"]>> {
   const { callerId, actorId, verb } = query;
   const preposition = verb === "enroll" ? "in" : "from";
-  if (!reader.capabilities(callerId).includes(EXPERIMENT_ADMIN_CAPABILITY)) {
+  if (
+    !reader.activeGrants(callerId).some((grant) => grant.capability === EXPERIMENT_ADMIN_CAPABILITY)
+  ) {
     throw new Error(
       `only an ${EXPERIMENT_ADMIN_CAPABILITY} holder may ${verb} an actor ${preposition} an experiment`
     );

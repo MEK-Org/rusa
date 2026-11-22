@@ -169,8 +169,9 @@ export interface CapabilityPolicy {
 
 /**
  * The active grant records `actorId` holds: its active durable rows (minus
- * those the policy ignores), plus policy-derived delegable capabilities (with
- * `grantedBy: null` and `delegable: "anyone"`) when it is the recipient.
+ * those the policy ignores), plus policy-derived role capabilities (with
+ * `grantedBy: null`, and `delegable: "anyone"` for `policy.delegableCapabilities`)
+ * when it is the recipient.
  */
 export function effectiveActiveGrants(
   grants: readonly CapabilityGrant[],
@@ -189,9 +190,21 @@ export function effectiveActiveGrants(
       grantedBy: grant.grantedBy,
       ...(grant.delegable ? { delegable: grant.delegable } : {}),
     }));
-  if (policy !== null && actorId === policy.recipientId && policy.delegableCapabilities) {
-    for (const capability of policy.delegableCapabilities) {
-      rows.push({ capability, grantedBy: null, delegable: "anyone" });
+  if (policy !== null && actorId === policy.recipientId) {
+    const delegableSet = new Set(policy.delegableCapabilities ?? []);
+    const seen = new Set<string>();
+    for (const capability of policy.capabilities) {
+      seen.add(capability);
+      rows.push({
+        capability,
+        grantedBy: null,
+        ...(delegableSet.has(capability) ? { delegable: "anyone" } : {}),
+      });
+    }
+    for (const capability of delegableSet) {
+      if (!seen.has(capability)) {
+        rows.push({ capability, grantedBy: null, delegable: "anyone" });
+      }
     }
   }
   return rows;
