@@ -1199,7 +1199,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(live.opts.isE2eRoot).toBe(false);
   });
 
-  it("#367 selects greater weekly headroom through the live runStart provider gate and retains fresh evidence through a cold response", async () => {
+  it("#367 selects greater weekly headroom through the live runStart provider gate when lanes are equally throttled, and retains the pick through a cold response", async () => {
     const socketPath = join(homeDir, "coordinator.sock");
     const observedAt = new Date().toISOString();
     const resetAtIso = new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000).toISOString();
@@ -1207,15 +1207,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
       key: `${provider}:weekly`,
       percentLeft,
       timeRemainingPct: 50,
-      error: 0,
+      // error = timeRemainingPct - percentLeft: both lanes burn ahead of pace
+      // (error > 0), so #1351 ranks them as equally throttled and weekly
+      // headroom decides the tie.
+      error: 50 - percentLeft,
       derivative: 0,
       requiredIntervalSeconds: 300,
       observedAt,
       resetAtIso,
     });
-    // Unpaced lanes keep both candidates immediately available for the second
-    // gate below, so it proves the retained admission observation is used.
-    const throttleStatus = (provider: string, percentLeft: number, intervalSeconds = 0) => ({
+    // Equally throttled lanes keep both candidates tied on the shortest
+    // governing throttle for the gates below, so each proves what it claims:
+    // the warm gate that the live weekly projection decides the tie, the cold
+    // gate that the retained last-good status keeps the pick.
+    const throttleStatus = (provider: string, percentLeft: number, intervalSeconds = 60) => ({
       provider,
       intervalSeconds,
       uncappedIntervalSeconds: intervalSeconds,
@@ -1253,11 +1258,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           providers: {
             // A changed claude interval lets the test observe that the production
             // client completed this cold collection, not just that the server sent it.
-            claude: throttleStatus("claude", 20, codexCold ? 1 : 0),
+            claude: throttleStatus("claude", 20, codexCold ? 120 : 60),
             // A cold lane is a 200 not_ready entry in the collection (§5.5, #480).
             codex: codexCold
               ? { error: { code: "not_ready", message: "cold", retryable: true } }
-              : throttleStatus("codex", 80),
+              : throttleStatus("codex", 40),
           },
         })
       );
@@ -1317,11 +1322,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       // The coordinator now reports codex cold. A changed claude interval is
       // applied only after the production client's collection read completes;
-      // waiting for it proves this same cold response was consumed. Codex's last
-      // trustworthy weekly observation remains fresh, so the production gate
-      // keeps selecting it without opening a local quota database.
+      // waiting for it proves this same cold response was consumed. Codex's
+      // last-good status (pacing and weekly evidence) is retained, so the
+      // production gate keeps selecting it — now on the shortest governing
+      // throttle — without opening a local quota database.
       codexCold = true;
-      await vi.waitFor(() => expect(coordinatorAppliedInterval?.("claude")).toBe(1), {
+      await vi.waitFor(() => expect(coordinatorAppliedInterval?.("claude")).toBe(120), {
         timeout: 5_000,
       });
       const afterCold = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);

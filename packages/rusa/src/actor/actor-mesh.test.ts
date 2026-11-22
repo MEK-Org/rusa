@@ -10066,17 +10066,21 @@ describe("ActorMesh", () => {
     });
   });
 
-  // #347 responsive promotion retains the normal admission choice. A queued
-  // normal run selected on a later-declared lane because it quoted sooner must
-  // use that same lane when promoted; responsive priority only bypasses queues.
+  // #347 responsive promotion. A queued normal run selected on a later-declared
+  // lane because it quoted sooner is promoted by a responsive delivery, which
+  // bypasses queues and pacing. Since #1351, responsive selection takes the
+  // first-declared lane the controller is not throttling, so promotion may
+  // move a queued run to an earlier-declared unthrottled lane; what survives
+  // is a single immediate run with the responsive selection recorded.
   describe("responsive promotion retains normal pool selection (#347)", () => {
-    it("promotes a queued run on its next-available lane, with exactly one immediate run", async () => {
+    it("promotes a queued run on its first-declared unthrottled lane, with exactly one immediate run", async () => {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
-      // pool-b's run blocks until released, so the promoted-but-not-yet-
+      // Both pool runs block until released, so the promoted-but-not-yet-
       // finished state can be inspected before the run completes.
+      const poolAGates: Array<() => void> = [];
       const poolBGates: Array<() => void> = [];
       const providerByName = new Map<string, CodingProvider>([
         [
@@ -10084,9 +10088,13 @@ describe("ActorMesh", () => {
           {
             name: "pool-a",
             providerName: "pool-a",
-            run: async (runOpts) => {
+            run: (runOpts) => {
               poolARuns.push(runOpts.cwd);
-              return { success: true, exitCode: 0, output: "a" };
+              return new Promise((resolve) => {
+                poolAGates.push(() => {
+                  resolve({ success: true, exitCode: 0, output: "a" });
+                });
+              });
             },
           },
         ],
@@ -10116,8 +10124,9 @@ describe("ActorMesh", () => {
         return pacer;
       };
       // pool-a is declared first but quotes later than pool-b, so the initial
-      // normal selection reserves pool-b — the selection responsive promotion
-      // must preserve.
+      // normal selection reserves pool-b; promotion then reselects
+      // responsively, which under #1351 takes the first-declared unthrottled
+      // lane (pool-a).
       pacerFor("pool-a").deferUntil(Date.now() + 20_000);
 
       const { mesh, registry, tick } = setup({
@@ -10210,25 +10219,32 @@ describe("ActorMesh", () => {
       expect(mesh.activeRunState(worker)?.phase).toBe("queued");
       expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
 
-      // A responsive delivery preserves pool-b, while bypassing
-      // pacing/concurrency entirely (blocker still holds the mesh's only slot).
+      // A responsive delivery reselects under the responsive rule (#1351):
+      // both lanes run at a zero governing interval — the controller asking
+      // for no throttle; pool-a's defer is a pacer queue reservation, not a
+      // controller throttle — so the first-declared lane wins, while still
+      // bypassing pacing/concurrency entirely (blocker holds the mesh's only
+      // slot).
       mesh.sendMessage(worker, "urgent", TEST_USER_ID, "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(poolARuns).toEqual([]);
-      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
-      expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
+      expect(poolARuns).toEqual([`/tmp/${worker}`]);
+      expect(poolBRuns).toEqual([]);
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-a");
       expect(mesh.getSelection(worker)?.responsive).toBe(true);
       expect(mesh.runningThreadIds()).toEqual(new Set([blocker, worker]));
 
+      poolAGates.splice(0).forEach((release) => {
+        release();
+      });
       poolBGates.splice(0).forEach((release) => {
         release();
       });
       blockerDeferred.releaseAll();
       await tick();
 
-      expect(poolARuns).toEqual([]);
-      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
+      expect(poolARuns).toEqual([`/tmp/${worker}`]);
+      expect(poolBRuns).toEqual([]);
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
     });
