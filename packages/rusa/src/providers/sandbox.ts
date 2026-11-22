@@ -709,10 +709,6 @@ export function addWritableDirBindIfRealDir(args: string[], source: string, targ
   addDirBindIfRealDir(args, "--bind", source, target);
 }
 
-function addReadonlyDirBindIfRealDir(args: string[], source: string, target: string): void {
-  addDirBindIfRealDir(args, "--ro-bind", source, target);
-}
-
 /**
  * Whether config still authorizes the installed Kimi CLI. A durable grant alone
  * is deliberately insufficient: an operator removing every Kimi provider
@@ -784,7 +780,7 @@ function addKimiHome(
       // re-expose only a real `bin/` directory read-only through the shadow while
       // keeping host sessions, mcp.json, credentials, and oauth hidden.
       const resolvedKimiBinDir = join(resolvedKimiCodeDir, "bin");
-      addReadonlyDirBindIfRealDir(args, resolvedKimiBinDir, resolvedKimiBinDir);
+      addDirBindIfRealDir(args, "--ro-bind", resolvedKimiBinDir, resolvedKimiBinDir);
       shadowedHostKimiHomes.push(resolvedKimiCodeDir);
     }
   }
