@@ -660,6 +660,38 @@ export function weeklyAdmissionObservation(status: PublishedThrottleProviderStat
   };
 }
 
+function laneBucketsControllerUnthrottled(
+  lane: Pick<PublishedThrottleProviderStatus, "buckets" | "freshness">
+): boolean {
+  if (lane.freshness.stale || lane.freshness.hardStale) return false;
+  if (!Array.isArray(lane.buckets) || lane.buckets.length === 0) return false;
+  return lane.buckets.every(
+    (bucket) =>
+      typeof bucket.error === "number" && Number.isFinite(bucket.error) && bucket.error <= 0
+  );
+}
+
+/**
+ * Whether the quota controller is asking for no throttle on this candidate
+ * lane (#1351): true only when the provider lane and every applicable model
+ * lane are fresh, have at least one bucket, and every bucket has `error <= 0`
+ * (on or under pace). Returns `undefined` when no published status exists.
+ */
+export function laneControllerUnthrottled(
+  status: PublishedThrottleProviderStatus | undefined,
+  model: string | undefined
+): boolean | undefined {
+  if (!status) return undefined;
+  if (!laneBucketsControllerUnthrottled(status)) return false;
+  if (!model) return true;
+  const lanes: unknown[] = Array.isArray(status.modelLanes) ? status.modelLanes : [];
+  for (const lane of lanes) {
+    if (!isPublishedModelLane(lane) || !modelListCovers(lane.models, model)) continue;
+    if (!laneBucketsControllerUnthrottled(lane)) return false;
+  }
+  return true;
+}
+
 export function validateProtocolMajor(
   body: unknown,
   expectedMajor: number = COORDINATOR_PROTOCOL_MAJOR

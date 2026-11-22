@@ -312,6 +312,7 @@ import {
   closedGoverningWindow,
   HISTORY_WINDOW_MS,
   isPublishedModelLane,
+  laneControllerUnthrottled,
   type ModelLanePacing,
   modelLanePacing,
   type PublishedThrottleProviderStatus,
@@ -2134,6 +2135,8 @@ async function composeStart(
   // usable through a transient cold, unavailable, or incompatible response.
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
+  const controllerUnthrottledFor = (providerName: string, model: string | undefined) =>
+    laneControllerUnthrottled(quotaCoordinatorClient?.getLastPublishedStatus(providerName), model);
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   // #655: only a coordinator-fresh publication can install an absolute
   // exhaustion gate. Keep its published deadline through an unavailable read;
@@ -3360,6 +3363,9 @@ async function composeStart(
           // reading it arrived with, and a stale one drops the tie-break.
           get weeklyQuota() {
             return weeklyQuotaFor(lane);
+          },
+          get controllerUnthrottled() {
+            return controllerUnthrottledFor(lane, c.model);
           },
         });
       }

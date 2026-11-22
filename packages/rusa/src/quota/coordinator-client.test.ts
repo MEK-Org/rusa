@@ -14,6 +14,7 @@ import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
   HISTORY_WINDOW_MS,
+  laneControllerUnthrottled,
   type PublishedHistoryRecord,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleResponse,
@@ -674,7 +675,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       const candidates = names.map((name) => ({
         config: name,
         lane: name,
-        pacer: new ProviderPacer(0, () => nowMs),
+        pacer: new ProviderPacer(60_000, () => nowMs),
         // The same projection start.ts composes into weeklyQuotaFor.
         weeklyQuota: weeklyAdmissionObservation(client.getLastPublishedStatus(name)),
       }));
@@ -706,6 +707,50 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
 
       expect(selectFromClient(client, nowMs)).toBe("codex");
       expect(client.getHealth()).toEqual({ quota_client_service_connected: 1 });
+    });
+
+    it("derives controllerUnthrottled from fresh provider and applicable model lane bucket errors (#1351)", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const observedAt = new Date(nowMs).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const makeLane = (error: number, stale = false) => {
+        const base = weeklyStatus("claude", 60, observedAt, resetAtIso);
+        return {
+          ...base,
+          freshness: { ...base.freshness, stale, hardStale: false },
+          buckets: [
+            {
+              key: "claude:weekly",
+              percentLeft: 60,
+              timeRemainingPct: 50,
+              error,
+              derivative: 0,
+              requiredIntervalSeconds: 12,
+              resetAtIso,
+              observedAt,
+            },
+          ],
+        };
+      };
+
+      expect(laneControllerUnthrottled(undefined, undefined)).toBeUndefined();
+      expect(laneControllerUnthrottled(makeLane(-10), undefined)).toBe(true);
+      expect(laneControllerUnthrottled(makeLane(0), undefined)).toBe(true);
+      expect(laneControllerUnthrottled(makeLane(5), undefined)).toBe(false);
+      expect(laneControllerUnthrottled(makeLane(-10, true), undefined)).toBe(false);
+
+      // Provider unthrottled, applicable model lane throttled -> false; other model -> true.
+      const withModelLane = {
+        ...makeLane(-10),
+        modelLanes: [
+          {
+            ...makeLane(5),
+            models: ["claude-fable-5-1"],
+          },
+        ],
+      };
+      expect(laneControllerUnthrottled(withModelLane, "claude-fable-5-1")).toBe(false);
+      expect(laneControllerUnthrottled(withModelLane, "claude-sonnet-4-6")).toBe(true);
     });
 
     // These four outcomes are decided by selectPoolLane at the merge base (the
