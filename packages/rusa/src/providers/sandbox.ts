@@ -673,6 +673,22 @@ function addWritableBindIfExists(args: string[], source: string, target: string)
   }
 }
 
+function addDirBindIfRealDir(
+  args: string[],
+  flag: "--bind" | "--ro-bind",
+  source: string,
+  target: string
+): void {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(source);
+  } catch {
+    return; // absent, or raced away mid-probe — best-effort, matches existing kimi/codex auth bind behavior
+  }
+  if (!st.isDirectory()) return; // not a real directory (plain file or symlink) — skip
+  args.push(flag, source, target);
+}
+
 /**
  * Like {@link addWritableBindIfExists}, but only for a real, non-symlink directory —
  * used for host credential directories, where a stray file left over from an older
@@ -690,14 +706,7 @@ function addWritableBindIfExists(args: string[], source: string, target: string)
  * sandbox — see the e2e-instance-manager's own kimi-code handling for why.
  */
 export function addWritableDirBindIfRealDir(args: string[], source: string, target: string): void {
-  let st: ReturnType<typeof lstatSync>;
-  try {
-    st = lstatSync(source);
-  } catch {
-    return; // absent, or raced away mid-probe — best-effort, matches existing kimi/codex auth bind behavior
-  }
-  if (!st.isDirectory()) return; // not a real directory (plain file or symlink) — skip
-  args.push("--bind", source, target);
+  addDirBindIfRealDir(args, "--bind", source, target);
 }
 
 /**
@@ -767,6 +776,11 @@ function addKimiHome(
     const resolvedKimiCodeDir = realpathIfExists(kimiCodeDir);
     if (existsSync(resolvedKimiCodeDir)) {
       args.push("--tmpfs", resolvedKimiCodeDir);
+      // Installed `~/.local/bin/kimi` symlinks into `~/.kimi-code/bin/kimi`, so
+      // re-expose only a real `bin/` directory read-only through the shadow while
+      // keeping host sessions, mcp.json, credentials, and oauth hidden.
+      const resolvedKimiBinDir = join(resolvedKimiCodeDir, "bin");
+      addDirBindIfRealDir(args, "--ro-bind", resolvedKimiBinDir, resolvedKimiBinDir);
       shadowedHostKimiHomes.push(resolvedKimiCodeDir);
     }
   }

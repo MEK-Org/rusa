@@ -361,6 +361,9 @@ describe("sandbox bwrap args", () => {
     mkdirSync(actorDir, { recursive: true });
     mkdirSync(join(home, ".kimi-code", "credentials"), { recursive: true });
     mkdirSync(join(home, ".kimi-code", "oauth"), { recursive: true });
+    const hostKimiBin = join(home, ".kimi-code", "bin");
+    mkdirSync(hostKimiBin, { recursive: true });
+    writeFileSync(join(hostKimiBin, "kimi"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
     mkdirSync(googleCredentialsDir, { recursive: true });
     writeFileSync(join(googleCredentialsDir, "drive-token.json"), '{"refresh_token":"synthetic"}');
     writeFileSync(join(home, ".kimi-code", "config.toml"), "default_model = 'kimi-for-coding'\n");
@@ -445,11 +448,31 @@ describe("sandbox bwrap args", () => {
       (arg, index) => arg === "--remount-ro" && granted[index + 1] === hostKimiHome
     );
     expect(auxiliaryRemount).toBeGreaterThan(googleShadow);
+    const binBindIdx = granted.findIndex(
+      (arg, index) =>
+        arg === "--ro-bind" &&
+        granted[index + 1] === hostKimiBin &&
+        granted[index + 2] === hostKimiBin
+    );
+    expect(binBindIdx).toBeGreaterThan(auxiliaryShadow);
+    expect(auxiliaryRemount).toBeGreaterThan(binBindIdx);
 
     const nativeKimi = buildActorBwrapArgs(actorDir, "kimi").args;
     expect(
       nativeKimi.some((arg, index) => arg === "--tmpfs" && nativeKimi[index + 1] === hostKimiHome)
     ).toBe(false);
+    expect(nativeKimi).not.toContain(hostKimiBin);
+
+    // When bin/ is missing or a symlink, the real-directory guard skips it.
+    rmSync(hostKimiBin, { recursive: true, force: true });
+    const missingBin = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    expect(missingBin).not.toContain(hostKimiBin);
+
+    const outsideBin = join(home, "outside-bin");
+    mkdirSync(outsideBin, { recursive: true });
+    symlinkSync(outsideBin, hostKimiBin);
+    const symlinkBin = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    expect(symlinkBin).not.toContain(hostKimiBin);
 
     mockLoadConfig.mockReturnValue({
       github: { account: "test" },
