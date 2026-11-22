@@ -478,6 +478,87 @@ describe("sandbox bwrap args", () => {
     expect(e2eRootArgs).not.toContain("/tmp/kimi-home/credentials");
   });
 
+  it("ro-binds only a real ~/.kimi-code/bin directory back through the auxiliary Kimi shadow", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-kimi-aux-bin-"));
+    tempDirs.push(home);
+    const mcHome = join(home, ".rusa");
+    const actorId = "codex-kimi-bin-reader";
+    const actorDir = join(mcHome, "workers", actorId);
+    const hostKimiHome = join(home, ".kimi-code");
+    const hostKimiBin = join(hostKimiHome, "bin");
+    mkdirSync(actorDir, { recursive: true });
+    mkdirSync(join(hostKimiHome, "credentials"), { recursive: true });
+    mkdirSync(join(hostKimiHome, "oauth"), { recursive: true });
+    mkdirSync(hostKimiBin, { recursive: true });
+    writeFileSync(join(hostKimiBin, "kimi"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
+    process.env.HOME = home;
+    mockLoadConfig.mockReturnValue({
+      github: { account: "test" },
+      providers: { auxiliaryKimi: { cliCommand: "kimi" } },
+      webhook: { port: 9742, secret: "secret" },
+      gitBridge: false,
+    });
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const dataDir = join(mcHome, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const db = new Database(join(dataDir, "mesh.db"));
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'test actor', NULL, '2026-11-19T00:00:00Z')"
+    ).run();
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-11-19T00:00:00Z')"
+    ).run(actorId);
+    db.prepare(
+      `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+       VALUES (?, 'kimi-cli', 'root', '2026-11-19T00:00:00Z', NULL)`
+    ).run(actorId);
+    db.close();
+
+    const { buildActorBwrapArgs, codexRolloutStoreDir, kimiSessionStoreDir } = await import(
+      "./sandbox.js"
+    );
+    tempDirs.push(codexRolloutStoreDir(actorDir), kimiSessionStoreDir(actorDir));
+
+    const granted = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    const shadowIdx = granted.findIndex(
+      (arg, idx) => arg === "--tmpfs" && granted[idx + 1] === hostKimiHome
+    );
+    const binBindIdx = granted.findIndex(
+      (arg, idx) =>
+        arg === "--ro-bind" && granted[idx + 1] === hostKimiBin && granted[idx + 2] === hostKimiBin
+    );
+    const remountIdx = granted.findIndex(
+      (arg, idx) => arg === "--remount-ro" && granted[idx + 1] === hostKimiHome
+    );
+    expect(shadowIdx).toBeGreaterThan(-1);
+    expect(binBindIdx).toBeGreaterThan(shadowIdx);
+    expect(remountIdx).toBeGreaterThan(binBindIdx);
+
+    // Native Kimi does not shadow ~/.kimi-code and does not add the bin/ re-bind.
+    const nativeKimi = buildActorBwrapArgs(actorDir, "kimi").args;
+    expect(nativeKimi).not.toContain(hostKimiBin);
+
+    // When bin/ is missing, no bin/ bind is emitted.
+    rmSync(hostKimiBin, { recursive: true, force: true });
+    const missingBin = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    expect(missingBin).not.toContain(hostKimiBin);
+
+    // When bin/ is a symlink, the real-directory guard skips it.
+    const outsideBin = join(home, "outside-bin");
+    mkdirSync(outsideBin, { recursive: true });
+    symlinkSync(outsideBin, hostKimiBin);
+    const symlinkBin = buildActorBwrapArgs(actorDir, "codex", "/tmp/codex-mcp.toml").args;
+    expect(symlinkBin).not.toContain(hostKimiBin);
+  });
+
   it("pins the per-invocation mcp config over the real ~/.gemini paths for antigravity", async () => {
     const home = mkdtempSync(join(tmpdir(), "mc-gemini-home-"));
     tempDirs.push(home);
