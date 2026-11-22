@@ -136,8 +136,18 @@ describe("capability administration is grant-derived", () => {
     expect(mesh.activeCapabilitiesFor("sibling")).toEqual([]);
   });
 
-  it("keeps the parent-grantable secret path for an ungranted parent", async () => {
-    const { mesh } = setup();
+  it("requires a delegable grant for a non-admin parent to delegate a secret", async () => {
+    const { grants, mesh } = setup();
+    await expect(
+      mesh.grantCapability("steward-child", "secret:gemini-api-key", "0b2c3d4e-steward")
+    ).rejects.toThrow(/capability-admin/);
+    grants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: "secret:gemini-api-key",
+      grantedBy: "configured",
+      grantedAt: "2026-01-01T00:00:00Z",
+      delegable: "descendants",
+    });
     await expect(
       mesh.grantCapability("steward-child", "secret:gemini-api-key", "0b2c3d4e-steward")
     ).resolves.not.toThrow();

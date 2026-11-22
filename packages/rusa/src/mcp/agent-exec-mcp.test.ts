@@ -2322,6 +2322,12 @@ describe("agent-execution MCP server", () => {
     ) as { thread_id: string };
 
     for (const capability of ["secret:gemini-api-key", "secret:mistral-api-key"]) {
+      const parentGrant = (await rootSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: parentId, capability, delegable: "descendants" },
+      })) as CallToolResult;
+      expect(parentGrant.isError).toBeFalsy();
+
       const granted = (await parentSrv.callTool({
         name: "grant_capability",
         arguments: { actor_id: childId, capability },
@@ -2329,7 +2335,9 @@ describe("agent-execution MCP server", () => {
       expect(granted.isError).toBeFalsy();
       expect(mesh.activeCapabilitiesFor(childId)).toEqual([capability]);
       // Audit event payload.grantedBy = the grantor (the parent endpoint's identity).
-      const audit = events.find((e) => e.kind === "capability_granted" && e.detail === capability);
+      const audit = events.find(
+        (e) => e.kind === "capability_granted" && e.actorId === childId && e.detail === capability
+      );
       expect(audit).toMatchObject({
         actorId: childId,
         detail: capability,
@@ -2405,7 +2413,7 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
       expect(res.isError).toBe(true);
       expect(dataOf(res)).toBe(
-        `only a capability-admin holder may grant ${guessed}; a parent without it may only grant: secret:gemini-api-key, secret:mistral-api-key`
+        `${parentId} lacks capability-admin and holds no delegable grant covering ${guessed}`
       );
     }
     expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
