@@ -1453,3 +1453,114 @@ describe("bounded execution and material reads (#1020)", () => {
     expect(await reply({ kind: "output" }, { status: "missing" })).toEqual({ status: "missing" });
   });
 });
+
+describe("workspace sweep capability (#1338)", () => {
+  async function registerWith(h: Awaited<ReturnType<typeof setup>>, id: string, offer?: object) {
+    const response = await h.post("/register", {
+      id,
+      platform: "linux",
+      pid: 7,
+      generation: `${id}-process-one`,
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      ...(offer ? { workspaceSweep: offer } : {}),
+    });
+    expect(response.status).toBe(200);
+    const reply = (await response.json()) as Record<string, unknown> & {
+      session: string;
+      leaderToken: string;
+    };
+    return { reply, identity: { id, generation: `${id}-process-one`, ...reply } };
+  }
+
+  it("echoes the capability only to a follower that offers it, on registration and reconnect", async () => {
+    const h = await setup();
+    const offered = await registerWith(h, "new", { version: 1 });
+    expect(offered.reply.workspaceSweep).toEqual({ version: 1 });
+    const legacy = await registerWith(h, "old");
+    expect(legacy.reply).not.toHaveProperty("workspaceSweep");
+    const future = await registerWith(h, "future", { version: 2 });
+    expect(future.reply).not.toHaveProperty("workspaceSweep");
+    // Same-process reconnect that stops offering it loses it before onRegister runs.
+    let seenCapOnReconnect: boolean | undefined;
+    h.hub.onRegister((follower) => {
+      seenCapOnReconnect = follower.workspaceSweep;
+    });
+    const again = await registerWith(h, "new");
+    expect(again.reply).not.toHaveProperty("workspaceSweep");
+    expect(seenCapOnReconnect).toBe(false);
+  });
+
+  it("sends {id, retired} only to a negotiated follower and sends nothing when empty or un-negotiated", async () => {
+    const h = await setup();
+    const capable = await registerWith(h, "capable", { version: 1 });
+    const legacy = await registerWith(h, "legacy");
+
+    // Empty registry sends nothing.
+    expect(h.hub.sweepWorkspaces("capable", [])).toBe(false);
+    // Un-negotiated follower receives nothing.
+    expect(h.hub.sweepWorkspaces("legacy", [{ id: "a", retired: true }])).toBe(false);
+
+    const extraFields = [{ id: "a", retired: true, extra: "drop-me" }] as unknown as Array<{
+      id: string;
+      retired: boolean;
+    }>;
+    expect(h.hub.sweepWorkspaces("capable", extraFields)).toBe(true);
+
+    const capableCommands = (await (await h.post("/poll", capable.identity)).json()) as Array<{
+      type: string;
+      actors?: unknown;
+    }>;
+    expect(capableCommands).toEqual([
+      { type: "workspaceSweep", actors: [{ id: "a", retired: true }] },
+    ]);
+
+    // Legacy follower's poll completes with nothing queued (abort immediately rather than waiting 20s).
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 50);
+    await fetch(`${h.origin}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json" },
+      body: JSON.stringify(legacy.identity),
+      signal: controller.signal,
+    }).catch(() => {});
+    clearTimeout(timer);
+    expect(h.hub.list().find((f) => f.id === "legacy")).toBeTruthy();
+  });
+
+  it("tracks host existence and fires onActorExit once per accepted exit event", async () => {
+    const h = await setup();
+    const capable = await registerWith(h, "capable", { version: 1 });
+    h.hub.createHost("capable", "actor-1");
+    expect(h.hub.hasActorHost("capable", "actor-1")).toBe(true);
+    expect(h.hub.hasActorHost("capable", "missing")).toBe(false);
+
+    const exits: Array<{ followerId: string; actorId: string; hostAliveDuringCallback: boolean }> =
+      [];
+    h.hub.onActorExit((follower, actorId) => {
+      exits.push({
+        followerId: follower.id,
+        actorId,
+        hostAliveDuringCallback: h.hub.hasActorHost(follower.id, actorId),
+      });
+    });
+
+    const exitBatch = {
+      ...capable.identity,
+      batchId: "b-exit",
+      events: [
+        {
+          eventId: "ev-exit-1",
+          actorId: "actor-1",
+          message: { type: "exit", code: 0, signal: null },
+        },
+      ],
+    };
+    await h.post("/events", exitBatch);
+    // Replayed eventId does not re-fire onActorExit.
+    await h.post("/events", { ...exitBatch, batchId: "b-exit-retry" });
+
+    expect(exits).toEqual([
+      { followerId: "capable", actorId: "actor-1", hostAliveDuringCallback: false },
+    ]);
+  });
+});

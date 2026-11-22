@@ -8,6 +8,7 @@ import { closeDb, getRepositories, initDb } from "../db/index.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
+import { antigravityScratchDir } from "../providers/antigravity.js";
 import { setProviderModelCatalog } from "../providers/model-catalog.js";
 import { refreshProviderModelCatalog } from "../providers/model-scrape.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
@@ -34,6 +35,8 @@ import {
   type EventTransferCapability,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
+  WORKSPACE_SWEEP_CAPABILITY,
+  type WorkspaceSweepCapability,
 } from "../remote-instances/protocol.js";
 import { FollowerRunMaterial } from "../remote-instances/run-material.js";
 import type { ResourceScope } from "../runtime/resource-scope.js";
@@ -426,6 +429,8 @@ export async function composeFollowerStart(
         credentialDir: config.chat?.gchatConfigDir ?? defaultGchatConfigDir(),
       }),
       material: runMaterial.options,
+      scratchDir: antigravityScratchDir(),
+      log: (message) => log.warn("follower_workspace_sweep_failed", { message }),
     }
   );
   resources.acquire("followerInstance", async () => {
@@ -476,6 +481,7 @@ export async function composeFollowerStart(
         leaderToken?: string;
         eventTransfer?: EventTransferCapability;
         boundedExecution?: BoundedExecutionCapability;
+        workspaceSweep?: WorkspaceSweepCapability;
       }>("/register", {
         platform: process.platform,
         pid: process.pid,
@@ -484,6 +490,7 @@ export async function composeFollowerStart(
         // The leader's update reconciliation compares this with its target.
         ...(release.runningSha ? { commitSha: release.runningSha } : {}),
         boundedExecution: runMaterial.offer,
+        workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
@@ -653,6 +660,8 @@ export async function composeFollowerStart(
           for (const command of commands) {
             if ("actorId" in command) {
               instance.dispatch(command);
+            } else if (command.type === "workspaceSweep") {
+              instance.sweepWorkspaces(command.actors);
             } else if (command.type === "update") {
               void handleUpdate(command);
             }

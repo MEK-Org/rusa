@@ -683,7 +683,12 @@ export function createStartRetireCleanups(
   workersDir: string,
   osScheduler: Pick<ActorWakeScheduler, "cancel">,
   e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">,
-  scratch?: { dir: string; listActors: () => readonly ActorLiveness[] }
+  scratch?: { dir: string; listActors: () => readonly ActorLiveness[] },
+  followerSweep?: {
+    sweep: (followerId: string, actors: readonly ActorLiveness[]) => void;
+    listActors: () => readonly ActorLiveness[];
+    hasLiveHost: (followerId: string, actorId: string) => boolean;
+  }
 ): RetireCleanup[] {
   return [
     ...(e2eInstance
@@ -701,6 +706,8 @@ export function createStartRetireCleanups(
         // Re-check immediately before deleting the source tree. The first
         // retirement cleanup normally stopped the unit already; this guard
         // makes the ordering fail closed if that stop threw transiently.
+        // Kept idempotent even for follower-placed actors because createActor
+        // and onRevive still ensure `<leader workersDir>/<id>`.
         e2eInstance?.stopForActorRetirement(record.id);
         teardownFlutterOverlay(join(workersDir, record.id));
         rmSync(join(workersDir, record.id), { recursive: true, force: true });
@@ -717,6 +724,7 @@ export function createStartRetireCleanups(
             name: "provider scratch workdir",
             deferUntilRunEnd: true,
             run: (record: ActorRecord) => {
+              if (record.executionConfig?.executionTarget) return;
               // Every spelling this actor's workspace may carry that no live
               // actor also answers to: the provider has named this directory
               // differently over time, and two of the three name an actor only
@@ -726,6 +734,32 @@ export function createStartRetireCleanups(
               for (const name of removableWorkspaceNames(record.id, scratch.listActors())) {
                 rmSync(join(scratch.dir, name), { recursive: true, force: true });
               }
+            },
+          },
+        ]
+      : []),
+    ...(followerSweep
+      ? [
+          {
+            name: "follower workspaces",
+            run: (record: ActorRecord) => {
+              const target = record.executionConfig?.executionTarget;
+              if (!target) return;
+              // While the follower still holds a host channel for this actor,
+              // `ActorHandle.close()` has sent `stop` and `onActorExit` will
+              // sweep after `{ type: "exit" }` removes it from `this.actors`
+              // (#1338). Running synchronously here (not `deferUntilRunEnd`)
+              // skips without deferring, so `[abandoned, exit]` in the same
+              // batch never triggers a duplicate sweep after `exit` clears the host.
+              if (followerSweep.hasLiveHost(target, record.id)) return;
+              let list: readonly ActorLiveness[];
+              try {
+                list = followerSweep.listActors();
+              } catch {
+                return;
+              }
+              if (list.length === 0) return;
+              followerSweep.sweep(target, list);
             },
           },
         ]
@@ -3408,10 +3442,22 @@ async function composeStart(
       return notifyingParent ? deliverable : undefined;
     },
     log: emitMeshRoutingLog,
-    retireCleanups: createStartRetireCleanups(workersDir, osScheduler, e2eInstance, {
-      dir: antigravityScratchDir(),
-      listActors: actorLiveness,
-    }),
+    retireCleanups: createStartRetireCleanups(
+      workersDir,
+      osScheduler,
+      e2eInstance,
+      {
+        dir: antigravityScratchDir(),
+        listActors: actorLiveness,
+      },
+      followerHub
+        ? {
+            sweep: (followerId, list) => followerHub.sweepWorkspaces(followerId, list),
+            listActors: actorLiveness,
+            hasLiveHost: (followerId, actorId) => followerHub.hasActorHost(followerId, actorId),
+          }
+        : undefined
+    ),
     lifecycleListeners: [
       {
         onRetire: ({ actorId }) => {

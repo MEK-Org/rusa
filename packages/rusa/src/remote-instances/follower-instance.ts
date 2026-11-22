@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../actor/computer-use-lock.js";
+import { type ActorLiveness, sweepOrphanedWorkspaces } from "../actor/workspace-sweep.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
 import { createActorRuntime, type RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
@@ -29,6 +30,10 @@ export interface FollowerInstanceOptions {
   fileOps?: FollowerFileOps;
   /** Without it, runs are never bound here and every `materialRead` is refused (#1020). */
   material?: RunMaterialOptions;
+  /** Provider CLI scratch area on this host; omitted when scratch sweep is not configured. */
+  scratchDir?: string;
+  /** Diagnostic sink for workspace sweep removal errors. */
+  log?: (message: string) => void;
 }
 
 /** Execution half of an instance: many ordinary Actors, one Node process. */
@@ -42,6 +47,8 @@ export class FollowerInstance {
   private readonly computerUseLock = new ComputerUseLock();
   private readonly fileOps?: FollowerFileOps;
   private readonly material?: RunMaterialOptions;
+  private readonly scratchDir?: string;
+  private readonly log?: (message: string) => void;
 
   constructor(
     private readonly home: string,
@@ -56,6 +63,8 @@ export class FollowerInstance {
     this.providerOptions = options?.providerOptions;
     this.fileOps = options?.fileOps;
     this.material = options?.material;
+    this.scratchDir = options?.scratchDir;
+    this.log = options?.log;
   }
 
   get isReconciled(): boolean {
@@ -187,6 +196,54 @@ export class FollowerInstance {
       eventId: randomUUID(),
       actorId,
       message: { type: "materialReadResult", requestId, result },
+    });
+  }
+
+  /**
+   * Sweep retired actors' working and scratch directories on this follower (#1338).
+   * An actor with a live runtime in `this.actors` is never swept even when the
+   * incoming list marks it retired; the leader re-sends the sweep after the
+   * follower emits `{ type: "exit" }`.
+   */
+  sweepWorkspaces(actors: readonly ActorLiveness[]): string[] {
+    if (this.stopped) return [];
+    if (!this.reconciled) {
+      this.log?.(
+        "[follower] workspace sweep skipped: follower instance is not reconciled with leader"
+      );
+      return [];
+    }
+    if (!Array.isArray(actors) || actors.length === 0) return [];
+    const valid = actors.every(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.id === "string" &&
+        entry.id.length > 0 &&
+        typeof entry.retired === "boolean"
+    );
+    if (!valid) {
+      this.log?.("[follower] workspace sweep refused: malformed actor liveness entry");
+      return [];
+    }
+    return this.runWorkspaceSweep(actors);
+  }
+
+  private runWorkspaceSweep(actors: readonly ActorLiveness[]): string[] {
+    const liveIds = new Set(this.actors.keys());
+    const effective: ActorLiveness[] = actors.map((entry) =>
+      liveIds.has(entry.id) ? { id: entry.id, retired: false } : entry
+    );
+    for (const id of liveIds) {
+      if (!effective.some((entry) => entry.id === id)) {
+        effective.push({ id, retired: false });
+      }
+    }
+    return sweepOrphanedWorkspaces({
+      workersDir: join(this.home, "workers"),
+      scratchDir: this.scratchDir,
+      actors: effective,
+      log: this.log,
     });
   }
 

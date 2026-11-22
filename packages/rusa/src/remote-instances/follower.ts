@@ -7,6 +7,7 @@ import { parseArgs } from "node:util";
 import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { resolveRepoRoot } from "../commands/service-instance.js";
 import { createLogger } from "../observability/logger.js";
+import { antigravityScratchDir } from "../providers/antigravity.js";
 import { GitRunner } from "../update/runner.js";
 import {
   FollowerEventAcceptanceFailedError,
@@ -27,6 +28,8 @@ import {
   type EventTransferCapability,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
+  WORKSPACE_SWEEP_CAPABILITY,
+  type WorkspaceSweepCapability,
 } from "./protocol.js";
 import { FollowerRunMaterial } from "./run-material.js";
 
@@ -103,6 +106,8 @@ const instance = new FollowerInstance(
   {
     fileOps: createFollowerFileOps({ credentialDir: defaultGchatConfigDir() }),
     material: runMaterial.options,
+    scratchDir: antigravityScratchDir(),
+    log: (message) => log.warn("follower_workspace_sweep_failed", { message }),
   }
 );
 // A registration can renew after an HTTP fault. It identifies this running
@@ -239,6 +244,7 @@ async function run(): Promise<void> {
           leaderToken?: string;
           eventTransfer?: EventTransferCapability;
           boundedExecution?: BoundedExecutionCapability;
+          workspaceSweep?: WorkspaceSweepCapability;
         }>("/register", {
           platform: process.platform,
           pid: process.pid,
@@ -246,6 +252,7 @@ async function run(): Promise<void> {
           protocolVersion: INSTANCE_PROTOCOL_VERSION,
           commitSha: tryGetCommitSha(repoRoot),
           boundedExecution: runMaterial.offer,
+          workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
         });
         if (registration.protocolVersion !== INSTANCE_PROTOCOL_VERSION)
           throw new Error("Incompatible instance protocol; rebuild leader and follower");
@@ -295,6 +302,8 @@ async function run(): Promise<void> {
       for (const command of commands) {
         if ("actorId" in command) {
           instance.dispatch(command);
+        } else if (command.type === "workspaceSweep") {
+          instance.sweepWorkspaces(command.actors);
         } else if (command.type === "update") {
           void handleUpdate(command);
         }

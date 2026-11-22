@@ -5,6 +5,7 @@ import {
   request as proxyRequest,
   type ServerResponse,
 } from "node:http";
+import type { ActorLiveness } from "../actor/workspace-sweep.js";
 import { MCP_HEADERS_TIMEOUT_MS, MCP_KEEP_ALIVE_TIMEOUT_MS } from "../mcp/http-server.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { McpServerSpec } from "../providers/types.js";
@@ -24,6 +25,7 @@ import type {
   FollowerUpdateCommand,
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
+  FollowerWorkspaceSweepCommand,
   LeaderCommand,
 } from "./protocol.js";
 import {
@@ -31,6 +33,7 @@ import {
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
   INSTANCE_PROTOCOL_VERSION,
   OLDEST_FOLLOWER_PROTOCOL_VERSION,
+  WORKSPACE_SWEEP_CAPABILITY,
 } from "./protocol.js";
 import {
   FollowerDedupeTracker,
@@ -44,6 +47,12 @@ import { isSafeFollowerBind } from "./safe-bind.js";
 /** Whether a `/register` body offers the bounded execution this leader speaks (#1020). */
 function offersBoundedExecution(body: Record<string, unknown>): boolean {
   const offer = body.boundedExecution as { version?: unknown } | null | undefined;
+  return typeof offer === "object" && offer !== null && offer.version === 1;
+}
+
+/** Whether a `/register` body offers the workspace sweep this leader speaks (#1338). */
+function offersWorkspaceSweep(body: Record<string, unknown>): boolean {
+  const offer = body.workspaceSweep as { version?: unknown } | null | undefined;
   return typeof offer === "object" && offer !== null && offer.version === 1;
 }
 
@@ -65,7 +74,10 @@ export interface FollowerActorCommand {
   message: LeaderCommand;
 }
 
-export type FollowerCommand = FollowerActorCommand | FollowerUpdateCommand;
+export type FollowerCommand =
+  | FollowerActorCommand
+  | FollowerUpdateCommand
+  | FollowerWorkspaceSweepCommand;
 
 export interface FollowerEvent {
   eventId: string;
@@ -171,6 +183,7 @@ export class FollowerHub {
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
   private onRegisterListeners: ((follower: RemoteInstance) => void)[] = [];
+  private onActorExitListeners: ((follower: RemoteInstance, actorId: string) => void)[] = [];
   private onUpdateStatusListeners: ((followerId: string, status: FollowerUpdateStatus) => void)[] =
     [];
   private onPlacementReleasedListeners: ((followerId: string) => void)[] = [];
@@ -235,6 +248,14 @@ export class FollowerHub {
     return () => {
       const idx = this.onRegisterListeners.indexOf(callback);
       if (idx >= 0) this.onRegisterListeners.splice(idx, 1);
+    };
+  }
+
+  onActorExit(callback: (follower: RemoteInstance, actorId: string) => void): () => void {
+    this.onActorExitListeners.push(callback);
+    return () => {
+      const idx = this.onActorExitListeners.indexOf(callback);
+      if (idx >= 0) this.onActorExitListeners.splice(idx, 1);
     };
   }
 
@@ -456,6 +477,18 @@ export class FollowerHub {
     for (const [key, route] of this.routes) {
       if (route.actorId === actorId) this.routes.delete(key);
     }
+  }
+
+  /** Whether the connected follower still has an active host channel for this actor. */
+  hasActorHost(followerId: string, actorId: string): boolean {
+    return this.followers.get(followerId)?.hosts.has(actorId) ?? false;
+  }
+
+  /** Ask a capable connected follower to sweep retired actors' workspaces (#1338). */
+  sweepWorkspaces(followerId: string, actors: readonly ActorLiveness[]): boolean {
+    const follower = this.followers.get(followerId);
+    if (!follower) return false;
+    return follower.sweepWorkspaces(actors);
   }
   /**
    * The actor's whole capability set, as a set of bearer URLs.
@@ -687,6 +720,10 @@ export class FollowerHub {
             followerId: existing.id,
             generation: existing.generation,
           });
+          // The same process offers the same capabilities; update them before
+          // registration listeners run so listeners see the current offer.
+          existing.boundedExecution = offersBoundedExecution(body);
+          existing.workspaceSweep = offersWorkspaceSweep(body);
           for (const listener of this.onRegisterListeners) {
             try {
               listener(existing);
@@ -694,8 +731,6 @@ export class FollowerHub {
               this.log.warn("follower_register_listener_error", { followerId: existing.id, err });
             }
           }
-          // The same process offers the same capabilities; answer them again.
-          existing.boundedExecution = offersBoundedExecution(body);
           reply(res, 200, {
             session: existing.session,
             protocolVersion: existing.protocolVersion,
@@ -704,6 +739,7 @@ export class FollowerHub {
             ...(existing.boundedExecution
               ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY }
               : {}),
+            ...(existing.workspaceSweep ? { workspaceSweep: WORKSPACE_SWEEP_CAPABILITY } : {}),
           });
           return;
         }
@@ -728,6 +764,7 @@ export class FollowerHub {
         FollowerHub.STALE_AFTER_MS
       );
       follower.boundedExecution = offersBoundedExecution(body);
+      follower.workspaceSweep = offersWorkspaceSweep(body);
       this.followers.set(follower.id, follower);
       this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
@@ -750,6 +787,7 @@ export class FollowerHub {
         leaderToken: this.leaderToken,
         eventTransfer: this.eventTransfers.capability,
         ...(follower.boundedExecution ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY } : {}),
+        ...(follower.workspaceSweep ? { workspaceSweep: WORKSPACE_SWEEP_CAPABILITY } : {}),
       });
       return;
     }
@@ -869,6 +907,7 @@ export class FollowerHub {
     // have performed a side effect before a later listener throws.
     follower.recordEvent(event.eventId, "failed");
     const statusEvent = event.actorId === "$instance" && event.message?.type === "update_status";
+    const actorExitEvent = event.actorId !== "$instance" && event.message?.type === "exit";
     const heldBefore = statusEvent && this.isPlacementHeld(follower.id);
     try {
       follower.receive(event);
@@ -881,6 +920,19 @@ export class FollowerHub {
       return false;
     }
     follower.recordEvent(event.eventId, "accepted");
+    if (actorExitEvent) {
+      for (const listener of this.onActorExitListeners) {
+        try {
+          listener(follower, event.actorId);
+        } catch (err) {
+          this.log.warn("follower_actor_exit_listener_error", {
+            followerId: follower.id,
+            actorId: event.actorId,
+            err,
+          });
+        }
+      }
+    }
     if (statusEvent) {
       const status = follower.updateStatus;
       if (status) {
