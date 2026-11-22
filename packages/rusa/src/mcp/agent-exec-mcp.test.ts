@@ -25,10 +25,7 @@ import {
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { AvailabilityHolds } from "../actor/availability-holds.js";
-import {
-  InMemoryCapabilityGrantStore,
-  PARENT_GRANTABLE_CAPABILITIES,
-} from "../actor/capability-grants.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import {
   type EventSourceOwnerStore,
   InMemoryEventSourceOwnerStore,
@@ -5389,10 +5386,6 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
   });
 
   it("is not a grantable capability, so no grant can hand it to a worker", async () => {
-    expect(PARENT_GRANTABLE_CAPABILITIES.has("enroll_actor_experiment")).toBe(false);
-    expect(PARENT_GRANTABLE_CAPABILITIES.has("unenroll_actor_experiment")).toBe(false);
-    expect(PARENT_GRANTABLE_CAPABILITIES.has("list_actor_experiments")).toBe(false);
-
     const { mesh } = setup();
     const worker = mesh.spawn({
       charter: "worker",

@@ -81,9 +81,10 @@ import {
 import {
   type CapabilityGrantStore,
   type CapabilityPolicy,
+  type DelegationReach,
+  effectiveActiveGrants,
   type GrantMutationEffect,
   InMemoryCapabilityGrantStore,
-  PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
 import type { RunStartHandle } from "./concurrency-limiter.js";
 import { assertSpawnContextSupported, resolveContextSelection } from "./context-selection.js";
@@ -3509,9 +3510,11 @@ export class ActorMesh {
    * something to an unauthorized caller.
    */
   private grantAuthorityReader(): GrantAuthorityReader {
+    const policy = this.capabilityPolicy();
     return {
       actor: (id) => this.actors.get(id),
       capabilities: (id) => this.grants.activeFor(id),
+      activeGrants: (id) => effectiveActiveGrants(this.grants.list(), id, policy),
     };
   }
 
@@ -3533,7 +3536,12 @@ export class ActorMesh {
    * on a live actor's next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
-  async grantCapability(actorId: string, capability: string, grantedBy: string): Promise<void> {
+  async grantCapability(
+    actorId: string,
+    capability: string,
+    grantedBy: string,
+    delegable?: DelegationReach
+  ): Promise<void> {
     actorId = this.resolveThreadId(actorId);
     grantedBy = this.resolveThreadId(grantedBy);
     if (!actorId.trim()) throw new Error("actorId is required");
@@ -3630,13 +3638,20 @@ export class ActorMesh {
       granteeId: actorId,
       capability,
       verb: "grant",
+      ...(delegable ? { delegable } : {}),
     });
     if (baseCapability === "secret") {
       const secretFilename = capability.slice("secret:".length);
       assertSecretContainment(secretFilename, this.secretsDir);
     }
     await this.requireWriter().write("grants.grant", {
-      grant: { actorId, capability, grantedBy, grantedAt: this.now() },
+      grant: {
+        actorId,
+        capability,
+        grantedBy,
+        grantedAt: this.now(),
+        ...(delegable ? { delegable } : {}),
+      },
       policy: this.capabilityPolicy(),
     });
   }

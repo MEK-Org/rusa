@@ -1057,17 +1057,23 @@ export function createAgentExecMcpServer(
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches only on obligations it may already manage); without 'capability-admin' you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' needs a 'capability-admin' holder) and only to your DIRECT children. Exception: a holder of whole-space 'chat-write:spaces/S', or of 'chat-write:*', may grant one thread of that space, 'chat-write:spaces/S/threads/T', to any actor, with no 'capability-admin' or ancestry; its grantee may reply only within that thread (no top-level posts, sibling threads, or reactions outside it) and cannot re-grant it. Revoking that grant still needs the ordinary authority above. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths (e.g. $RUSA_HOME/secrets/mistral-api-key); secret grants do not export environment variables (for tools expecting an env var, pass it per-command: MISTRAL_API_KEY=\"$(cat \"$RUSA_HOME/secrets/mistral-api-key\")\" ...). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' is instead checked on every obligation tool call, so it takes effect immediately, even in an open session. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree and set any delegation reach ('descendants' or 'anyone'). Without 'capability-admin' (or outside an admin's subtree), you may delegate a capability you hold if your grant carries a 'delegable' flag ('descendants' = your subtree, 'anyone' = any existing actor), including Chat space-to-thread narrowing; you may pass 'delegable' to the recipient no wider than your own reach (default: not delegable), and you cannot overwrite an active grant made by someone else. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths (e.g. $RUSA_HOME/secrets/mistral-api-key); secret grants do not export environment variables. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' takes effect immediately. Rejected if the capability isn't grantable, fails containment checks, or you lack authority.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
           .string()
           .describe("The grantable capability name, e.g. 'secret:mistral-api-key'."),
+        delegable: z
+          .enum(["descendants", "anyone"])
+          .optional()
+          .describe(
+            "Optional delegation reach for the recipient ('descendants' for its subtree, or 'anyone'). Omit for a non-delegable grant."
+          ),
       },
     },
-    async ({ actor_id, capability }) => {
+    async ({ actor_id, capability, delegable }) => {
       try {
-        await mesh.grantCapability(actor_id, capability, selfId);
+        await mesh.grantCapability(actor_id, capability, selfId, delegable);
         return toolOk(`granted ${capability} to ${actor_id}`);
       } catch (err) {
         return toolError(err);
@@ -1080,7 +1086,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin' you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. A thread grant ('chat-write:spaces/S/threads/T') follows these same rules: holding its space does not authorize revoking it. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' is instead checked on every obligation tool call, so its revocation takes effect immediately, even in an open session.",
+        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin', you may revoke an active grant that you granted. Revoking does not cascade to grants the recipient made. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' takes effect immediately.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),

@@ -22,33 +22,16 @@ export const SECRET_CAPABILITY_PREFIX = "secret:";
 export const SECRET_CAPABILITY_BASE = "secret";
 
 /**
- * Secret filenames a NON-root parent may delegate to its DIRECT children — the
- * LLM API keys that were parent-grantable before #542 generalized the secret
- * capability. The list is deliberately explicit: a generic `secret:<filename>`
- * outside it (webhook secrets, service passwords, anything an operator drops
- * into the directory later) stays root-only, so a compromised worker cannot
- * exfiltrate an infrastructure secret by guessing its filename and granting it
- * to a sub-worker. Extending parent delegation to another file is a deliberate
- * edit here, never a side effect of creating the file.
+ * How far a grantee may delegate a capability it holds (#1346):
+ * - `"descendants"`: to any actor in its own subtree
+ * - `"anyone"`: to any existing actor
+ * Absent (`undefined`) means the grant is not delegable.
  */
-export const PARENT_GRANTABLE_SECRET_FILENAMES: readonly string[] = [
-  "gemini-api-key",
-  "mistral-api-key",
-];
+export type DelegationReach = "descendants" | "anyone";
 
-/**
- * Capabilities a NON-root parent may grant to / revoke from its DIRECT children:
- * exactly the `secret:<filename>` capabilities for
- * {@link PARENT_GRANTABLE_SECRET_FILENAMES}. Everything else — every other
- * secret file and every MCP-server capability — needs a `capability-admin`
- * holder (#549). Matched by the FULL capability name (never by the `secret`
- * prefix), and enforced in the mesh
- * (`ActorMesh.grantCapability`/`revokeCapability`), not just the tool layer, so
- * the invariant holds for any caller.
- */
-export const PARENT_GRANTABLE_CAPABILITIES: ReadonlySet<string> = new Set(
-  PARENT_GRANTABLE_SECRET_FILENAMES.map((filename) => `${SECRET_CAPABILITY_PREFIX}${filename}`)
-);
+export function isDelegationReach(value: unknown): value is DelegationReach {
+  return value === "descendants" || value === "anyone";
+}
 
 /**
  * A grant of an extra MCP capability to a specific actor, beyond the default
@@ -75,6 +58,16 @@ export interface CapabilityGrant {
   grantedAt: string;
   /** ISO timestamp of revocation; absent while the grant is active. */
   revokedAt?: string;
+  /** Whether the grantee may delegate this capability onward, and how far (#1346). */
+  delegable?: DelegationReach;
+}
+
+/** Active grant view used by authority checks (durable row or policy-derived entry). */
+export interface ActiveGrantRecord {
+  readonly capability: string;
+  /** Durable grantor id, or `null` for policy-derived entries that have no grant row. */
+  readonly grantedBy: string | null;
+  readonly delegable?: DelegationReach;
 }
 
 /** The kind of a committed grant or revocation's writer effect (#1289 D1). */
@@ -166,8 +159,40 @@ export interface CapabilityPolicy {
   /** The actor holding `capabilities` without a grant row, once one is selected. */
   readonly recipientId: string | undefined;
   readonly capabilities: readonly string[];
+  /** Policy-derived capabilities the recipient may delegate to anyone (#1346 ruling 1). */
+  readonly delegableCapabilities?: readonly string[];
   /** Rows granted by this grantor are kept for audit but confer nothing. */
   readonly ignoredGrantor: string;
+}
+
+/**
+ * The active grant records `actorId` holds: its active durable rows (minus
+ * those the policy ignores), plus policy-derived delegable capabilities (with
+ * `grantedBy: null` and `delegable: "anyone"`) when it is the recipient.
+ */
+export function effectiveActiveGrants(
+  grants: readonly CapabilityGrant[],
+  actorId: string,
+  policy: CapabilityPolicy | null
+): ActiveGrantRecord[] {
+  const rows: ActiveGrantRecord[] = grants
+    .filter(
+      (grant) =>
+        grant.actorId === actorId &&
+        !grant.revokedAt &&
+        (policy === null || grant.grantedBy !== policy.ignoredGrantor)
+    )
+    .map((grant) => ({
+      capability: grant.capability,
+      grantedBy: grant.grantedBy,
+      ...(grant.delegable ? { delegable: grant.delegable } : {}),
+    }));
+  if (policy !== null && actorId === policy.recipientId && policy.delegableCapabilities) {
+    for (const capability of policy.delegableCapabilities) {
+      rows.push({ capability, grantedBy: null, delegable: "anyone" });
+    }
+  }
+  return rows;
 }
 
 /**

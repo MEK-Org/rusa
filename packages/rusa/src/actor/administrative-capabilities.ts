@@ -165,18 +165,27 @@ export function withDefaultActorCapabilities(
   };
 }
 
+/** Policy-derived communication capabilities that the default actor may delegate to anyone (#1346 ruling 1). */
+export function isPolicyCommunicationCapability(capability: string): boolean {
+  return capability.startsWith("chat-write:") || capability.startsWith("slack-write:");
+}
+
 /**
  * The default actor's role-derived authority as one policy: `recipient` holds
  * `capabilities` without a grant row, and legacy bootstrap rows confer
- * nothing. The mesh's grant view and its grant writes both apply it (#1289).
+ * nothing. Its communication capabilities are delegable to anyone (#1346 ruling
+ * 1); administrative capabilities stay subtree-bound. The mesh's grant view and
+ * its grant writes both apply it (#1289).
  */
 export function defaultActorCapabilityPolicy(
   recipient: () => string | undefined,
   capabilities: readonly string[]
 ): () => CapabilityPolicy {
+  const delegableCapabilities = capabilities.filter(isPolicyCommunicationCapability);
   return () => ({
     recipientId: recipient(),
     capabilities,
+    delegableCapabilities,
     ignoredGrantor: CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
   });
 }

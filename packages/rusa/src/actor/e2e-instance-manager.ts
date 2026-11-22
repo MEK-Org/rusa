@@ -31,7 +31,6 @@ import {
   setupFlutterOverlay,
   teardownFlutterOverlay,
 } from "../providers/sandbox.js";
-import { PARENT_GRANTABLE_SECRET_FILENAMES } from "./capability-grants.js";
 
 export const E2E_INSTANCE_UNIT_NAME = "rusa-e2e-instance";
 const E2E_INSTANCE_PORT = 8083 as const;
@@ -560,7 +559,7 @@ export class E2EInstanceManager {
       // symlink) is refused rather than bound.
       const secretsSourceDir = join(this.opts.mcHome, SECRETS_DIRNAME);
       const secretsTargetDir = join(baseConfigHome, SECRETS_DIRNAME);
-      for (const filename of PARENT_GRANTABLE_SECRET_FILENAMES) {
+      for (const filename of ["gemini-api-key", "mistral-api-key"]) {
         let realSecretSource: string;
         try {
           realSecretSource = assertSecretContainment(filename, secretsSourceDir);

@@ -60,6 +60,7 @@ import { metricSamples } from "./0064_metric_samples.js";
 import { recentActivityHistoryIndexes } from "./0066_recent_activity_history_indexes.js";
 import { pushDeviceTokens } from "./0067_push_device_tokens.js";
 import { actorInboxDeliveredIndex } from "./0068_actor_inbox_delivered_index.js";
+import { capabilityGrantDelegation } from "./0069_capability_grant_delegation.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -132,4 +133,5 @@ export const migrations: Migration[] = [
   recentActivityHistoryIndexes,
   pushDeviceTokens,
   actorInboxDeliveredIndex,
+  capabilityGrantDelegation,
 ];

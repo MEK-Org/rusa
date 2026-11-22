@@ -115,7 +115,13 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
       ["stranger", "chat-write:spaces/BBB"],
       ["wildcard", "chat-write:*"],
     ] as const) {
-      repos.capabilityGrants.grant({ actorId, capability, grantedBy: "test", grantedAt: AT });
+      repos.capabilityGrants.grant({
+        actorId,
+        capability,
+        grantedBy: "test",
+        grantedAt: AT,
+        delegable: "anyone",
+      });
     }
     seed.close();
     host = boot(path);
@@ -159,28 +165,37 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
         capability: "chat-write:AAA",
         grantedBy: "test",
         grantedAt: AT,
+        delegable: "anyone",
       });
       await host.mesh.grantCapability("worker", T1_WRITE, "watcher");
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
     });
 
-    it("lets a chat-write:* holder grant a thread like a space holder", async () => {
+    it("refuses a thread grant when the space holder has no delegable flag (#1346)", async () => {
+      host.repos.capabilityGrants.grant({
+        actorId: "watcher",
+        capability: SPACE_WRITE,
+        grantedBy: "test",
+        grantedAt: AT,
+      });
+      await expect(host.mesh.grantCapability("worker", T1_WRITE, "watcher")).rejects.toThrow(
+        /no delegable grant/
+      );
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
+    });
+
+    it("lets a delegable chat-write:* holder grant a thread or space, and revoke what it granted (#1346)", async () => {
       await host.mesh.grantCapability("worker", T1_WRITE, "wildcard");
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
       expect(host.mesh.hasActiveCapability("worker", SPACE_WRITE)).toBe(false);
-      // Wildcard is never a whole space to hand on, and the grantee cannot re-grant.
-      await expect(host.mesh.grantCapability("worker", SPACE_WRITE, "wildcard")).rejects.toThrow(
-        /capability-admin/
-      );
+      // The grantee did not receive a delegable flag, so it cannot re-grant.
       await expect(host.mesh.grantCapability("watcher", T1_WRITE, "worker")).rejects.toThrow(
-        /capability-admin/
+        /no delegable grant/
       );
 
-      // Nor does wildcard possession authorize revoking it.
-      await expect(host.mesh.revokeCapability("worker", T1_WRITE, "wildcard")).rejects.toThrow(
-        /capability-admin/
-      );
-      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
+      // The delegator can take back what it gave.
+      await host.mesh.revokeCapability("worker", T1_WRITE, "wildcard");
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
     });
 
     it("refuses a thread grant from anyone not holding that space", async () => {
@@ -195,13 +210,10 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
       expect(host.mesh.hasActiveCapability("watcher", T1_WRITE)).toBe(false);
     });
 
-    it("refuses a space writer widening a grantee to the whole space", async () => {
-      await expect(host.mesh.grantCapability("worker", SPACE_WRITE, "steward")).rejects.toThrow(
-        /capability-admin/
-      );
+    it("refuses a space writer delegating a different space", async () => {
       await expect(
         host.mesh.grantCapability("worker", "chat-write:spaces/BBB/threads/T1", "steward")
-      ).rejects.toThrow(/capability-admin/);
+      ).rejects.toThrow(/no delegable grant/);
     });
 
     it("refuses a malformed thread scope before deciding authority", async () => {
@@ -233,19 +245,23 @@ describe("thread-scoped Chat write grants and thread delegation (#1311)", () => 
       expect(host.repos.capabilityGrants.activeFor("worker")).not.toContain(T1_WRITE);
     });
 
-    it("keeps the ordinary revoke authority: space possession does not revoke", async () => {
+    it("lets the delegator revoke what it granted, refuses others, and allows capability-admin (#1346)", async () => {
       await host.mesh.grantCapability("worker", T1_WRITE, "steward");
 
-      // Not even the grantor's own grant: #1311 commissions granting only.
-      for (const revoker of ["steward", "stranger", "worker"]) {
+      for (const revoker of ["stranger", "worker"]) {
         await expect(
           host.mesh.revokeCapability("worker", T1_WRITE, revoker),
           `${revoker} must not revoke ${T1_WRITE}`
-        ).rejects.toThrow(/capability-admin/);
+        ).rejects.toThrow(/granted by steward/);
       }
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(true);
 
+      // The delegator may revoke what it granted.
+      await host.mesh.revokeCapability("worker", T1_WRITE, "steward");
+      expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
+
       // A capability-admin over the grantee revokes it as any other grant.
+      await host.mesh.grantCapability("worker", T1_WRITE, "steward");
       grantAdmin("root");
       await host.mesh.revokeCapability("worker", T1_WRITE, "root");
       expect(host.mesh.hasActiveCapability("worker", T1_WRITE)).toBe(false);
