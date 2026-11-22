@@ -1425,6 +1425,49 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     await vi.advanceTimersByTimeAsync(0);
     await expect(handle.result).resolves.toBe("codex");
   });
+
+  it("treats sub-millisecond governing intervals as tied with exact zero (#1348)", () => {
+    const now = Date.now();
+    const decaying = {
+      config: "first-declared",
+      lane: "first-declared",
+      pacer: new ProviderPacer(4.65e-227, clock),
+    };
+    const exactZero = {
+      config: "second-declared",
+      lane: "second-declared",
+      pacer: new ProviderPacer(0, clock),
+    };
+    expect(decaying.pacer.quote(now)).toBe(now);
+    expect(exactZero.pacer.quote(now)).toBe(now);
+
+    // Without usable weekly evidence, declared order breaks the tie.
+    expect(selectPoolLane([decaying, exactZero], now)?.config).toBe("first-declared");
+    expect(selectPoolLane([decaying, exactZero], now, { responsive: true })?.config).toBe(
+      "first-declared"
+    );
+
+    // With trustworthy weekly evidence, the lane with more headroom wins regardless of order.
+    const decayingMoreHeadroom = { ...decaying, weeklyQuota: weekly(80) };
+    const exactZeroLessHeadroom = { ...exactZero, weeklyQuota: weekly(30) };
+    expect(selectPoolLane([decayingMoreHeadroom, exactZeroLessHeadroom], now)?.config).toBe(
+      "first-declared"
+    );
+    expect(
+      selectPoolLane([decayingMoreHeadroom, exactZeroLessHeadroom], now, { responsive: true })
+        ?.config
+    ).toBe("first-declared");
+
+    const decayingLessHeadroom = { ...decaying, weeklyQuota: weekly(30) };
+    const exactZeroMoreHeadroom = { ...exactZero, weeklyQuota: weekly(80) };
+    expect(selectPoolLane([decayingLessHeadroom, exactZeroMoreHeadroom], now)?.config).toBe(
+      "second-declared"
+    );
+    expect(
+      selectPoolLane([decayingLessHeadroom, exactZeroMoreHeadroom], now, { responsive: true })
+        ?.config
+    ).toBe("second-declared");
+  });
 });
 
 describe("responsive starts do not charge or reset ordinary pacing clock (#962)", () => {

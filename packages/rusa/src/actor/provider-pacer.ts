@@ -513,12 +513,19 @@ function selectByQuote<C>(
   return headroomWinner ?? shortest[0];
 }
 
-/** The candidates, in declared order, whose governing pacer interval is the shortest. */
+/**
+ * The candidates, in declared order, whose governing pacer interval is shortest
+ * at whole-millisecond pacing resolution.
+ */
 function withShortestGoverningInterval<C>(
   candidates: readonly PoolLaneCandidate<C>[]
 ): PoolLaneCandidate<C>[] {
-  const shortest = Math.min(...candidates.map((candidate) => candidate.pacer.governingInterval));
-  return candidates.filter((candidate) => candidate.pacer.governingInterval === shortest);
+  const shortest = Math.min(
+    ...candidates.map((candidate) => Math.round(candidate.pacer.governingInterval))
+  );
+  return candidates.filter(
+    (candidate) => Math.round(candidate.pacer.governingInterval) === shortest
+  );
 }
 
 export interface PoolGateSelection<C> {
