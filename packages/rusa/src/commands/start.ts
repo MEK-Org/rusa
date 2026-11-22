@@ -2130,9 +2130,10 @@ async function composeStart(
     return pacer;
   };
   // Admission projects the existing cached coordinator bucket representation.
-  // It starts no quota read: missing, stale, invalid, and tied evidence leaves
-  // selection in declared order, while a still-fresh trusted observation stays
-  // usable through a transient cold, unavailable, or incompatible response.
+  // It starts no quota read: weekly headroom is consulted only when every
+  // lane in an equally-throttled tie holds a trustworthy reading, while a
+  // still-fresh trusted observation stays usable through a transient cold,
+  // unavailable, or incompatible response.
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const controllerUnthrottledFor = (providerName: string, model: string | undefined) =>

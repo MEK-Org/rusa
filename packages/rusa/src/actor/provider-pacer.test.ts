@@ -580,26 +580,25 @@ describe("ProviderPacer", () => {
       expect(winner?.config).toBe("a");
     });
 
-    it("does not let unknown weekly quota evidence outrank a known immediate candidate among equally throttled lanes", () => {
+    it("keeps declared order in an equally throttled tie when not every lane has trustworthy weekly evidence (#1351)", () => {
       const now = Date.now();
       const a = laneFor("a", 60_000);
       const b = laneFor("b", 60_000);
-      const winner = selectPoolLane(
-        [
-          { ...a },
-          {
-            ...b,
-            weeklyQuota: {
-              percentLeft: 30,
-              observedAt: new Date(now).toISOString(),
-              resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
-            },
+      const candidates = [
+        { ...a },
+        {
+          ...b,
+          weeklyQuota: {
+            percentLeft: 30,
+            observedAt: new Date(now).toISOString(),
+            resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
           },
-        ],
-        now
-      );
-
-      expect(winner?.config).toBe("b");
+        },
+      ];
+      // One fresh reading never outranks declared order over lanes with stale
+      // or missing evidence, on either path.
+      expect(selectPoolLane(candidates, now)?.config).toBe("a");
+      expect(selectPoolLane(candidates, now, { responsive: true })?.config).toBe("a");
     });
 
     it("falls back to declared order when trustworthy weekly headroom is tied", () => {
@@ -1583,6 +1582,58 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     expect(selectPoolLane([first, secondTied], now)?.config).toBe("first-throttled");
     expect(selectPoolLane([first, secondTied], now, { responsive: true })?.config).toBe(
       "first-throttled"
+    );
+  });
+
+  it("keeps declared order in an equally throttled tie when the first-declared lane's weekly evidence is stale (#1351)", () => {
+    const now = Date.now();
+    const stale = (percentLeft: number) => ({
+      percentLeft,
+      observedAt: new Date(now - 31 * 60 * 1000).toISOString(),
+      resetAtIso: new Date(now + 4 * 24 * 60 * MINUTE).toISOString(),
+    });
+    const first = {
+      config: "first-declared-stale",
+      lane: "first",
+      pacer: new ProviderPacer(60_000, clock),
+      weeklyQuota: stale(10),
+    };
+    const second = {
+      config: "second-declared-fresh",
+      lane: "second",
+      pacer: new ProviderPacer(60_000, clock),
+      weeklyQuota: weekly(90),
+    };
+
+    expect(selectPoolLane([first, second], now)?.config).toBe("first-declared-stale");
+    expect(selectPoolLane([first, second], now, { responsive: true })?.config).toBe(
+      "first-declared-stale"
+    );
+  });
+
+  it("prefers first-declared among unthrottled lanes even when its weekly evidence is stale (#1351)", () => {
+    const now = Date.now();
+    const stale = {
+      percentLeft: 10,
+      observedAt: new Date(now - 31 * 60 * 1000).toISOString(),
+      resetAtIso: new Date(now + 4 * 24 * 60 * MINUTE).toISOString(),
+    };
+    const first = {
+      config: "first-declared-stale",
+      lane: "first",
+      pacer: new ProviderPacer(0, clock),
+      weeklyQuota: stale,
+    };
+    const second = {
+      config: "second-declared-fresh",
+      lane: "second",
+      pacer: new ProviderPacer(0, clock),
+      weeklyQuota: weekly(90),
+    };
+
+    expect(selectPoolLane([first, second], now)?.config).toBe("first-declared-stale");
+    expect(selectPoolLane([first, second], now, { responsive: true })?.config).toBe(
+      "first-declared-stale"
     );
   });
 });

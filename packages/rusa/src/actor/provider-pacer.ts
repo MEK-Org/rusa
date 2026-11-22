@@ -455,9 +455,11 @@ function weeklyQuotaHeadroom(
  *    a model lane's own interval or its provider's, whichever is stricter)
  *    wins (#895).
  * 3. Trustworthy weekly quota headroom only breaks ties between **equally
- *    throttled** lanes; it never outranks declared order among unthrottled
- *    lanes. Unknown, stale, invalid, or tied headroom falls back to declared
- *    order.
+ *    throttled** lanes, and only when **every** lane in the tie has a
+ *    trustworthy reading; a single fresh reading never outranks declared
+ *    order over lanes with stale or missing evidence. It never outranks
+ *    declared order among unthrottled lanes. Tied headroom falls back to
+ *    declared order.
  *
  * For normal requests, {@link ProviderPacer.quote} still gates availability:
  * when only one lane is available now (or all lanes must wait), the earliest
@@ -484,25 +486,18 @@ export function selectPoolLane<C>(
     if (unthrottled.length > 0) return unthrottled[0];
 
     // All candidates are throttled: shortest governing throttle wins (#895),
-    // and weekly headroom breaks ties between equally throttled lanes.
+    // and weekly headroom breaks the tie only when every tied lane has a
+    // trustworthy reading; otherwise declared order stands.
     const shortest = withShortestGoverningInterval(candidates);
-    const comparable = shortest.flatMap((candidate) => {
-      const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
-      return headroom === undefined ? [] : [{ candidate, headroom }];
-    });
-    if (comparable.length >= 2) {
-      return comparable.reduce((best, candidate) =>
-        candidate.headroom > best.headroom ? candidate : best
-      ).candidate;
-    }
-    return selectByQuote(shortest, now);
+    return headroomTieWinner(shortest, now) ?? selectByQuote(shortest, now);
   }
   return selectByQuote(candidates, now);
 }
 
 /**
  * Earliest quote first; among lanes available now, unthrottled lanes win in
- * declared order, otherwise shortest governing throttle then weekly headroom.
+ * declared order, otherwise the shortest governing throttle ranks the tie and
+ * weekly headroom decides only when every tied lane has a trustworthy reading.
  */
 function selectByQuote<C>(
   candidates: readonly PoolLaneCandidate<C>[],
@@ -525,17 +520,31 @@ function selectByQuote<C>(
   if (unthrottled.length > 0) return unthrottled[0];
 
   const shortest = withShortestGoverningInterval(immediatelyAvailable);
+  return headroomTieWinner(shortest, now) ?? shortest[0];
+}
+
+/**
+ * The headroom winner across an equally-throttled tie, or `undefined` when
+ * headroom must not be consulted at all (#1351): weekly headroom decides a
+ * tie only when **every** lane in the tie has a trustworthy reading, so one
+ * lane's fresh observation never outranks declared order over lanes whose
+ * evidence is stale or missing. Tied headroom keeps the first declared.
+ */
+function headroomTieWinner<C>(
+  tie: readonly PoolLaneCandidate<C>[],
+  now: number
+): PoolLaneCandidate<C> | undefined {
+  let winner: PoolLaneCandidate<C> | undefined;
   let bestHeadroom: number | undefined;
-  let headroomWinner: PoolLaneCandidate<C> | undefined;
-  for (const candidate of shortest) {
+  for (const candidate of tie) {
     const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
-    if (headroom === undefined) continue;
+    if (headroom === undefined) return undefined;
     if (bestHeadroom === undefined || headroom > bestHeadroom) {
       bestHeadroom = headroom;
-      headroomWinner = candidate;
+      winner = candidate;
     }
   }
-  return headroomWinner ?? shortest[0];
+  return winner;
 }
 
 function isCandidateUnthrottled<C>(candidate: PoolLaneCandidate<C>): boolean {
