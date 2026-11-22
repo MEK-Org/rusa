@@ -171,6 +171,7 @@ function grantAuthorityReader(
   return {
     actor: (id) => repos.actors.get(id),
     capabilities: (id) => effectiveCapabilities(repos.grants.list(), id, policy),
+    activeGrants: (id) => repos.grants.list().filter((g) => g.actorId === id && !g.revokedAt),
   };
 }
 

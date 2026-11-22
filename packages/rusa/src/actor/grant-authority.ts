@@ -20,6 +20,8 @@ export interface GrantAuthorityReader {
   actor(id: string): { readonly parentId?: string | null; readonly status?: string } | undefined;
   /** The capabilities the actor holds now. */
   capabilities(id: string): readonly string[];
+  /** Active grant rows (with provenance) held by the actor now, when available. */
+  activeGrants?(id: string): readonly { readonly capability: string; readonly grantedBy: string }[];
 }
 
 /** True if `ancestorId` is `id` itself or any ancestor up the actor tree. */
@@ -52,16 +54,73 @@ function parentGrantBase(capability: string): string {
   return capability;
 }
 
+const GLASS_GOALS_PREFIX = "glass_goals:";
+
+function parseGlassGoalsScope(
+  capability: string
+): { readonly user: string; readonly access: "read" | "write" } | undefined {
+  if (!capability.startsWith(GLASS_GOALS_PREFIX)) return undefined;
+  const rest = capability.slice(GLASS_GOALS_PREFIX.length);
+  const sep = rest.indexOf(":");
+  if (sep <= 0) return undefined;
+  const user = rest.slice(0, sep);
+  const access = rest.slice(sep + 1);
+  if (access !== "read" && access !== "write") return undefined;
+  return { user, access };
+}
+
+function glassGoalsCovers(
+  held: { readonly user: string; readonly access: "read" | "write" },
+  target: { readonly user: string; readonly access: "read" | "write" }
+): boolean {
+  return held.user === target.user && (held.access === "write" || held.access === target.access);
+}
+
+/**
+ * True when `grantorId` actively holds a `glass_goals:<user>:read|write`
+ * capability covering `target` that was not itself delegated by a non-admin
+ * parent (one-level delegation, #1344).
+ */
+function holdsDelegableGlassGoals(
+  reader: GrantAuthorityReader,
+  grantorId: string,
+  target: { readonly user: string; readonly access: "read" | "write" }
+): boolean {
+  const activeCaps = new Set(reader.capabilities(grantorId));
+  if (reader.activeGrants) {
+    const grantorParentId = reader.actor(grantorId)?.parentId ?? null;
+    for (const grant of reader.activeGrants(grantorId)) {
+      if (!activeCaps.has(grant.capability)) continue;
+      const held = parseGlassGoalsScope(grant.capability);
+      if (!held || !glassGoalsCovers(held, target)) continue;
+      const delegatedByNonAdminParent =
+        grantorParentId !== null &&
+        grant.grantedBy === grantorParentId &&
+        !reader.capabilities(grant.grantedBy).includes(CAPABILITY_ADMIN_CAPABILITY);
+      if (!delegatedByNonAdminParent) return true;
+    }
+    return false;
+  }
+  for (const cap of activeCaps) {
+    const held = parseGlassGoalsScope(cap);
+    if (held && glassGoalsCovers(held, target)) return true;
+  }
+  return false;
+}
+
 /**
  * Grantor authority for a grant or revocation. Granting a thread-scoped
  * `chat-write:spaces/S/threads/T` is authorized by the grantor's own active
  * `chat-write` on space S, for any existing grantee (#1311): the grant is
  * narrower than what the grantor already holds. #1311 commissions that grant
- * only, so revoking it keeps the rules below. Otherwise a `capability-admin`
- * holder may grant or revoke within its own subtree, itself included, and any
- * other grantor may only touch a capability in
- * {@link PARENT_GRANTABLE_CAPABILITIES}, and only on its direct child.
- * Fail-closed: an unknown grantor holds nothing. Ids are already resolved.
+ * only, so revoking it keeps the rules below. Granting or revoking a
+ * `glass_goals:<user>:read|write` capability on a direct child is authorized
+ * by the grantor's own non-parent-delegated active covering `glass_goals`
+ * capability (#1344). Otherwise a `capability-admin` holder may grant or
+ * revoke within its own subtree, itself included, and any other grantor may
+ * only touch a capability in {@link PARENT_GRANTABLE_CAPABILITIES}, and only
+ * on its direct child. Fail-closed: an unknown grantor holds nothing. Ids are
+ * already resolved.
  */
 export function assertGrantAuthority(
   reader: GrantAuthorityReader,
@@ -83,6 +142,14 @@ export function assertGrantAuthority(
     verb === "grant" &&
     chatScope?.kind === "thread" &&
     holdsChatWriteSpace(reader.capabilities(grantorId), chatScope.space)
+  ) {
+    return;
+  }
+  const glassGoalsScope = parseGlassGoalsScope(capability);
+  if (
+    glassGoalsScope &&
+    grantee.parentId === grantorId &&
+    holdsDelegableGlassGoals(reader, grantorId, glassGoalsScope)
   ) {
     return;
   }

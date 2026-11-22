@@ -3512,6 +3512,7 @@ export class ActorMesh {
     return {
       actor: (id) => this.actors.get(id),
       capabilities: (id) => this.grants.activeFor(id),
+      activeGrants: (id) => this.grants.list().filter((g) => g.actorId === id && !g.revokedAt),
     };
   }
 
