@@ -183,6 +183,7 @@ export class FollowerHub {
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
   private onRegisterListeners: ((follower: RemoteInstance) => void)[] = [];
+  private onActorExitListeners: ((follower: RemoteInstance, actorId: string) => void)[] = [];
   private onUpdateStatusListeners: ((followerId: string, status: FollowerUpdateStatus) => void)[] =
     [];
   private onPlacementReleasedListeners: ((followerId: string) => void)[] = [];
@@ -247,6 +248,14 @@ export class FollowerHub {
     return () => {
       const idx = this.onRegisterListeners.indexOf(callback);
       if (idx >= 0) this.onRegisterListeners.splice(idx, 1);
+    };
+  }
+
+  onActorExit(callback: (follower: RemoteInstance, actorId: string) => void): () => void {
+    this.onActorExitListeners.push(callback);
+    return () => {
+      const idx = this.onActorExitListeners.indexOf(callback);
+      if (idx >= 0) this.onActorExitListeners.splice(idx, 1);
     };
   }
 
@@ -468,6 +477,11 @@ export class FollowerHub {
     for (const [key, route] of this.routes) {
       if (route.actorId === actorId) this.routes.delete(key);
     }
+  }
+
+  /** Whether the connected follower still has an active host channel for this actor. */
+  hasActorHost(followerId: string, actorId: string): boolean {
+    return this.followers.get(followerId)?.hosts.has(actorId) ?? false;
   }
 
   /** Ask a capable connected follower to sweep retired actors' workspaces (#1338). */
@@ -893,6 +907,7 @@ export class FollowerHub {
     // have performed a side effect before a later listener throws.
     follower.recordEvent(event.eventId, "failed");
     const statusEvent = event.actorId === "$instance" && event.message?.type === "update_status";
+    const actorExitEvent = event.actorId !== "$instance" && event.message?.type === "exit";
     const heldBefore = statusEvent && this.isPlacementHeld(follower.id);
     try {
       follower.receive(event);
@@ -905,6 +920,19 @@ export class FollowerHub {
       return false;
     }
     follower.recordEvent(event.eventId, "accepted");
+    if (actorExitEvent) {
+      for (const listener of this.onActorExitListeners) {
+        try {
+          listener(follower, event.actorId);
+        } catch (err) {
+          this.log.warn("follower_actor_exit_listener_error", {
+            followerId: follower.id,
+            actorId: event.actorId,
+            err,
+          });
+        }
+      }
+    }
     if (statusEvent) {
       const status = follower.updateStatus;
       if (status) {

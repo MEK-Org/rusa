@@ -200,13 +200,14 @@ describe("createStartRetireCleanups", () => {
     expect(existsSync(workdir)).toBe(false);
   });
 
-  it("defers follower workspace sweep until run_end for follower-placed actors and skips empty/unreadable registries", () => {
+  it("defers follower workspace sweep until run_end when no live host blocks it, and skips while a host is live (#1338)", () => {
     const actorId = "follower-actor-1";
     const localWorkdir = join(workersDir, actorId);
     mkdirSync(localWorkdir, { recursive: true });
     const swept: Array<{ followerId: string; actors: Array<{ id: string; retired: boolean }> }> =
       [];
     let listMode: "normal" | "empty" | "throw" = "normal";
+    let hostLive = false;
     const registry = new InMemoryActorRepository();
     registry.upsert({
       id: actorId,
@@ -233,6 +234,7 @@ describe("createStartRetireCleanups", () => {
             if (listMode === "empty") return [];
             return [{ id: actorId, retired: registry.get(actorId)?.status === "retired" }];
           },
+          hasLiveHost: () => hostLive,
         }
       ),
     });
@@ -247,6 +249,22 @@ describe("createStartRetireCleanups", () => {
     ]);
     // Leader-local directory is left untouched for follower-placed actors.
     expect(existsSync(localWorkdir)).toBe(true);
+
+    // When the follower still holds a live host channel (waiting on `exit`),
+    // createStartRetireCleanups skips sending a premature sweep.
+    const waitingExitActor = "follower-actor-live-host";
+    registry.upsert({
+      id: waitingExitActor,
+      charter: "follower worker",
+      parentId: "root",
+      executionConfig: { executionTarget: "mac-follower" },
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    hostLive = true;
+    mesh.retire(waitingExitActor);
+    expect(swept).toHaveLength(1);
+    hostLive = false;
 
     // Empty or throwing registry sends nothing.
     const emptyActor = "follower-actor-empty";

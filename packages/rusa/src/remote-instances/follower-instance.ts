@@ -49,7 +49,6 @@ export class FollowerInstance {
   private readonly material?: RunMaterialOptions;
   private readonly scratchDir?: string;
   private readonly log?: (message: string) => void;
-  private pendingRetireSweepActors?: readonly ActorLiveness[];
 
   constructor(
     private readonly home: string,
@@ -103,11 +102,6 @@ export class FollowerInstance {
     // Existing actors may finish normally during an update, but no new actor
     // is admitted once the follower has begun its bounded quiescence window.
     if (this.draining) return;
-    if (this.pendingRetireSweepActors) {
-      this.pendingRetireSweepActors = this.pendingRetireSweepActors.map((entry) =>
-        entry.id === actorId ? { id: entry.id, retired: false } : entry
-      );
-    }
     const cwd = join(this.home, "workers", actorId);
     mkdirSync(cwd, { recursive: true });
     let actor = this.actors.get(actorId);
@@ -121,16 +115,6 @@ export class FollowerInstance {
         (event) => this.emit({ eventId: randomUUID(), actorId, message: event }),
         () => {
           this.actors.delete(actorId);
-          if (
-            !this.stopped &&
-            this.pendingRetireSweepActors?.some((entry) => entry.id === actorId && entry.retired)
-          ) {
-            const snapshot = this.pendingRetireSweepActors;
-            this.runWorkspaceSweep(snapshot);
-            if (!snapshot.some((entry) => entry.retired && this.actors.has(entry.id))) {
-              this.pendingRetireSweepActors = undefined;
-            }
-          }
           this.emit({
             eventId: randomUUID(),
             actorId,
@@ -218,8 +202,8 @@ export class FollowerInstance {
   /**
    * Sweep retired actors' working and scratch directories on this follower (#1338).
    * An actor with a live runtime in `this.actors` is never swept even when the
-   * incoming list marks it retired; if a retired actor is still closing, its
-   * cleanup runs right after `onClosed` removes it from `this.actors`.
+   * incoming list marks it retired; the leader re-sends the sweep after the
+   * follower emits `{ type: "exit" }`.
    */
   sweepWorkspaces(actors: readonly ActorLiveness[]): string[] {
     if (this.stopped) return [];
@@ -240,12 +224,6 @@ export class FollowerInstance {
       }
     }
     if (normalized.length === 0) return [];
-
-    const hasDeferredRetired = normalized.some(
-      (entry) => entry.retired && this.actors.has(entry.id)
-    );
-    this.pendingRetireSweepActors = hasDeferredRetired ? normalized : undefined;
-
     return this.runWorkspaceSweep(normalized);
   }
 

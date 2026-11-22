@@ -3155,11 +3155,12 @@ describe("follower workdir retirement cleanup (#1338)", () => {
 
     h.mesh.retire(actorId);
     await h.runtime(actorId).exited;
+    await waitUntil(() => !existsSync(workdir));
 
     expect(existsSync(workdir)).toBe(false);
   });
 
-  it("defers follower workdir and scratch cleanup until an active run ends", async () => {
+  it("defers follower workdir and scratch cleanup until after exit in Case A (abandoned before exit)", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-retire-defer-"));
     const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-scratch-"));
     dirs.push(cwd, scratchDir);
@@ -3188,21 +3189,86 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     expect(existsSync(workdir)).toBe(true);
     expect(existsSync(scratch)).toBe(true);
 
+    // Track every workspaceSweep sent and verify none is sent before `exit`.
+    const sentSweeps: Array<{ when: "before_exit" | "after_exit" }> = [];
+    let sawExit = false;
+    const origSweep = h.remote.sweepWorkspaces.bind(h.remote);
+    h.remote.sweepWorkspaces = (list) => {
+      sentSweeps.push({ when: sawExit ? "after_exit" : "before_exit" });
+      return origSweep(list);
+    };
+    const origReceive = h.remote.receive.bind(h.remote);
+    h.remote.receive = (event) => {
+      if (event.actorId === actorId && event.message.type === "exit") sawExit = true;
+      return origReceive(event);
+    };
+
     h.mesh.retire(actorId, { force: true });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(h.actors.get(actorId)?.status).toBe("retired");
     expect(existsSync(workdir)).toBe(true);
     expect(existsSync(scratch)).toBe(true);
+    expect(sentSweeps).toEqual([]);
 
     rejectRun(new Error("aborted after retire"));
     await h.runtime(actorId).exited;
     await waitUntil(() => !existsSync(workdir) && !existsSync(scratch));
 
+    expect(sentSweeps).toEqual([{ when: "after_exit" }]);
     expect(existsSync(workdir)).toBe(false);
     expect(existsSync(scratch)).toBe(false);
   });
 
-  it("skips an actor with a live runtime entry on the follower even when the sweep list says retired", async () => {
+  it("sweeps follower workdir and scratch after exit in Case B when force-retired provider resolves normally without run_end or run_abandoned", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-retire-case-b-"));
+    const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-case-b-scratch-"));
+    dirs.push(cwd, scratchDir);
+    let resolveRun!: (result: { success: boolean; output: string; exitCode: number }) => void;
+    const providerFactory: ProviderFactory = () => ({
+      name: "instance-fixture",
+      providerName: "instance-fixture",
+      run: () =>
+        new Promise((resolve) => {
+          resolveRun = resolve;
+        }),
+    });
+    const h = createHarness({
+      cwd,
+      scratchDir,
+      idgen: () => randomUUID(),
+      providerFactory,
+    });
+    instances.push(h);
+
+    const actorId = h.spawn("Case B normal resolution after force retire");
+    await waitUntil(() => h.runtime(actorId).isRunning);
+    const workdir = join(h.home, "workers", actorId);
+    const scratch = join(scratchDir, `worker-${actorId.slice(0, 8)}`);
+    mkdirSync(scratch, { recursive: true });
+    expect(existsSync(workdir)).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
+
+    h.mesh.retire(actorId, { force: true });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(existsSync(workdir)).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
+
+    // Provider resolves normally after stop was received: `complete` is skipped,
+    // so neither `run_end` nor `run_abandoned` fires, yet `exit` still fires.
+    resolveRun({ success: true, output: "resolved after retire", exitCode: 0 });
+    await h.runtime(actorId).exited;
+    await waitUntil(() => !existsSync(workdir) && !existsSync(scratch));
+
+    expect(
+      h.meshEvents.some(
+        (e) => e.actorId === actorId && (e.kind === "run_end" || e.kind === "run_abandoned")
+      )
+    ).toBe(false);
+    expect(existsSync(workdir)).toBe(false);
+    expect(existsSync(scratch)).toBe(false);
+  });
+
+  it("skips an actor with a live runtime entry on the follower even when the sweep list says retired, without caching a stale snapshot", async () => {
     const scratchDir = mkdtempSync(join(tmpdir(), "rusa-follower-live-skip-"));
     dirs.push(scratchDir);
     const release = releasableCapabilityProvider();
@@ -3222,7 +3288,8 @@ describe("follower workdir retirement cleanup (#1338)", () => {
     mkdirSync(scratch, { recursive: true });
 
     // Even if a stale or mismatched liveness list claims liveId is retired,
-    // FollowerInstance skips it while its runtime is still live.
+    // FollowerInstance skips it while its runtime is still live and remembers
+    // nothing across onClosed when no follow-up sweep arrives.
     const removed = h.follower.sweepWorkspaces([{ id: liveId, retired: true }]);
     expect(removed).toEqual([]);
     expect(existsSync(workdir)).toBe(true);
@@ -3230,6 +3297,11 @@ describe("follower workdir retirement cleanup (#1338)", () => {
 
     release.release("Keep live runtime workspace");
     await waitUntil(() => h.events.some((e) => e.actorId === liveId && e.event.type === "result"));
+    // Stop directly on the follower without leader retire so no exit-time sweep is sent.
+    h.follower.dispatch({ actorId: liveId, message: { type: "stop" } });
+    await h.runtime(liveId).exited;
+    expect(existsSync(workdir)).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
   });
 
   it("sweeps nothing when the liveness list is empty", () => {

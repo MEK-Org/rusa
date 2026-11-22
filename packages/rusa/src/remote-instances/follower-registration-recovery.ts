@@ -1,5 +1,6 @@
 import type { ActorMesh, MeshActor } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import type { ActorLiveness } from "../actor/workspace-sweep.js";
 import type { Logger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { FollowerHub } from "./follower-hub.js";
@@ -7,12 +8,53 @@ import type { RemoteInstance } from "./remote-instance.js";
 
 type ReattachableActor = MeshActor & { attachHost?: (host: unknown) => void };
 
+/**
+ * Send `workspaceSweep` when a follower actor exits if the leader's registry
+ * already marks that actor retired on this follower (#1338).
+ *
+ * The follower emits `{ type: "exit" }` only after removing the actor from its
+ * live runtime map, so sweeping here avoids racing against a still-closing
+ * runtime while keeping the follower stateless (one sweep rule, one deletion
+ * site). Empty or unreadable registries never send a sweep.
+ */
+export function sweepRetiredFollowerActorOnExit(deps: {
+  followerId: string;
+  actorId: string;
+  actors: Pick<ActorRepository, "list"> & Partial<Pick<ActorRepository, "get">>;
+  sweepWorkspaces: (followerId: string, actors: readonly ActorLiveness[]) => void;
+  onError?: (err: unknown) => void;
+}): boolean {
+  try {
+    const record = deps.actors.get
+      ? deps.actors.get(deps.actorId)
+      : deps.actors.list().find((entry) => entry.id === deps.actorId);
+    if (
+      !record ||
+      record.status !== "retired" ||
+      record.executionConfig?.executionTarget !== deps.followerId
+    ) {
+      return false;
+    }
+    const allActors = deps.actors.list();
+    if (allActors.length === 0) return false;
+    deps.sweepWorkspaces(
+      deps.followerId,
+      allActors.map((entry) => ({ id: entry.id, retired: entry.status === "retired" }))
+    );
+    return true;
+  } catch (err) {
+    deps.onError?.(err);
+    return false;
+  }
+}
+
 export interface FollowerRegistrationRecoveryDeps {
-  actors: Pick<ActorRepository, "list">;
+  actors: Pick<ActorRepository, "list"> & Partial<Pick<ActorRepository, "get">>;
   hub: Pick<
     FollowerHub,
     "onRegister" | "onPlacementReleased" | "rebindHost" | "stopActor" | "sweepWorkspaces"
-  >;
+  > &
+    Partial<Pick<FollowerHub, "onActorExit">>;
   log: Pick<Logger, "warn">;
   mesh: Pick<ActorMesh, "dispatch" | "get" | "rehydrate">;
 }
@@ -96,7 +138,23 @@ export function registerFollowerRegistrationRecovery({
       );
     }
   });
+  const unregisterExit =
+    hub.onActorExit?.((follower, actorId) => {
+      sweepRetiredFollowerActorOnExit({
+        followerId: follower.id,
+        actorId,
+        actors,
+        sweepWorkspaces: (id, list) => hub.sweepWorkspaces(id, list),
+        onError: (err) =>
+          log.warn("follower_exit_sweep_registry_read_failed", {
+            followerId: follower.id,
+            actorId,
+            err,
+          }),
+      });
+    }) ?? (() => {});
   return () => {
+    unregisterExit();
     unregisterRegister();
     unregisterReleased();
   };

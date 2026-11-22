@@ -1526,4 +1526,41 @@ describe("workspace sweep capability (#1338)", () => {
     clearTimeout(timer);
     expect(h.hub.list().find((f) => f.id === "legacy")).toBeTruthy();
   });
+
+  it("tracks host existence and fires onActorExit once per accepted exit event", async () => {
+    const h = await setup();
+    const capable = await registerWith(h, "capable", { version: 1 });
+    h.hub.createHost("capable", "actor-1");
+    expect(h.hub.hasActorHost("capable", "actor-1")).toBe(true);
+    expect(h.hub.hasActorHost("capable", "missing")).toBe(false);
+
+    const exits: Array<{ followerId: string; actorId: string; hostAliveDuringCallback: boolean }> =
+      [];
+    h.hub.onActorExit((follower, actorId) => {
+      exits.push({
+        followerId: follower.id,
+        actorId,
+        hostAliveDuringCallback: h.hub.hasActorHost(follower.id, actorId),
+      });
+    });
+
+    const exitBatch = {
+      ...capable.identity,
+      batchId: "b-exit",
+      events: [
+        {
+          eventId: "ev-exit-1",
+          actorId: "actor-1",
+          message: { type: "exit", code: 0, signal: null },
+        },
+      ],
+    };
+    await h.post("/events", exitBatch);
+    // Replayed eventId does not re-fire onActorExit.
+    await h.post("/events", { ...exitBatch, batchId: "b-exit-retry" });
+
+    expect(exits).toEqual([
+      { followerId: "capable", actorId: "actor-1", hostAliveDuringCallback: false },
+    ]);
+  });
 });

@@ -32,6 +32,7 @@ import type { RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./fixture-provider.js";
 import type { FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
+import { sweepRetiredFollowerActorOnExit } from "./follower-registration-recovery.js";
 import type { ActorEvent, ProviderFactory } from "./protocol.js";
 import { RemoteInstance } from "./remote-instance.js";
 
@@ -97,7 +98,18 @@ export function createHarness(options: {
     false,
     (event) => {
       followerEvents.push(structuredClone(event));
-      queueMicrotask(() => remote.receive(structuredClone(event)));
+      queueMicrotask(() => {
+        const cloned = structuredClone(event);
+        remote.receive(cloned);
+        if (cloned.actorId !== "$instance" && cloned.message.type === "exit") {
+          sweepRetiredFollowerActorOnExit({
+            followerId: remote.id,
+            actorId: cloned.actorId,
+            actors,
+            sweepWorkspaces: (_followerId, list) => remote.sweepWorkspaces(list),
+          });
+        }
+      });
     },
     options.providerFactory ?? createProvider,
     {
@@ -204,6 +216,7 @@ export function createHarness(options: {
         sweep: (_followerId, list) => remote.sweepWorkspaces(list),
         listActors: () =>
           actors.list().map((record) => ({ id: record.id, retired: record.status === "retired" })),
+        hasLiveHost: (_followerId, actorId) => remote.hosts.has(actorId),
       }
     ),
     ...(options.obligationClosure

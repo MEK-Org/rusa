@@ -780,6 +780,58 @@ describe("follower registration recovery", () => {
     expect(existsSync(join(home, "workers", "model-probe-claude"))).toBe(true);
     expect(existsSync(join(scratchDir, `worker-${unknownId.slice(0, 8)}`))).toBe(true);
     expect(existsSync(join(scratchDir, "hand-named-clone"))).toBe(true);
+
+    // Same-generation reconnect also receives workspaceSweep, and a capability
+    // newly offered on reconnect is recorded before onRegister runs.
+    const lateRetiredId = "b2c3d4e5-1111-4222-8333-555566667777";
+    actors.upsert({
+      id: lateRetiredId,
+      parentId: "root",
+      charter: "retired between reconnects",
+      executionConfig: { executionTarget: "sweep-follower" },
+      status: "retired",
+      createdAt: new Date().toISOString(),
+    });
+    mkdirSync(join(home, "workers", lateRetiredId), { recursive: true });
+
+    const reconnectRes = await fetch(`${origin}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "sweep-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation: "gen-1",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
+      }),
+    });
+    expect(reconnectRes.status).toBe(200);
+    const reconnectReg = (await reconnectRes.json()) as {
+      session: string;
+      workspaceSweep?: unknown;
+    };
+    expect(reconnectReg.workspaceSweep).toEqual(WORKSPACE_SWEEP_CAPABILITY);
+
+    const reconnectPoll = await fetch(`${origin}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "sweep-follower", session: reconnectReg.session }),
+    });
+    expect(reconnectPoll.status).toBe(200);
+    const reconnectCommands = (await reconnectPoll.json()) as FollowerCommand[];
+    const reconnectSweep = reconnectCommands.find(
+      (cmd) => !("actorId" in cmd) && cmd.type === "workspaceSweep"
+    );
+    expect(reconnectSweep).toBeDefined();
+    if (
+      reconnectSweep &&
+      !("actorId" in reconnectSweep) &&
+      reconnectSweep.type === "workspaceSweep"
+    ) {
+      follower.sweepWorkspaces(reconnectSweep.actors);
+    }
+    expect(existsSync(join(home, "workers", lateRetiredId))).toBe(false);
   });
 
   it("sends no workspaceSweep on registration when the registry is empty or unreadable, or when un-negotiated", async () => {

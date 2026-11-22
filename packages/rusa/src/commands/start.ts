@@ -687,6 +687,7 @@ export function createStartRetireCleanups(
   followerSweep?: {
     sweep: (followerId: string, actors: readonly ActorLiveness[]) => void;
     listActors: () => readonly ActorLiveness[];
+    hasLiveHost?: (followerId: string, actorId: string) => boolean;
   }
 ): RetireCleanup[] {
   return [
@@ -744,6 +745,11 @@ export function createStartRetireCleanups(
             run: (record: ActorRecord) => {
               const target = record.executionConfig?.executionTarget;
               if (!target) return;
+              // While the follower still holds a host channel for this actor,
+              // its `exit` event (emitted right after `actors.delete(id)`) has
+              // not landed yet; let the exit listener trigger the sweep so
+              // the retired id is guaranteed out of `actors` first (#1338).
+              if (followerSweep.hasLiveHost?.(target, record.id)) return;
               let list: readonly ActorLiveness[];
               try {
                 list = followerSweep.listActors();
@@ -3446,6 +3452,7 @@ async function composeStart(
         ? {
             sweep: (followerId, list) => followerHub.sweepWorkspaces(followerId, list),
             listActors: actorLiveness,
+            hasLiveHost: (followerId, actorId) => followerHub.hasActorHost(followerId, actorId),
           }
         : undefined
     ),
