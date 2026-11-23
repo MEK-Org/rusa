@@ -10066,16 +10066,20 @@ describe("ActorMesh", () => {
     });
   });
 
-  // #347 responsive promotion retains the normal admission choice. A queued
-  // normal run selected on a later-declared lane because it quoted sooner must
-  // use that same lane when promoted; responsive priority only bypasses queues.
-  describe("responsive promotion retains normal pool selection (#347)", () => {
-    it("promotes a queued run on its next-available lane, with exactly one immediate run", async () => {
+  // #347 responsive promotion. A queued normal run selected on a later-declared
+  // lane because it quoted sooner is promoted by a responsive delivery, which
+  // bypasses queues and pacing. Since #1351, responsive selection takes the
+  // first-declared lane the controller is not throttling — but a lane waiting
+  // out an exhaustion deferral is not unthrottled, so promotion keeps normal
+  // admission's lane while recording the responsive selection; what survives
+  // is a single immediate run.
+  describe("responsive promotion reselects by the responsive lane rule (#347, #1351)", () => {
+    it("promotes a queued run on its next-available lane, keeping the non-deferred lane, with exactly one immediate run", async () => {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
-      // pool-b's run blocks until released, so the promoted-but-not-yet-
+      // pool-b runs block until released, so the promoted-but-not-yet-
       // finished state can be inspected before the run completes.
       const poolBGates: Array<() => void> = [];
       const providerByName = new Map<string, CodingProvider>([
@@ -10115,9 +10119,13 @@ describe("ActorMesh", () => {
         }
         return pacer;
       };
-      // pool-a is declared first but quotes later than pool-b, so the initial
-      // normal selection reserves pool-b — the selection responsive promotion
-      // must preserve.
+      // pool-a is declared first but quotes later than pool-b: its pacer is
+      // waiting out an exhaustion deferral (deferUntil is only ever set from
+      // exhaustion deadlines). The initial normal selection therefore
+      // reserves pool-b; promotion then reselects responsively, and under
+      // #1351 a lane under an active exhaustion deferral is not unthrottled,
+      // whatever its governing interval — so pool-b wins directly as the
+      // sole unthrottled candidate under rule 1.
       pacerFor("pool-a").deferUntil(Date.now() + 20_000);
 
       const { mesh, registry, tick } = setup({
@@ -10210,8 +10218,13 @@ describe("ActorMesh", () => {
       expect(mesh.activeRunState(worker)?.phase).toBe("queued");
       expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
 
-      // A responsive delivery preserves pool-b, while bypassing
-      // pacing/concurrency entirely (blocker still holds the mesh's only slot).
+      // A responsive delivery reselects under the responsive rule (#1351):
+      // both lanes run at a zero governing interval, but pool-a's active
+      // exhaustion deferral disqualifies it from the unthrottled class, so
+      // pool-b wins directly as the sole unthrottled candidate under rule 1
+      // — the lane normal admission reserved — and the run starts there at
+      // once, still bypassing pacing/concurrency entirely (blocker holds the
+      // mesh's only slot).
       mesh.sendMessage(worker, "urgent", TEST_USER_ID, "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
