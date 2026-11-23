@@ -10069,11 +10069,12 @@ describe("ActorMesh", () => {
   // #347 responsive promotion. A queued normal run selected on a later-declared
   // lane because it quoted sooner is promoted by a responsive delivery, which
   // bypasses queues and pacing. Since #1351, responsive selection takes the
-  // first-declared lane the controller is not throttling, so promotion may
-  // move a queued run to an earlier-declared unthrottled lane; what survives
-  // is a single immediate run with the responsive selection recorded.
+  // first-declared lane the controller is not throttling — but a lane waiting
+  // out an exhaustion deferral is not unthrottled, so promotion keeps normal
+  // admission's lane while recording the responsive selection; what survives
+  // is a single immediate run.
   describe("responsive promotion reselects by the responsive lane rule (#347, #1351)", () => {
-    it("promotes a queued run on its first-declared unthrottled lane, with exactly one immediate run", async () => {
+    it("promotes a queued run on its next-available lane, keeping the non-deferred lane, with exactly one immediate run", async () => {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
@@ -10123,10 +10124,13 @@ describe("ActorMesh", () => {
         }
         return pacer;
       };
-      // pool-a is declared first but quotes later than pool-b, so the initial
-      // normal selection reserves pool-b; promotion then reselects
-      // responsively, which under #1351 takes the first-declared unthrottled
-      // lane (pool-a).
+      // pool-a is declared first but quotes later than pool-b: its pacer is
+      // waiting out an exhaustion deferral (deferUntil is only ever set from
+      // exhaustion deadlines). The initial normal selection therefore
+      // reserves pool-b; promotion then reselects responsively, and under
+      // #1351 a lane under an active exhaustion deferral is not unthrottled,
+      // whatever its governing interval — so the responsive tie falls to the
+      // earliest quote, the lane normal admission picked (pool-b).
       pacerFor("pool-a").deferUntil(Date.now() + 20_000);
 
       const { mesh, registry, tick } = setup({
@@ -10220,17 +10224,18 @@ describe("ActorMesh", () => {
       expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
 
       // A responsive delivery reselects under the responsive rule (#1351):
-      // both lanes run at a zero governing interval — the controller asking
-      // for no throttle; pool-a's defer is a pacer queue reservation, not a
-      // controller throttle — so the first-declared lane wins, while still
+      // both lanes run at a zero governing interval, but pool-a's active
+      // exhaustion deferral disqualifies it from the unthrottled class, so
+      // the tie falls to the earliest quote (pool-b) — the lane normal
+      // admission reserved — and the run starts there at once, still
       // bypassing pacing/concurrency entirely (blocker holds the mesh's only
       // slot).
       mesh.sendMessage(worker, "urgent", TEST_USER_ID, "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(poolARuns).toEqual([`/tmp/${worker}`]);
-      expect(poolBRuns).toEqual([]);
-      expect(mesh.getSelection(worker)?.provider).toBe("pool-a");
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
       expect(mesh.getSelection(worker)?.responsive).toBe(true);
       expect(mesh.runningThreadIds()).toEqual(new Set([blocker, worker]));
 
@@ -10243,8 +10248,8 @@ describe("ActorMesh", () => {
       blockerDeferred.releaseAll();
       await tick();
 
-      expect(poolARuns).toEqual([`/tmp/${worker}`]);
-      expect(poolBRuns).toEqual([]);
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
     });

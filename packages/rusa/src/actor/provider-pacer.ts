@@ -54,6 +54,13 @@ export class ProviderPacer {
   private intervalMs: number;
   private lastStartedAt: number | null = null;
   private nextAvailableAt = 0;
+  /**
+   * The latest exhaustion deadline handed to {@link deferUntil}, kept
+   * separately from `nextAvailableAt` (which interval bookkeeping can lower)
+   * so lane classification can tell an active deferral apart from an ordinary
+   * cooldown (#1351).
+   */
+  private deferredUntilMs = 0;
   private readonly queue: Array<PacerRequest<unknown>> = [];
   private staged: PacerRequest<unknown> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -217,8 +224,20 @@ export class ProviderPacer {
       throw new Error(`availableAtMs must be a non-negative finite number, got ${availableAtMs}`);
     }
     this.nextAvailableAt = Math.max(this.nextAvailableAt, availableAtMs);
+    this.deferredUntilMs = Math.max(this.deferredUntilMs, availableAtMs);
     this.schedule();
     for (const dependent of this.dependents) dependent.schedule();
+  }
+
+  /**
+   * Whether an exhaustion deferral this pacer or its linked provider pacer
+   * holds is still in the future at `atMs`. Scheduling still reads
+   * `nextAvailableAt`; this is the classification signal for "the lane is
+   * waiting out an exhaustion deadline" (#1351), which is never true of a
+   * mere post-start cooldown.
+   */
+  isDeferredAt(atMs: number): boolean {
+    return this.deferredUntilMs > atMs || (this.linked?.isDeferredAt(atMs) ?? false);
   }
 
   submit<T>(fn: () => Promise<T>, opts: ProviderPacerSubmitOptions): RunStartHandle<T> {
@@ -401,10 +420,13 @@ export interface PoolLaneCandidate<C> {
    * Whether the quota controller is asking for no throttle on this candidate
    * lane (#1351): every current bucket on the provider lane and any
    * applicable model lanes has a fresh reading with `error <= 0`. Optional.
-   * {@link selectPoolLane} counts a lane unthrottled when this is `true` **or**
-   * `Math.round(pacer.governingInterval) === 0`, so an omitted, missing or
-   * stale (`false`) reading leaves a lane whose pacer has reached 0 ms
-   * unthrottled and ranks every other lane by its governing throttle.
+   * {@link selectPoolLane} counts a lane unthrottled when this is `true`,
+   * when `Math.round(pacer.governingInterval) === 0`, **and** the pacer holds
+   * no active exhaustion deferral (`ProviderPacer.isDeferredAt`) — so an
+   * omitted, missing or stale (`false`) reading leaves a lane whose pacer has
+   * reached 0 ms unthrottled and ranks every other lane by its governing
+   * throttle, while a lane waiting out a `deferUntil` deadline never counts
+   * as unthrottled.
    */
   controllerUnthrottled?: boolean;
 }
@@ -451,7 +473,10 @@ function weeklyQuotaHeadroom(
  *
  * 1. Lanes the controller is not throttling (`controllerUnthrottled === true`,
  *    or `Math.round(pacer.governingInterval) === 0`) are equal on pacing.
- *    Among them, **the first declared wins**.
+ *    Among them, **the first declared wins**. A lane waiting out an
+ *    exhaustion deferral (`ProviderPacer.isDeferredAt`) is not unthrottled,
+ *    whatever its interval rounds to: every deferral is exhaustion evidence,
+ *    even when the coordinator reading that set it has gone stale.
  * 2. A preferred lane is skipped only when it is throttled or exhausted.
  *    Among throttled lanes, the shortest governing throttle
  *    ({@link ProviderPacer.governingInterval} at whole-millisecond resolution:
@@ -473,8 +498,10 @@ function weeklyQuotaHeadroom(
  *
  * For responsive requests (`opts.responsive`), pacing never disqualifies a
  * lane and the reservation bypasses the wait, so unthrottled lanes win in
- * declared order ahead of throttled lanes, and among throttled lanes the
- * shortest governing throttle ranks first, with weekly headroom breaking ties
+ * declared order ahead of lanes that count as throttled — including lanes
+ * under an active exhaustion deferral, which rank by the pre-existing
+ * throttled-lane rules below — and among throttled lanes the shortest
+ * governing throttle ranks first, with weekly headroom breaking ties
  * between equally throttled lanes. Without unanimous headroom evidence, an
  * equally-throttled responsive tie goes to the earliest quote, as normal
  * admission would pick (#655). Lanes at absolute zero are expected to have
@@ -491,7 +518,7 @@ export function selectPoolLane<C>(
 ): PoolLaneCandidate<C> | undefined {
   if (candidates.length === 0) return undefined;
   if (opts.responsive === true) {
-    const unthrottled = candidates.filter(isCandidateUnthrottled);
+    const unthrottled = candidates.filter((candidate) => isCandidateUnthrottled(candidate, now));
     if (unthrottled.length > 0) return unthrottled[0];
 
     // All candidates are throttled: shortest governing throttle wins (#895),
@@ -541,7 +568,9 @@ function selectByQuote<C>(
   const { best, immediatelyAvailable } = earliestQuote(candidates, now);
   if (!best || immediatelyAvailable.length < 2) return best;
 
-  const unthrottled = immediatelyAvailable.filter(isCandidateUnthrottled);
+  const unthrottled = immediatelyAvailable.filter((candidate) =>
+    isCandidateUnthrottled(candidate, now)
+  );
   if (unthrottled.length > 0) return unthrottled[0];
 
   const shortest = withShortestGoverningInterval(immediatelyAvailable);
@@ -572,7 +601,17 @@ function headroomTieWinner<C>(
   return winner;
 }
 
-function isCandidateUnthrottled<C>(candidate: PoolLaneCandidate<C>): boolean {
+/**
+ * Whether a lane counts as unthrottled for rule 1 (#1351). One-directional
+ * and deferral-aware: an active exhaustion deferral disqualifies the lane
+ * whatever its governing interval rounds to (the deferral is exhaustion
+ * evidence, even when the reading that set it has gone stale), while a
+ * `false` or missing `controllerUnthrottled` reading never demotes a lane
+ * the pacer itself has released to 0 ms — only a non-zero governing interval
+ * ranks a lane as throttled.
+ */
+function isCandidateUnthrottled<C>(candidate: PoolLaneCandidate<C>, now: number): boolean {
+  if (candidate.pacer.isDeferredAt(now)) return false;
   return (
     candidate.controllerUnthrottled === true || Math.round(candidate.pacer.governingInterval) === 0
   );

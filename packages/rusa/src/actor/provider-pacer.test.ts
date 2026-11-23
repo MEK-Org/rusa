@@ -1569,7 +1569,8 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     ).toBe("decaying-second");
   });
 
-  it("does not hold normal work on an on-pace preferred lane that is still cooling down (#1351)", () => {
+  it("does not hold normal work on an on-pace preferred lane that is still cooling down (#1351)", async () => {
+    const mesh = new ConcurrencyLimiter(1);
     const now = Date.now();
     const decayingFirst = {
       config: "decaying-first",
@@ -1584,14 +1585,69 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     };
     // Both idle: the on-pace first-declared lane wins despite its residual interval.
     expect(selectPoolLane([decayingFirst, zeroSecond], now)?.config).toBe("decaying-first");
+    expect(selectPoolLane([decayingFirst, zeroSecond], now, { responsive: true })?.config).toBe(
+      "decaying-first"
+    );
 
-    // While it waits out that interval after a start, a normal run spills to
-    // the lane available now rather than waiting; responsive keeps declared order.
-    decayingFirst.pacer.deferUntil(now + 12_000);
+    // A normal start charges its 12 s clock: while the lane cools down a
+    // normal run spills to the lane available now rather than waiting, and
+    // responsive keeps declared order (a post-start cooldown is not an
+    // exhaustion deferral).
+    await decayingFirst.pacer.submit(async () => "prior", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+    }).result;
     expect(selectPoolLane([decayingFirst, zeroSecond], now)?.config).toBe("zero-second");
     expect(selectPoolLane([decayingFirst, zeroSecond], now, { responsive: true })?.config).toBe(
       "decaying-first"
     );
+  });
+
+  it("does not treat a lane under an active exhaustion deferral as unthrottled (#1351)", () => {
+    const now = Date.now();
+    const deferredFirst = {
+      config: "deferred-first",
+      lane: "deferred-first",
+      pacer: new ProviderPacer(0, clock),
+    };
+    const freeSecond = {
+      config: "free-second",
+      lane: "free-second",
+      pacer: new ProviderPacer(0, clock),
+    };
+    deferredFirst.pacer.deferUntil(now + 60_000);
+
+    // The deferral is exhaustion evidence — every production caller sets it
+    // from an exhaustion deadline, including when the coordinator reading has
+    // gone stale — so rule 1's first-declared shortcut does not apply on the
+    // responsive path, whatever the governing interval rounds to. The tie
+    // falls to the earliest quote, the lane normal admission picked. (On the
+    // normal path the quote rule already steered away from a deferred lane.)
+    expect(selectPoolLane([deferredFirst, freeSecond], now, { responsive: true })?.config).toBe(
+      "free-second"
+    );
+
+    // A fresh on-pace signal does not override an active deferral either.
+    const onPaceDeferredFirst = { ...deferredFirst, controllerUnthrottled: true };
+    expect(
+      selectPoolLane([onPaceDeferredFirst, freeSecond], now, { responsive: true })?.config
+    ).toBe("free-second");
+
+    // Disqualification from rule 1 is not exclusion: among lanes that count
+    // as throttled, the deferred lane still wins on the shortest interval
+    // (#895), and a responsive start on it does not wait out the deadline.
+    const throttledSecond = {
+      config: "throttled-second",
+      lane: "throttled-second",
+      pacer: new ProviderPacer(60_000, clock),
+    };
+    expect(
+      selectPoolLane([deferredFirst, throttledSecond], now, { responsive: true })?.config
+    ).toBe("deferred-first");
+
+    // Once the deadline passes, the lane counts as unthrottled again.
+    expect(
+      selectPoolLane([deferredFirst, freeSecond], now + 60_001, { responsive: true })?.config
+    ).toBe("deferred-first");
   });
 
   it("breaks ties between equally throttled lanes by weekly headroom, falling back to declared order (#1351)", () => {
