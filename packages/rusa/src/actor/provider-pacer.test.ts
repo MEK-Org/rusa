@@ -1602,7 +1602,7 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     );
   });
 
-  it("does not treat a lane under an active exhaustion deferral as unthrottled (#1351)", () => {
+  it("does not treat a lane under an active exhaustion deferral as unthrottled (#1351)", async () => {
     const now = Date.now();
     const deferredFirst = {
       config: "deferred-first",
@@ -1619,9 +1619,10 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     // The deferral is exhaustion evidence — every production caller sets it
     // from an exhaustion deadline, including when the coordinator reading has
     // gone stale — so rule 1's first-declared shortcut does not apply on the
-    // responsive path, whatever the governing interval rounds to. The tie
-    // falls to the earliest quote, the lane normal admission picked. (On the
-    // normal path the quote rule already steered away from a deferred lane.)
+    // responsive path, whatever the governing interval rounds to. freeSecond
+    // is at 0 ms and not deferred, so it wins directly as the sole
+    // unthrottled candidate under rule 1. (On the normal path the quote rule
+    // already steered away from a deferred lane.)
     expect(selectPoolLane([deferredFirst, freeSecond], now, { responsive: true })?.config).toBe(
       "free-second"
     );
@@ -1631,6 +1632,16 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     expect(
       selectPoolLane([onPaceDeferredFirst, freeSecond], now, { responsive: true })?.config
     ).toBe("free-second");
+
+    // A model pacer linked to a deferred provider pacer inherits the deferral.
+    const linkedModelFirst = {
+      config: "linked-model-first",
+      lane: "linked-model-first",
+      pacer: new ProviderPacer(0, clock, deferredFirst.pacer),
+    };
+    expect(selectPoolLane([linkedModelFirst, freeSecond], now, { responsive: true })?.config).toBe(
+      "free-second"
+    );
 
     // Disqualification from rule 1 is not exclusion: among lanes that count
     // as throttled, the deferred lane still wins on the shortest interval
@@ -1648,6 +1659,26 @@ describe("pool selection by each candidate's governing pacer (#895)", () => {
     expect(
       selectPoolLane([deferredFirst, freeSecond], now + 60_001, { responsive: true })?.config
     ).toBe("deferred-first");
+
+    // Early recovery: after a prior start, setInterval(0) without re-applying
+    // deferUntil lowers nextAvailableAt and clears the deferral latch in sync.
+    const mesh = new ConcurrencyLimiter(1);
+    const recoveredFirst = {
+      config: "recovered-first",
+      lane: "recovered-first",
+      pacer: new ProviderPacer(0, clock),
+    };
+    await recoveredFirst.pacer.submit(async () => "prior", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+    }).result;
+    recoveredFirst.pacer.deferUntil(now + 60_000);
+    expect(selectPoolLane([recoveredFirst, freeSecond], now, { responsive: true })?.config).toBe(
+      "free-second"
+    );
+    recoveredFirst.pacer.setInterval(0);
+    expect(selectPoolLane([recoveredFirst, freeSecond], now, { responsive: true })?.config).toBe(
+      "recovered-first"
+    );
   });
 
   it("breaks ties between equally throttled lanes by weekly headroom, falling back to declared order (#1351)", () => {

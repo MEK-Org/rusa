@@ -210,6 +210,9 @@ export class ProviderPacer {
     this.intervalMs = intervalMs;
     if (this.lastStartedAt !== null) {
       this.nextAvailableAt = this.lastStartedAt + intervalMs;
+      // Overwriting nextAvailableAt ends any prior deferral; callers that
+      // remain expired re-apply deferUntil immediately after setInterval.
+      this.deferredUntilMs = 0;
     }
     this.schedule();
     for (const dependent of this.dependents) dependent.schedule();
@@ -420,8 +423,8 @@ export interface PoolLaneCandidate<C> {
    * Whether the quota controller is asking for no throttle on this candidate
    * lane (#1351): every current bucket on the provider lane and any
    * applicable model lanes has a fresh reading with `error <= 0`. Optional.
-   * {@link selectPoolLane} counts a lane unthrottled when this is `true`,
-   * when `Math.round(pacer.governingInterval) === 0`, **and** the pacer holds
+   * {@link selectPoolLane} counts a lane unthrottled when this is `true`
+   * **or** `Math.round(pacer.governingInterval) === 0`, **and** the pacer holds
    * no active exhaustion deferral (`ProviderPacer.isDeferredAt`) — so an
    * omitted, missing or stale (`false`) reading leaves a lane whose pacer has
    * reached 0 ms unthrottled and ranks every other lane by its governing

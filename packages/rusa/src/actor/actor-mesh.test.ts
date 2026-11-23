@@ -10079,9 +10079,8 @@ describe("ActorMesh", () => {
       const poolBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
-      // Both pool runs block until released, so the promoted-but-not-yet-
+      // pool-b runs block until released, so the promoted-but-not-yet-
       // finished state can be inspected before the run completes.
-      const poolAGates: Array<() => void> = [];
       const poolBGates: Array<() => void> = [];
       const providerByName = new Map<string, CodingProvider>([
         [
@@ -10089,13 +10088,9 @@ describe("ActorMesh", () => {
           {
             name: "pool-a",
             providerName: "pool-a",
-            run: (runOpts) => {
+            run: async (runOpts) => {
               poolARuns.push(runOpts.cwd);
-              return new Promise((resolve) => {
-                poolAGates.push(() => {
-                  resolve({ success: true, exitCode: 0, output: "a" });
-                });
-              });
+              return { success: true, exitCode: 0, output: "a" };
             },
           },
         ],
@@ -10129,8 +10124,8 @@ describe("ActorMesh", () => {
       // exhaustion deadlines). The initial normal selection therefore
       // reserves pool-b; promotion then reselects responsively, and under
       // #1351 a lane under an active exhaustion deferral is not unthrottled,
-      // whatever its governing interval — so the responsive tie falls to the
-      // earliest quote, the lane normal admission picked (pool-b).
+      // whatever its governing interval — so pool-b wins directly as the
+      // sole unthrottled candidate under rule 1.
       pacerFor("pool-a").deferUntil(Date.now() + 20_000);
 
       const { mesh, registry, tick } = setup({
@@ -10226,10 +10221,10 @@ describe("ActorMesh", () => {
       // A responsive delivery reselects under the responsive rule (#1351):
       // both lanes run at a zero governing interval, but pool-a's active
       // exhaustion deferral disqualifies it from the unthrottled class, so
-      // the tie falls to the earliest quote (pool-b) — the lane normal
-      // admission reserved — and the run starts there at once, still
-      // bypassing pacing/concurrency entirely (blocker holds the mesh's only
-      // slot).
+      // pool-b wins directly as the sole unthrottled candidate under rule 1
+      // — the lane normal admission reserved — and the run starts there at
+      // once, still bypassing pacing/concurrency entirely (blocker holds the
+      // mesh's only slot).
       mesh.sendMessage(worker, "urgent", TEST_USER_ID, "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
@@ -10239,9 +10234,6 @@ describe("ActorMesh", () => {
       expect(mesh.getSelection(worker)?.responsive).toBe(true);
       expect(mesh.runningThreadIds()).toEqual(new Set([blocker, worker]));
 
-      poolAGates.splice(0).forEach((release) => {
-        release();
-      });
       poolBGates.splice(0).forEach((release) => {
         release();
       });
