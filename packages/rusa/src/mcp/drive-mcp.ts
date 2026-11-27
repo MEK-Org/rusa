@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { DriveClient, DriveFileMetadata } from "../drive/drive-client.js";
 import type {
+  FollowerFileDownloadResult,
   FollowerFileOperation,
   FollowerFileOperationResult,
 } from "../remote-instances/protocol.js";
@@ -49,12 +50,15 @@ function fileToolsAvailable(options: DriveReadMcpOptions): boolean {
 function followerFileOp(
   options: DriveReadMcpOptions,
   operation: FollowerFileOperation
-): Promise<FollowerFileOperationResult> {
+): Promise<FollowerFileDownloadResult> {
   const pending = options.followerFileOp?.(operation);
   if (!pending) {
     throw new Error("Drive file tools are unavailable for follower-hosted actors (see #812)");
   }
-  return pending;
+  return pending.then((result) => {
+    if (!("path" in result)) throw new Error("follower returned a malformed Drive download result");
+    return result;
+  });
 }
 
 /** Read-only Google Drive tools whose authorization is enforced at the server boundary. */

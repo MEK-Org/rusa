@@ -8,14 +8,21 @@ import {
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
 import { type DriveClient, GoogleDriveClient } from "../drive/drive-client.js";
-import { resolveDownloadPath, streamNewFileInWorkdir } from "../mcp/workdir-path.js";
+import {
+  readBoundedRegularFile,
+  resolveAttachmentPath,
+  resolveDownloadPath,
+  streamNewFileInWorkdir,
+} from "../mcp/workdir-path.js";
 import type { FollowerFileOps } from "./follower-instance.js";
 import type { FollowerFileOperation, FollowerFileOperationResult } from "./protocol.js";
 
 export interface FollowerFileOpsOptions {
   /** This follower's own Google OAuth directory (client.json, token.json, drive-token.json). */
   credentialDir: string;
-  chatClient?: (credentialDir: string) => Pick<ChatClient, "downloadAttachmentStream">;
+  chatClient?: (
+    credentialDir: string
+  ) => Pick<ChatClient, "downloadAttachmentStream" | "uploadAttachment">;
   driveClient?: (credentialDir: string) => Pick<DriveClient, "downloadFileStream">;
 }
 
@@ -44,7 +51,12 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
     workDir,
     operation: FollowerFileOperation
   ): Promise<FollowerFileOperationResult> => {
-    if (typeof operation?.destinationPath !== "string") throw new Error("invalid destinationPath");
+    if (
+      operation.kind !== "chatAttachmentUpload" &&
+      typeof operation.destinationPath !== "string"
+    ) {
+      throw new Error("invalid destinationPath");
+    }
     switch (operation.kind) {
       case "chatAttachmentDownload": {
         const { resourceName, destinationPath, maxBytes } = operation;
@@ -77,6 +89,28 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
         const { bytes, sha256 } = await streamNewFileInWorkdir(workDir, target, resp.body);
         const contentType = resp.headers.get("content-type");
         return { path: target, bytes, sha256, ...(contentType ? { contentType } : {}) };
+      }
+      case "chatAttachmentUpload": {
+        const { spaceName, filePath, filename, mimeType, maxBytes } = operation;
+        if (!/^spaces\/[^/]+$/.test(spaceName)) throw new Error("invalid Chat space name");
+        if (typeof filePath !== "string" || !filePath)
+          throw new Error("invalid attachment file path");
+        if (typeof filename !== "string" || !filename)
+          throw new Error("invalid attachment filename");
+        if (typeof mimeType !== "string" || !mimeType)
+          throw new Error("invalid attachment MIME type");
+        if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+          throw new Error("invalid Chat attachment byte limit");
+        }
+        requireCredentials(options.credentialDir, "Chat", CHAT_CREDENTIALS);
+        const target = await resolveAttachmentPath(workDir, filePath);
+        const bytes = await readBoundedRegularFile(workDir, target, maxBytes, "attachment");
+        return chatClient(options.credentialDir).uploadAttachment(
+          spaceName,
+          filename,
+          bytes,
+          mimeType
+        );
       }
       default:
         throw new Error("unsupported file operation");

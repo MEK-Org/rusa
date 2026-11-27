@@ -993,13 +993,13 @@ describe("follower protocol window (#719)", () => {
     ...extra,
   });
 
-  it("fully admits a deployed v8 follower, holds its runs for the pending update and records it reconciled", async () => {
-    // The client is the deployed v8 follower.ts, reduced to its wire handling: it
+  it("fully admits a deployed v9 follower, holds its runs for the pending update and records it reconciled", async () => {
+    // The client is the deployed v9 follower.ts, reduced to its wire handling: it
     // sends its own constant, stops unless the reply carries exactly that constant,
     // and takes an update as a command without actorId whose type is "update",
     // reading targetSha and branch. The literal is the release this leader must
     // still serve; when a bump moves it out of the window, move it to the new N−1.
-    const V8 = 8;
+    const V9 = 9;
     const root = mkdtempSync(join(tmpdir(), "follower-protocol-window-"));
     roots.push(root);
     const store = new FollowerUpdateTriggerStore(root);
@@ -1009,22 +1009,22 @@ describe("follower protocol window (#719)", () => {
     h.hub.onRegister((follower) => registered.push(follower.generation));
     h.hub.armReconciliation();
 
-    const registerV8 = async () => {
-      const response = await h.post("/register", identity("lagging", V8));
+    const registerV9 = async () => {
+      const response = await h.post("/register", identity("lagging", V9));
       expect(response.status).toBe(200);
       const registration = (await response.json()) as { session: string; protocolVersion: number };
-      if (registration.protocolVersion !== V8) {
+      if (registration.protocolVersion !== V9) {
         throw new Error("Incompatible instance protocol; rebuild leader and follower");
       }
       return registration.session;
     };
 
-    await registerV8();
+    await registerV9();
     // A dropped session (410) re-registers the same generation, the reconnect path.
-    const session = await registerV8();
+    const session = await registerV9();
     expect(registered).toEqual(["lagging-process-one", "lagging-process-one"]);
     expect(h.hub.list()).toEqual([
-      expect.objectContaining({ id: "lagging", protocolVersion: V8, commitSha: oldSha }),
+      expect.objectContaining({ id: "lagging", protocolVersion: V9, commitSha: oldSha }),
     ]);
     // Full admission: it takes actor placement like any current follower.
     expect(() => h.hub.createHost("lagging", "actor-1")).not.toThrow();
@@ -1159,8 +1159,16 @@ describe("follower file operations (#1013)", () => {
     destinationPath: "out.bin",
   };
   const result = { path: "/follower/workers/actor-1/out.bin", bytes: 3, sha256: "a".repeat(64) };
+  const upload = {
+    kind: "chatAttachmentUpload" as const,
+    spaceName: "spaces/A",
+    filePath: "report.txt",
+    filename: "report.txt",
+    mimeType: "text/plain",
+    maxBytes: 1234,
+  };
 
-  it("sends a v9 follower one fileOp command and settles on its fileOpResult event", async () => {
+  it("sends a v10 follower one fileOp command and settles on its fileOpResult event", async () => {
     const h = await setup();
     const identity = await h.register("mac");
     h.hub.createHost("mac", "actor-1");
@@ -1241,17 +1249,77 @@ describe("follower file operations (#1013)", () => {
     await malformed;
   });
 
-  it("returns undefined for a v8 follower, so its actors keep the refusal", async () => {
+  it("keeps v9 downloads working but refuses a v10 Chat upload before dispatch", async () => {
     const h = await setup();
     const response = await h.post("/register", {
       id: "lagging",
       platform: "linux",
       pid: 321,
       generation: "lagging-process-one",
-      protocolVersion: 8,
+      protocolVersion: 9,
     });
     expect(response.status).toBe(200);
-    expect(h.hub.fileOp("lagging", "actor-1", operation)).toBeUndefined();
+    const identity = { id: "lagging", ...((await response.json()) as { session: string }) };
+    const pending = h.hub.fileOp("lagging", "actor-1", operation);
+    expect(pending).toBeDefined();
+    expect(h.hub.fileOp("lagging", "actor-1", upload)).toBeUndefined();
+    const commands = (await (await h.post("/poll", identity)).json()) as Array<{
+      message: { type: string; requestId: string; operation: unknown };
+    }>;
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ message: { type: "fileOp", operation } });
+    await h.post("/events", {
+      ...identity,
+      batchId: "v9-download-result",
+      events: [
+        {
+          eventId: "v9-download-result-event",
+          actorId: "actor-1",
+          message: { type: "fileOpResult", requestId: commands[0]?.message.requestId, result },
+        },
+      ],
+    });
+    await expect(pending).resolves.toEqual(result);
+  });
+
+  it("accepts either Chat attachment reference form and rejects a result for the wrong pending operation", async () => {
+    const h = await setup();
+    const identity = await h.register("mac");
+    const tokenResult = expect(h.hub.fileOp("mac", "actor-1", upload)).resolves.toEqual({
+      attachmentDataRef: { attachmentUploadToken: "opaque-upload-token" },
+    });
+    const wrongShape = expect(h.hub.fileOp("mac", "actor-1", upload)).rejects.toThrow(
+      "Follower mac returned a malformed file result"
+    );
+    const commands = (await (await h.post("/poll", identity)).json()) as Array<{
+      message: { requestId: string };
+    }>;
+    await h.post("/events", {
+      ...identity,
+      batchId: "upload-results",
+      events: [
+        {
+          eventId: "token-result",
+          actorId: "actor-1",
+          message: {
+            type: "fileOpResult",
+            requestId: commands[0]?.message.requestId,
+            result: { attachmentDataRef: { attachmentUploadToken: "opaque-upload-token" } },
+          },
+        },
+        {
+          eventId: "wrong-upload-result",
+          actorId: "actor-1",
+          message: {
+            type: "fileOpResult",
+            requestId: commands[1]?.message.requestId,
+            result,
+          },
+        },
+      ],
+    });
+    await tokenResult;
+    await wrongShape;
   });
 
   it("rejects for a follower that is not connected", async () => {

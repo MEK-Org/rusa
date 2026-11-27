@@ -15,7 +15,7 @@ import type {
   ProviderFactory,
 } from "./protocol.js";
 
-/** Runs one leader-authorized provider download inside an actor's working directory (#1013). */
+/** Runs one leader-authorized provider file operation inside an actor's working directory (#1013, #795). */
 export type FollowerFileOps = (
   workDir: string,
   operation: FollowerFileOperation

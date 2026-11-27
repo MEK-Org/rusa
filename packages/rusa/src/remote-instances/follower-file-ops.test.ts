@@ -33,6 +33,9 @@ function chatClient(body = "attachment-bytes") {
       name: "spec.pdf",
       contentType: "application/pdf",
     })),
+    uploadAttachment: vi.fn(async () => ({
+      attachmentDataRef: { resourceName: "spaces/A/attachments/uploaded" },
+    })),
   };
 }
 
@@ -54,6 +57,14 @@ const driveOp: FollowerFileOperation = {
   kind: "driveFileDownload",
   fileId: "file-1",
   destinationPath: "out.bin",
+};
+const uploadOp: FollowerFileOperation = {
+  kind: "chatAttachmentUpload",
+  spaceName: "spaces/A",
+  filePath: "report.txt",
+  filename: "report.txt",
+  mimeType: "text/plain",
+  maxBytes: 1234,
 };
 
 describe("follower file operations (#1013)", () => {
@@ -94,6 +105,51 @@ describe("follower file operations (#1013)", () => {
     expect(drive.downloadFileStream).toHaveBeenCalledWith("file-1");
   });
 
+  it("uploads an attachment from this follower's workdir with this follower's credentials", async () => {
+    const credentialDir = credentials("client.json", "token.json");
+    const workDir = tempDir("rusa-follower-work-");
+    const bytes = Buffer.from([0x00, 0xff, 0x50, 0x4b]);
+    writeFileSync(join(workDir, uploadOp.filePath), bytes);
+    const chat = chatClient();
+    const run = createFollowerFileOps({ credentialDir, chatClient: () => chat });
+
+    await expect(run(workDir, uploadOp)).resolves.toEqual({
+      attachmentDataRef: { resourceName: "spaces/A/attachments/uploaded" },
+    });
+    expect(chat.uploadAttachment).toHaveBeenCalledWith(
+      "spaces/A",
+      "report.txt",
+      bytes,
+      "text/plain"
+    );
+    expect(chat.downloadAttachmentStream).not.toHaveBeenCalled();
+  });
+
+  it("keeps follower upload containment, size and regular-file checks ahead of the provider", async () => {
+    const credentialDir = credentials("client.json", "token.json");
+    const workDir = tempDir("rusa-follower-work-");
+    const elsewhere = tempDir("rusa-follower-elsewhere-");
+    const chat = chatClient();
+    const run = createFollowerFileOps({ credentialDir, chatClient: () => chat });
+    mkdirSync(join(workDir, "directory"));
+    writeFileSync(join(workDir, "oversized.bin"), Buffer.alloc(20));
+    writeFileSync(join(elsewhere, "outside.txt"), "outside");
+
+    await expect(run(workDir, { ...uploadOp, filePath: "../outside.txt" })).rejects.toThrow(
+      "access denied: filePath escapes the actor workdir"
+    );
+    await expect(
+      run(workDir, { ...uploadOp, filePath: join(elsewhere, "outside.txt") })
+    ).rejects.toThrow("access denied: filePath escapes the actor workdir");
+    await expect(run(workDir, { ...uploadOp, filePath: "directory" })).rejects.toThrow(
+      "access denied: filePath is not a regular file"
+    );
+    await expect(
+      run(workDir, { ...uploadOp, filePath: "oversized.bin", maxBytes: 10 })
+    ).rejects.toThrow("attachment size limit exceeded");
+    expect(chat.uploadAttachment).not.toHaveBeenCalled();
+  });
+
   it("refuses with the missing credential files named, before any provider call", async () => {
     const workDir = tempDir("rusa-follower-work-");
     const chat = chatClient();
@@ -107,6 +163,9 @@ describe("follower file operations (#1013)", () => {
     await expect(run(workDir, chatOp)).rejects.toThrow(
       "this follower has no Google Chat credentials: missing token.json"
     );
+    await expect(run(workDir, uploadOp)).rejects.toThrow(
+      "this follower has no Google Chat credentials: missing token.json"
+    );
     await expect(run(workDir, driveOp)).rejects.toThrow(
       "this follower has no Google Drive credentials: missing drive-token.json"
     );
@@ -115,6 +174,7 @@ describe("follower file operations (#1013)", () => {
       "this follower has no Google Drive credentials: missing client.json, drive-token.json"
     );
     expect(chat.downloadAttachmentStream).not.toHaveBeenCalled();
+    expect(chat.uploadAttachment).not.toHaveBeenCalled();
     expect(drive.downloadFileStream).not.toHaveBeenCalled();
   });
 
@@ -180,7 +240,7 @@ describe("follower file operations (#1013)", () => {
 
     await expect(
       run(workDir, {
-        kind: "chatAttachmentUpload",
+        kind: "unsupportedFileOperation",
         destinationPath: "x",
       } as unknown as FollowerFileOperation)
     ).rejects.toThrow("unsupported file operation");

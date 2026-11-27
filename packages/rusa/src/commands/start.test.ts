@@ -11078,7 +11078,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
         message: {
           type: "request",
           requestId,
-          request: { op: "admit", candidates: [selected], responsive: false, mode: "ordinary" },
+          request: {
+            op: "admit",
+            candidates: [selected],
+            responsive: false,
+            mode: "ordinary",
+            modelConfigGeneration: 0,
+          },
         },
       });
       const reply = await vi.waitFor(() => {

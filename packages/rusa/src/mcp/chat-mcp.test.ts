@@ -21,7 +21,13 @@ import { FakeChatClient } from "../chat/fake.js";
 import { GchatClient } from "../chat/gchat-client.js";
 import { MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
 import type { Logger } from "../observability/logger.js";
-import type { FollowerFileOperation } from "../remote-instances/protocol.js";
+import { createFollowerFileOps } from "../remote-instances/follower-file-ops.js";
+import { FollowerInstance } from "../remote-instances/follower-instance.js";
+import {
+  type FollowerFileOperation,
+  INSTANCE_PROTOCOL_VERSION,
+} from "../remote-instances/protocol.js";
+import { RemoteInstance } from "../remote-instances/remote-instance.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
   createChatReadMcpServer,
@@ -1046,6 +1052,110 @@ describe("chat MCP server", () => {
       expect(fake.uploadedAttachments[0]?.content).toEqual(binaryData);
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("has a follower-hosted actor upload filePath bytes on its own host for both Chat write tools", async () => {
+    const leaderWorkDir = realpathSync(mkdtempSync(join(tmpdir(), "chat-mcp-leader-")));
+    const followerHome = realpathSync(mkdtempSync(join(tmpdir(), "chat-mcp-follower-")));
+    const credentialDir = join(followerHome, "credentials");
+    mkdirSync(credentialDir);
+    writeFileSync(join(credentialDir, "client.json"), "{}");
+    writeFileSync(join(credentialDir, "token.json"), "{}");
+
+    const fake = new FakeChatClient();
+    const actorId = "actor-1";
+    const remote = new RemoteInstance(
+      "test-follower",
+      process.platform,
+      process.pid,
+      undefined,
+      undefined,
+      INSTANCE_PROTOCOL_VERSION
+    );
+    const follower = new FollowerInstance(
+      followerHome,
+      false,
+      (event) => remote.receive(event),
+      () => ({
+        name: "test-provider",
+        providerName: "test-provider",
+        run: async () => ({ success: true, exitCode: 0, output: "" }),
+        stop: () => {},
+      }),
+      { fileOps: createFollowerFileOps({ credentialDir, chatClient: () => fake }) }
+    );
+    remote.createHost(actorId);
+    follower.dispatch({
+      actorId,
+      message: { type: "init", bootstrap: { id: actorId, cwd: followerHome } },
+    });
+    remote.flush = () => {
+      for (const command of remote.commands.splice(0)) {
+        if ("actorId" in command) follower.dispatch(command);
+      }
+    };
+
+    const followerWorkDir = join(followerHome, "workers", actorId);
+    const relativeBytes = Buffer.from([0x00, 0xff, 0x50, 0x4b]);
+    const absoluteBytes = Buffer.from("sent from follower", "utf8");
+    writeFileSync(join(followerWorkDir, "relative.bin"), relativeBytes);
+    const absolutePath = join(followerWorkDir, "absolute.txt");
+    writeFileSync(absolutePath, absoluteBytes);
+
+    const client = await connect(
+      createChatWriteMcpServer(actorId, fake, {
+        allowedSpaces: ["spaces/A"],
+        workDir: leaderWorkDir,
+        fileToolsAvailable: false,
+        followerFileOp: (operation) => remote.fileOp(actorId, operation),
+      })
+    );
+    try {
+      const upload = (await client.callTool({
+        name: "upload_attachment",
+        arguments: {
+          spaceName: "spaces/A",
+          filePath: "relative.bin",
+          filename: "renamed.bin",
+          mimeType: "application/x-custom",
+        },
+      })) as CallToolResult;
+      expect(upload.isError, textOf(upload)).toBeFalsy();
+      fake.uploadResponseMode = "token";
+
+      const sent = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "attached from follower",
+          attachments: [{ filePath: absolutePath }],
+        },
+      })) as CallToolResult;
+      expect(sent.isError).toBeFalsy();
+
+      expect(fake.uploadedAttachments).toMatchObject([
+        {
+          filename: "renamed.bin",
+          mimeType: "application/x-custom",
+          content: relativeBytes,
+        },
+        {
+          filename: "absolute.txt",
+          mimeType: "text/plain",
+          content: absoluteBytes,
+        },
+      ]);
+      expect(fake.sent[0]?.attachments).toEqual([
+        {
+          attachmentDataRef: { attachmentUploadToken: "fake-upload-token-2" },
+        },
+      ]);
+    } finally {
+      await client.close();
+      follower.close();
+      rmSync(leaderWorkDir, { recursive: true, force: true });
+      rmSync(followerHome, { recursive: true, force: true });
     }
   });
 

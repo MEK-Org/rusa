@@ -442,8 +442,8 @@ export class FollowerHub {
     return host;
   }
   /**
-   * Has the follower hosting an actor run one provider download for it
-   * (#1013). Undefined when that follower predates `fileOp`.
+   * Has the follower hosting an actor run one provider file operation for it.
+   * Undefined when that follower does not support the requested operation.
    */
   fileOp(
     followerId: string,

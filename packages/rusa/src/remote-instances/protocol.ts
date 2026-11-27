@@ -3,6 +3,7 @@ import type { ActorRuntimeState } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import type { ActorRunMode, RunNudge } from "../actor/trigger-runner.js";
 import type { ActorLiveness } from "../actor/workspace-sweep.js";
+import type { ChatAttachmentDataRef } from "../chat/types.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
 
@@ -116,17 +117,10 @@ export interface FollowerParkedEvent {
 // sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
 // this, delete the adapters that only served the version now falling out of range.
 //
-// #725 added optional fields without a bump: the leader numbers each pool it sends
-// (`init`, `modelConfig`) and the follower echoes that number on `admit`. A follower
-// built before #725 (v7 or v8) omits it, and the leader falls back to its own view
-// of the queued report. Pre- and post-#725 v8 followers share a version, so the
-// fallback lives until v8 leaves the window, not at the next bump. It is tagged
-// `pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8`.
-//
-// v9 (#1013) adds the `fileOp` command and its `fileOpResult` event. The leader
-// sends `fileOp` only to a v9 follower; a v8 follower's actors keep the
-// file-tool refusal.
-export const INSTANCE_PROTOCOL_VERSION = 9;
+// v9 (#1013) adds download `fileOp` commands and results. v10 (#795) adds the
+// Chat upload variant. The leader still sends downloads to v9 followers, but
+// never sends uploads until the follower is on v10.
+export const INSTANCE_PROTOCOL_VERSION = 10;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
@@ -200,10 +194,7 @@ export type Request =
        * retained, under the request id the leader's gate still answers on.
        */
       resume?: boolean;
-      /**
-       * The pool generation `candidates` were quoted under, as last numbered by
-       * the leader. Absent from a follower built before #725.
-       */
+      /** The pool generation `candidates` were quoted under, as last numbered by the leader. */
       modelConfigGeneration?: number;
     }
   | { op: "sendMessage"; to: string; body: string }
@@ -215,9 +206,9 @@ export type Request =
   | { op: "providerAttempt"; attempt: RawProviderModelConfig };
 
 /**
- * A provider download a follower runs for one of its own actors (#1013). The
- * leader has already authorized it; the follower calls the provider with its
- * own credentials and writes inside that actor's working directory.
+ * A provider file operation a follower runs for one of its own actors. The
+ * leader has already authorized it; the follower uses its own credentials and
+ * keeps file bytes on its own host (#1013, #795).
  */
 export type FollowerFileOperation =
   | {
@@ -227,9 +218,18 @@ export type FollowerFileOperation =
       /** The leader's byte limit for this actor; the follower also applies its own. */
       maxBytes: number;
     }
-  | { kind: "driveFileDownload"; fileId: string; destinationPath: string };
+  | { kind: "driveFileDownload"; fileId: string; destinationPath: string }
+  | {
+      kind: "chatAttachmentUpload";
+      spaceName: string;
+      filePath: string;
+      filename: string;
+      mimeType: string;
+      /** The leader's byte limit for this actor; the follower also applies its own. */
+      maxBytes: number;
+    };
 
-export interface FollowerFileOperationResult {
+export interface FollowerFileDownloadResult {
   /** Absolute path on the follower. */
   path: string;
   bytes: number;
@@ -238,13 +238,22 @@ export interface FollowerFileOperationResult {
   contentType?: string;
 }
 
+/** An upload runs entirely on the follower; only Chat's opaque reference returns to the leader. */
+export interface FollowerChatAttachmentUploadResult {
+  attachmentDataRef: ChatAttachmentDataRef;
+}
+
+export type FollowerFileOperationResult =
+  | FollowerFileDownloadResult
+  | FollowerChatAttachmentUploadResult;
+
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   /** Replace the follower Actor's next-run pool without resetting its runtime. */
   | {
       type: "modelConfig";
       modelConfig: RawProviderModelConfig[];
-      /** The leader's number for this pool, echoed on `admit`; absent before #725. */
+      /** The leader's number for this pool, echoed on `admit`. */
       generation?: number;
     }
   | { type: "wake"; nudge?: RunNudge }
@@ -263,7 +272,7 @@ export type LeaderCommand =
   | { type: "unkillable" }
   | { type: "stop" }
   | { type: "reply"; requestId: number; value?: unknown; error?: string }
-  /** v9: run one provider download for this actor; answered by `fileOpResult`. */
+  /** v9 downloads and v10 Chat uploads; answered by `fileOpResult`. */
   | { type: "fileOp"; requestId: string; operation: FollowerFileOperation }
   /**
    * Bounded execution: read one retained original of this actor's run on this
@@ -297,8 +306,7 @@ export type ActorEvent =
     }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }
-  /** Wire state; "winding_down" is retained for v7/v8 follower compatibility until OLDEST_FOLLOWER_PROTOCOL_VERSION > 8. */
-  | { type: "state"; state: ActorRuntimeState | "winding_down"; yielded?: boolean }
+  | { type: "state"; state: ActorRuntimeState; yielded?: boolean }
   | { type: "session"; sessionId: string }
   | { type: "queued"; responsive: boolean; mode: ActorRunMode; runId?: string }
   | { type: "error"; error: string }
@@ -328,7 +336,7 @@ export type ActorEvent =
   | { type: "coalesced"; count: number; ageMs: number }
   | { type: "log"; chunk: string }
   | { type: "fatal"; error: string }
-  /** v9: the outcome of a `fileOp`; exactly one of result or error. */
+  /** v9 downloads and v10 Chat uploads: exactly one of result or error. */
   | {
       type: "fileOpResult";
       requestId: string;

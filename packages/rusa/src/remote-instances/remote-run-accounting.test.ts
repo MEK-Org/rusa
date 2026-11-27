@@ -203,6 +203,7 @@ describe("remote actor run accounting", () => {
         candidates: [{ provider: "codex", model: "gpt-5.5" }],
         responsive: false,
         mode: "ordinary",
+        modelConfigGeneration: 0,
       },
     });
     await Promise.resolve();
@@ -268,6 +269,7 @@ describe("remote actor run accounting", () => {
         candidates: [{ provider: "codex", model: "gpt-5.5" }],
         responsive: false,
         mode: "ordinary",
+        modelConfigGeneration: 0,
       },
     });
     await Promise.resolve();
@@ -323,6 +325,7 @@ describe("remote actor run accounting", () => {
         candidates: [{ provider: "codex", model: "gpt-5.5" }],
         responsive: false,
         mode: "ordinary",
+        modelConfigGeneration: 0,
       },
     });
     await Promise.resolve();
@@ -541,6 +544,7 @@ describe("remote actor run accounting", () => {
         candidates: [{ provider: "codex", model: "gpt-5.5" }],
         responsive: false,
         mode: "ordinary",
+        modelConfigGeneration: 0,
       },
     });
     await Promise.resolve();
