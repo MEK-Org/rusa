@@ -573,6 +573,42 @@ describe("grantable capabilities allow-list ", () => {
     expect(fakeChatClient.sent[0]?.threadName).toBeUndefined();
   });
 
+  it("wires follower-hosted chat filePath uploads to that grantee's file operation", async () => {
+    const leaderChat = new FakeChatClient();
+    const fileToolsAvailableForActor = vi.fn((actorId: string) => actorId !== "follower-actor");
+    const followerFileOpForActor = vi.fn(async (actorId: string) => {
+      expect(actorId).toBe("follower-actor");
+      return { attachmentDataRef: { attachmentUploadToken: "follower-upload-token" } };
+    });
+    const factory = buildGrantableServers({
+      ...STUB_DEPS,
+      chatClient: leaderChat,
+      fileToolsAvailableForActor,
+      followerFileOpForActor,
+    }).get("chat-write");
+    if (!factory) throw new Error("expected chat-write factory");
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await factory("follower-actor", ["spaces/A"]).connect(serverTransport);
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(clientTransport);
+
+    const result = await client.callTool({
+      name: "upload_attachment",
+      arguments: { spaceName: "spaces/A", filePath: "written-on-follower.txt" },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(fileToolsAvailableForActor).toHaveBeenCalledWith("follower-actor");
+    expect(followerFileOpForActor).toHaveBeenCalledWith(
+      "follower-actor",
+      expect.objectContaining({
+        kind: "chatAttachmentUpload",
+        filePath: "written-on-follower.txt",
+      })
+    );
+    expect(leaderChat.uploadedAttachments).toEqual([]);
+  });
+
   it("wires selectedInboxEntriesForActor to slack-write reply placement", async () => {
     const slackClient = new SlackClient("xoxb-synthetic");
     const send = vi.fn(async () => "9.9");

@@ -25,6 +25,7 @@ import { isFullCommitSha } from "./follower-update-validation.js";
 import { executeFollowerUpdate, FollowerBuildRunner } from "./follower-updater.js";
 import {
   type BoundedExecutionCapability,
+  CHAT_ATTACHMENT_UPLOAD_CAPABILITY,
   type EventTransferCapability,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
@@ -253,6 +254,7 @@ async function run(): Promise<void> {
           commitSha: tryGetCommitSha(repoRoot),
           boundedExecution: runMaterial.offer,
           workspaceSweep: WORKSPACE_SWEEP_CAPABILITY,
+          chatAttachmentUpload: CHAT_ATTACHMENT_UPLOAD_CAPABILITY,
         });
         if (registration.protocolVersion !== INSTANCE_PROTOCOL_VERSION)
           throw new Error("Incompatible instance protocol; rebuild leader and follower");

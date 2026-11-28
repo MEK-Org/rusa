@@ -312,6 +312,7 @@ import {
   closedGoverningWindow,
   HISTORY_WINDOW_MS,
   isPublishedModelLane,
+  laneControllerUnthrottled,
   type ModelLanePacing,
   modelLanePacing,
   type PublishedThrottleProviderStatus,
@@ -2129,11 +2130,19 @@ async function composeStart(
     return pacer;
   };
   // Admission projects the existing cached coordinator bucket representation.
-  // It starts no quota read: missing, stale, invalid, and tied evidence leaves
-  // selection in declared order, while a still-fresh trusted observation stays
-  // usable through a transient cold, unavailable, or incompatible response.
+  // It starts no quota read: weekly headroom is consulted only when every
+  // lane in an equally-throttled tie holds a trustworthy reading (valid
+  // percent, observed in the past, reset inside the coming week; no age
+  // cut-off, #1351), and a retained reading stays usable through a transient
+  // cold, unavailable, or incompatible response until its window rolls over.
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
+  const controllerUnthrottledFor = (providerName: string, model: string | undefined) =>
+    laneControllerUnthrottled(
+      quotaCoordinatorClient?.getLastPublishedStatus(providerName),
+      model,
+      Date.now()
+    );
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   // #655: only a coordinator-fresh publication can install an absolute
   // exhaustion gate. Keep its published deadline through an unavailable read;
@@ -2703,7 +2712,7 @@ async function composeStart(
     { selectedInboxEntries: (actorId) => mesh.selectedInboxEntries(actorId) },
     inboxStore
   );
-  // A follower-hosted actor's downloads run on its follower, with that
+  // A follower-hosted actor's file operations run on its follower, with that
   // follower's credentials (#1013). Undefined keeps the tool's refusal.
   const followerFileOpFor = (
     actorId: string,
@@ -3357,9 +3366,15 @@ async function composeStart(
             return candidatePacerFor(lane, c.model);
           },
           // Read at claim time, not enqueue time: an actor can wait past the
-          // reading it arrived with, and a stale one drops the tie-break.
+          // reading it arrived with, and one whose weekly window has rolled
+          // over drops the tie-break.
           get weeklyQuota() {
             return weeklyQuotaFor(lane);
+          },
+          // Read at claim time as well, so a retained status that has aged
+          // past soft-stale stops counting the lane as unthrottled.
+          get controllerUnthrottled() {
+            return controllerUnthrottledFor(lane, c.model);
           },
         });
       }

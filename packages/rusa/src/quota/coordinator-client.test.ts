@@ -14,6 +14,7 @@ import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
   HISTORY_WINDOW_MS,
+  laneControllerUnthrottled,
   type PublishedHistoryRecord,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleResponse,
@@ -674,7 +675,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       const candidates = names.map((name) => ({
         config: name,
         lane: name,
-        pacer: new ProviderPacer(0, () => nowMs),
+        pacer: new ProviderPacer(60_000, () => nowMs),
         // The same projection start.ts composes into weeklyQuotaFor.
         weeklyQuota: weeklyAdmissionObservation(client.getLastPublishedStatus(name)),
       }));
@@ -708,10 +709,125 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(client.getHealth()).toEqual({ quota_client_service_connected: 1 });
     });
 
-    // These four outcomes are decided by selectPoolLane at the merge base (the
-    // 30-minute age guard and its finite/tied checks); they document #349
-    // semantics surviving the coordinator adapter, not cache retention.
-    it("retains declared order for missing, stale, invalid, and tied buckets", () => {
+    it("derives controllerUnthrottled from fresh provider and applicable model lane bucket errors (#1351)", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const observedAt = new Date(nowMs).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const makeLane = (error: number, stale = false) => {
+        const base = weeklyStatus("claude", 60, observedAt, resetAtIso);
+        return {
+          ...base,
+          freshness: { ...base.freshness, stale, hardStale: false },
+          buckets: [
+            {
+              key: "claude:weekly",
+              percentLeft: 60,
+              timeRemainingPct: 50,
+              error,
+              derivative: 0,
+              requiredIntervalSeconds: 12,
+              resetAtIso,
+              observedAt,
+            },
+          ],
+        };
+      };
+
+      expect(laneControllerUnthrottled(undefined, undefined, nowMs)).toBeUndefined();
+      expect(laneControllerUnthrottled(makeLane(-10), undefined, nowMs)).toBe(true);
+      expect(laneControllerUnthrottled(makeLane(0), undefined, nowMs)).toBe(true);
+      expect(laneControllerUnthrottled(makeLane(5), undefined, nowMs)).toBe(false);
+      expect(laneControllerUnthrottled(makeLane(-10, true), undefined, nowMs)).toBe(false);
+      // An exhausted lane is never "unthrottled", even on a retained on-pace error.
+      expect(laneControllerUnthrottled({ ...makeLane(-10), expired: true }, undefined, nowMs)).toBe(
+        false
+      );
+
+      // Provider unthrottled, applicable model lane throttled -> false; other model -> true.
+      const withModelLane = {
+        ...makeLane(-10),
+        modelLanes: [
+          {
+            ...makeLane(5),
+            models: ["claude-fable-5-1"],
+          },
+        ],
+      };
+      expect(laneControllerUnthrottled(withModelLane, "claude-fable-5-1", nowMs)).toBe(false);
+      expect(laneControllerUnthrottled(withModelLane, "claude-sonnet-4-6", nowMs)).toBe(true);
+    });
+
+    it("re-ages a retained status against the wall clock before counting a lane unthrottled (#1351)", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const observedAt = new Date(nowMs).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const base = weeklyStatus("claude", 60, observedAt, resetAtIso);
+      const lane = {
+        ...base,
+        freshness: { ...base.freshness, mode: "scrape" as const, staleAfterMs: 45 * 60 * 1_000 },
+        buckets: [{ ...base.buckets[0], error: -10 }],
+      };
+      // The published flags were frozen fresh; the wall clock decides once the
+      // status is retained past soft-stale through a cold or unavailable read.
+      expect(laneControllerUnthrottled(lane, undefined, nowMs + 45 * 60 * 1_000)).toBe(true);
+      expect(laneControllerUnthrottled(lane, undefined, nowMs + 45 * 60 * 1_000 + 1)).toBe(false);
+    });
+
+    it("judges only current buckets (newest scrape or governing) for controllerUnthrottled (#1351)", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const newest = new Date(nowMs).toISOString();
+      const earlier = new Date(nowMs - 10 * 60 * 1_000).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const bucket = (key: string, error: number, observedAt: string) => ({
+        key,
+        percentLeft: 60,
+        timeRemainingPct: 50,
+        error,
+        derivative: 0,
+        requiredIntervalSeconds: 12,
+        resetAtIso,
+        observedAt,
+      });
+      const lane = {
+        ...providerStatus(12, "claude"),
+        updatedAt: newest,
+        buckets: [
+          bucket("claude:weekly", -10, newest),
+          // A kind the provider stopped emitting: its last reasoned row was
+          // ahead of pace, but it is neither in the newest scrape nor governing.
+          bucket("claude:opus-weekly", 5, earlier),
+        ],
+      };
+      expect(laneControllerUnthrottled(lane, undefined, nowMs)).toBe(true);
+
+      // The same row as the governing bucket still decides.
+      expect(
+        laneControllerUnthrottled(
+          { ...lane, governingBucketKey: "claude:opus-weekly" },
+          undefined,
+          nowMs
+        )
+      ).toBe(false);
+      // In the newest scrape it decides too.
+      expect(
+        laneControllerUnthrottled(
+          {
+            ...lane,
+            buckets: [
+              bucket("claude:weekly", -10, newest),
+              bucket("claude:opus-weekly", 5, newest),
+            ],
+          },
+          undefined,
+          nowMs
+        )
+      ).toBe(false);
+    });
+
+    // These outcomes are decided by selectPoolLane at the merge base (the
+    // validity checks in weeklyQuotaHeadroom); they document #349 semantics
+    // surviving the coordinator adapter, not cache retention.
+    it("retains declared order for missing, rolled-over, invalid, and tied buckets, and counts an older valid reading", () => {
       const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
       const fresh = new Date(nowMs).toISOString();
       const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
@@ -726,22 +842,27 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       apply("codex", providerStatus(300, "codex"));
       expect(selectFromClient(client, nowMs)).toBe("claude"); // missing
 
-      apply(
-        "codex",
-        weeklyStatus("codex", 90, new Date(nowMs - 30 * 60 * 1_000 - 1).toISOString(), resetAtIso)
-      );
-      expect(selectFromClient(client, nowMs)).toBe("claude"); // stale
+      apply("codex", weeklyStatus("codex", 90, fresh, new Date(nowMs - 60_000).toISOString()));
+      expect(selectFromClient(client, nowMs)).toBe("claude"); // reset passed
 
       apply("codex", weeklyStatus("codex", Number.NaN, fresh, resetAtIso));
       expect(selectFromClient(client, nowMs)).toBe("claude"); // invalid
 
       apply("codex", weeklyStatus("codex", 40, fresh, resetAtIso));
       expect(selectFromClient(client, nowMs)).toBe("claude"); // tied
+
+      // No age cut-off (#1351): a reading older than 30 minutes with a valid
+      // future reset still counts, and headroom decides the tie.
+      apply(
+        "codex",
+        weeklyStatus("codex", 90, new Date(nowMs - 30 * 60 * 1_000 - 1).toISOString(), resetAtIso)
+      );
+      expect(selectFromClient(client, nowMs)).toBe("codex"); // older but valid
     });
 
-    it("retains a fresh winning cache through cold, unavailable, and incompatible responses, then falls back once it is stale", async () => {
+    it("retains a fresh winning cache through cold, unavailable, and incompatible responses, then falls back once the weekly window rolls over", async () => {
       const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
-      const staleNowMs = nowMs + 30 * 60 * 1_000 + 1;
+      const rolledOverMs = nowMs + 5 * 24 * 60 * 60 * 1_000;
 
       const coldClient = warmedClient(nowMs);
       expect(
@@ -752,14 +873,14 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       ).toBe(false);
       expect(coldClient.getLastPublishedStatus("codex")).toBeDefined();
       expect(selectFromClient(coldClient, nowMs)).toBe("codex");
-      expect(selectFromClient(coldClient, staleNowMs)).toBe("claude");
+      expect(selectFromClient(coldClient, rolledOverMs)).toBe("claude");
 
       const unavailableClient = warmedClient(nowMs);
       await expect(unavailableClient.getThrottle()).resolves.toBeNull();
       expect(unavailableClient.getHealth()).toEqual({ quota_client_service_connected: 0 });
       expect(unavailableClient.getLastPublishedStatus("codex")).toBeDefined();
       expect(selectFromClient(unavailableClient, nowMs)).toBe("codex");
-      expect(selectFromClient(unavailableClient, staleNowMs)).toBe("claude");
+      expect(selectFromClient(unavailableClient, rolledOverMs)).toBe("claude");
 
       const incompatibleClient = warmedClient(nowMs);
       expect(
@@ -771,7 +892,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(incompatibleClient.getHealth()).toEqual({ quota_client_service_connected: 0 });
       expect(incompatibleClient.getLastPublishedStatus("codex")).toBeDefined();
       expect(selectFromClient(incompatibleClient, nowMs)).toBe("codex");
-      expect(selectFromClient(incompatibleClient, staleNowMs)).toBe("claude");
+      expect(selectFromClient(incompatibleClient, rolledOverMs)).toBe("claude");
     });
   });
 

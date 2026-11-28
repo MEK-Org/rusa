@@ -54,6 +54,13 @@ export class ProviderPacer {
   private intervalMs: number;
   private lastStartedAt: number | null = null;
   private nextAvailableAt = 0;
+  /**
+   * The latest exhaustion deadline handed to {@link deferUntil}, kept
+   * separately from `nextAvailableAt` (which interval bookkeeping can lower)
+   * so lane classification can tell an active deferral apart from an ordinary
+   * cooldown (#1351).
+   */
+  private deferredUntilMs = 0;
   private readonly queue: Array<PacerRequest<unknown>> = [];
   private staged: PacerRequest<unknown> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -203,6 +210,9 @@ export class ProviderPacer {
     this.intervalMs = intervalMs;
     if (this.lastStartedAt !== null) {
       this.nextAvailableAt = this.lastStartedAt + intervalMs;
+      // Overwriting nextAvailableAt ends any prior deferral; callers that
+      // remain expired re-apply deferUntil immediately after setInterval.
+      this.deferredUntilMs = 0;
     }
     this.schedule();
     for (const dependent of this.dependents) dependent.schedule();
@@ -217,8 +227,20 @@ export class ProviderPacer {
       throw new Error(`availableAtMs must be a non-negative finite number, got ${availableAtMs}`);
     }
     this.nextAvailableAt = Math.max(this.nextAvailableAt, availableAtMs);
+    this.deferredUntilMs = Math.max(this.deferredUntilMs, availableAtMs);
     this.schedule();
     for (const dependent of this.dependents) dependent.schedule();
+  }
+
+  /**
+   * Whether an exhaustion deferral this pacer or its linked provider pacer
+   * holds is still in the future at `atMs`. Scheduling still reads
+   * `nextAvailableAt`; this is the classification signal for "the lane is
+   * waiting out an exhaustion deadline" (#1351), which is never true of a
+   * mere post-start cooldown.
+   */
+  isDeferredAt(atMs: number): boolean {
+    return this.deferredUntilMs > atMs || (this.linked?.isDeferredAt(atMs) ?? false);
   }
 
   submit<T>(fn: () => Promise<T>, opts: ProviderPacerSubmitOptions): RunStartHandle<T> {
@@ -397,9 +419,22 @@ export interface PoolLaneCandidate<C> {
    * without quota probing configured.
    */
   weeklyQuota?: WeeklyQuotaObservation;
+  /**
+   * Whether the quota controller is asking for no throttle on this candidate
+   * lane (#1351): every current bucket on the provider lane and any
+   * applicable model lanes has a fresh reading with `error <= 0`. Optional.
+   * {@link selectPoolLane} counts a lane unthrottled when this is `true`
+   * **or** `Math.round(pacer.governingInterval) === 0`, **and** the pacer holds
+   * no active exhaustion deferral (`ProviderPacer.isDeferredAt`) — so an
+   * omitted, missing or stale (`false`) reading leaves a lane whose pacer has
+   * reached 0 ms unthrottled and ranks every other lane by its governing
+   * throttle, while a lane waiting out a `deferUntil` deadline never counts
+   * as unthrottled.
+   */
+  controllerUnthrottled?: boolean;
 }
 
-/** The provider-wide weekly reading used only to break an immediate-lane tie. */
+/** The provider-wide weekly reading used only to break an equally-throttled tie. */
 interface WeeklyQuotaObservation {
   /** Percentage of the weekly quota still available, from 0 through 100. */
   percentLeft: number;
@@ -410,13 +445,14 @@ interface WeeklyQuotaObservation {
 }
 
 const WEEKLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-// This matches the longest existing quota-service cache lifetime (Codex).
-// Older readings remain useful for dashboard history, but not for admission.
-const MAX_WEEKLY_QUOTA_AGE_MS = 30 * 60 * 1000;
 
 /**
  * Return a candidate's weekly headroom relative to the remaining weekly
  * window, or `undefined` unless the quota evidence is safe to compare.
+ * There is deliberately no age cut-off (#1351): weekly quota moves slowly
+ * against a seven-day window, a rolled-over window fails the reset checks
+ * below, and headroom only breaks ties between equally throttled lanes, so
+ * an older valid reading cannot move work off a preferred lane.
  */
 function weeklyQuotaHeadroom(
   observation: WeeklyQuotaObservation | undefined,
@@ -428,7 +464,7 @@ function weeklyQuotaHeadroom(
   const observedAt = Date.parse(observation.observedAt);
   const resetAt = Date.parse(observation.resetAtIso);
   if (!Number.isFinite(observedAt) || !Number.isFinite(resetAt)) return undefined;
-  if (observedAt > now || now - observedAt > MAX_WEEKLY_QUOTA_AGE_MS) return undefined;
+  if (observedAt > now) return undefined;
   if (resetAt <= now || resetAt > now + WEEKLY_WINDOW_MS) return undefined;
 
   const windowRemainingPct = ((resetAt - now) / WEEKLY_WINDOW_MS) * 100;
@@ -436,56 +472,79 @@ function weeklyQuotaHeadroom(
 }
 
 /**
- * Pick the earliest-available declared candidate across canonical provider
- * lanes, by comparing each lane's side-effect-free {@link ProviderPacer.quote}.
- * When multiple lanes are available now, the shortest governing throttle
- * ({@link ProviderPacer.governingInterval}: a model lane's own interval or its
- * provider's, whichever is stricter) ranks first, and trustworthy weekly quota
- * headroom then breaks the remaining tie. Otherwise, declaration order remains
- * the stable fallback (including unknown, stale, invalid, or tied quota
- * evidence). Callers must reserve the winning lane (via `submit`)
- * synchronously, with no `await` between calling this and reserving — JS's
- * single-threaded execution is what keeps concurrent wakes from double-booking
- * the same slot.
+ * Pick the winning declared candidate across canonical provider lanes (#1351):
  *
- * For a responsive request (`opts.responsive`), pacing never disqualifies a
- * lane and the reservation bypasses the wait, so the shortest governing
- * throttle ranks first, ahead of the quote (#895). Among the lanes tied on
- * it, when at least two have trustworthy weekly quota evidence, the one with
- * more headroom against the remaining window wins however hot its quote is
- * (#655); with fewer, the quote rule above applies. Lanes at absolute zero are
- * expected to have been excluded by the caller.
+ * 1. Lanes the controller is not throttling (`controllerUnthrottled === true`,
+ *    or `Math.round(pacer.governingInterval) === 0`) are equal on pacing.
+ *    Among them, **the first declared wins**. A lane waiting out an
+ *    exhaustion deferral (`ProviderPacer.isDeferredAt`) is not unthrottled,
+ *    whatever its interval rounds to: every deferral is exhaustion evidence,
+ *    even when the coordinator reading that set it has gone stale.
+ * 2. A preferred lane is skipped only when it is throttled or exhausted.
+ *    Among throttled lanes, the shortest governing throttle
+ *    ({@link ProviderPacer.governingInterval} at whole-millisecond resolution:
+ *    a model lane's own interval or its provider's, whichever is stricter)
+ *    wins (#895).
+ * 3. Trustworthy weekly quota headroom only breaks ties between **equally
+ *    throttled** lanes, and only when **every** lane in the tie has a
+ *    trustworthy reading; one lane's reading never outranks declared order
+ *    over lanes with missing or untrustworthy evidence. It never outranks
+ *    declared order among unthrottled lanes. Tied headroom falls back to
+ *    declared order.
+ *
+ * For normal requests, {@link ProviderPacer.quote} still gates availability:
+ * when only one lane is available now (or all lanes must wait), the earliest
+ * quote wins; when multiple lanes are available now, the rule above decides.
+ * The quote rule means a preferred lane that is still waiting out its last
+ * start's interval does not hold normal work: a lane available now wins over
+ * one that is not, whatever their declared order.
+ *
+ * For responsive requests (`opts.responsive`), pacing never disqualifies a
+ * lane and the reservation bypasses the wait, so unthrottled lanes win in
+ * declared order ahead of lanes that count as throttled — including lanes
+ * under an active exhaustion deferral, which rank by the pre-existing
+ * throttled-lane rules below — and among throttled lanes the shortest
+ * governing throttle ranks first, with weekly headroom breaking ties
+ * between equally throttled lanes. Without unanimous headroom evidence, an
+ * equally-throttled responsive tie goes to the earliest quote, as normal
+ * admission would pick (#655). Lanes at absolute zero are expected to have
+ * been excluded by the caller.
+ *
+ * Callers must reserve the winning lane (via `submit`) synchronously, with no
+ * `await` between calling this and reserving — JS's single-threaded execution
+ * is what keeps concurrent wakes from double-booking the same slot.
  */
 export function selectPoolLane<C>(
   candidates: readonly PoolLaneCandidate<C>[],
   now: number,
   opts: { responsive?: boolean } = {}
 ): PoolLaneCandidate<C> | undefined {
+  if (candidates.length === 0) return undefined;
   if (opts.responsive === true) {
-    // Absolute quota gates, pacing ranks: a responsive run bypasses the
-    // pacing wait, so the shortest governing throttle comes first; among
-    // those, a lane that still has quota is preferred by headroom regardless
-    // of its pacing quote.
+    const unthrottled = candidates.filter((candidate) => isCandidateUnthrottled(candidate, now));
+    if (unthrottled.length > 0) return unthrottled[0];
+
+    // All candidates are throttled: shortest governing throttle wins (#895),
+    // and weekly headroom breaks the tie only when every tied lane has a
+    // trustworthy reading. Otherwise the tie goes to the lane normal admission
+    // would pick among those tied lanes, the earliest quote with declared
+    // order breaking equal quotes (unchanged from #655), so responsive and
+    // normal priority differ only in bypassing the wait.
     const shortest = withShortestGoverningInterval(candidates);
-    const comparable = shortest.flatMap((candidate) => {
-      const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
-      return headroom === undefined ? [] : [{ candidate, headroom }];
-    });
-    if (comparable.length >= 2) {
-      return comparable.reduce((best, candidate) =>
-        candidate.headroom > best.headroom ? candidate : best
-      ).candidate;
-    }
-    return selectByQuote(shortest, now);
+    return headroomTieWinner(shortest, now) ?? earliestQuote(shortest, now).best;
   }
   return selectByQuote(candidates, now);
 }
 
-/** Earliest quote first; lanes available now rank by governing throttle, then weekly headroom. */
-function selectByQuote<C>(
+/**
+ * The candidate with the earliest quote (declared order breaks equal quotes),
+ * and every candidate available now. A quote is never earlier than `now`, so
+ * the first available candidate is also the earliest.
+ */
+function earliestQuote<C>(
   candidates: readonly PoolLaneCandidate<C>[],
   now: number
-): PoolLaneCandidate<C> | undefined {
+): { best: PoolLaneCandidate<C> | undefined; immediatelyAvailable: PoolLaneCandidate<C>[] } {
   let best: PoolLaneCandidate<C> | undefined;
   let bestQuote = Number.POSITIVE_INFINITY;
   const immediatelyAvailable: PoolLaneCandidate<C>[] = [];
@@ -497,20 +556,68 @@ function selectByQuote<C>(
     }
     if (quote <= now) immediatelyAvailable.push(candidate);
   }
+  return { best, immediatelyAvailable };
+}
+
+/**
+ * Earliest quote first; among lanes available now, unthrottled lanes win in
+ * declared order, otherwise the shortest governing throttle ranks the tie and
+ * weekly headroom decides only when every tied lane has a trustworthy reading.
+ */
+function selectByQuote<C>(
+  candidates: readonly PoolLaneCandidate<C>[],
+  now: number
+): PoolLaneCandidate<C> | undefined {
+  const { best, immediatelyAvailable } = earliestQuote(candidates, now);
   if (!best || immediatelyAvailable.length < 2) return best;
 
+  const unthrottled = immediatelyAvailable.filter((candidate) =>
+    isCandidateUnthrottled(candidate, now)
+  );
+  if (unthrottled.length > 0) return unthrottled[0];
+
   const shortest = withShortestGoverningInterval(immediatelyAvailable);
+  return headroomTieWinner(shortest, now) ?? shortest[0];
+}
+
+/**
+ * The headroom winner across an equally-throttled tie, or `undefined` when
+ * headroom must not be consulted at all (#1351): weekly headroom decides a
+ * tie only when **every** lane in the tie has a trustworthy reading, so one
+ * lane's observation never outranks declared order over lanes whose
+ * evidence is missing or untrustworthy. Tied headroom keeps the first declared.
+ */
+function headroomTieWinner<C>(
+  tie: readonly PoolLaneCandidate<C>[],
+  now: number
+): PoolLaneCandidate<C> | undefined {
+  let winner: PoolLaneCandidate<C> | undefined;
   let bestHeadroom: number | undefined;
-  let headroomWinner: PoolLaneCandidate<C> | undefined;
-  for (const candidate of shortest) {
+  for (const candidate of tie) {
     const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
-    if (headroom === undefined) continue;
+    if (headroom === undefined) return undefined;
     if (bestHeadroom === undefined || headroom > bestHeadroom) {
       bestHeadroom = headroom;
-      headroomWinner = candidate;
+      winner = candidate;
     }
   }
-  return headroomWinner ?? shortest[0];
+  return winner;
+}
+
+/**
+ * Whether a lane counts as unthrottled for rule 1 (#1351). One-directional
+ * and deferral-aware: an active exhaustion deferral disqualifies the lane
+ * whatever its governing interval rounds to (the deferral is exhaustion
+ * evidence, even when the reading that set it has gone stale), while a
+ * `false` or missing `controllerUnthrottled` reading never demotes a lane
+ * the pacer itself has released to 0 ms — only a non-zero governing interval
+ * ranks a lane as throttled.
+ */
+function isCandidateUnthrottled<C>(candidate: PoolLaneCandidate<C>, now: number): boolean {
+  if (candidate.pacer.isDeferredAt(now)) return false;
+  return (
+    candidate.controllerUnthrottled === true || Math.round(candidate.pacer.governingInterval) === 0
+  );
 }
 
 /**
@@ -563,11 +670,13 @@ export interface SubmitPoolGateOptions<C>
  * lanes as a single composed {@link RunStartHandle}. A normal request paces
  * through the winning lane's `ProviderPacer`, chosen by {@link selectPoolLane}
  * among non-halted candidates. Responsive priority excludes coordinator-known
- * exhausted lanes through this same selection path, ranks survivors by quota
- * headroom rather than pacing heat, and then skips pacing once its selected
- * lane has been reserved (#655).
+ * exhausted lanes through this same selection path, ranks survivors by the
+ * responsive rule of {@link selectPoolLane} (first-declared unthrottled lane,
+ * else shortest governing throttle with unanimous weekly headroom breaking
+ * ties, #1351), and then skips pacing once its selected lane has been
+ * reserved (#655).
  *
- * `promote()` re-runs the normal selection rule before bypassing pacing. When
+ * `promote()` re-runs that responsive selection before bypassing pacing. When
  * the newly selected lane differs, the stale reservation is cancelled; a
  * `generation` counter on the outer handle ignores the stale lane's
  * now-asynchronous cancellation rejection so it can never clobber the freshly
@@ -981,7 +1090,9 @@ export class UnifiedAdmissionQueue<C> {
    * delay left. Requiring an idle lane keeps at most one claimed-but-unstarted
    * actor per lane, so work waiting on mesh concurrency stays in this list
    * (reorderable, cancellable) rather than draining into per-lane FIFOs.
-   * `selectPoolLane` keeps the weekly-headroom tie-break among idle lanes.
+   * `selectPoolLane` ranks idle lanes: the first-declared unthrottled lane,
+   * else the shortest governing throttle with unanimous weekly headroom
+   * breaking ties (#1351).
    *
    * This is greedy, as requested in #633: when several lanes are idle in one
    * pass, an earlier actor may take the lane a later, narrower actor needed

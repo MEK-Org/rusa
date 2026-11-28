@@ -6,6 +6,8 @@ import type { ActorChannel } from "./actor-channel.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import type {
   ActorEvent,
+  FollowerChatAttachmentUploadResult,
+  FollowerFileDownloadResult,
   FollowerFileOperation,
   FollowerFileOperationResult,
   FollowerParkedEvent,
@@ -41,8 +43,36 @@ export const FILE_OP_TIMEOUT_MS = 30 * 60_000;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /** Keeps only the known result fields, so nothing else a follower sends reaches a tool result. */
-function parseFileOpResult(value: unknown): FollowerFileOperationResult | undefined {
-  const candidate = value as Partial<FollowerFileOperationResult> | null;
+function parseFileOpResult(
+  value: unknown,
+  operation: FollowerFileOperation
+): FollowerFileOperationResult | undefined {
+  const candidate = value as Partial<
+    FollowerFileDownloadResult & FollowerChatAttachmentUploadResult
+  > | null;
+  if (operation.kind === "chatAttachmentUpload") {
+    const ref = candidate?.attachmentDataRef;
+    if (!ref || typeof ref !== "object") return undefined;
+    const resourceName = (ref as { resourceName?: unknown }).resourceName;
+    const attachmentUploadToken = (ref as { attachmentUploadToken?: unknown })
+      .attachmentUploadToken;
+    if (
+      (typeof resourceName !== "string" || resourceName.trim().length === 0) &&
+      (typeof attachmentUploadToken !== "string" || attachmentUploadToken.trim().length === 0)
+    ) {
+      return undefined;
+    }
+    return {
+      attachmentDataRef: {
+        ...(typeof resourceName === "string" && resourceName.trim().length > 0
+          ? { resourceName }
+          : {}),
+        ...(typeof attachmentUploadToken === "string" && attachmentUploadToken.trim().length > 0
+          ? { attachmentUploadToken }
+          : {}),
+      },
+    };
+  }
   if (
     !candidate ||
     typeof candidate.path !== "string" ||
@@ -160,6 +190,7 @@ interface PendingMaterialRead {
 
 interface PendingFileOp {
   actorId: string;
+  operation: FollowerFileOperation;
   resolve: (result: FollowerFileOperationResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -261,6 +292,8 @@ export class RemoteInstance {
   boundedExecution = false;
   /** Set when this generation offered workspace sweep and the hub echoed it (#1338). */
   workspaceSweep = false;
+  /** Set when this generation offered negotiated Chat uploads (#795). */
+  chatAttachmentUpload = false;
   private readonly materialReads = new Map<string, PendingMaterialRead>();
 
   constructor(
@@ -401,17 +434,18 @@ export class RemoteInstance {
   }
 
   /**
-   * Has this follower run one provider download for an actor it hosts
-   * (#1013). Undefined when the follower predates `fileOp`; the caller keeps
-   * its refusal. Settles on the follower's `fileOpResult`, or rejects when
-   * this generation closes or the deadline passes. A result after the
-   * deadline is ignored.
+   * Has this follower run one provider file operation for an actor it hosts.
+   * Undefined when it does not support that operation; the caller keeps its
+   * refusal. Settles on the follower's `fileOpResult`, or rejects when this
+   * generation closes or the deadline passes. A result after the deadline is
+   * ignored.
    */
   fileOp(
     actorId: string,
     operation: FollowerFileOperation
   ): Promise<FollowerFileOperationResult> | undefined {
     if (this.protocolVersion < FILE_OP_PROTOCOL_VERSION) return undefined;
+    if (operation.kind === "chatAttachmentUpload" && !this.chatAttachmentUpload) return undefined;
     const requestId = randomUUID();
     const result = new Promise<FollowerFileOperationResult>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -423,7 +457,7 @@ export class RemoteInstance {
         );
       }, FILE_OP_TIMEOUT_MS);
       timer.unref?.();
-      this.fileOps.set(requestId, { actorId, resolve, reject, timer });
+      this.fileOps.set(requestId, { actorId, operation, resolve, reject, timer });
     });
     this.commands.push({ actorId, message: { type: "fileOp", requestId, operation } });
     this.flush();
@@ -439,7 +473,7 @@ export class RemoteInstance {
       pending.reject(new Error(message.error));
       return;
     }
-    const result = parseFileOpResult(message.result);
+    const result = parseFileOpResult(message.result, pending.operation);
     if (result) pending.resolve(result);
     else pending.reject(new Error(`Follower ${this.id} returned a malformed file result`));
   }
