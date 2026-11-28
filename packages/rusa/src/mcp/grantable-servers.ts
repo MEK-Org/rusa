@@ -102,7 +102,7 @@ export interface GrantableServerDeps {
   actorHandleFor?: (actorId: string) => string;
   /** Whether a grantee's file tools can access the host where it executes. */
   fileToolsAvailableForActor?: (actorId: string) => boolean;
-  /** Runs a download on a follower-hosted grantee's follower; undefined keeps the refusal (#1013). */
+  /** Runs a file operation on a follower-hosted grantee's follower; undefined keeps the refusal (#1013, #795). */
   followerFileOpForActor?: (
     actorId: string,
     operation: FollowerFileOperation
@@ -255,6 +255,15 @@ export function buildGrantableServers(
         getRunSelection: () => deps.getRunSelectionForActor(selfId),
         onWrite: deps.onChatWrite,
         ...(workDir ? { workDir } : {}),
+        ...(deps.fileToolsAvailableForActor
+          ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
+          : {}),
+        ...(deps.followerFileOpForActor
+          ? {
+              followerFileOp: (operation: FollowerFileOperation) =>
+                deps.followerFileOpForActor?.(selfId, operation),
+            }
+          : {}),
         selectedInboxEntries: deps.selectedInboxEntriesForActor
           ? () => deps.selectedInboxEntriesForActor?.(selfId) ?? []
           : undefined,

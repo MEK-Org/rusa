@@ -2712,7 +2712,7 @@ async function composeStart(
     { selectedInboxEntries: (actorId) => mesh.selectedInboxEntries(actorId) },
     inboxStore
   );
-  // A follower-hosted actor's downloads run on its follower, with that
+  // A follower-hosted actor's file operations run on its follower, with that
   // follower's credentials (#1013). Undefined keeps the tool's refusal.
   const followerFileOpFor = (
     actorId: string,

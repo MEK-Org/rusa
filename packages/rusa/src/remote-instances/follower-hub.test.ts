@@ -1159,8 +1159,16 @@ describe("follower file operations (#1013)", () => {
     destinationPath: "out.bin",
   };
   const result = { path: "/follower/workers/actor-1/out.bin", bytes: 3, sha256: "a".repeat(64) };
+  const upload = {
+    kind: "chatAttachmentUpload" as const,
+    spaceName: "spaces/A",
+    filePath: "report.txt",
+    filename: "report.txt",
+    mimeType: "text/plain",
+    maxBytes: 1234,
+  };
 
-  it("sends a v9 follower one fileOp command and settles on its fileOpResult event", async () => {
+  it("sends a v9 follower a download fileOp command and settles on its fileOpResult event", async () => {
     const h = await setup();
     const identity = await h.register("mac");
     h.hub.createHost("mac", "actor-1");
@@ -1241,7 +1249,40 @@ describe("follower file operations (#1013)", () => {
     await malformed;
   });
 
-  it("returns undefined for a v8 follower, so its actors keep the refusal", async () => {
+  it("keeps v9 downloads working but refuses a Chat upload without its capability offer", async () => {
+    const h = await setup();
+    const response = await h.post("/register", {
+      id: "lagging",
+      platform: "linux",
+      pid: 321,
+      generation: "lagging-process-one",
+      protocolVersion: 9,
+    });
+    expect(response.status).toBe(200);
+    const identity = { id: "lagging", ...((await response.json()) as { session: string }) };
+    const pending = h.hub.fileOp("lagging", "actor-1", operation);
+    expect(pending).toBeDefined();
+    expect(h.hub.fileOp("lagging", "actor-1", upload)).toBeUndefined();
+    const commands = (await (await h.post("/poll", identity)).json()) as Array<{
+      message: { type: string; requestId: string; operation: unknown };
+    }>;
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ message: { type: "fileOp", operation } });
+    await h.post("/events", {
+      ...identity,
+      batchId: "v9-download-result",
+      events: [
+        {
+          eventId: "v9-download-result-event",
+          actorId: "actor-1",
+          message: { type: "fileOpResult", requestId: commands[0]?.message.requestId, result },
+        },
+      ],
+    });
+    await expect(pending).resolves.toEqual(result);
+  });
+
+  it("returns undefined for a v8 follower, so its actors keep the file-operation refusal", async () => {
     const h = await setup();
     const response = await h.post("/register", {
       id: "lagging",
@@ -1249,9 +1290,64 @@ describe("follower file operations (#1013)", () => {
       pid: 321,
       generation: "lagging-process-one",
       protocolVersion: 8,
+      chatAttachmentUpload: { version: 1 },
     });
     expect(response.status).toBe(200);
     expect(h.hub.fileOp("lagging", "actor-1", operation)).toBeUndefined();
+    expect(h.hub.fileOp("lagging", "actor-1", upload)).toBeUndefined();
+  });
+
+  it("dispatches an offered Chat upload and rejects a result for the wrong pending operation", async () => {
+    const h = await setup();
+    const response = await h.post("/register", {
+      id: "mac",
+      platform: "darwin",
+      pid: 123,
+      generation: "mac-process-one",
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      chatAttachmentUpload: { version: 1 },
+    });
+    expect(response.status).toBe(200);
+    const identity = {
+      id: "mac",
+      generation: "mac-process-one",
+      ...((await response.json()) as { session: string; leaderToken: string }),
+    };
+    const tokenResult = expect(h.hub.fileOp("mac", "actor-1", upload)).resolves.toEqual({
+      attachmentDataRef: { attachmentUploadToken: "opaque-upload-token" },
+    });
+    const wrongShape = expect(h.hub.fileOp("mac", "actor-1", upload)).rejects.toThrow(
+      "Follower mac returned a malformed file result"
+    );
+    const commands = (await (await h.post("/poll", identity)).json()) as Array<{
+      message: { requestId: string };
+    }>;
+    await h.post("/events", {
+      ...identity,
+      batchId: "upload-results",
+      events: [
+        {
+          eventId: "token-result",
+          actorId: "actor-1",
+          message: {
+            type: "fileOpResult",
+            requestId: commands[0]?.message.requestId,
+            result: { attachmentDataRef: { attachmentUploadToken: "opaque-upload-token" } },
+          },
+        },
+        {
+          eventId: "wrong-upload-result",
+          actorId: "actor-1",
+          message: {
+            type: "fileOpResult",
+            requestId: commands[1]?.message.requestId,
+            result,
+          },
+        },
+      ],
+    });
+    await tokenResult;
+    await wrongShape;
   });
 
   it("rejects for a follower that is not connected", async () => {
