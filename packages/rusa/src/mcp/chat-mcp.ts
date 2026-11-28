@@ -381,25 +381,44 @@ function followerChatAttachmentUpload(
   const pending = options.followerFileOp?.(operation);
   if (!pending) {
     throw new Error(
-      "Chat attachment uploads are unavailable for follower-hosted actors (see #812)"
+      "Chat attachment uploads are unavailable for follower-hosted actors (see #795)"
     );
   }
   return pending.then((result) => {
-    if (!("attachmentDataRef" in result)) {
+    const attachmentDataRef = normalizeChatAttachmentDataRef(
+      result && typeof result === "object" && "attachmentDataRef" in result
+        ? result.attachmentDataRef
+        : undefined
+    );
+    if (!attachmentDataRef) {
       throw new Error("follower returned a malformed Chat attachment upload result");
     }
-    const { attachmentDataRef } = result;
-    const hasResource =
-      typeof attachmentDataRef.resourceName === "string" &&
-      attachmentDataRef.resourceName.trim().length > 0;
-    const hasToken =
-      typeof attachmentDataRef.attachmentUploadToken === "string" &&
-      attachmentDataRef.attachmentUploadToken.trim().length > 0;
-    if (!hasResource && !hasToken) {
-      throw new Error("follower returned a malformed Chat attachment upload result");
-    }
-    return result;
+    return { attachmentDataRef };
   });
+}
+
+function normalizeChatAttachmentDataRef(value: unknown): ChatAttachmentDataRef | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as {
+    resourceName?: unknown;
+    attachmentUploadToken?: unknown;
+  };
+  const resourceName = candidate.resourceName;
+  const attachmentUploadToken = candidate.attachmentUploadToken;
+  const ref: ChatAttachmentDataRef = {
+    ...(typeof resourceName === "string" && resourceName.trim().length > 0 ? { resourceName } : {}),
+    ...(typeof attachmentUploadToken === "string" && attachmentUploadToken.trim().length > 0
+      ? { attachmentUploadToken }
+      : {}),
+  };
+  return Object.keys(ref).length > 0 ? ref : undefined;
+}
+
+function chatAttachmentByteLimit(options: Pick<ChatWriteMcpOptions, "maxAttachmentBytes">): number {
+  return Math.min(
+    options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES,
+    MAX_CHAT_ATTACHMENT_BYTES
+  );
 }
 
 async function uploadAttachmentFromFilePath(
@@ -412,7 +431,7 @@ async function uploadAttachmentFromFilePath(
 ): Promise<ChatUploadAttachmentResult> {
   const effectiveFilename = filename || basename(filePath) || "attachment.bin";
   const effectiveMimeType = mimeType ?? inferChatMimeType(effectiveFilename);
-  const maxBytes = options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
+  const maxBytes = chatAttachmentByteLimit(options);
   if (!fileToolsAvailable(options)) {
     return followerChatAttachmentUpload(options, {
       kind: "chatAttachmentUpload",
@@ -730,18 +749,12 @@ export function createChatWriteMcpServer(
         if (attachments && attachments.length > 0) {
           for (const att of attachments) {
             if (att.attachmentDataRef !== undefined) {
-              const rawToken = att.attachmentDataRef.attachmentUploadToken;
-              const rawResource = att.attachmentDataRef.resourceName;
-              const hasToken = rawToken !== undefined && rawToken.trim().length > 0;
-              const hasResource = rawResource !== undefined && rawResource.trim().length > 0;
-              if (!hasToken && !hasResource) {
+              const dataRef = normalizeChatAttachmentDataRef(att.attachmentDataRef);
+              if (!dataRef) {
                 throw new Error(
                   "malformed attachment reference: attachmentDataRef must contain attachmentUploadToken or resourceName"
                 );
               }
-              const dataRef: ChatAttachmentDataRef = {};
-              if (rawToken !== undefined && hasToken) dataRef.attachmentUploadToken = rawToken;
-              if (rawResource !== undefined && hasResource) dataRef.resourceName = rawResource;
               normalizedAttachments.push({ attachmentDataRef: dataRef });
             } else if (att.resourceName !== undefined) {
               if (att.resourceName.trim().length === 0) {
@@ -759,7 +772,7 @@ export function createChatWriteMcpServer(
               );
               normalizedAttachments.push(uploaded);
             } else if (att.contentBase64) {
-              const maxBytes = options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
+              const maxBytes = chatAttachmentByteLimit(options);
               const estimatedBytes = Math.ceil((att.contentBase64.length * 3) / 4);
               if (estimatedBytes > maxBytes + 4) {
                 throw new Error(
@@ -854,7 +867,7 @@ export function createChatWriteMcpServer(
         if (!contentBase64) {
           throw new Error("Either filePath or contentBase64 must be provided");
         }
-        const maxBytes = options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
+        const maxBytes = chatAttachmentByteLimit(options);
         const estimatedBytes = Math.ceil((contentBase64.length * 3) / 4);
         if (estimatedBytes > maxBytes + 4) {
           throw new Error(

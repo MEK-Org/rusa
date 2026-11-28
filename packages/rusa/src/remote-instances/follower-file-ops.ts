@@ -52,12 +52,7 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
     workDir,
     operation: FollowerFileOperation
   ): Promise<FollowerFileOperationResult> => {
-    if (
-      operation.kind !== "chatAttachmentUpload" &&
-      typeof operation.destinationPath !== "string"
-    ) {
-      throw new Error("invalid destinationPath");
-    }
+    if (!operation || typeof operation !== "object") throw new Error("invalid file operation");
     switch (operation.kind) {
       case "chatAttachmentDownload": {
         const { resourceName, destinationPath, maxBytes } = operation;
@@ -70,6 +65,7 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
         if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
           throw new Error("invalid Chat attachment byte limit");
         }
+        if (typeof destinationPath !== "string") throw new Error("invalid destinationPath");
         requireCredentials(options.credentialDir, "Chat", CHAT_CREDENTIALS);
         const target = await resolveDownloadPath(workDir, destinationPath);
         const { resp, name, contentType } = await chatClient(
@@ -84,6 +80,7 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
       case "driveFileDownload": {
         const { fileId, destinationPath } = operation;
         if (typeof fileId !== "string" || !fileId) throw new Error("invalid Drive file ID");
+        if (typeof destinationPath !== "string") throw new Error("invalid destinationPath");
         requireCredentials(options.credentialDir, "Drive", DRIVE_CREDENTIALS);
         const target = await resolveDownloadPath(workDir, destinationPath);
         const resp = await driveClient(options.credentialDir).downloadFileStream(fileId);
@@ -93,7 +90,9 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
       }
       case "chatAttachmentUpload": {
         const { spaceName, filePath, filename, mimeType, maxBytes } = operation;
-        if (!/^spaces\/[^/]+$/.test(spaceName)) throw new Error("invalid Chat space name");
+        if (typeof spaceName !== "string" || !/^spaces\/[^/]+$/.test(spaceName)) {
+          throw new Error("invalid Chat space name");
+        }
         if (typeof filePath !== "string" || !filePath)
           throw new Error("invalid attachment file path");
         if (typeof filename !== "string" || !filename)

@@ -265,6 +265,15 @@ describe("follower file operations (#1013)", () => {
     await expect(
       run(workDir, { ...chatOp, resourceName: "spaces/A/../../etc" } as FollowerFileOperation)
     ).rejects.toThrow("invalid Chat attachment resource name");
+    await expect(run(workDir, null as unknown as FollowerFileOperation)).rejects.toThrow(
+      "invalid file operation"
+    );
+    await expect(
+      run(workDir, { ...chatOp, destinationPath: undefined } as unknown as FollowerFileOperation)
+    ).rejects.toThrow("invalid destinationPath");
+    await expect(
+      run(workDir, { ...uploadOp, spaceName: 1 } as unknown as FollowerFileOperation)
+    ).rejects.toThrow("invalid Chat space name");
     expect(chat.downloadAttachmentStream).not.toHaveBeenCalled();
   });
 });

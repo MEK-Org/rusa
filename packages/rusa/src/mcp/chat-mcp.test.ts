@@ -19,12 +19,13 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it, vi } from "vitest";
 import { FakeChatClient } from "../chat/fake.js";
 import { GchatClient } from "../chat/gchat-client.js";
-import { MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
+import { MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
 import type { Logger } from "../observability/logger.js";
 import { createFollowerFileOps } from "../remote-instances/follower-file-ops.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
 import {
   type FollowerFileOperation,
+  type FollowerFileOperationResult,
   INSTANCE_PROTOCOL_VERSION,
 } from "../remote-instances/protocol.js";
 import { RemoteInstance } from "../remote-instances/remote-instance.js";
@@ -1159,6 +1160,123 @@ describe("chat MCP server", () => {
       follower.close();
       rmSync(leaderWorkDir, { recursive: true, force: true });
       rmSync(followerHome, { recursive: true, force: true });
+    }
+  });
+
+  it("caps a follower-hosted Chat upload before dispatch", async () => {
+    const operations: FollowerFileOperation[] = [];
+    const client = await connect(
+      createChatWriteMcpServer("follower-actor", new FakeChatClient(), {
+        allowedSpaces: ["spaces/A"],
+        maxAttachmentBytes: MAX_CHAT_ATTACHMENT_BYTES * 2,
+        fileToolsAvailable: false,
+        followerFileOp: (operation) => {
+          operations.push(operation);
+          return Promise.resolve({
+            attachmentDataRef: { resourceName: "spaces/A/attachments/ATT1" },
+          });
+        },
+      })
+    );
+    try {
+      const res = (await client.callTool({
+        name: "upload_attachment",
+        arguments: { spaceName: "spaces/A", filePath: "from-follower.bin" },
+      })) as CallToolResult;
+      expect(res.isError, textOf(res)).toBeFalsy();
+      expect(operations).toEqual([
+        expect.objectContaining({
+          kind: "chatAttachmentUpload",
+          maxBytes: MAX_CHAT_ATTACHMENT_BYTES,
+        }),
+      ]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("refuses unavailable follower filePath uploads for both write tools", async () => {
+    const followerFileOp = vi.fn(() => undefined);
+    const client = await connect(
+      createChatWriteMcpServer("follower-actor", new FakeChatClient(), {
+        allowedSpaces: ["spaces/A"],
+        fileToolsAvailable: false,
+        followerFileOp,
+      })
+    );
+    try {
+      const upload = (await client.callTool({
+        name: "upload_attachment",
+        arguments: { spaceName: "spaces/A", filePath: "from-follower.bin" },
+      })) as CallToolResult;
+      const sent = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "attachment",
+          attachments: [{ filePath: "from-follower.bin" }],
+        },
+      })) as CallToolResult;
+      expect(upload.isError).toBe(true);
+      expect(sent.isError).toBe(true);
+      expect(textOf(upload)).toContain("unavailable for follower-hosted actors (see #795)");
+      expect(textOf(sent)).toContain("unavailable for follower-hosted actors (see #795)");
+      expect(followerFileOp).toHaveBeenCalledTimes(2);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("rejects ungranted filePath uploads before asking the follower", async () => {
+    const followerFileOp = vi.fn();
+    const client = await connect(
+      createChatWriteMcpServer("follower-actor", new FakeChatClient(), {
+        allowedSpaces: ["spaces/A"],
+        fileToolsAvailable: false,
+        followerFileOp,
+      })
+    );
+    try {
+      const upload = (await client.callTool({
+        name: "upload_attachment",
+        arguments: { spaceName: "spaces/B", filePath: "from-follower.bin" },
+      })) as CallToolResult;
+      const sent = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/B",
+          text: "attachment",
+          attachments: [{ filePath: "from-follower.bin" }],
+        },
+      })) as CallToolResult;
+      expect(upload.isError).toBe(true);
+      expect(sent.isError).toBe(true);
+      expect(textOf(upload)).toContain("access denied: space spaces/B is not in allowed spaces");
+      expect(textOf(sent)).toContain("access denied: space spaces/B is not in allowed spaces");
+      expect(followerFileOp).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("reports a malformed follower upload result without a raw TypeError", async () => {
+    const client = await connect(
+      createChatWriteMcpServer("follower-actor", new FakeChatClient(), {
+        allowedSpaces: ["spaces/A"],
+        fileToolsAvailable: false,
+        followerFileOp: () =>
+          Promise.resolve({ attachmentDataRef: null } as unknown as FollowerFileOperationResult),
+      })
+    );
+    try {
+      const res = (await client.callTool({
+        name: "upload_attachment",
+        arguments: { spaceName: "spaces/A", filePath: "from-follower.bin" },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("follower returned a malformed Chat attachment upload result");
+    } finally {
+      await client.close();
     }
   });
 
