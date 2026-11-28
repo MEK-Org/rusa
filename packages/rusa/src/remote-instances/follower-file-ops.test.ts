@@ -274,6 +274,19 @@ describe("follower file operations (#1013)", () => {
     await expect(
       run(workDir, { ...uploadOp, spaceName: 1 } as unknown as FollowerFileOperation)
     ).rejects.toThrow("invalid Chat space name");
+    for (const spaceName of [
+      "spaces/.",
+      "spaces/..",
+      "spaces/A.B",
+      "spaces/A?x",
+      "spaces/A#x",
+      "spaces/A B",
+    ]) {
+      await expect(run(workDir, { ...uploadOp, spaceName })).rejects.toThrow(
+        "invalid Chat space name"
+      );
+    }
     expect(chat.downloadAttachmentStream).not.toHaveBeenCalled();
+    expect(chat.uploadAttachment).not.toHaveBeenCalled();
   });
 });

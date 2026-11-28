@@ -29,6 +29,8 @@ export interface FollowerFileOpsOptions {
 
 const CHAT_CREDENTIALS = ["client.json", "token.json"];
 const DRIVE_CREDENTIALS = ["client.json", "drive-token.json"];
+// GchatClient interpolates the space into a path, so retain one safe ID segment.
+const CHAT_SPACE_NAME_RE = /^spaces\/[A-Za-z0-9_-]+$/;
 
 function requireCredentials(credentialDir: string, provider: string, files: string[]): void {
   const missing = files.filter((file) => !existsSync(join(credentialDir, file)));
@@ -90,7 +92,7 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
       }
       case "chatAttachmentUpload": {
         const { spaceName, filePath, filename, mimeType, maxBytes } = operation;
-        if (typeof spaceName !== "string" || !/^spaces\/[^/]+$/.test(spaceName)) {
+        if (typeof spaceName !== "string" || !CHAT_SPACE_NAME_RE.test(spaceName)) {
           throw new Error("invalid Chat space name");
         }
         if (typeof filePath !== "string" || !filePath)

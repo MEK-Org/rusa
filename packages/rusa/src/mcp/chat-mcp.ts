@@ -81,7 +81,9 @@ function followerFileOp(
     throw new Error("Chat file tools are unavailable for follower-hosted actors (see #812)");
   }
   return pending.then((result) => {
-    if (!("path" in result)) throw new Error("follower returned a malformed Chat download result");
+    if (!result || typeof result !== "object" || !("path" in result)) {
+      throw new Error("follower returned a malformed Chat download result");
+    }
     return result;
   });
 }

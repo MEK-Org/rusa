@@ -795,6 +795,25 @@ describe("chat MCP server", () => {
     );
   });
 
+  it("reports a malformed follower download result without a raw TypeError", async () => {
+    const client = await connect(
+      createChatReadMcpServer(new FakeChatClient(), {
+        fileToolsAvailable: false,
+        followerFileOp: () => Promise.resolve(null as unknown as FollowerFileOperationResult),
+      })
+    );
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: {
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "out.bin",
+      },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("follower returned a malformed Chat download result");
+    await client.close();
+  });
+
   it("has a follower-hosted actor's follower stream the attachment under the leader's cap", async () => {
     const fake = new FakeChatClient();
     const download = vi.spyOn(fake, "downloadAttachmentStream");

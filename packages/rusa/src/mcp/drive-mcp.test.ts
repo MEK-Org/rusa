@@ -7,7 +7,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it, vi } from "vitest";
 import { type DriveClient, GoogleDriveClient } from "../drive/drive-client.js";
-import type { FollowerFileOperation } from "../remote-instances/protocol.js";
+import type {
+  FollowerFileOperation,
+  FollowerFileOperationResult,
+} from "../remote-instances/protocol.js";
 import {
   createDriveReadMcpServer,
   type DriveReadMcpOptions,
@@ -421,6 +424,23 @@ describe("drive-read MCP server", () => {
         "Drive file tools are unavailable for follower-hosted actors (see #812)"
       );
       expect(fake.calls.map((call) => call.method)).not.toContain("downloadFileStream");
+    });
+
+    it("reports a malformed follower download result without a raw TypeError", async () => {
+      const fake = fakeDriveClient();
+      const client = await connect(fake.client, [], {
+        fileToolsAvailable: false,
+        followerFileOp: () => Promise.resolve(null as unknown as FollowerFileOperationResult),
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("follower returned a malformed Drive download result");
+      await client.close();
     });
 
     it("authorizes on the leader, then has the actor's follower stream the file into its own root", async () => {

@@ -56,7 +56,9 @@ function followerFileOp(
     throw new Error("Drive file tools are unavailable for follower-hosted actors (see #812)");
   }
   return pending.then((result) => {
-    if (!("path" in result)) throw new Error("follower returned a malformed Drive download result");
+    if (!result || typeof result !== "object" || !("path" in result)) {
+      throw new Error("follower returned a malformed Drive download result");
+    }
     return result;
   });
 }
