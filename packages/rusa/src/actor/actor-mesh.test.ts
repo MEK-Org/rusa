@@ -6379,8 +6379,8 @@ describe("ActorMesh", () => {
     expect(mounted).toEqual([["iu-thread", "understanding-write", ["understanding-write"]]]);
   });
 
-  // ── Grantor authorization : root grants anything grantable; a non-root
-  // parent grants/revokes only PARENT_GRANTABLE secrets, only to direct children.
+  // ── Grantor authorization (#1346): capability-admin grants/revokes within its
+  // subtree; non-admin delegation follows the grant row's `delegable` flag.
 
   it("root grants any grantable capability to any actor (unchanged), audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
@@ -6542,7 +6542,7 @@ describe("ActorMesh", () => {
     ]);
   });
 
-  it("a parent grants an allow-listed secret to its DIRECT child, audited with peerId = grantor", async () => {
+  it("a parent with a delegable secret grant delegates to its child, audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({
       events: (e) => events.push(e),
@@ -6550,13 +6550,33 @@ describe("ActorMesh", () => {
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
+    await mesh.grantCapability(parent, "secret:gemini-api-key", "root", "descendants");
+    expect(
+      events.find((e) => e.kind === "capability_granted" && e.actorId === parent)
+    ).toMatchObject({
+      actorId: parent,
+      detail: "secret:gemini-api-key",
+      payload: JSON.stringify({ grantedBy: "root", delegable: "descendants" }),
+    });
 
     await mesh.grantCapability(child, "secret:gemini-api-key", parent);
     expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:gemini-api-key"]);
-    expect(events.find((e) => e.kind === "capability_granted")).toMatchObject({
+    expect(
+      events.find((e) => e.kind === "capability_granted" && e.actorId === child)
+    ).toMatchObject({
       actorId: child,
       detail: "secret:gemini-api-key",
       payload: JSON.stringify({ grantedBy: parent }),
+    });
+
+    // Re-granting without `delegable` clears the flag in the emitted event too.
+    await mesh.grantCapability(parent, "secret:gemini-api-key", "root");
+    expect(
+      events.filter((e) => e.kind === "capability_granted" && e.actorId === parent).at(-1)
+    ).toMatchObject({
+      actorId: parent,
+      detail: "secret:gemini-api-key",
+      payload: JSON.stringify({ grantedBy: "root" }),
     });
 
     // ...and revokes it again.
@@ -6564,7 +6584,7 @@ describe("ActorMesh", () => {
     expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
   });
 
-  it("a parent cannot grant a secret to a non-child (sibling, grandchild, or itself)", async () => {
+  it("a parent with descendants reach delegates to descendants, not siblings or itself", async () => {
     const { mesh } = setup({
       grantableCapabilities: new Set(["secret"]),
     });
@@ -6572,26 +6592,25 @@ describe("ActorMesh", () => {
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
     const grandchild = mesh.spawn({ charter: "grandchild", parentId: child });
+    await mesh.grantCapability(parent, "secret:gemini-api-key", "root", "descendants");
 
     await expect(mesh.grantCapability(sibling, "secret:gemini-api-key", parent)).rejects.toThrow(
-      /direct children/
+      /own subtree/
     );
-    await expect(mesh.grantCapability(grandchild, "secret:gemini-api-key", parent)).rejects.toThrow(
-      /direct children/
-    );
+    await expect(
+      mesh.grantCapability(grandchild, "secret:gemini-api-key", parent)
+    ).resolves.not.toThrow();
     await expect(mesh.grantCapability(parent, "secret:gemini-api-key", parent)).rejects.toThrow(
-      /direct children/
+      /cannot delegate secret:gemini-api-key to itself/
     );
     await expect(
       mesh.grantCapability("ghost-grantee", "secret:gemini-api-key", parent)
     ).rejects.toThrow("unknown thread id: ghost-grantee");
     expect(mesh.activeCapabilitiesFor(sibling)).toEqual([]);
-    expect(mesh.activeCapabilitiesFor(grandchild)).toEqual([]);
-    expect(mesh.activeCapabilitiesFor(parent)).toEqual([]);
-    // A non-child revoke is rejected the same way (a parent can't strip a
-    // capability root granted to some other actor).
+    expect(mesh.activeCapabilitiesFor(grandchild)).toEqual(["secret:gemini-api-key"]);
+    // A non-descendant revoke is rejected (a parent can't strip a grant it did not make).
     await expect(mesh.revokeCapability(sibling, "secret:gemini-api-key", parent)).rejects.toThrow(
-      /direct children/
+      /only a capability-admin holder or the grantor of an active grant may revoke/
     );
     await expect(
       mesh.revokeCapability("ghost-grantee", "secret:gemini-api-key", parent)
@@ -6683,7 +6702,7 @@ describe("ActorMesh", () => {
         "secret:",
       ]) {
         await expect(mesh.grantCapability(child, guessed, parent)).rejects.toThrow(
-          /only a capability-admin holder may grant|bare secret grant/
+          /lacks capability-admin and holds no delegable grant|bare secret grant/
         );
       }
       expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
@@ -6691,19 +6710,21 @@ describe("ActorMesh", () => {
       // The refusal is the same whether or not the guessed file exists: a
       // non-root grantor gets no existence oracle over the secrets directory.
       await expect(mesh.grantCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
-        /only a capability-admin holder may grant secret:webhook-secret/
+        /lacks capability-admin and holds no delegable grant covering secret:webhook-secret/
       );
       await expect(mesh.grantCapability(child, "secret:no-such-file", parent)).rejects.toThrow(
-        /only a capability-admin holder may grant secret:no-such-file/
+        /lacks capability-admin and holds no delegable grant covering secret:no-such-file/
       );
       // Nor may the parent strip such a grant that root made.
       await mesh.grantCapability(child, "secret:webhook-secret", "root");
       await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
-        /only a capability-admin holder may revoke/
+        /cannot revoke secret:webhook-secret from .*: it was granted by root/
       );
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
 
-      // The allow-listed LLM keys still delegate exactly as before #542.
+      // Once granted with delegable: "descendants", the parent can delegate and revoke them.
+      await mesh.grantCapability(parent, "secret:gemini-api-key", "root", "descendants");
+      await mesh.grantCapability(parent, "secret:mistral-api-key", "root", "descendants");
       await mesh.grantCapability(child, "secret:gemini-api-key", parent);
       await mesh.grantCapability(child, "secret:mistral-api-key", parent);
       expect(mesh.activeCapabilitiesFor(child).sort()).toEqual([
@@ -6722,7 +6743,7 @@ describe("ActorMesh", () => {
       const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
       writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
 
-      const { mesh } = setup({
+      const { mesh, capabilityGrants } = setup({
         secretsDir: customSecretsDir,
         grantableCapabilities: new Set(["secret"]),
       });
@@ -6731,7 +6752,14 @@ describe("ActorMesh", () => {
 
       await mesh.grantCapability(child, "secret:webhook-secret", "root");
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
-      // Authorized name, but no such file on this host: containment still gates it.
+      // Parent holds a delegable grant for the secret, but no such file on this host: containment still gates it.
+      capabilityGrants.grant({
+        actorId: parent,
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-01-01T00:00:00Z",
+        delegable: "descendants",
+      });
       await expect(mesh.grantCapability(child, "secret:gemini-api-key", parent)).rejects.toThrow(
         /secret file does not exist/
       );
@@ -6799,7 +6827,7 @@ describe("ActorMesh", () => {
     expect(mesh.hasActiveCapability(child, OBLIGATIONS_ADMIN_CAPABILITY)).toBe(true);
   });
 
-  it("a parent cannot grant a non-allow-listed capability, even to its direct child", async () => {
+  it("a parent cannot grant an undelegable capability, even to its direct child", async () => {
     const { mesh } = setup({
       grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
@@ -6807,11 +6835,11 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent });
 
     await expect(mesh.grantCapability(child, "understanding-write", parent)).rejects.toThrow(
-      /only a capability-admin holder may grant/
+      /lacks capability-admin and holds no delegable grant covering understanding-write/
     );
     expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
     await expect(mesh.revokeCapability(child, "understanding-write", parent)).rejects.toThrow(
-      /only a capability-admin holder may revoke/
+      /only a capability-admin holder or the grantor of an active grant may revoke/
     );
   });
 
@@ -6827,7 +6855,7 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
     await expect(mesh.grantCapability("iu-thread", "understanding-write", "ghost")).rejects.toThrow(
-      /only a capability-admin holder may grant/
+      /lacks capability-admin/
     );
   });
 
@@ -6869,16 +6897,22 @@ describe("ActorMesh", () => {
     // A sandboxed parentless record (ab-rig-holder shape) is refused grant & revoke authority
     await expect(
       mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")
-    ).rejects.toThrow(/only a capability-admin holder may grant/);
+    ).rejects.toThrow(
+      /lacks capability-admin and holds no delegable grant covering understanding-write/
+    );
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "ab-rig-holder")
-    ).rejects.toThrow(/only a capability-admin holder may revoke/);
+    ).rejects.toThrow(
+      /only a capability-admin holder or the grantor of an active grant may revoke/
+    );
 
     // So is a parentless record that runs unsandboxed, as root does: neither
     // topology nor running unsandboxed confers authority
     await expect(
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
-    ).rejects.toThrow(/only a capability-admin holder may grant/);
+    ).rejects.toThrow(
+      /lacks capability-admin and holds no delegable grant covering understanding-write/
+    );
   });
 
   it("scopes a capability-admin holder's authority to its own subtree; a second parentless root holds none until granted (#549)", async () => {
@@ -6908,7 +6942,7 @@ describe("ActorMesh", () => {
     // until it holds capability-admin itself (a row, not a topology inference).
     await expect(
       mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
-    ).rejects.toThrow(/only a capability-admin holder may grant/);
+    ).rejects.toThrow(/lacks capability-admin/);
     capabilityGrants.grant({
       actorId: "account-b-root",
       capability: CAPABILITY_ADMIN_CAPABILITY,

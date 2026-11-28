@@ -3,6 +3,7 @@ import {
   type CapabilityGrant,
   type CapabilityGrantStore,
   GrantMutationListenerSlot,
+  isDelegationReach,
 } from "../../actor/capability-grants.js";
 
 type GrantRow = {
@@ -11,6 +12,7 @@ type GrantRow = {
   granted_by: string;
   granted_at: string;
   revoked_at: string | null;
+  delegable: string | null;
 };
 
 function fromRow(row: GrantRow): CapabilityGrant {
@@ -20,6 +22,7 @@ function fromRow(row: GrantRow): CapabilityGrant {
     grantedBy: row.granted_by,
     grantedAt: row.granted_at,
     ...(row.revoked_at !== null ? { revokedAt: row.revoked_at } : {}),
+    ...(isDelegationReach(row.delegable) ? { delegable: row.delegable } : {}),
   };
 }
 
@@ -38,14 +41,21 @@ export class DbCapabilityGrantStore implements CapabilityGrantStore {
   grant(grant: CapabilityGrant): void {
     this.db
       .prepare(
-        `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
-         VALUES (?, ?, ?, ?, NULL)
+        `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at, delegable)
+         VALUES (?, ?, ?, ?, NULL, ?)
          ON CONFLICT(actor_id, capability) DO UPDATE SET
            granted_by = excluded.granted_by,
            granted_at = excluded.granted_at,
-           revoked_at = NULL`
+           revoked_at = NULL,
+           delegable = excluded.delegable`
       )
-      .run(grant.actorId, grant.capability, grant.grantedBy, grant.grantedAt);
+      .run(
+        grant.actorId,
+        grant.capability,
+        grant.grantedBy,
+        grant.grantedAt,
+        grant.delegable ?? null
+      );
   }
 
   revoke(actorId: string, capability: string, at: string): void {
@@ -61,7 +71,7 @@ export class DbCapabilityGrantStore implements CapabilityGrantStore {
     return (
       this.db
         .prepare(
-          "SELECT actor_id, capability, granted_by, granted_at, revoked_at FROM capability_grants"
+          "SELECT actor_id, capability, granted_by, granted_at, revoked_at, delegable FROM capability_grants"
         )
         .all() as GrantRow[]
     ).map(fromRow);

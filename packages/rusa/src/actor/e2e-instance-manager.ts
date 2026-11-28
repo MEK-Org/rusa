@@ -31,7 +31,6 @@ import {
   setupFlutterOverlay,
   teardownFlutterOverlay,
 } from "../providers/sandbox.js";
-import { PARENT_GRANTABLE_SECRET_FILENAMES } from "./capability-grants.js";
 
 export const E2E_INSTANCE_UNIT_NAME = "rusa-e2e-instance";
 const E2E_INSTANCE_PORT = 8083 as const;
@@ -551,8 +550,8 @@ export class E2EInstanceManager {
         args.push("--dir", socketDirectory);
         args.push("--ro-bind", realpathIfExists(socketDirectory), socketDirectory);
       }
-      // Carry exactly the LLM keys the nested instance always received — the
-      // parent-grantable allow-list (#542) — never the whole secrets directory:
+      // Carry only the LLM API keys the e2e test instance needs in its sandbox,
+      // never the whole secrets directory:
       // webhook secrets and service passwords stay on the host. Each key passes
       // the same containment check a grant does, and the bind source is the
       // canonical path that check resolved. A key that is missing is simply not
@@ -560,7 +559,7 @@ export class E2EInstanceManager {
       // symlink) is refused rather than bound.
       const secretsSourceDir = join(this.opts.mcHome, SECRETS_DIRNAME);
       const secretsTargetDir = join(baseConfigHome, SECRETS_DIRNAME);
-      for (const filename of PARENT_GRANTABLE_SECRET_FILENAMES) {
+      for (const filename of ["gemini-api-key", "mistral-api-key"]) {
         let realSecretSource: string;
         try {
           realSecretSource = assertSecretContainment(filename, secretsSourceDir);

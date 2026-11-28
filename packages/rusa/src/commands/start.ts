@@ -3326,10 +3326,10 @@ async function composeStart(
         }
       : {}),
     // Grantable = every registered MCP-server capability PLUS the generic
-    // `secret` base (#542), under which ROOT grants any contained
-    // `secret:<filename>`; which of those a non-root parent may delegate is
-    // decided by PARENT_GRANTABLE_CAPABILITIES inside the mesh, not by this
-    // set. Secrets deliberately have NO server factory: the
+    // `secret` base (#542), under which a `capability-admin` grants any contained
+    // `secret:<filename>`; which of those a non-admin may delegate is decided by
+    // the grant row's `delegable` flag (#1346), not by this set. Secrets
+    // deliberately have NO server factory: the
     // `grantableServers.get(cap)` loop in createActor skips them safely, and the
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
     // #549: the administrative capabilities gate the management tools on the

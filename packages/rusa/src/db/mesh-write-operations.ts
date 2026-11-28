@@ -3,7 +3,7 @@ import {
   type CapabilityGrant,
   type CapabilityGrantStore,
   type CapabilityPolicy,
-  effectiveCapabilities,
+  effectiveActiveGrants,
   GRANT_MUTATION_EFFECT,
   type GrantMutationEffect,
 } from "../actor/capability-grants.js";
@@ -170,7 +170,7 @@ function grantAuthorityReader(
 ): GrantAuthorityReader {
   return {
     actor: (id) => repos.actors.get(id),
-    capabilities: (id) => effectiveCapabilities(repos.grants.list(), id, policy),
+    activeGrants: (id) => effectiveActiveGrants(repos.grants.list(), id, policy),
   };
 }
 
@@ -588,6 +588,7 @@ export const MESH_WRITE_OPERATIONS = {
       granteeId: grant.actorId,
       capability: grant.capability,
       verb: "grant",
+      ...(grant.delegable ? { delegable: grant.delegable } : {}),
     });
     context.repos.grants.grant(grant);
     context.emit({
@@ -596,6 +597,7 @@ export const MESH_WRITE_OPERATIONS = {
       actorId: grant.actorId,
       capability: grant.capability,
       by: grant.grantedBy,
+      ...(grant.delegable ? { delegable: grant.delegable } : {}),
     });
   },
 

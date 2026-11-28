@@ -81,9 +81,10 @@ import {
 import {
   type CapabilityGrantStore,
   type CapabilityPolicy,
+  type DelegationReach,
+  effectiveActiveGrants,
   type GrantMutationEffect,
   InMemoryCapabilityGrantStore,
-  PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
 import type { RunStartHandle } from "./concurrency-limiter.js";
 import { assertSpawnContextSupported, resolveContextSelection } from "./context-selection.js";
@@ -3509,9 +3510,10 @@ export class ActorMesh {
    * something to an unauthorized caller.
    */
   private grantAuthorityReader(): GrantAuthorityReader {
+    const policy = this.capabilityPolicy();
     return {
       actor: (id) => this.actors.get(id),
-      capabilities: (id) => this.grants.activeFor(id),
+      activeGrants: (id) => effectiveActiveGrants(this.grants.list(), id, policy),
     };
   }
 
@@ -3522,18 +3524,24 @@ export class ActorMesh {
   }
 
   /**
-   * Grant an extra `capability` to a specific actor by id (ISSUE_NUM, phase 1a).
+   * Grant an extra `capability` to a specific actor by id.
    * We enforce the allow-list so the primitive can never hand out a capability
-   * the wiring didn't mark grantable, plus grantor authorization: a
+   * the wiring didn't mark grantable, plus grantor authorization (#1346): a
    * `capability-admin` holder may grant most grantable capabilities in its
    * subtree; an operator-provisioned capability is refused here regardless of
-   * grantor. Any other grantor may only grant a {@link PARENT_GRANTABLE_CAPABILITIES}
-   * capability, and only to its direct children. Idempotent per (actorId,
-   * capability). MCP-server grants take effect
-   * on a live actor's next run; secrets are rebound by its next sandboxed run.
+   * grantor. Any other grantor (or an admin acting outside its subtree) may
+   * delegate a capability only if it holds a covering active grant with a
+   * `delegable` reach (`"descendants"` or `"anyone"`). Idempotent per
+   * (actorId, capability). MCP-server grants take effect on a live actor's
+   * next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
-  async grantCapability(actorId: string, capability: string, grantedBy: string): Promise<void> {
+  async grantCapability(
+    actorId: string,
+    capability: string,
+    grantedBy: string,
+    delegable?: DelegationReach
+  ): Promise<void> {
     actorId = this.resolveThreadId(actorId);
     grantedBy = this.resolveThreadId(grantedBy);
     if (!actorId.trim()) throw new Error("actorId is required");
@@ -3630,13 +3638,20 @@ export class ActorMesh {
       granteeId: actorId,
       capability,
       verb: "grant",
+      ...(delegable ? { delegable } : {}),
     });
     if (baseCapability === "secret") {
       const secretFilename = capability.slice("secret:".length);
       assertSecretContainment(secretFilename, this.secretsDir);
     }
     await this.requireWriter().write("grants.grant", {
-      grant: { actorId, capability, grantedBy, grantedAt: this.now() },
+      grant: {
+        actorId,
+        capability,
+        grantedBy,
+        grantedAt: this.now(),
+        ...(delegable ? { delegable } : {}),
+      },
       policy: this.capabilityPolicy(),
     });
   }
@@ -3656,7 +3671,10 @@ export class ActorMesh {
         kind: "capability_granted",
         actorId,
         detail: capability,
-        payload: JSON.stringify({ grantedBy: effect.by }),
+        payload: JSON.stringify({
+          grantedBy: effect.by,
+          ...(effect.delegable ? { delegable: effect.delegable } : {}),
+        }),
       });
       try {
         this.onCapabilityGranted?.(actorId, capability);
@@ -3684,7 +3702,7 @@ export class ActorMesh {
    * grantor authorization as {@link grantCapability}: a `capability-admin`
    * holder revokes most capabilities in its subtree; an operator-provisioned
    * capability is refused here regardless of grantor. Any other `revokedBy`
-   * only revokes a parent-grantable capability from a direct child. No-op on
+   * only revokes an active grant it made (`grantedBy === revokedBy`). No-op on
    * the store if not active, but the unmount hook still
    * fires so a stale mounted endpoint is torn down idempotently. A mounted
    * endpoint admits each request against the actor's capabilities, so it

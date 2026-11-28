@@ -88,12 +88,12 @@ describe("grant and experiment writes decide authority in the transaction (#1289
       policy: null,
     });
     await expect(grant("worker", "drive-read", "steward")).rejects.toThrow(
-      "only a capability-admin holder may grant drive-read"
+      "steward lacks capability-admin and holds no delegable grant covering drive-read"
     );
     expect(repos.capabilityGrants.activeFor("worker")).toEqual(["understanding-write"]);
   });
 
-  it("refuses a parent's grant and revocation once the grantee is reparented away", async () => {
+  it("refuses a descendants-flagged grant once the grantee is reparented away, while preserving take-back (#1346)", async () => {
     await writer.write("grants.revoke", {
       actorId: "steward",
       capability: CAPABILITY_ADMIN_CAPABILITY,
@@ -101,23 +101,36 @@ describe("grant and experiment writes decide authority in the transaction (#1289
       at: AT,
       policy: null,
     });
-    // A parent without capability-admin may delegate the LLM keys to its child.
+    repos.capabilityGrants.grant({
+      actorId: "steward",
+      capability: "secret:gemini-api-key",
+      grantedBy: "root",
+      grantedAt: AT,
+      delegable: "descendants",
+    });
+    repos.capabilityGrants.grant({
+      actorId: "steward",
+      capability: "secret:mistral-api-key",
+      grantedBy: "root",
+      grantedAt: AT,
+      delegable: "descendants",
+    });
+    // A parent with descendants-flagged secrets may delegate them inside its subtree.
     await grant("worker", "secret:gemini-api-key", "steward");
     repos.actors.patch("worker", { parentId: "root" });
 
     await expect(grant("worker", "secret:mistral-api-key", "steward")).rejects.toThrow(
-      "worker is not a child of steward"
+      "steward may only delegate secret:mistral-api-key within its own subtree"
     );
-    await expect(
-      writer.write("grants.revoke", {
-        actorId: "worker",
-        capability: "secret:gemini-api-key",
-        revokedBy: "steward",
-        at: AT,
-        policy: null,
-      })
-    ).rejects.toThrow("worker is not a child of steward");
-    expect(repos.capabilityGrants.activeFor("worker")).toEqual(["secret:gemini-api-key"]);
+    // Ruling 3: the delegator may still take back what it granted.
+    await writer.write("grants.revoke", {
+      actorId: "worker",
+      capability: "secret:gemini-api-key",
+      revokedBy: "steward",
+      at: AT,
+      policy: null,
+    });
+    expect(repos.capabilityGrants.activeFor("worker")).toEqual([]);
   });
 
   it("refuses a capability-admin grant outside the grantor's subtree after a reparent", async () => {
@@ -152,7 +165,7 @@ describe("grant and experiment writes decide authority in the transaction (#1289
     expect(repos.capabilityGrants.activeFor("default-child")).toEqual(["understanding-write"]);
     // A former default's bootstrap row confers nothing under the policy.
     await expect(grantWith("other-child", "other")).rejects.toThrow(
-      "only a capability-admin holder may grant understanding-write"
+      "other lacks capability-admin and holds no delegable grant covering understanding-write"
     );
     expect(repos.capabilityGrants.activeFor("other-child")).toEqual([]);
   });
@@ -276,7 +289,7 @@ describe("grant and experiment writes decide authority in the transaction (#1289
       releaseWrites();
 
       await expect(pending).rejects.toThrow(
-        "only a capability-admin holder may grant understanding-write"
+        "steward lacks capability-admin and holds no delegable grant covering understanding-write"
       );
       expect(repos.capabilityGrants.activeFor("worker")).toEqual([]);
       expect(events.filter((e) => e.kind === "capability_granted")).toEqual([]);
