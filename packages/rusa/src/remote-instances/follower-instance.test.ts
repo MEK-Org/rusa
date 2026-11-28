@@ -1293,7 +1293,6 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
           candidates: [{ provider: "instance-fixture", model: "scripted" }],
           responsive: false,
           mode: "ordinary",
-          modelConfigGeneration: 0,
         },
       },
     });
@@ -1938,6 +1937,36 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
 
       await waitUntil(() => runStarts(h, id).length === 1);
       expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-crossing" });
+      expect(h.failures).toEqual([]);
+    });
+
+    it("re-quotes an admission that names no pool, from a follower built before #725, that the pin overtook", async () => {
+      const h = setup();
+      // A v7/v8 follower built before #725 ignores the numbered pool and sends
+      // `admit` without the generation it quoted under (the pre-echo adapter).
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      h.remote.receive = (event) => {
+        const { message } = event;
+        if (message.type === "request" && message.request.op === "admit") {
+          const { modelConfigGeneration: _omitted, ...preEchoRequest } = message.request;
+          const preEchoEvent = { ...event, message: { ...message, request: preEchoRequest } };
+          if (held.length === 0) {
+            held.push(preEchoEvent);
+            return;
+          }
+          return receive(preEchoEvent);
+        }
+        receive(event);
+      };
+      const id = h.spawn("Pinned before a pre-echo admission arrives");
+      await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
+
+      h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-pre-echo" }], "root");
+      receive(held[0]);
+
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-pre-echo" });
       expect(h.failures).toEqual([]);
     });
 
@@ -2979,6 +3008,22 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     release();
     await waitUntil(() => queuedReports() === 2);
     expect(h.meshEvents.filter((event) => event.kind === "run_return_rejected")).toHaveLength(1);
+  });
+
+  it("normalizes an admitted v7/v8 follower's winding_down state to running (#828)", async () => {
+    const h = setup({ delayMs: 300 });
+    const id = h.mesh.spawn({
+      charter: "legacy follower",
+      parentId: "root",
+      modelConfig: { provider: "instance-fixture", model: "scripted" },
+    });
+    // Synthesize an older follower reporting winding_down while its provider is alive
+    h.remote.receive({
+      actorId: id,
+      message: { type: "state", state: "winding_down" as const },
+    });
+    expect(h.mesh.activeRunState(id)).toEqual({ actorId: id, phase: "running" });
+    expect(() => h.mesh.retire(id)).toThrow(/cannot retire/);
   });
 });
 

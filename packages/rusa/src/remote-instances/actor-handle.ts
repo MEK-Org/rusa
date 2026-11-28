@@ -104,6 +104,24 @@ export class ActorHandle implements MeshActor {
    */
   private pendingQueuedCancel = false;
   private pendingQueuedCancelRetain?: boolean;
+  /**
+   * The pool changed between the follower's queued report and its admission
+   * request, which was quoted under the old pool; refuse it as stale on arrival.
+   * Only a request that does not name its pool relies on this.
+   * pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+   * with quotedGeneration.
+   */
+  private pendingQueuedRequote = false;
+  /**
+   * The pool the leader had sent before it processed the follower's queued
+   * report, or before the latest re-quote it asked for. A pin that crosses that
+   * report on the wire is stamped here as already quoted, so for a follower
+   * built before #725, which does not name its pool on `admit`, that one run can
+   * start on the pre-pin pool.
+   * pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+   * with the branch of rescheduleQueuedRun that reads it.
+   */
+  private quotedGeneration = 0;
   private state: ActorRuntimeState = "idle";
   private closed = false;
   private terminated = false;
@@ -446,6 +464,8 @@ export class ActorHandle implements MeshActor {
     this.pendingQueuedCancel = false;
     const retain = this.pendingQueuedCancelRetain ?? true;
     this.pendingQueuedCancelRetain = undefined;
+    // The resumed start asks again under the pool the follower holds by then.
+    this.pendingQueuedRequote = false;
     this.pendingQueuedPromotion = false;
     this.send({ type: "cancelQueued", retain });
     this.send({ type: "reply", requestId, error: COORDINATOR_ADMISSION_CANCELLED_ERROR });
@@ -564,6 +584,25 @@ export class ActorHandle implements MeshActor {
       gate.modelConfigStale = true;
       if (gate.handle.cancel?.()) rescheduled = cancelledGate = true;
     }
+    // pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8.
+    // An echoed generation refuses the stale request by itself; the mesh
+    // re-dispatches nothing for a queued actor, so returning false here changes
+    // no outcome.
+    if (
+      !rescheduled &&
+      this.state === "queued" &&
+      !this.runOpen &&
+      this.gates.size === 0 &&
+      !this.pendingQueuedCancel &&
+      this.quotedGeneration !== this.modelConfigGeneration
+    ) {
+      this.pendingQueuedRequote = true;
+      rescheduled = true;
+    }
+    // The stale reply follows the `modelConfig` command, so the re-ask is quoted
+    // under the current pool. pre-echo adapter (#725): remove once
+    // OLDEST_FOLLOWER_PROTOCOL_VERSION > 8, with quotedGeneration.
+    if (rescheduled) this.quotedGeneration = this.modelConfigGeneration;
     // As Actor.rescheduleQueuedRun: the old quote's recorded selection is gone.
     // Only a gate records one; the request-in-flight branch has none to clear.
     if (cancelledGate) this.opts.context.onQueuedRunCancelled?.();
@@ -572,7 +611,15 @@ export class ActorHandle implements MeshActor {
 
   /** Refuse an admission request quoted under a pool replaced before it arrived. */
   private rejectStaleAdmission(requestId: number, quotedGeneration: number | undefined): boolean {
-    if (quotedGeneration === this.modelConfigGeneration) return false;
+    // A follower names the pool it quoted; one built before #725 leaves the
+    // leader to infer it (pre-echo adapter (#725): remove once
+    // OLDEST_FOLLOWER_PROTOCOL_VERSION > 8).
+    const stale =
+      quotedGeneration === undefined
+        ? this.pendingQueuedRequote
+        : quotedGeneration !== this.modelConfigGeneration;
+    this.pendingQueuedRequote = false;
+    if (!stale) return false;
     this.send({ type: "reply", requestId, error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR });
     return true;
   }
@@ -587,6 +634,7 @@ export class ActorHandle implements MeshActor {
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
     this.pendingQueuedCancel = false;
+    this.pendingQueuedRequote = false;
     this.resumeCancelledPending = false;
     this.outstandingPreempt = undefined;
     void this.cancelRetainedAdmission();
@@ -631,6 +679,7 @@ export class ActorHandle implements MeshActor {
     if (!this.retainedAdmission) this.pendingQueuedPromotion = false;
     // The follower re-derives its queued run on reattach; that is a fresh request.
     this.pendingQueuedCancel = false;
+    this.pendingQueuedRequote = false;
   }
 
   private releaseGates(): void {
@@ -970,13 +1019,28 @@ export class ActorHandle implements MeshActor {
         clearTimeout(this.stateStaleTimer);
         this.stateStaleTimer = undefined;
         const reattachReport = this.stateStale || this.stateUnconfirmed;
-        this.state = message.state;
+        // A fresh queued report, including the follower's re-derived run after
+        // a reattach, is taken as quoted under the pool the leader had sent
+        // before processing it. A pin that crossed the report on the wire
+        // breaks that; only the generation an `admit` echoes catches it.
+        // pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+        // with quotedGeneration.
+        if (message.state === "queued" && (this.state !== "queued" || reattachReport)) {
+          this.quotedGeneration = this.modelConfigGeneration;
+        }
+        // Legacy wire reader: older v7/v8 followers can still report "winding_down"
+        // while their provider is alive; normalize it to "running" so activeRunState
+        // and isRunning treat the live run as running until those versions leave
+        // the supported window.
+        const wireState: ActorRuntimeState =
+          message.state === "winding_down" ? "running" : message.state;
+        this.state = wireState;
         this.stateStale = false;
         this.stateUnconfirmed = false;
-        if (message.state !== "running") {
+        if (wireState !== "running") {
           this.finalizingRunId = undefined;
         }
-        if (message.state !== "queued") {
+        if (wireState !== "queued") {
           this.pendingQueuedPromotion = false;
           this.pendingQueuedCancel = false;
         }
@@ -986,7 +1050,7 @@ export class ActorHandle implements MeshActor {
         }
         // Any wake held since reattach is now ordered behind the preempt decision.
         this.settleState?.();
-        ctx.onRuntimeStateChanged(message.state);
+        ctx.onRuntimeStateChanged(wireState);
         // The first report after a reattach is the deadline for claiming a
         // retained ticket: whatever the follower holds now, it is not the run
         // that ticket was reserved for.

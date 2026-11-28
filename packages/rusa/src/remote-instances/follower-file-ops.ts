@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { GchatClient } from "../chat/gchat-client.js";
 import {
   type ChatClient,
+  MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
   MEDIA_TOKEN_RE,
   MESSAGE_ATTACHMENT_NAME_RE,
@@ -104,7 +105,12 @@ export function createFollowerFileOps(options: FollowerFileOpsOptions): Follower
         }
         requireCredentials(options.credentialDir, "Chat", CHAT_CREDENTIALS);
         const target = await resolveAttachmentPath(workDir, filePath);
-        const bytes = await readBoundedRegularFile(workDir, target, maxBytes, "attachment");
+        const bytes = await readBoundedRegularFile(
+          workDir,
+          target,
+          Math.min(maxBytes, MAX_CHAT_ATTACHMENT_BYTES),
+          "attachment"
+        );
         return chatClient(options.credentialDir).uploadAttachment(
           spaceName,
           filename,

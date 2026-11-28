@@ -56,6 +56,12 @@ function offersWorkspaceSweep(body: Record<string, unknown>): boolean {
   return typeof offer === "object" && offer !== null && offer.version === 1;
 }
 
+/** Whether a `/register` body offers negotiated Chat attachment uploads (#795). */
+function offersChatAttachmentUpload(body: Record<string, unknown>): boolean {
+  const offer = body.chatAttachmentUpload as { version?: unknown } | null | undefined;
+  return typeof offer === "object" && offer !== null && offer.version === 1;
+}
+
 export interface FollowerInfo {
   id: string;
   platform: string;
@@ -724,6 +730,7 @@ export class FollowerHub {
           // registration listeners run so listeners see the current offer.
           existing.boundedExecution = offersBoundedExecution(body);
           existing.workspaceSweep = offersWorkspaceSweep(body);
+          existing.chatAttachmentUpload = offersChatAttachmentUpload(body);
           for (const listener of this.onRegisterListeners) {
             try {
               listener(existing);
@@ -765,6 +772,7 @@ export class FollowerHub {
       );
       follower.boundedExecution = offersBoundedExecution(body);
       follower.workspaceSweep = offersWorkspaceSweep(body);
+      follower.chatAttachmentUpload = offersChatAttachmentUpload(body);
       this.followers.set(follower.id, follower);
       this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {

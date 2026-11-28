@@ -1,9 +1,17 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
+import { MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
 import { createFollowerFileOps } from "./follower-file-ops.js";
 import type { FollowerFileOperation } from "./protocol.js";
 
@@ -146,6 +154,16 @@ describe("follower file operations (#1013)", () => {
     );
     await expect(
       run(workDir, { ...uploadOp, filePath: "oversized.bin", maxBytes: 10 })
+    ).rejects.toThrow("attachment size limit exceeded");
+    const leaderTooLarge = join(workDir, "leader-too-large.bin");
+    writeFileSync(leaderTooLarge, "");
+    truncateSync(leaderTooLarge, MAX_CHAT_ATTACHMENT_BYTES + 1);
+    await expect(
+      run(workDir, {
+        ...uploadOp,
+        filePath: "leader-too-large.bin",
+        maxBytes: MAX_CHAT_ATTACHMENT_BYTES * 2,
+      })
     ).rejects.toThrow("attachment size limit exceeded");
     expect(chat.uploadAttachment).not.toHaveBeenCalled();
   });

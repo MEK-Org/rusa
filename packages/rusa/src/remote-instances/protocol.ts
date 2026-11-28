@@ -58,6 +58,17 @@ export interface WorkspaceSweepCapability {
 }
 export const WORKSPACE_SWEEP_CAPABILITY: WorkspaceSweepCapability = { version: 1 };
 
+/**
+ * Negotiated Chat attachment uploads (#795). A follower offers this on
+ * `/register`; the leader sends the new `fileOp` variant only when that offer
+ * is present. Older v9 followers keep their existing download support and
+ * never receive an upload operation.
+ */
+export interface ChatAttachmentUploadCapability {
+  version: 1;
+}
+export const CHAT_ATTACHMENT_UPLOAD_CAPABILITY: ChatAttachmentUploadCapability = { version: 1 };
+
 export interface FollowerWorkspaceSweepCommand {
   type: "workspaceSweep";
   actors: ActorLiveness[];
@@ -117,10 +128,18 @@ export interface FollowerParkedEvent {
 // sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
 // this, delete the adapters that only served the version now falling out of range.
 //
-// v9 (#1013) adds download `fileOp` commands and results. v10 (#795) adds the
-// Chat upload variant. The leader still sends downloads to v9 followers, but
-// never sends uploads until the follower is on v10.
-export const INSTANCE_PROTOCOL_VERSION = 10;
+// #725 added optional fields without a bump: the leader numbers each pool it sends
+// (`init`, `modelConfig`) and the follower echoes that number on `admit`. A follower
+// built before #725 (v7 or v8) omits it, and the leader falls back to its own view
+// of the queued report. Pre- and post-#725 v8 followers share a version, so the
+// fallback lives until v8 leaves the window, not at the next bump. It is tagged
+// `pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8`.
+//
+// v9 (#1013) adds the `fileOp` command and its `fileOpResult` event. The leader
+// sends `fileOp` only to a v9 follower; a v8 follower's actors keep the
+// file-tool refusal. #795 adds its upload variant behind
+// `CHAT_ATTACHMENT_UPLOAD_CAPABILITY`, so it does not change that window.
+export const INSTANCE_PROTOCOL_VERSION = 9;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
@@ -194,7 +213,10 @@ export type Request =
        * retained, under the request id the leader's gate still answers on.
        */
       resume?: boolean;
-      /** The pool generation `candidates` were quoted under, as last numbered by the leader. */
+      /**
+       * The pool generation `candidates` were quoted under, as last numbered by
+       * the leader. Absent from a follower built before #725.
+       */
       modelConfigGeneration?: number;
     }
   | { op: "sendMessage"; to: string; body: string }
@@ -253,7 +275,7 @@ export type LeaderCommand =
   | {
       type: "modelConfig";
       modelConfig: RawProviderModelConfig[];
-      /** The leader's number for this pool, echoed on `admit`. */
+      /** The leader's number for this pool, echoed on `admit`; absent before #725. */
       generation?: number;
     }
   | { type: "wake"; nudge?: RunNudge }
@@ -272,7 +294,7 @@ export type LeaderCommand =
   | { type: "unkillable" }
   | { type: "stop" }
   | { type: "reply"; requestId: number; value?: unknown; error?: string }
-  /** v9 downloads and v10 Chat uploads; answered by `fileOpResult`. */
+  /** v9 downloads and negotiated Chat uploads; answered by `fileOpResult`. */
   | { type: "fileOp"; requestId: string; operation: FollowerFileOperation }
   /**
    * Bounded execution: read one retained original of this actor's run on this
@@ -306,7 +328,8 @@ export type ActorEvent =
     }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }
-  | { type: "state"; state: ActorRuntimeState; yielded?: boolean }
+  /** Wire state; "winding_down" is retained for v7/v8 follower compatibility until OLDEST_FOLLOWER_PROTOCOL_VERSION > 8. */
+  | { type: "state"; state: ActorRuntimeState | "winding_down"; yielded?: boolean }
   | { type: "session"; sessionId: string }
   | { type: "queued"; responsive: boolean; mode: ActorRunMode; runId?: string }
   | { type: "error"; error: string }
@@ -336,7 +359,7 @@ export type ActorEvent =
   | { type: "coalesced"; count: number; ageMs: number }
   | { type: "log"; chunk: string }
   | { type: "fatal"; error: string }
-  /** v9 downloads and v10 Chat uploads: exactly one of result or error. */
+  /** v9 downloads and negotiated Chat uploads: exactly one of result or error. */
   | {
       type: "fileOpResult";
       requestId: string;

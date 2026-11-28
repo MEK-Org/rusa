@@ -32,8 +32,6 @@ import {
  * it stays 9 when `INSTANCE_PROTOCOL_VERSION` moves on.
  */
 export const FILE_OP_PROTOCOL_VERSION = 9;
-/** First protocol whose follower can upload a local Chat attachment (#795). */
-export const CHAT_ATTACHMENT_UPLOAD_PROTOCOL_VERSION = 10;
 
 /**
  * How long the leader waits for a follower's `fileOpResult`. Generous enough
@@ -294,6 +292,8 @@ export class RemoteInstance {
   boundedExecution = false;
   /** Set when this generation offered workspace sweep and the hub echoed it (#1338). */
   workspaceSweep = false;
+  /** Set when this generation offered negotiated Chat uploads (#795). */
+  chatAttachmentUpload = false;
   private readonly materialReads = new Map<string, PendingMaterialRead>();
 
   constructor(
@@ -444,22 +444,15 @@ export class RemoteInstance {
     actorId: string,
     operation: FollowerFileOperation
   ): Promise<FollowerFileOperationResult> | undefined {
-    const requiredProtocolVersion =
-      operation.kind === "chatAttachmentUpload"
-        ? CHAT_ATTACHMENT_UPLOAD_PROTOCOL_VERSION
-        : FILE_OP_PROTOCOL_VERSION;
-    if (this.protocolVersion < requiredProtocolVersion) return undefined;
+    if (this.protocolVersion < FILE_OP_PROTOCOL_VERSION) return undefined;
+    if (operation.kind === "chatAttachmentUpload" && !this.chatAttachmentUpload) return undefined;
     const requestId = randomUUID();
     const result = new Promise<FollowerFileOperationResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.fileOps.delete(requestId);
-        const uncertainty =
-          operation.kind === "chatAttachmentUpload"
-            ? "the upload may still have completed on the follower"
-            : "the file may still appear at the destination";
         reject(
           new Error(
-            `Follower ${this.id} did not finish the file operation within ${FILE_OP_TIMEOUT_MS / 60_000} minutes; ${uncertainty}`
+            `Follower ${this.id} did not finish the file operation within ${FILE_OP_TIMEOUT_MS / 60_000} minutes; the file may still appear at the destination`
           )
         );
       }, FILE_OP_TIMEOUT_MS);

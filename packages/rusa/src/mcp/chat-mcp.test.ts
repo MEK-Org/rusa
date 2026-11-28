@@ -1063,7 +1063,8 @@ describe("chat MCP server", () => {
     writeFileSync(join(credentialDir, "client.json"), "{}");
     writeFileSync(join(credentialDir, "token.json"), "{}");
 
-    const fake = new FakeChatClient();
+    const leaderChat = new FakeChatClient();
+    const followerChat = new FakeChatClient();
     const actorId = "actor-1";
     const remote = new RemoteInstance(
       "test-follower",
@@ -1073,6 +1074,7 @@ describe("chat MCP server", () => {
       undefined,
       INSTANCE_PROTOCOL_VERSION
     );
+    remote.chatAttachmentUpload = true;
     const follower = new FollowerInstance(
       followerHome,
       false,
@@ -1083,7 +1085,7 @@ describe("chat MCP server", () => {
         run: async () => ({ success: true, exitCode: 0, output: "" }),
         stop: () => {},
       }),
-      { fileOps: createFollowerFileOps({ credentialDir, chatClient: () => fake }) }
+      { fileOps: createFollowerFileOps({ credentialDir, chatClient: () => followerChat }) }
     );
     remote.createHost(actorId);
     follower.dispatch({
@@ -1104,7 +1106,7 @@ describe("chat MCP server", () => {
     writeFileSync(absolutePath, absoluteBytes);
 
     const client = await connect(
-      createChatWriteMcpServer(actorId, fake, {
+      createChatWriteMcpServer(actorId, leaderChat, {
         allowedSpaces: ["spaces/A"],
         workDir: leaderWorkDir,
         fileToolsAvailable: false,
@@ -1122,7 +1124,7 @@ describe("chat MCP server", () => {
         },
       })) as CallToolResult;
       expect(upload.isError, textOf(upload)).toBeFalsy();
-      fake.uploadResponseMode = "token";
+      followerChat.uploadResponseMode = "token";
 
       const sent = (await client.callTool({
         name: "send_message",
@@ -1134,7 +1136,7 @@ describe("chat MCP server", () => {
       })) as CallToolResult;
       expect(sent.isError).toBeFalsy();
 
-      expect(fake.uploadedAttachments).toMatchObject([
+      expect(followerChat.uploadedAttachments).toMatchObject([
         {
           filename: "renamed.bin",
           mimeType: "application/x-custom",
@@ -1146,7 +1148,8 @@ describe("chat MCP server", () => {
           content: absoluteBytes,
         },
       ]);
-      expect(fake.sent[0]?.attachments).toEqual([
+      expect(leaderChat.uploadedAttachments).toEqual([]);
+      expect(leaderChat.sent[0]?.attachments).toEqual([
         {
           attachmentDataRef: { attachmentUploadToken: "fake-upload-token-2" },
         },

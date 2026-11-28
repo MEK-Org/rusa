@@ -1168,7 +1168,7 @@ describe("follower file operations (#1013)", () => {
     maxBytes: 1234,
   };
 
-  it("sends a v10 follower one fileOp command and settles on its fileOpResult event", async () => {
+  it("sends a v9 follower a download fileOp command and settles on its fileOpResult event", async () => {
     const h = await setup();
     const identity = await h.register("mac");
     h.hub.createHost("mac", "actor-1");
@@ -1249,7 +1249,7 @@ describe("follower file operations (#1013)", () => {
     await malformed;
   });
 
-  it("keeps v9 downloads working but refuses a v10 Chat upload before dispatch", async () => {
+  it("keeps v9 downloads working but refuses a Chat upload without its capability offer", async () => {
     const h = await setup();
     const response = await h.post("/register", {
       id: "lagging",
@@ -1282,9 +1282,22 @@ describe("follower file operations (#1013)", () => {
     await expect(pending).resolves.toEqual(result);
   });
 
-  it("accepts either Chat attachment reference form and rejects a result for the wrong pending operation", async () => {
+  it("dispatches an offered Chat upload and rejects a result for the wrong pending operation", async () => {
     const h = await setup();
-    const identity = await h.register("mac");
+    const response = await h.post("/register", {
+      id: "mac",
+      platform: "darwin",
+      pid: 123,
+      generation: "mac-process-one",
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      chatAttachmentUpload: { version: 1 },
+    });
+    expect(response.status).toBe(200);
+    const identity = {
+      id: "mac",
+      generation: "mac-process-one",
+      ...((await response.json()) as { session: string; leaderToken: string }),
+    };
     const tokenResult = expect(h.hub.fileOp("mac", "actor-1", upload)).resolves.toEqual({
       attachmentDataRef: { attachmentUploadToken: "opaque-upload-token" },
     });
